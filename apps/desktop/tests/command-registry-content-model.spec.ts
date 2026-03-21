@@ -1,0 +1,319 @@
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { test, expect } from '@playwright/test';
+import { CommandBus } from '../src/main/services/command-bus';
+import { JobRegistry } from '../src/main/services/job-runner';
+import { registerCoreCommands } from '../src/main/services/command-registry';
+import { AppErrorCode } from '@kb-vault/shared-types';
+
+async function createTestHarness() {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch2-commands-'));
+  await mkdir(workspaceRoot, { recursive: true });
+  const bus = new CommandBus();
+  const jobs = new JobRegistry();
+  registerCoreCommands(bus, jobs, workspaceRoot);
+
+  const createWorkspace = async () => {
+    const workspaceName = `ws-${randomUUID()}`;
+    const created = await bus.execute({
+      method: 'workspace.create',
+      payload: {
+        name: workspaceName,
+        zendeskSubdomain: 'support',
+        defaultLocale: 'en-us',
+        enabledLocales: ['en-us', 'es-es']
+      }
+    });
+    expect(created.ok).toBe(true);
+    return created.data as { id: string };
+  };
+
+  return { workspaceRoot, bus, jobs, createWorkspace, cleanup: () => rm(workspaceRoot, { recursive: true, force: true }) };
+}
+
+test.describe('command registry content model transitions', () => {
+  let bus: CommandBus;
+  let cleanup: () => Promise<void>;
+  let createWorkspace: () => Promise<{ id: string }>;
+
+  test.beforeEach(async () => {
+    const harness = await createTestHarness();
+    bus = harness.bus;
+    createWorkspace = harness.createWorkspace;
+    cleanup = harness.cleanup;
+  });
+
+  test.afterEach(async () => {
+    await cleanup();
+  });
+
+  test('handles workspace settings command read/write + validation', async () => {
+    const workspace = await createWorkspace();
+
+    const getResp = await bus.execute({
+      method: 'workspace.settings.get',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(getResp.ok).toBe(true);
+    expect((getResp.data as { zendeskSubdomain: string }).zendeskSubdomain).toBe('support');
+
+    const updateResp = await bus.execute({
+      method: 'workspace.settings.update',
+      payload: {
+        workspaceId: workspace.id,
+        defaultLocale: 'es-es',
+        enabledLocales: ['es-es']
+      }
+    });
+    expect(updateResp.ok).toBe(true);
+    expect((updateResp.data as { enabledLocales: string[] }).enabledLocales).toEqual(['es-es']);
+
+    const invalidNoPayload = await bus.execute({
+      method: 'workspace.settings.update',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(invalidNoPayload.ok).toBe(false);
+    expect(invalidNoPayload.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+  });
+
+  test('handles articleFamily command lifecycle', async () => {
+    const workspace = await createWorkspace();
+
+    const createResp = await bus.execute({
+      method: 'articleFamily.create',
+      payload: {
+        workspaceId: workspace.id,
+        externalKey: 'kb-start',
+        title: 'KB Start'
+      }
+    });
+    expect(createResp.ok).toBe(true);
+    const family = createResp.data as { id: string };
+
+    const listResp = await bus.execute({
+      method: 'articleFamily.list',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(listResp.ok).toBe(true);
+    expect((listResp.data as { families: Array<{ id: string }>}).families.length).toBe(1);
+
+    const getResp = await bus.execute({
+      method: 'articleFamily.get',
+      payload: { workspaceId: workspace.id, familyId: family.id }
+    });
+    expect(getResp.ok).toBe(true);
+    expect((getResp.data as { title: string }).title).toBe('KB Start');
+
+    const updateResp = await bus.execute({
+      method: 'articleFamily.update',
+      payload: {
+        workspaceId: workspace.id,
+        familyId: family.id,
+        title: 'KB Start Updated'
+      }
+    });
+    expect(updateResp.ok).toBe(true);
+
+    const invalidUpdateResp = await bus.execute({
+      method: 'articleFamily.update',
+      payload: {
+        workspaceId: workspace.id,
+        familyId: family.id
+      }
+    });
+    expect(invalidUpdateResp.ok).toBe(false);
+    expect(invalidUpdateResp.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+
+    const deleteResp = await bus.execute({
+      method: 'articleFamily.delete',
+      payload: { workspaceId: workspace.id, familyId: family.id }
+    });
+    expect(deleteResp.ok).toBe(true);
+
+    const getAfterDelete = await bus.execute({
+      method: 'articleFamily.get',
+      payload: { workspaceId: workspace.id, familyId: family.id }
+    });
+    expect(getAfterDelete.ok).toBe(false);
+    expect(getAfterDelete.error?.code).toBe(AppErrorCode.NOT_FOUND);
+  });
+
+  test('handles localeVariant transitions and validation', async () => {
+    const workspace = await createWorkspace();
+    const familyResp = await bus.execute({
+      method: 'articleFamily.create',
+      payload: {
+        workspaceId: workspace.id,
+        externalKey: 'variant-family',
+        title: 'Variant Family'
+      }
+    });
+    const family = familyResp.data as { id: string };
+
+    const createVariantResp = await bus.execute({
+      method: 'localeVariant.create',
+      payload: {
+        workspaceId: workspace.id,
+        familyId: family.id,
+        locale: 'en-us',
+        status: 'live'
+      }
+    });
+    expect(createVariantResp.ok).toBe(true);
+    const variant = createVariantResp.data as { id: string };
+
+    const listResp = await bus.execute({
+      method: 'localeVariant.list',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(listResp.ok).toBe(true);
+    expect((listResp.data as { variants: Array<{ id: string }>}).variants.length).toBe(1);
+
+    const getResp = await bus.execute({
+      method: 'localeVariant.get',
+      payload: { workspaceId: workspace.id, variantId: variant.id }
+    });
+    expect(getResp.ok).toBe(true);
+
+    const duplicateResp = await bus.execute({
+      method: 'localeVariant.create',
+      payload: {
+        workspaceId: workspace.id,
+        familyId: family.id,
+        locale: 'en-us'
+      }
+    });
+    expect(duplicateResp.ok).toBe(false);
+    expect(duplicateResp.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+
+    const updateResp = await bus.execute({
+      method: 'localeVariant.update',
+      payload: {
+        workspaceId: workspace.id,
+        variantId: variant.id,
+        locale: 'en-gb'
+      }
+    });
+    expect(updateResp.ok).toBe(true);
+
+    const updateInvalid = await bus.execute({
+      method: 'localeVariant.update',
+      payload: {
+        workspaceId: workspace.id,
+        variantId: variant.id
+      }
+    });
+    expect(updateInvalid.ok).toBe(false);
+    expect(updateInvalid.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+
+    const deleteResp = await bus.execute({
+      method: 'localeVariant.delete',
+      payload: { workspaceId: workspace.id, variantId: variant.id }
+    });
+    expect(deleteResp.ok).toBe(true);
+
+    const getAfterDelete = await bus.execute({
+      method: 'localeVariant.get',
+      payload: { workspaceId: workspace.id, variantId: variant.id }
+    });
+    expect(getAfterDelete.ok).toBe(false);
+    expect(getAfterDelete.error?.code).toBe(AppErrorCode.NOT_FOUND);
+  });
+
+  test('handles revision transitions and numeric validation', async () => {
+    const workspace = await createWorkspace();
+    const familyResp = await bus.execute({
+      method: 'articleFamily.create',
+      payload: {
+        workspaceId: workspace.id,
+        externalKey: 'revision-family',
+        title: 'Revision Family'
+      }
+    });
+    const family = familyResp.data as { id: string };
+
+    const variantResp = await bus.execute({
+      method: 'localeVariant.create',
+      payload: { workspaceId: workspace.id, familyId: family.id, locale: 'en-us' }
+    });
+    const variant = variantResp.data as { id: string };
+
+    const createResp = await bus.execute({
+      method: 'revision.create',
+      payload: {
+        workspaceId: workspace.id,
+        localeVariantId: variant.id,
+        revisionType: 'live',
+        branchId: null,
+        filePath: '/tmp/revision-one.json',
+        status: 'open',
+        revisionNumber: 1
+      }
+    });
+    expect(createResp.ok).toBe(true);
+    const revision = createResp.data as { id: string };
+
+    const listResp = await bus.execute({
+      method: 'revision.list',
+      payload: { workspaceId: workspace.id, localeVariantId: variant.id }
+    });
+    expect(listResp.ok).toBe(true);
+    expect((listResp.data as { revisions: Array<{ id: string; revisionNumber: number }>}).revisions.length).toBe(1);
+
+    const getResp = await bus.execute({
+      method: 'revision.get',
+      payload: { workspaceId: workspace.id, revisionId: revision.id }
+    });
+    expect(getResp.ok).toBe(true);
+
+    const updateResp = await bus.execute({
+      method: 'revision.update',
+      payload: {
+        workspaceId: workspace.id,
+        revisionId: revision.id,
+        status: 'promoted',
+        revisionNumber: 2
+      }
+    });
+    expect(updateResp.ok).toBe(true);
+
+    const invalidUpdate = await bus.execute({
+      method: 'revision.update',
+      payload: {
+        workspaceId: workspace.id,
+        revisionId: revision.id
+      }
+    });
+    expect(invalidUpdate.ok).toBe(false);
+    expect(invalidUpdate.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+
+    const invalidNumberResp = await bus.execute({
+      method: 'revision.create',
+      payload: {
+        workspaceId: workspace.id,
+        localeVariantId: variant.id,
+        revisionType: 'live',
+        filePath: '/tmp/revision-two.json',
+        status: 'open',
+        revisionNumber: 1
+      }
+    });
+    expect(invalidNumberResp.ok).toBe(false);
+    expect(invalidNumberResp.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+
+    const deleteResp = await bus.execute({
+      method: 'revision.delete',
+      payload: { workspaceId: workspace.id, revisionId: revision.id }
+    });
+    expect(deleteResp.ok).toBe(true);
+
+    const getAfterDelete = await bus.execute({
+      method: 'revision.get',
+      payload: { workspaceId: workspace.id, revisionId: revision.id }
+    });
+    expect(getAfterDelete.ok).toBe(false);
+    expect(getAfterDelete.error?.code).toBe(AppErrorCode.NOT_FOUND);
+  });
+});

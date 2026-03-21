@@ -1,0 +1,28 @@
+# Batch 1 Schema
+
+## Core route model
+- `AppRoute.WORKSPACE_SWITCHER`
+- `AppRoute.KB_VAULT_HOME`
+- `AppRoute.ARTICLE_EXPLORER`
+- `AppRoute.PBI_BATCHES`
+- `AppRoute.PROPOSAL_REVIEW`
+- `AppRoute.DRAFTS`
+- `AppRoute.PUBLISH_QUEUE`
+- `AppRoute.TEMPLATES_AND_PROMPTS`
+- `AppRoute.SETTINGS`
+
+## Error taxonomy
+- `UNKNOWN_COMMAND`
+- `INVALID_REQUEST`
+- `INTERNAL_ERROR`
+- `VALIDATION_ERROR`
+- `NOT_FOUND`
+- `NOT_AUTHORIZED`
+
+## Job taxonomy
+- `QUEUED`
+- `RUNNING`
+- `SUCCEEDED`
+- `FAILED`
+- `CANCELED`
+- `PAUSED`

@@ -1,0 +1,10 @@
+{
+  "name": "@kb-vault/html-preview",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "echo '\"html-preview\" tests are not implemented in batch 1'"
+  }
+}

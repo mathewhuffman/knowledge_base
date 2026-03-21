@@ -1,0 +1,23 @@
+{
+  "name": "kb-vault",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "apps/desktop",
+    "packages/shared-types",
+    "packages/db",
+    "packages/zendesk-client",
+    "packages/agent-runtime",
+    "packages/mcp-server",
+    "packages/diff-engine",
+    "packages/html-preview"
+  ],
+  "scripts": {
+    "dev": "pnpm -C apps/desktop dev",
+    "build": "pnpm -r run build",
+    "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test"
+  }
+}

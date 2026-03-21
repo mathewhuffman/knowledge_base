@@ -1,0 +1,10 @@
+{
+  "name": "@kb-vault/zendesk-client",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "echo '\"zendesk-client\" tests are not implemented in batch 1'"
+  }
+}

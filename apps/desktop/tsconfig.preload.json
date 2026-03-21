@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "outDir": "./dist/preload",
+    "baseUrl": ".",
+    "paths": {},
+    "types": ["node"],
+    "lib": ["ES2022"],
+    "noEmitOnError": true
+  },
+  "include": ["src/preload/**/*"]
+}
