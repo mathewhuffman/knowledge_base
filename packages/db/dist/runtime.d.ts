@@ -10,6 +10,7 @@ export interface CatalogWorkspaceRow {
     default_locale: string;
     enabled_locales: string;
     state: string;
+    is_default?: number;
 }
 export interface MigrationStateRow {
     id: number;

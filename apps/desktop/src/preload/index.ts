@@ -32,6 +32,7 @@ interface JobEvent {
 const IPC_CHANNELS = {
   INVOKE: 'kbv:invoke',
   JOB_INVOKE: 'kbv:job:invoke',
+  JOB_CANCEL: 'kbv:job:cancel',
   JOB_EVENT: 'kbv:job:event'
 } as const;
 
@@ -51,5 +52,6 @@ const emitJobEvents = (cb: (event: JobEvent) => void) => {
 contextBridge.exposeInMainWorld('kbv', {
   invoke,
   emitJobEvents,
-  startJob: (command: string, input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.JOB_INVOKE, { command, input })
+  startJob: (command: string, input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.JOB_INVOKE, { command, input }),
+  cancelJob: (jobId: string) => ipcRenderer.invoke(IPC_CHANNELS.JOB_CANCEL, { jobId })
 });

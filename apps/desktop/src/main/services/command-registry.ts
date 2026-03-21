@@ -5,6 +5,7 @@ import {
   AppRoute,
   type JobRunContext,
   type SearchPayload,
+  type ZendeskCredentialsInput,
   type WorkspaceCreateRequest,
   type WorkspaceSettingsUpdateRequest,
   type ArticleFamilyCreateRequest,
@@ -14,18 +15,44 @@ import {
   type RevisionCreateRequest,
   type RevisionUpdateRequest,
   RevisionState,
-  RevisionStatus
+  RevisionStatus,
+  type ZendeskCategoryRecord,
+  type ZendeskSectionRecord,
+  type ZendeskSearchArticleRecord,
+  type ZendeskCategoriesListRequest,
+  type ZendeskSectionsListRequest,
+  type ZendeskSearchArticlesRequest,
+  type WorkspaceDefaultRequest,
+  type ZendeskSyncRunRequest
 } from '@kb-vault/shared-types';
+import { ZendeskClient } from '@kb-vault/zendesk-client';
 import { CommandBus } from './command-bus';
 import { JobRegistry } from './job-runner';
 import { JobState } from '@kb-vault/shared-types';
 import { WorkspaceRepository } from './workspace-repository';
+import { ZendeskSyncService, type ZendeskSyncServiceInput } from './zendesk-sync-service';
 import { logger } from './logger';
 
 export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspaceRoot: string) {
   const workspaceRepository = new WorkspaceRepository(workspaceRoot);
+  const zendeskSyncService = new ZendeskSyncService(workspaceRepository);
   const validRevisionStates = new Set(Object.values(RevisionState));
   const validRevisionStatuses = new Set(Object.values(RevisionStatus));
+  const buildZendeskClient = async (workspaceId: string): Promise<ZendeskClient> => {
+    const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
+    const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
+    if (!credentials) {
+      throw new Error('Zendesk credentials are not configured for this workspace');
+    }
+    return ZendeskClient.fromConfig(
+      { timeoutMs: 30_000 },
+      {
+        subdomain: settings.zendeskSubdomain,
+        email: credentials.email,
+        apiToken: credentials.apiToken
+      }
+    );
+  };
 
   bus.register('workspace.getRouteConfig', async () => ({
     ok: true,
@@ -224,6 +251,29 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
 
       await workspaceRepository.deleteWorkspace(workspaceId);
       return { ok: true, data: { workspaceId, deleted: true } };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('workspace.default.set', async (payload) => {
+    try {
+      const { workspaceId } = payload as WorkspaceDefaultRequest;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'workspace.default.set requires workspaceId');
+      }
+
+      await workspaceRepository.setDefaultWorkspace(workspaceId);
+      return {
+        ok: true,
+        data: {
+          workspaceId,
+          isDefault: true
+        }
+      };
     } catch (error) {
       if ((error as Error).message === 'Workspace not found') {
         return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
@@ -688,6 +738,216 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       progress: 100,
       message: `Workspace path: ${path.resolve(workspaceRoot)}`
     });
+  });
+
+  bus.register('zendesk.credentials.get', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.credentials.get requires workspaceId');
+      }
+
+      const credentials = await workspaceRepository.getZendeskCredentials(workspaceId);
+      return {
+        ok: true,
+        data: credentials
+      };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('zendesk.credentials.save', async (payload) => {
+    try {
+      const input = payload as ZendeskCredentialsInput | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.credentials.save requires workspaceId');
+      }
+      if (!input.email?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.credentials.save requires email');
+      }
+      if (!input.apiToken?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.credentials.save requires apiToken');
+      }
+
+      const saved = await workspaceRepository.saveZendeskCredentials(input.workspaceId, input.email, input.apiToken);
+      return { ok: true, data: saved };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      if ((error as Error).message === 'Encrypted credential storage is unavailable') {
+        return createErrorResult(AppErrorCode.NOT_AUTHORIZED, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('zendesk.connection.test', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.connection.test requires workspaceId');
+      }
+
+      const client = await buildZendeskClient(workspaceId);
+      const result = await client.testConnection();
+      return { ok: true, data: { ...result, workspaceId, checkedAtUtc: new Date().toISOString() } };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      if ((error as Error).message === 'Encrypted credential storage is unavailable') {
+        return createErrorResult(AppErrorCode.NOT_AUTHORIZED, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('zendesk.categories.list', async (payload) => {
+    try {
+      const { workspaceId, locale } = payload as ZendeskCategoriesListRequest;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.categories.list requires workspaceId');
+      }
+      if (!locale?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.categories.list requires locale');
+      }
+      const client = await buildZendeskClient(workspaceId);
+      const categories = await client.listCategories(locale.trim()) as unknown as ZendeskCategoryRecord[];
+      return { ok: true, data: categories };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      if ((error as Error).message === 'Zendesk credentials are not configured for this workspace') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      if ((error as Error).message === 'Encrypted credential storage is unavailable') {
+        return createErrorResult(AppErrorCode.NOT_AUTHORIZED, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('zendesk.sections.list', async (payload) => {
+    try {
+      const { workspaceId, locale, categoryId } = payload as ZendeskSectionsListRequest;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.sections.list requires workspaceId');
+      }
+      if (!locale?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.sections.list requires locale');
+      }
+      if (!Number.isInteger(categoryId) || categoryId < 0) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.sections.list requires categoryId');
+      }
+      const client = await buildZendeskClient(workspaceId);
+      const sections = await client.listSections(categoryId, locale.trim()) as unknown as ZendeskSectionRecord[];
+      return { ok: true, data: sections };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      if ((error as Error).message === 'Zendesk credentials are not configured for this workspace') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      if ((error as Error).message === 'Encrypted credential storage is unavailable') {
+        return createErrorResult(AppErrorCode.NOT_AUTHORIZED, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('zendesk.articles.search', async (payload) => {
+    try {
+      const { workspaceId, locale, query } = payload as ZendeskSearchArticlesRequest;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.articles.search requires workspaceId');
+      }
+      if (!locale?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.articles.search requires locale');
+      }
+      if (!query?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.articles.search requires query');
+      }
+      const client = await buildZendeskClient(workspaceId);
+      const articles = await client.searchArticles(locale.trim(), query.trim()) as unknown as ZendeskSearchArticleRecord[];
+      return { ok: true, data: articles };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      if ((error as Error).message === 'Zendesk credentials are not configured for this workspace') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      if ((error as Error).message === 'Encrypted credential storage is unavailable') {
+        return createErrorResult(AppErrorCode.NOT_AUTHORIZED, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('zendesk.sync.getLatest', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.sync.getLatest requires workspaceId');
+      }
+
+      const latest = await workspaceRepository.getLatestSyncRun(workspaceId);
+      return {
+        ok: true,
+        data: latest ?? null
+      };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  jobs.registerRunner('zendesk.sync.run', async (payload: JobRunContext, emit) => {
+    const input = payload.input as unknown as ZendeskSyncServiceInput | ZendeskSyncRunRequest | undefined;
+    if (!input?.workspaceId || !input.mode) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'zendesk.sync.run requires workspaceId and mode'
+      });
+      return;
+    }
+    if (input.mode !== 'full' && input.mode !== 'incremental') {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'sync mode must be full or incremental'
+      });
+      return;
+    }
+
+    const syncInput = input as unknown as ZendeskSyncServiceInput;
+    await zendeskSyncService.runSync(
+      {
+        workspaceId: syncInput.workspaceId,
+        mode: syncInput.mode,
+        locale: syncInput.locale ? String(syncInput.locale).trim() : undefined,
+        maxRetries: syncInput.maxRetries,
+        retryDelayMs: syncInput.retryDelayMs,
+        retryMaxDelayMs: syncInput.retryMaxDelayMs
+      },
+      emit,
+      payload.command,
+      payload.jobId
+    );
   });
 
   bus.register('system.migrations.health', async (payload) => {

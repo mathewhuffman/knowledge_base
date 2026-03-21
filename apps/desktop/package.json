@@ -7,10 +7,10 @@
   "scripts": {
     "dev": "node -e \"console.log('Run from renderer with npm run dev:renderer and main with npm run dev:main')\"",
     "dev:renderer": "vite",
-    "dev:main": "electron dist/main/main.js",
+    "dev:main": "pnpm run build:main && electron dist/main/main.js",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3",
     "build": "pnpm -C ../../packages/shared-types build && tsc -p tsconfig.main.json && tsc -p tsconfig.preload.json && tsc -p tsconfig.renderer.json && vite build",
-    "build:main": "pnpm -C ../../packages/shared-types build && tsc -p tsconfig.main.json && tsc -p tsconfig.preload.json",
+    "build:main": "pnpm -C ../../packages/shared-types build && pnpm -C ../../packages/db build && pnpm -C ../../packages/zendesk-client build && tsc -p tsconfig.main.json && tsc -p tsconfig.preload.json",
     "build:preload": "tsc -p tsconfig.preload.json",
     "build:renderer": "vite build",
     "typecheck": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json",
@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@kb-vault/db": "workspace:*",
+    "@kb-vault/zendesk-client": "workspace:*",
     "@kb-vault/shared-types": "workspace:*",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"

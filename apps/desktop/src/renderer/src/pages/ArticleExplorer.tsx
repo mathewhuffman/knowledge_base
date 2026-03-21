@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { RevisionState, type ExplorerNode, type SearchResult, type SearchResponse } from '@kb-vault/shared-types';
+import { RevisionState, type ExplorerNode, type SearchResult, type SearchResponse, type ZendeskSyncRunRecord } from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
 import { LoadingState } from '../components/LoadingState';
@@ -7,11 +7,22 @@ import { ErrorState } from '../components/ErrorState';
 import { Badge } from '../components/Badge';
 import { StatusChip } from '../components/StatusChip';
 import { Drawer } from '../components/Drawer';
-import { IconFolder, IconFileText, IconSearch } from '../components/icons';
+import { IconFolder, IconFileText, IconSearch, IconRefreshCw } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc } from '../hooks/useIpc';
 
 type Filter = 'all' | 'live' | 'drafts' | 'retired' | 'conflicted';
+
+function formatSyncAge(utcStr: string): { label: string; freshness: 'fresh' | 'stale' | 'unknown' } {
+  const diff = Date.now() - new Date(utcStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return { label: 'just now', freshness: 'fresh' };
+  if (mins < 60) return { label: `${mins}m ago`, freshness: 'fresh' };
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return { label: `${hrs}h ago`, freshness: hrs < 4 ? 'fresh' : 'stale' };
+  const days = Math.floor(hrs / 24);
+  return { label: `${days}d ago`, freshness: 'stale' };
+}
 
 function revisionStateToBadge(state: RevisionState): 'live' | 'draft' | 'retired' | 'conflicted' {
   switch (state) {
@@ -27,16 +38,18 @@ export const ArticleExplorer = () => {
   const { activeWorkspace } = useWorkspace();
   const treeQuery = useIpc<{ workspaceId?: string; nodes: ExplorerNode[] }>('workspace.explorer.getTree');
   const searchQuery = useIpc<SearchResponse>('workspace.search');
+  const latestSyncQuery = useIpc<ZendeskSyncRunRecord | null>('zendesk.sync.getLatest');
 
   const [activeFilter, setActiveFilter] = useState<Filter>('all');
   const [searchText, setSearchText] = useState('');
   const [selectedLocale, setSelectedLocale] = useState<string | null>(null);
   const [historyDrawer, setHistoryDrawer] = useState<{ open: boolean; familyTitle: string; revisions: unknown[] }>({ open: false, familyTitle: '', revisions: [] });
 
-  // Fetch tree when workspace changes
+  // Fetch tree and sync status when workspace changes
   useEffect(() => {
     if (activeWorkspace) {
       treeQuery.execute({ workspaceId: activeWorkspace.id });
+      latestSyncQuery.execute({ workspaceId: activeWorkspace.id });
     }
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -218,6 +231,33 @@ export const ArticleExplorer = () => {
 
         {/* Main content */}
         <div style={{ flex: 1 }}>
+          {/* Sync freshness banner */}
+          {latestSyncQuery.data && latestSyncQuery.data.endedAtUtc && (() => {
+            const info = formatSyncAge(latestSyncQuery.data!.endedAtUtc);
+            return (
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 'var(--space-2)',
+                padding: 'var(--space-2) var(--space-3)',
+                marginBottom: 'var(--space-3)',
+                borderRadius: 'var(--radius-md)',
+                fontSize: 'var(--text-xs)',
+                background: info.freshness === 'fresh' ? 'var(--color-success-bg)' : 'var(--color-warning-bg)',
+                color: info.freshness === 'fresh' ? 'var(--color-success)' : 'var(--color-warning)',
+              }}>
+                <IconRefreshCw size={12} />
+                <span>
+                  Last synced {info.label}
+                  {' '}({latestSyncQuery.data!.mode} &middot; {latestSyncQuery.data!.syncedArticles} articles)
+                </span>
+                {latestSyncQuery.data!.state === 'FAILED' && (
+                  <Badge variant="danger" >Sync failed</Badge>
+                )}
+              </div>
+            );
+          })()}
+
           {treeQuery.loading ? (
             <LoadingState message="Loading article tree..." />
           ) : treeQuery.error ? (
@@ -289,10 +329,20 @@ export const ArticleExplorer = () => {
                     <Badge variant="danger">Conflict</Badge>
                   )}
 
-                  {/* Locale tags */}
+                  {/* Locale tags with freshness */}
                   {node.locales.map((l) => (
                     <Badge key={l.locale} variant="neutral">{l.locale}</Badge>
                   ))}
+
+                  {/* Freshness indicator for first locale variant */}
+                  {node.locales[0]?.revision?.updatedAtUtc && (() => {
+                    const info = formatSyncAge(node.locales[0].revision.updatedAtUtc);
+                    return (
+                      <span className={`sync-freshness-badge sync-freshness-badge--${info.freshness}`}>
+                        {info.label}
+                      </span>
+                    );
+                  })()}
                 </div>
               ))}
             </div>

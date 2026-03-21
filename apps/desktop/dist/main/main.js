@@ -36,6 +36,11 @@ function registerIpcHandlers() {
         logger_1.logger.info('JOB invoke', { command: payload?.command });
         return jobs.start(payload.command, payload.input);
     });
+    electron_1.ipcMain.handle(shared_types_1.IPC_CHANNELS.JOB_CANCEL, async (_event, payload) => {
+        const jobId = payload?.jobId;
+        logger_1.logger.info('JOB cancel', { jobId });
+        return jobs.cancel(jobId);
+    });
     jobs.setEmitter((event) => {
         electron_1.BrowserWindow.getAllWindows().forEach((win) => {
             win.webContents.send(shared_types_1.IPC_CHANNELS.JOB_EVENT, event);

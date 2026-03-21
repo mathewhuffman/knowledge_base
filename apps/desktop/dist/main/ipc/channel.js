@@ -17,5 +17,6 @@ const emitJobEvents = (cb) => {
 electron_1.contextBridge.exposeInMainWorld('kbv', {
     invoke,
     emitJobEvents,
-    startJob: (command, input) => electron_1.ipcRenderer.invoke(shared_types_1.IPC_CHANNELS.JOB_INVOKE, { command, input })
+    startJob: (command, input) => electron_1.ipcRenderer.invoke(shared_types_1.IPC_CHANNELS.JOB_INVOKE, { command, input }),
+    cancelJob: (jobId) => electron_1.ipcRenderer.invoke(shared_types_1.IPC_CHANNELS.JOB_CANCEL, { jobId })
 });

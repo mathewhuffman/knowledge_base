@@ -16,6 +16,9 @@ importers:
       '@kb-vault/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
+      '@kb-vault/zendesk-client':
+        specifier: workspace:*
+        version: link:../../packages/zendesk-client
       react:
         specifier: ^18.2.0
         version: 18.3.1

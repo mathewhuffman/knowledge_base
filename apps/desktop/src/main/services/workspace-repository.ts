@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { inspect } from 'node:util';
+import { safeStorage } from 'electron';
 import {
   type WorkspaceCreateRequest,
   type WorkspaceSettingsRecord,
@@ -25,7 +26,9 @@ import {
   type LocaleVariantUpdateRequest,
   type RevisionCreateRequest,
   type RevisionUpdateRequest,
-  type ExplorerNode
+  type ExplorerNode,
+  type ZendeskCredentialRecord,
+  type ZendeskSyncCheckpoint
 } from '@kb-vault/shared-types';
 import {
   applyWorkspaceMigrations,
@@ -81,7 +84,7 @@ export class WorkspaceRepository {
     const catalog = await this.openCatalogWithRecovery();
     try {
       const rows = catalog.all<CatalogWorkspaceRow>(`
-        SELECT id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, state
+        SELECT id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, state, is_default
         FROM workspaces
         ORDER BY name COLLATE NOCASE
       `);
@@ -116,6 +119,7 @@ export class WorkspaceRepository {
       }
 
       const workspace = await this.getWorkspace(id);
+      await this.ensureWorkspaceDb(workspace.path);
       const workspaceDbPath = path.join(workspace.path, '.meta', DEFAULT_DB_FILE);
       const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
       try {
@@ -319,6 +323,8 @@ export class WorkspaceRepository {
 
       const id = randomUUID();
       const enabledLocales = normalizeLocales(payload.enabledLocales);
+      const totalExisting = catalog.get<{ total: number }>('SELECT COUNT(*) AS total FROM workspaces');
+      const shouldBeDefault = (totalExisting?.total ?? 0) === 0;
       await this.prepareWorkspaceFilesystem(resolvedPath);
       await this.ensureWorkspaceDb(resolvedPath);
 
@@ -328,6 +334,7 @@ export class WorkspaceRepository {
         createdAtUtc: now,
         updatedAtUtc: now,
         lastOpenedAtUtc: now,
+        isDefaultWorkspace: shouldBeDefault,
         zendeskConnectionId: id,
         defaultLocale: payload.defaultLocale,
         enabledLocales,
@@ -338,10 +345,10 @@ export class WorkspaceRepository {
       catalog.run(
         `INSERT INTO workspaces (
           id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain,
-          zendesk_brand_id, default_locale, enabled_locales, state
+          zendesk_brand_id, default_locale, enabled_locales, state, is_default
         ) VALUES (
           @id, @name, @path, @createdAt, @updatedAt, @lastOpenedAt, @subdomain,
-          @brand, @defaultLocale, @enabledLocales, @state
+          @brand, @defaultLocale, @enabledLocales, @state, @isDefault
         )`,
         {
           id,
@@ -354,7 +361,8 @@ export class WorkspaceRepository {
           brand: payload.zendeskBrandId ?? null,
           defaultLocale: payload.defaultLocale,
           enabledLocales: JSON.stringify(enabledLocales),
-          state: WorkspaceState.ACTIVE
+          state: WorkspaceState.ACTIVE,
+          isDefault: shouldBeDefault ? 1 : 0
         }
       );
 
@@ -438,7 +446,7 @@ export class WorkspaceRepository {
     const catalog = await this.openCatalogWithRecovery();
     try {
       const catalogRows = catalog.all<CatalogWorkspaceRow>(`
-        SELECT id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, state
+        SELECT id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, state, is_default
         FROM workspaces
         ORDER BY name COLLATE NOCASE
       `);
@@ -482,7 +490,7 @@ export class WorkspaceRepository {
     let itemCount = 0;
     try {
       const catalogRows = catalog.all<CatalogWorkspaceRow>(`
-        SELECT id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, state
+        SELECT id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, state, is_default
         FROM workspaces
         ORDER BY name COLLATE NOCASE
       `);
@@ -506,6 +514,28 @@ export class WorkspaceRepository {
         elapsedMs,
         count: itemCount
       });
+      catalog.close();
+    }
+  }
+
+  async setDefaultWorkspace(workspaceId: string): Promise<void> {
+    const catalog = await this.openCatalogWithRecovery();
+    try {
+      const existing = catalog.get<CatalogWorkspaceRow>(`SELECT id FROM workspaces WHERE id = @id`, { id: workspaceId });
+      if (!existing) {
+        throw new Error('Workspace not found');
+      }
+
+      catalog.run('BEGIN IMMEDIATE');
+      try {
+        catalog.run('UPDATE workspaces SET is_default = 0');
+        catalog.run(`UPDATE workspaces SET is_default = 1 WHERE id = @id`, { id: workspaceId });
+        catalog.run('COMMIT');
+      } catch (error) {
+        catalog.run('ROLLBACK');
+        throw error;
+      }
+    } finally {
       catalog.close();
     }
   }
@@ -890,6 +920,129 @@ export class WorkspaceRepository {
     }
   }
 
+  async listLocaleVariantsByLocale(workspaceId: string, locale: string): Promise<LocaleVariantRecord[]> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      return workspaceDb.all<LocaleVariantRecord>(
+        `SELECT lv.id, lv.family_id as familyId, lv.locale, lv.status, lv.retired_at as retiredAtUtc
+         FROM locale_variants lv
+         JOIN article_families af ON af.id = lv.family_id
+         WHERE af.workspace_id = @workspaceId AND lv.locale = @locale`,
+        { workspaceId, locale }
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async reconcileSyncedLocaleVariants(
+    workspaceId: string,
+    locale: string,
+    remoteFamilyExternalKeys: string[]
+  ): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const now = new Date().toISOString();
+      const retainedStatus = RevisionState.LIVE;
+      const retiredStatus = RevisionState.RETIRED;
+      const retiredAtUtc = now;
+
+      if (!remoteFamilyExternalKeys.length) {
+        workspaceDb.run(
+          `UPDATE locale_variants
+           SET status = @retiredStatus,
+               retired_at = @retiredAtUtc
+           WHERE id IN (
+             SELECT lv.id
+             FROM locale_variants lv
+             JOIN article_families af ON af.id = lv.family_id
+             WHERE af.workspace_id = @workspaceId AND lv.locale = @locale AND lv.status != @retiredStatus
+           )`,
+          { workspaceId, locale, retiredStatus, retiredAtUtc }
+        );
+        workspaceDb.run(
+          `UPDATE draft_branches
+           SET state = 'obsolete', updated_at = @retiredAtUtc
+           WHERE workspace_id = @workspaceId
+             AND state != 'obsolete'
+             AND locale_variant_id IN (
+               SELECT lv.id
+               FROM locale_variants lv
+               JOIN article_families af ON af.id = lv.family_id
+               WHERE af.workspace_id = @workspaceId AND lv.locale = @locale
+             )`,
+          { workspaceId, locale, retiredAtUtc }
+        );
+        return;
+      }
+
+      const keys = Array.from(new Set(remoteFamilyExternalKeys.filter(Boolean)));
+      const placeholders = keys.map((_, idx) => `@remoteKey${idx}`).join(',');
+      const queryParams: Record<string, string> = {
+        workspaceId,
+        locale,
+        retainedStatus,
+        retiredStatus,
+        retiredAtUtc
+      };
+      keys.forEach((key, index) => {
+        queryParams[`remoteKey${index}`] = key;
+      });
+
+      workspaceDb.run(
+        `UPDATE locale_variants
+         SET status = @retainedStatus,
+             retired_at = NULL
+         WHERE id IN (
+           SELECT lv.id
+           FROM locale_variants lv
+           JOIN article_families af ON af.id = lv.family_id
+           WHERE af.workspace_id = @workspaceId
+             AND lv.locale = @locale
+             AND af.external_key IN (${placeholders})
+         )`,
+        queryParams
+      );
+
+      workspaceDb.run(
+        `UPDATE locale_variants
+         SET status = @retiredStatus,
+             retired_at = @retiredAtUtc
+         WHERE id IN (
+           SELECT lv.id
+           FROM locale_variants lv
+           JOIN article_families af ON af.id = lv.family_id
+           WHERE af.workspace_id = @workspaceId
+             AND lv.locale = @locale
+             AND af.external_key NOT IN (${placeholders})
+         )`,
+        queryParams
+      );
+
+      workspaceDb.run(
+        `UPDATE draft_branches
+         SET state = 'obsolete', updated_at = @retiredAtUtc
+         WHERE workspace_id = @workspaceId
+           AND state != 'obsolete'
+           AND locale_variant_id IN (
+             SELECT lv.id
+             FROM locale_variants lv
+             JOIN article_families af ON af.id = lv.family_id
+             WHERE af.workspace_id = @workspaceId
+               AND lv.locale = @locale
+               AND af.external_key NOT IN (${placeholders})
+           )`,
+        queryParams
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async getRevision(workspaceId: string, revisionId: string): Promise<RevisionRecord> {
     const workspace = await this.getWorkspace(workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
@@ -1228,6 +1381,377 @@ export class WorkspaceRepository {
     };
   }
 
+  async getZendeskCredentials(workspaceId: string): Promise<ZendeskCredentialRecord | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<{ email: string; has_token: number }>(
+        `SELECT email, CASE WHEN encrypted_api_token IS NOT NULL AND encrypted_api_token != '' THEN 1 ELSE 0 END AS has_token
+         FROM zendesk_credentials WHERE workspace_id = @workspaceId`,
+        { workspaceId }
+      );
+      if (!row) {
+        return null;
+      }
+      return {
+        workspaceId,
+        email: row.email,
+        hasApiToken: Boolean(row.has_token)
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getZendeskCredentialsForSync(workspaceId: string): Promise<{ workspaceId: string; email: string; apiToken: string } | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<{ email: string; encrypted_api_token: string }>(
+        `SELECT email, encrypted_api_token FROM zendesk_credentials WHERE workspace_id = @workspaceId`,
+        { workspaceId }
+      );
+      if (!row || !row.encrypted_api_token) {
+        return null;
+      }
+      if (!safeStorage.isEncryptionAvailable()) {
+        throw new Error('Encrypted credential storage is unavailable');
+      }
+      return {
+        workspaceId,
+        email: row.email,
+        apiToken: safeStorage.decryptString(Buffer.from(row.encrypted_api_token, 'base64'))
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async saveZendeskCredentials(workspaceId: string, email: string, apiToken: string): Promise<ZendeskCredentialRecord> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      if (!safeStorage.isEncryptionAvailable()) {
+        throw new Error('Encrypted credential storage is unavailable');
+      }
+      const normalizedEmail = email.trim().toLowerCase();
+      const token = apiToken.trim();
+      const encryptedApiToken = safeStorage.encryptString(token).toString('base64');
+      workspaceDb.run(
+        `INSERT OR REPLACE INTO zendesk_credentials (workspace_id, email, encrypted_api_token, updated_at)
+         VALUES (@workspaceId, @email, @token, @updatedAt)`,
+        {
+          workspaceId,
+          email: normalizedEmail,
+          token: encryptedApiToken,
+          updatedAt: new Date().toISOString()
+        }
+      );
+      return {
+        workspaceId,
+        email: normalizedEmail,
+        hasApiToken: true
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getSyncCheckpoint(workspaceId: string, locale: string): Promise<ZendeskSyncCheckpoint | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<{
+        locale: string;
+        last_synced_at: string | null;
+        cursor: string | null;
+        synced_articles: number;
+        updated_at: string;
+      }>(
+        `SELECT locale, last_synced_at, cursor, synced_articles, updated_at
+         FROM zendesk_sync_checkpoints
+         WHERE workspace_id = @workspaceId AND locale = @locale`,
+        { workspaceId, locale }
+      );
+      if (!row) {
+        return null;
+      }
+      return {
+        workspaceId,
+        locale: row.locale,
+        lastSyncedAt: row.last_synced_at ?? undefined,
+        cursor: row.cursor ?? undefined,
+        syncedArticles: row.synced_articles,
+        updatedAtUtc: row.updated_at
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async upsertSyncCheckpoint(
+    workspaceId: string,
+    locale: string,
+    syncedArticles: number,
+    lastSyncedAt?: string,
+    cursor?: string
+  ): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `INSERT INTO zendesk_sync_checkpoints (workspace_id, locale, last_synced_at, cursor, synced_articles, updated_at)
+         VALUES (@workspaceId, @locale, @lastSyncedAt, @cursor, @syncedArticles, @updatedAt)
+         ON CONFLICT(workspace_id, locale) DO UPDATE SET
+           last_synced_at = excluded.last_synced_at,
+           cursor = excluded.cursor,
+           synced_articles = excluded.synced_articles,
+           updated_at = excluded.updated_at`,
+        {
+          workspaceId,
+          locale,
+          lastSyncedAt: lastSyncedAt ?? null,
+          cursor: cursor ?? null,
+          syncedArticles,
+          updatedAt: new Date().toISOString()
+        }
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async logSyncRunStart(workspaceId: string, runId: string, mode: string): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const now = new Date().toISOString();
+      workspaceDb.run(
+        `INSERT INTO zendesk_sync_runs (
+          id, workspace_id, mode, state, started_at, updated_at
+        ) VALUES (
+          @id, @workspaceId, @mode, 'RUNNING', @startedAt, @updatedAt
+        )
+        ON CONFLICT(id) DO UPDATE SET
+          mode = excluded.mode,
+          state = excluded.state,
+          started_at = excluded.started_at,
+          updated_at = excluded.updated_at`,
+        {
+          id: runId,
+          workspaceId,
+          mode,
+          startedAt: now,
+          updatedAt: now
+        }
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async logSyncRunComplete(
+    workspaceId: string,
+    runId: string,
+    state: string,
+    syncedArticles: number,
+    skippedArticles: number,
+    createdFamilies: number,
+    createdVariants: number,
+    createdRevisions: number,
+    remoteError?: string,
+    cursorSummary?: string
+  ): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `UPDATE zendesk_sync_runs SET
+           state = @state,
+           ended_at = @endedAt,
+           synced_articles = @syncedArticles,
+           skipped_articles = @skippedArticles,
+           created_families = @createdFamilies,
+           created_variants = @createdVariants,
+           created_revisions = @createdRevisions,
+           remote_error = @remoteError,
+           cursor_summary = @cursorSummary,
+           updated_at = @updatedAt
+         WHERE id = @runId AND workspace_id = @workspaceId`,
+        {
+          workspaceId,
+          runId,
+          state,
+          endedAt: new Date().toISOString(),
+          syncedArticles,
+          skippedArticles,
+          createdFamilies,
+          createdVariants,
+          createdRevisions,
+          remoteError: remoteError ?? null,
+          cursorSummary: cursorSummary ?? null,
+          updatedAt: new Date().toISOString()
+        }
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getLatestSyncRun(workspaceId: string): Promise<{
+    id: string;
+    mode: string;
+    state: string;
+    startedAtUtc: string;
+    endedAtUtc?: string;
+    syncedArticles: number;
+    skippedArticles: number;
+    createdFamilies: number;
+    createdVariants: number;
+    createdRevisions: number;
+    cursorSummary?: Record<string, string>;
+    remoteError?: string;
+  } | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<{
+        id: string;
+        mode: string;
+        state: string;
+        started_at: string;
+        ended_at: string | null;
+        synced_articles: number;
+        skipped_articles: number;
+        created_families: number;
+        created_variants: number;
+        created_revisions: number;
+        cursor_summary: string | null;
+        remote_error: string | null;
+      }>(
+        `SELECT id, mode, state, started_at, ended_at, synced_articles, skipped_articles,
+                created_families, created_variants, created_revisions, cursor_summary, remote_error
+         FROM zendesk_sync_runs
+         WHERE workspace_id = @workspaceId
+         ORDER BY started_at DESC
+         LIMIT 1`,
+        { workspaceId }
+      );
+
+      if (!row) {
+        return null;
+      }
+
+      return {
+        id: row.id,
+        mode: row.mode,
+        state: row.state,
+        startedAtUtc: row.started_at,
+        endedAtUtc: row.ended_at ?? undefined,
+        syncedArticles: row.synced_articles,
+        skippedArticles: row.skipped_articles,
+        createdFamilies: row.created_families,
+        createdVariants: row.created_variants,
+        createdRevisions: row.created_revisions,
+        cursorSummary: (() => {
+          if (!row.cursor_summary) {
+            return undefined;
+          }
+          try {
+            const parsed = JSON.parse(row.cursor_summary) as Record<string, string>;
+            return parsed;
+          } catch {
+            return undefined;
+          }
+        })(),
+        remoteError: row.remote_error ?? undefined
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getArticleFamilyByExternalKey(workspaceId: string, externalKey: string): Promise<ArticleFamilyRecord | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<ArticleFamilyRecord>(
+        `SELECT id, workspace_id as workspaceId, external_key as externalKey, title, section_id as sectionId, category_id as categoryId, retired_at as retiredAtUtc
+         FROM article_families WHERE workspace_id = @workspaceId AND external_key = @externalKey`,
+        { workspaceId, externalKey }
+      );
+      return row ?? null;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getLocaleVariantByFamilyAndLocale(workspaceId: string, familyId: string, locale: string): Promise<LocaleVariantRecord | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<LocaleVariantRecord>(
+        `SELECT id, family_id as familyId, locale, status, retired_at as retiredAtUtc
+         FROM locale_variants
+         WHERE family_id = @familyId AND locale = @locale`,
+        { familyId, locale, workspaceId }
+      );
+      return row ?? null;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getLatestRevision(workspaceId: string, localeVariantId: string, revisionType?: RevisionState): Promise<RevisionRecord | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<RevisionRecord>(`SELECT id, locale_variant_id as localeVariantId, revision_type as revisionType, branch_id as branchId,
+                workspace_id as workspaceId, file_path as filePath, content_hash as contentHash, source_revision_id as sourceRevisionId,
+                revision_number as revisionNumber, status, created_at as createdAtUtc, updated_at as updatedAtUtc
+         FROM revisions
+         WHERE locale_variant_id = @localeVariantId
+         ${revisionType ? 'AND revision_type = @revisionType' : ''}
+         ORDER BY revision_number DESC LIMIT 1`,
+        { localeVariantId, revisionType, workspaceId }
+      );
+      return row ?? null;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async markDraftBranchesAsObsolete(workspaceId: string, localeVariantId: string): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `UPDATE draft_branches
+         SET state = 'obsolete', updated_at = @updatedAt
+         WHERE workspace_id = @workspaceId AND locale_variant_id = @localeVariantId AND state != 'obsolete'`,
+        {
+          workspaceId,
+          localeVariantId,
+          updatedAt: new Date().toISOString()
+        }
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async getMigrationHealth(workspaceId?: string): Promise<WorkspaceMigrationHealthReport> {
     const catalog = await this.openCatalogWithRecovery();
     try {
@@ -1300,6 +1824,7 @@ export class WorkspaceRepository {
         catalogExists
       });
       const catalog = ensureCatalogSchema(this.catalogDbPath);
+      this.ensureCatalogDefaultWorkspaceColumn(catalog);
       logger.info('workspace-repository.openCatalogWithRecovery success', { elapsedMs: Date.now() - startedAt });
       this.lastCatalogFailureMs = 0;
       this.lastCatalogFailureMessage = undefined;
@@ -1322,6 +1847,7 @@ export class WorkspaceRepository {
       try {
         await fs.rm(this.catalogDbPath, { force: true });
         const catalog = ensureCatalogSchema(this.catalogDbPath);
+        this.ensureCatalogDefaultWorkspaceColumn(catalog);
         logger.info('workspace-repository.openCatalogWithRecovery repaired', { elapsedMs: Date.now() - startedAt });
         this.lastCatalogFailureMs = 0;
         this.lastCatalogFailureMessage = undefined;
@@ -1346,6 +1872,50 @@ export class WorkspaceRepository {
 
   private repairWorkspaceDb(dbPath: string) {
     return applyWorkspaceMigrations(dbPath);
+  }
+
+  private ensureCatalogDefaultWorkspaceColumn(catalog: ReturnType<typeof openWorkspaceDatabase>) {
+    const columns = catalog.all<{ name: string }>(`PRAGMA table_info(workspaces)`).map((column) => column.name);
+    if (!columns.includes('is_default')) {
+      catalog.exec('ALTER TABLE workspaces ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0');
+    }
+
+    const row = catalog.get<{ id: string }>(`
+      SELECT id FROM workspaces
+      WHERE is_default = 1
+      ORDER BY (last_opened_at IS NULL) ASC, last_opened_at DESC, created_at DESC
+      LIMIT 1
+    `);
+    if (row) {
+      const defaultCount = catalog.get<{ total: number }>(`SELECT COUNT(*) AS total FROM workspaces WHERE is_default = 1`);
+      if ((defaultCount?.total ?? 0) !== 1) {
+        catalog.run(`
+          UPDATE workspaces
+          SET is_default = CASE
+            WHEN id = @defaultId THEN 1
+            ELSE 0
+          END`,
+          { defaultId: row.id }
+        );
+      }
+      return;
+    }
+
+    const fallback = catalog.get<{ id: string }>(`
+      SELECT id FROM workspaces
+      ORDER BY (last_opened_at IS NULL) ASC, last_opened_at DESC, created_at DESC
+      LIMIT 1
+    `);
+    if (fallback) {
+      catalog.run(`
+        UPDATE workspaces
+        SET is_default = CASE
+          WHEN id = @defaultId THEN 1
+          ELSE 0
+        END`,
+        { defaultId: fallback.id }
+      );
+    }
   }
 
   private openWorkspaceDbWithRecovery(dbPath: string) {
@@ -1424,6 +1994,7 @@ function mapWorkspaceRow(row: CatalogWorkspaceRow): WorkspaceRecord {
     defaultLocale: row.default_locale,
     enabledLocales: safeParseLocales(row.enabled_locales),
     state: row.state as WorkspaceState,
+    isDefaultWorkspace: Boolean(row.is_default),
     path: row.path
   };
 }

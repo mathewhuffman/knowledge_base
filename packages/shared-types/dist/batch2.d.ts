@@ -42,11 +42,15 @@ export interface WorkspaceRecord {
     createdAtUtc: string;
     updatedAtUtc: string;
     lastOpenedAtUtc?: string;
+    isDefaultWorkspace: boolean;
     zendeskConnectionId: EntityId;
     defaultLocale: string;
     enabledLocales: string[];
     state: WorkspaceState;
     path: string;
+}
+export interface WorkspaceDefaultRequest {
+    workspaceId: EntityId;
 }
 export interface WorkspaceCreateRequest {
     name: string;
@@ -71,6 +75,7 @@ export interface WorkspaceSettingsUpdateRequest {
     enabledLocales?: string[];
 }
 export interface WorkspaceListItem extends WorkspaceRecord {
+    isDefaultWorkspace: boolean;
     articleCount: number;
     draftCount: number;
 }

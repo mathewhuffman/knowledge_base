@@ -55,5 +55,6 @@ var emitJobEvents = function (cb) {
 electron_1.contextBridge.exposeInMainWorld('kbv', {
     invoke: invoke,
     emitJobEvents: emitJobEvents,
-    startJob: function (command, input) { return electron_1.ipcRenderer.invoke(shared_types_1.IPC_CHANNELS.JOB_INVOKE, { command: command, input: input }); }
+    startJob: function (command, input) { return electron_1.ipcRenderer.invoke(shared_types_1.IPC_CHANNELS.JOB_INVOKE, { command: command, input: input }); },
+    cancelJob: function (jobId) { return electron_1.ipcRenderer.invoke(shared_types_1.IPC_CHANNELS.JOB_CANCEL, { jobId: jobId }); }
 });

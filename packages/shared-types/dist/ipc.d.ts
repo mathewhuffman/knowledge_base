@@ -2,6 +2,7 @@ import { AppError, AppErrorCode } from './errors';
 export declare const IPC_CHANNELS: {
     INVOKE: string;
     JOB_INVOKE: string;
+    JOB_CANCEL: string;
     JOB_EVENT: string;
 };
 export interface RpcRequest {
@@ -47,5 +48,8 @@ export interface JobRunContext {
 export interface JobPayload {
     jobId: string;
     state: JobState;
+}
+export interface JobCancelPayload {
+    jobId: string;
 }
 export declare const createErrorResult: (code: AppErrorCode, message: string, requestId?: string) => RpcResponse;

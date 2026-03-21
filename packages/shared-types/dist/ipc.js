@@ -4,6 +4,7 @@ exports.createErrorResult = exports.JobState = exports.IPC_CHANNELS = void 0;
 exports.IPC_CHANNELS = {
     INVOKE: 'kbv:invoke',
     JOB_INVOKE: 'kbv:job:invoke',
+    JOB_CANCEL: 'kbv:job:cancel',
     JOB_EVENT: 'kbv:job:event'
 };
 var JobState;
