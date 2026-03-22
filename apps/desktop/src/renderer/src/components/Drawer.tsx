@@ -7,15 +7,22 @@ interface DrawerProps {
   title: string;
   children: ReactNode;
   footer?: ReactNode;
+  /** Use "wide" for article detail drawers (560px instead of 420px) */
+  /** Use "fullscreen" for full-screen article reader experience */
+  variant?: 'default' | 'wide' | 'fullscreen';
 }
 
-export function Drawer({ open, onClose, title, children, footer }: DrawerProps) {
+export function Drawer({ open, onClose, title, children, footer, variant = 'default' }: DrawerProps) {
   if (!open) return null;
+
+  const drawerClass = `drawer${
+    variant === 'wide' ? ' drawer--wide' : variant === 'fullscreen' ? ' drawer--fullscreen' : ''
+  }`;
 
   return (
     <>
       <div className="drawer-backdrop" onClick={onClose} />
-      <aside className="drawer" role="dialog" aria-modal="true" aria-label={title}>
+      <aside className={drawerClass} role="dialog" aria-modal="true" aria-label={title}>
         <div className="drawer-header">
           <h2 className="drawer-title">{title}</h2>
           <button className="btn btn-ghost btn-icon" onClick={onClose} aria-label="Close">

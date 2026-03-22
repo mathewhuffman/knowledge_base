@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, IpcMainInvokeEvent } from 'electron';
 import fs from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { resolveAppWorkspaceRoot, DEFAULT_WORKSPACE_ROOT } from './config/workspace-root';
 import { loadConfig } from './config/config-loader';
@@ -8,9 +9,31 @@ import { CommandBus } from './services/command-bus';
 import { JobRegistry } from './services/job-runner';
 import { IPC_CHANNELS, type RpcRequest, type RpcResponse, type JobEvent } from '@kb-vault/shared-types';
 import { registerCoreCommands } from './services/command-registry';
+import { McpBridgeService } from './services/mcp-bridge-service';
 
 const commandBus = new CommandBus();
 const jobs = new JobRegistry();
+let mcpBridge: McpBridgeService | null = null;
+
+async function writeCursorMcpConfig(projectRoot: string, socketPath: string, bridgeScript: string, nodeBinary: string) {
+  const cursorDir = path.join(projectRoot, '.cursor');
+  const mcpConfigPath = path.join(cursorDir, 'mcp.json');
+  const payload = {
+    mcpServers: {
+      'kb-vault': {
+        type: 'stdio',
+        command: nodeBinary,
+        args: [bridgeScript],
+        env: {
+          KBV_MCP_BRIDGE_SOCKET_PATH: socketPath
+        }
+      }
+    }
+  };
+
+  await mkdir(cursorDir, { recursive: true });
+  await writeFile(mcpConfigPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
 
 function registerIpcHandlers() {
   ipcMain.handle(IPC_CHANNELS.INVOKE, async (_event: IpcMainInvokeEvent, request: RpcRequest) => {
@@ -47,7 +70,7 @@ function registerIpcHandlers() {
   });
 }
 
-function bootstrapApp() {
+async function bootstrapApp() {
   const config = loadConfig();
   const workspaceRoot = resolveAppWorkspaceRoot(process.env.KB_VAULT_WORKSPACE_ROOT, config);
 
@@ -88,7 +111,21 @@ function bootstrapApp() {
     }
   } as RpcResponse));
 
-  registerCoreCommands(commandBus, jobs, workspaceRoot);
+  const { agentRuntime } = registerCoreCommands(commandBus, jobs, workspaceRoot);
+  mcpBridge = new McpBridgeService(agentRuntime);
+  await mcpBridge.start();
+
+  const appRoot = app.isPackaged ? app.getAppPath() : process.cwd();
+  const bridgeSocketPath = mcpBridge.getSocketPath();
+  const bridgeScriptPath = path.join(appRoot, 'dist', 'main', 'mcp-bridge-client.js');
+  const nodeBinary = process.env.KBV_NODE_BINARY ?? 'node';
+
+  process.env.KBV_MCP_BRIDGE_SOCKET_PATH = bridgeSocketPath;
+  process.env.KBV_MCP_BRIDGE_SCRIPT = bridgeScriptPath;
+  process.env.KBV_NODE_BINARY = nodeBinary;
+  process.env.KBV_ACP_CWD = appRoot;
+
+  await writeCursorMcpConfig(appRoot, bridgeSocketPath, bridgeScriptPath, nodeBinary);
 }
 
 function createWindow() {
@@ -137,8 +174,8 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(() => {
-  bootstrapApp();
+app.whenReady().then(async () => {
+  await bootstrapApp();
   registerIpcHandlers();
   createWindow();
 
@@ -153,4 +190,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', () => {
+  void mcpBridge?.stop();
 });

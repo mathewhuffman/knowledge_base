@@ -13,6 +13,8 @@ import { EmptyState } from '../components/EmptyState';
 import { Badge } from '../components/Badge';
 import { StatusChip } from '../components/StatusChip';
 import { LoadingState } from '../components/LoadingState';
+import { HealthStatusPanel, SessionListPanel, SessionDetailPanel } from '../components/AgentRuntimePanel';
+import type { AgentSessionRecord } from '@kb-vault/shared-types';
 import { IconSettings, IconSearch, IconRefreshCw, IconCheckCircle, IconAlertCircle, IconFolder } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
@@ -254,9 +256,10 @@ function ZendeskSyncSection({ workspaceId }: { workspaceId: string }) {
   const [syncCanceling, setSyncCanceling] = useState(false);
 
   const syncJobIdRef = useRef<string | null>(null);
+  const { execute: executeLatestSync } = latestSyncQuery;
 
   useEffect(() => {
-    latestSyncQuery.execute({ workspaceId });
+    executeLatestSync({ workspaceId });
   }, [workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Job event listener
@@ -271,11 +274,16 @@ function ZendeskSyncSection({ workspaceId }: { workspaceId: string }) {
       setSyncMessage(event.message ?? '');
 
       if (st === 'SUCCEEDED' || st === 'FAILED' || st === 'CANCELED') {
-        latestSyncQuery.execute({ workspaceId });
+        executeLatestSync({ workspaceId });
       }
     };
-    window.kbv.emitJobEvents(handler);
-  }, [syncJobId, workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+    const unsubscribe = window.kbv.emitJobEvents(handler);
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, [executeLatestSync, workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleRunSync = async () => {
     const response = await window.kbv.startJob('zendesk.sync.run', { workspaceId, mode: syncMode });
@@ -657,6 +665,7 @@ export const Settings = () => {
   const credentialsQuery = useIpc<ZendeskCredentialRecord | null>('zendesk.credentials.get');
 
   const [activeSection, setActiveSection] = useState('zendesk');
+  const [selectedSession, setSelectedSession] = useState<AgentSessionRecord | null>(null);
 
   // Form state for locale settings
   const [defaultLocale, setDefaultLocale] = useState('');
@@ -837,13 +846,19 @@ export const Settings = () => {
           {activeSection === 'ai' && (
             <div>
               <h3 className="settings-heading">AI Runtime</h3>
-              <div className="card card-padded">
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-3)' }}>
-                  <span style={{ fontWeight: 'var(--weight-medium)', fontSize: 'var(--text-sm)' }}>Cursor ACP</span>
-                  <StatusChip status="pending" label="Not configured" />
-                </div>
-                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>Cursor ACP integration will be configured in a future batch.</div>
-              </div>
+              <HealthStatusPanel workspaceId={activeWorkspace.id} />
+              {selectedSession ? (
+                <SessionDetailPanel
+                  workspaceId={activeWorkspace.id}
+                  session={selectedSession}
+                  onBack={() => setSelectedSession(null)}
+                />
+              ) : (
+                <SessionListPanel
+                  workspaceId={activeWorkspace.id}
+                  onSelectSession={setSelectedSession}
+                />
+              )}
             </div>
           )}
 

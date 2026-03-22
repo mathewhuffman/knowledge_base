@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kb-vault": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/Users/mathewhuffman/ReactArena/knowledge_base/apps/desktop/dist/main/mcp-bridge-client.js"
+      ],
+      "env": {
+        "KBV_MCP_BRIDGE_SOCKET_PATH": "/var/folders/s6/snrtghhd58j_lhvnw7xsdc0r0000gn/T/kb-vault-mcp-bridge.sock"
+      }
+    }
+  }
+}

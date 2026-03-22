@@ -46,7 +46,11 @@ const invoke = async <T>(method: string, payload?: unknown): Promise<RpcResponse
 };
 
 const emitJobEvents = (cb: (event: JobEvent) => void) => {
-  ipcRenderer.on(IPC_CHANNELS.JOB_EVENT, (_event, data: JobEvent) => cb(data));
+  const listener = (_event: Electron.IpcRendererEvent, data: JobEvent) => cb(data);
+  ipcRenderer.on(IPC_CHANNELS.JOB_EVENT, listener);
+  return () => {
+    ipcRenderer.removeListener(IPC_CHANNELS.JOB_EVENT, listener);
+  };
 };
 
 contextBridge.exposeInMainWorld('kbv', {

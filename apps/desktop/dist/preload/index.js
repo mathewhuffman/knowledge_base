@@ -16,7 +16,11 @@ const invoke = async (method, payload) => {
     return electron_1.ipcRenderer.invoke(IPC_CHANNELS.INVOKE, request);
 };
 const emitJobEvents = (cb) => {
-    electron_1.ipcRenderer.on(IPC_CHANNELS.JOB_EVENT, (_event, data) => cb(data));
+    const listener = (_event, data) => cb(data);
+    electron_1.ipcRenderer.on(IPC_CHANNELS.JOB_EVENT, listener);
+    return () => {
+        electron_1.ipcRenderer.removeListener(IPC_CHANNELS.JOB_EVENT, listener);
+    };
 };
 electron_1.contextBridge.exposeInMainWorld('kbv', {
     invoke,

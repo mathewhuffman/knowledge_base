@@ -35,6 +35,34 @@ export enum ProposalDecision {
   CREATE_BRANCH = 'create_branch'
 }
 
+export enum PBIBatchStatus {
+  IMPORTED = 'imported',
+  SCOPED = 'scoped',
+  SUBMITTED = 'submitted',
+  ANALYZED = 'analyzed',
+  REVIEW_IN_PROGRESS = 'review_in_progress',
+  REVIEW_COMPLETE = 'review_complete',
+  ARCHIVED = 'archived'
+}
+
+export enum PBIBatchScopeMode {
+  ALL = 'all',
+  ALL_EXCEPT_SELECTED = 'all_except_selected',
+  SELECTED_ONLY = 'selected_only'
+}
+
+export enum PBIImportFormat {
+  CSV = 'csv',
+  HTML = 'html'
+}
+
+export enum PBIValidationStatus {
+  CANDIDATE = 'candidate',
+  MALFORMED = 'malformed',
+  DUPLICATE = 'duplicate',
+  IGNORED = 'ignored'
+}
+
 export enum PublishStatus {
   QUEUED = 'queued',
   RUNNING = 'running',
@@ -228,8 +256,17 @@ export interface PBIBatchRecord {
   name: string;
   sourceFileName: string;
   sourceRowCount: number;
+  sourcePath: string;
+  sourceFormat: PBIImportFormat;
+  candidateRowCount: number;
+  ignoredRowCount: number;
+  malformedRowCount: number;
+  duplicateRowCount: number;
+  scopedRowCount: number;
+  scopeMode: PBIBatchScopeMode;
+  scopePayload?: string;
   importedAtUtc: string;
-  status: 'imported' | 'analyzed' | 'proposed' | 'archived';
+  status: PBIBatchStatus | 'proposed';
 }
 
 export interface PBIRecord {
@@ -239,7 +276,92 @@ export interface PBIRecord {
   externalId: string;
   title: string;
   description?: string;
+  state?: PBIValidationStatus;
   priority?: 'low' | 'medium' | 'high' | 'urgent';
+  workItemType?: string;
+  title1?: string;
+  title2?: string;
+  title3?: string;
+  rawDescription?: string;
+  rawAcceptanceCriteria?: string;
+  descriptionText?: string;
+  acceptanceCriteriaText?: string;
+  parentExternalId?: string;
+  parentRecordId?: string;
+  validationStatus?: PBIValidationStatus;
+  validationReason?: string;
+}
+
+export interface PBIFieldMapping {
+  externalId: string;
+  title: string;
+  description: string;
+  acceptanceCriteria?: string;
+  priority?: string;
+  type?: string;
+  parentExternalId?: string;
+}
+
+export interface PBIImportScope {
+  mode?: PBIBatchScopeMode;
+  selectedRows?: number[];
+  selectedExternalIds?: string[];
+}
+
+export interface PBIBatchImportRequest {
+  workspaceId: EntityId;
+  batchName?: string;
+  sourceFileName: string;
+  sourcePath?: string;
+  sourceContent?: string;
+  sourceFormat?: PBIImportFormat;
+  fieldMapping?: Partial<PBIFieldMapping>;
+  scope?: PBIImportScope;
+}
+
+export interface PBIBatchScopePayload {
+  batchId: EntityId;
+  workspaceId: EntityId;
+  mode: PBIBatchScopeMode;
+  selectedRows?: number[];
+  selectedExternalIds?: string[];
+  scopedRowNumbers?: number[];
+  scopedCount?: number;
+  updatedAtUtc: string;
+}
+
+export interface PBIBatchRowsRequest {
+  workspaceId: EntityId;
+  batchId: EntityId;
+  validationStatuses?: PBIValidationStatus[];
+}
+
+export interface PBIBatchDeleteRequest {
+  workspaceId: EntityId;
+  batchId: EntityId;
+}
+
+export interface PBIBatchStatusUpdateRequest {
+  workspaceId: EntityId;
+  batchId: EntityId;
+  status: PBIBatchStatus | 'proposed';
+  force?: boolean;
+}
+
+export interface PBIBatchImportSummary {
+  batch: PBIBatchRecord;
+  rows: PBIRecord[];
+  summary: {
+    totalRows: number;
+    candidateRowCount: number;
+    malformedRowCount: number;
+    duplicateRowCount: number;
+    ignoredRowCount: number;
+    scopedRowCount: number;
+  };
+  invalidRows: PBIRecord[];
+  duplicateRows: PBIRecord[];
+  ignoredRows: PBIRecord[];
 }
 
 export interface AiRunRecord {
@@ -353,6 +475,7 @@ export interface ExplorerNode {
   familyStatus: RevisionState;
   locales: {
     locale: string;
+    localeVariantId: EntityId;
     revision: {
       revisionId: EntityId;
       revisionNumber: number;
@@ -364,12 +487,26 @@ export interface ExplorerNode {
   }[];
 }
 
+export type SearchScope = 'all' | 'live' | 'drafts' | 'retired' | 'conflicted';
+
+export interface SearchFilterPayload {
+  scope?: SearchScope;
+  locales?: string[];
+  includeArchived?: boolean;
+  changedWithinHours?: number;
+  hasDrafts?: boolean;
+  includeConflicts?: boolean;
+}
+
 export interface SearchResult {
   revisionId: EntityId;
   familyId: EntityId;
+  localeVariantId: EntityId;
   locale: string;
   title: string;
   snippet: string;
+  familyExternalKey: string;
+  matchContext?: 'title' | 'body' | 'metadata';
   score: number;
 }
 
@@ -378,6 +515,10 @@ export interface SearchPayload {
   query: string;
   locales?: string[];
   includeArchived?: boolean;
+  scope?: SearchScope;
+  changedWithinHours?: number;
+  hasDrafts?: boolean;
+  includeConflicts?: boolean;
 }
 
 export interface SearchResponse {
@@ -394,6 +535,66 @@ export interface RevisionHistoryResponse {
   workspaceId: EntityId;
   localeVariantId: EntityId;
   revisions: RevisionRecord[];
+}
+
+export interface PlaceholderToken {
+  token: string;
+  description?: string;
+}
+
+export interface LineageRecord {
+  id: EntityId;
+  localeVariantId: EntityId;
+  predecessorRevisionId: EntityId;
+  successorRevisionId: EntityId;
+  createdBy: 'system' | 'manual';
+  createdAtUtc: string;
+}
+
+export interface ArticlePublishRecord {
+  id: EntityId;
+  revisionId: EntityId;
+  zendeskArticleId?: string;
+  result?: string;
+  publishedAtUtc: string;
+}
+
+export interface ArticleDetailRequest {
+  workspaceId: EntityId;
+  revisionId?: EntityId;
+  localeVariantId?: EntityId;
+  preferRevisionType?: RevisionState;
+  includeSource?: boolean;
+  includePreview?: boolean;
+  includeLineage?: boolean;
+  includePublishLog?: boolean;
+}
+
+export interface ArticleDetailResponse {
+  workspaceId: EntityId;
+  familyId: EntityId;
+  familyTitle: string;
+  familyStatus: RevisionState;
+  externalKey?: string;
+  localeVariant: {
+    id: EntityId;
+    locale: string;
+    status: RevisionState;
+  };
+  revision: {
+    id: EntityId;
+    revisionType: RevisionState;
+    revisionNumber: number;
+    updatedAtUtc: string;
+    contentHash?: string;
+  };
+  sourceHtml: string;
+  previewHtml: string;
+  placeholders: PlaceholderToken[];
+  lineage: LineageRecord[];
+  relatedPbis: PBIRecord[];
+  publishLog: ArticlePublishRecord[];
+  filePath: string;
 }
 
 export interface RepositoryStructurePayload {

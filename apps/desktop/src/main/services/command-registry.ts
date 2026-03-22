@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import {
   AppErrorCode,
   createErrorResult,
@@ -16,28 +17,311 @@ import {
   type RevisionUpdateRequest,
   RevisionState,
   RevisionStatus,
+  ProposalAction,
+  PBIBatchScopeMode,
+  PBIBatchStatus,
+  PBIValidationStatus,
+  type PBIBatchImportRequest,
+  type PBIBatchRowsRequest,
+  type PBIBatchStatusUpdateRequest,
+  type PBIBatchDeleteRequest,
   type ZendeskCategoryRecord,
   type ZendeskSectionRecord,
   type ZendeskSearchArticleRecord,
   type ZendeskCategoriesListRequest,
   type ZendeskSectionsListRequest,
   type ZendeskSearchArticlesRequest,
+  type ArticleDetailRequest,
   type WorkspaceDefaultRequest,
-  type ZendeskSyncRunRequest
+  type ZendeskSyncRunRequest,
+  type AgentAnalysisRunRequest,
+  type AgentArticleEditRunRequest,
+  type AgentSessionCreateRequest,
+  type AgentSessionListRequest,
+  type AgentSessionGetRequest,
+  type AgentSessionCloseRequest,
+  type AgentSessionListResponse,
+  type AgentTranscriptRequest,
+  type MCPGetArticleFamilyInput,
+  type MCPGetArticleInput,
+  type MCPGetArticleHistoryInput,
+  type MCPGetBatchContextInput,
+  type MCPGetLocaleVariantInput,
+  type MCPGetPBISubsetInput,
+  type MCPGetPBIInput,
+  type MCPListArticleTemplatesInput,
+  type MCPListCategoriesInput,
+  type MCPListSectionsInput,
+  type MCPRecordAgentNotesInput,
+  type MCPFindRelatedArticlesInput,
+  type AgentStreamingPayload
 } from '@kb-vault/shared-types';
 import { ZendeskClient } from '@kb-vault/zendesk-client';
+import { CursorAcpRuntime, type AgentRuntimeToolContext } from '@kb-vault/agent-runtime';
 import { CommandBus } from './command-bus';
 import { JobRegistry } from './job-runner';
 import { JobState } from '@kb-vault/shared-types';
 import { WorkspaceRepository } from './workspace-repository';
 import { ZendeskSyncService, type ZendeskSyncServiceInput } from './zendesk-sync-service';
+import { PBIBatchImportService } from './pbi-batch-import-service';
 import { logger } from './logger';
+
+const ZENDESK_PREVIEW_STYLE_TOKENS: Record<string, string> = {
+  base_font_size: '16px',
+  bg_color: '#ffffff',
+  bg_color_boxed: '#ffffff',
+  bg_color_content_blocks: '#f8f9fa',
+  bg_color_cta: '#f8fbff',
+  bg_color_custom_blocks: '#f7fafc',
+  bg_color_footer: '#f3f5f7',
+  bg_color_header: '#ffffff',
+  bg_color_hero: '#ffffff',
+  bg_color_notification: '#edf2f7',
+  bg_color_secondary_hero: '#f5f7fa',
+  bg_gradient_hero_gradient: 'none',
+  color_border: '#e2e8f0',
+  color_footer_link: '#1f73b7',
+  color_gray_100: '#f7fafc',
+  color_gray_200: '#edf2f7',
+  color_gray_600: '#4a5568',
+  color_header_link: '#1f73b7',
+  color_header_link_fixed: '#1f73b7',
+  color_heading: '#1a202c',
+  color_heading_cta: '#1a202c',
+  color_hero_heading: '#1a202c',
+  color_hero_text: '#2d3748',
+  color_link: '#1f73b7',
+  color_note: '#3182ce',
+  color_notification: '#2c5282',
+  color_outline: '#cbd5e0',
+  color_primary: '#1f73b7',
+  color_primary_inverse: '#ffffff',
+  color_secondary: '#2d3748',
+  color_secondary_inverse: '#ffffff',
+  color_tertiary: '#3182ce',
+  color_tertiary_inverse: '#ffffff',
+  color_text: '#1a202c',
+  color_text_cta: '#ffffff',
+  color_warning: '#dd6b20',
+  community_background_image: 'none',
+  header_height: '72px',
+  heading_font: "'Inter', 'Segoe UI', Arial, sans-serif",
+  homepage_background_image: 'none',
+  logo_height: '32px',
+  note_title: '#2c5282',
+  text_font: "'Inter', 'Segoe UI', Arial, sans-serif",
+  warning_title: '#b7791f'
+};
+
+const sanitizeZendeskStyles = (cssText: string): string => {
+  const withFunctionsStripped = cssText
+    .replace(/(?:darken|lighten)\(\s*([^)]+?),\s*[0-9.]+%?\s*\)/g, '$1');
+
+  return withFunctionsStripped.replace(/\$([a-zA-Z0-9_-]+)/g, 'var(--kbv-zendesk-preview-$1)');
+};
+
+const buildFallbackZendeskVariableCss = (): string => {
+  const vars = Object.entries(ZENDESK_PREVIEW_STYLE_TOKENS)
+    .map(([token, value]) => `  --kbv-zendesk-preview-${token}: ${value};`)
+    .join('\n');
+  return `:root {\n${vars}\n}\n`;
+};
+
+const resolveArticlePreviewStylePath = async (override?: string): Promise<string | null> => {
+  const explicit = override?.trim();
+  const envPath = (process.env.KB_VAULT_ARTICLE_PREVIEW_STYLE_PATH ?? process.env.KB_VAULT_ZENDESK_STYLE_PATH ?? '').trim();
+  const candidates = [
+    explicit,
+    envPath,
+    path.resolve(process.cwd(), 'style1.css'),
+    path.resolve(process.cwd(), '..', 'style1.css')
+  ].filter(Boolean) as string[];
+
+  for (const candidate of candidates) {
+    const absoluteCandidate = path.isAbsolute(candidate) ? candidate : path.resolve(process.cwd(), candidate);
+    try {
+      await fs.access(absoluteCandidate);
+      return absoluteCandidate;
+    } catch {
+      // try next location
+    }
+  }
+
+  return null;
+};
 
 export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspaceRoot: string) {
   const workspaceRepository = new WorkspaceRepository(workspaceRoot);
   const zendeskSyncService = new ZendeskSyncService(workspaceRepository);
+  const pbiBatchImportService = new PBIBatchImportService(workspaceRepository);
   const validRevisionStates = new Set(Object.values(RevisionState));
   const validRevisionStatuses = new Set(Object.values(RevisionStatus));
+  const validPBIScopeModes = new Set([PBIBatchScopeMode.ALL, PBIBatchScopeMode.SELECTED_ONLY]);
+  const validPBIBatchStatuses = new Set(Object.values(PBIBatchStatus));
+  const validPBIValidationStatuses = new Set(Object.values(PBIValidationStatus));
+  type ProposalToolContext = Parameters<AgentRuntimeToolContext['proposeCreateKb']>[1];
+  const runtimeToolContext: AgentRuntimeToolContext = {
+    searchKb: async (input: MCPFindRelatedArticlesInput & { workspaceId: string }) => {
+      return workspaceRepository.searchArticles(input.workspaceId, {
+        workspaceId: input.workspaceId,
+        query: input.query,
+        scope: 'all',
+        includeArchived: true
+      });
+    },
+    getExplorerTree: async (workspaceId: string) => {
+      return workspaceRepository.getExplorerTree(workspaceId);
+    },
+    getArticle: async (input: MCPGetArticleInput) => {
+      return workspaceRepository.getArticleDetail(input.workspaceId, {
+        workspaceId: input.workspaceId,
+        revisionId: input.revisionId,
+        localeVariantId: input.localeVariantId,
+        includePublishLog: true,
+        includeLineage: true
+      });
+    },
+    getArticleFamily: async (input: MCPGetArticleFamilyInput) => {
+      return workspaceRepository.getArticleFamily(input.workspaceId, input.familyId);
+    },
+    getLocaleVariant: async (input: MCPGetLocaleVariantInput) => {
+      return workspaceRepository.getLocaleVariant(input.workspaceId, input.familyId);
+    },
+    findRelatedArticles: async (input: MCPFindRelatedArticlesInput) => {
+      const result = await workspaceRepository.searchArticles(input.workspaceId, {
+        workspaceId: input.workspaceId,
+        query: input.query,
+        scope: 'all',
+        includeArchived: true,
+        changedWithinHours: input.max ?? undefined
+      });
+      return result;
+    },
+    listCategories: async (input: MCPListCategoriesInput) => {
+      const client = await buildZendeskClient(input.workspaceId);
+      const categories = await client.listCategories(input.locale.trim()) as unknown as ZendeskCategoryRecord[];
+      return {
+        ok: true,
+        workspaceId: input.workspaceId,
+        locale: input.locale,
+        categories
+      };
+    },
+    listSections: async (input: MCPListSectionsInput) => {
+      const client = await buildZendeskClient(input.workspaceId);
+      const sections = await client.listSections(input.categoryId, input.locale.trim()) as unknown as ZendeskSectionRecord[];
+      return {
+        ok: true,
+        workspaceId: input.workspaceId,
+        locale: input.locale,
+        categoryId: input.categoryId,
+        sections
+      };
+    },
+    listArticleTemplates: async (input: MCPListArticleTemplatesInput) => {
+      const templates = await workspaceRepository.listTemplatePacks(input.workspaceId);
+      return { workspaceId: input.workspaceId, templates };
+    },
+    getTemplate: async (input: MCPListArticleTemplatesInput & { templatePackId: string; workspaceId: string }) => {
+      return workspaceRepository.getTemplatePack(input.workspaceId, input.templatePackId);
+    },
+    getBatchContext: async (input: MCPGetBatchContextInput) => {
+      const context = await workspaceRepository.getBatchContext(input.workspaceId, input.batchId);
+      if (!context) {
+        throw new Error('batch not found');
+      }
+      return context;
+    },
+    getPBI: async (input: MCPGetPBIInput) => {
+      const pbi = await workspaceRepository.getPBIRecord(input.workspaceId, input.pbiId);
+      if (!pbi) {
+        throw new Error('pbi not found');
+      }
+      return pbi;
+    },
+    getPBISubset: async (input: MCPGetPBISubsetInput) => {
+      return workspaceRepository.getPBISubset(input.workspaceId, input.batchId, input.rowNumbers);
+    },
+    getArticleHistory: async (input: MCPGetArticleHistoryInput) => {
+      return workspaceRepository.getHistory(input.workspaceId, input.localeVariantId);
+    },
+    recordAgentNotes: async (input: MCPRecordAgentNotesInput) => ({
+      ok: true,
+      workspaceId: input.workspaceId,
+      sessionId: input.sessionId,
+      recorded: true,
+      note: input.note
+    }),
+    proposeCreateKb: async (input: MCPRecordAgentNotesInput, context: ProposalToolContext) => {
+      if (!context.workspaceId) {
+        throw new Error('workspaceId is required');
+      }
+      const batchId = input.batchId || context.batchId || '';
+      const sessionId = input.sessionId || context.sessionId || '';
+      if (!batchId) {
+        throw new Error('batchId is required for create proposal');
+      }
+      const created = await workspaceRepository.createAgentProposal({
+        workspaceId: context.workspaceId,
+        batchId,
+        action: ProposalAction.CREATE,
+        _sessionId: sessionId,
+        localeVariantId: input.localeVariantId,
+        note: input.note,
+        rationale: input.rationale,
+        relatedPbiIds: input.pbiIds,
+        metadata: input.metadata
+      });
+      return { ok: true, ...created };
+    },
+    proposeEditKb: async (input: MCPRecordAgentNotesInput, context: ProposalToolContext) => {
+      if (!context.workspaceId) {
+        throw new Error('workspaceId is required');
+      }
+      const batchId = input.batchId || context.batchId || '';
+      const sessionId = input.sessionId || context.sessionId || '';
+      if (!batchId) {
+        throw new Error('batchId is required for edit proposal');
+      }
+      const created = await workspaceRepository.createAgentProposal({
+        workspaceId: context.workspaceId,
+        batchId,
+        action: ProposalAction.EDIT,
+        _sessionId: sessionId,
+        localeVariantId: input.localeVariantId,
+        note: input.note,
+        rationale: input.rationale,
+        relatedPbiIds: input.pbiIds,
+        metadata: input.metadata
+      });
+      return { ok: true, ...created };
+    },
+    proposeRetireKb: async (input: MCPRecordAgentNotesInput, context: ProposalToolContext) => {
+      if (!context.workspaceId) {
+        throw new Error('workspaceId is required');
+      }
+      const batchId = input.batchId || context.batchId || '';
+      const sessionId = input.sessionId || context.sessionId || '';
+      if (!batchId) {
+        throw new Error('batchId is required for retire proposal');
+      }
+      const created = await workspaceRepository.createAgentProposal({
+        workspaceId: context.workspaceId,
+        batchId,
+        action: ProposalAction.RETIRE,
+        _sessionId: sessionId,
+        localeVariantId: input.localeVariantId,
+        note: input.note,
+        rationale: input.rationale,
+        relatedPbiIds: input.pbiIds,
+        metadata: input.metadata
+      });
+      return { ok: true, ...created };
+    }
+  };
+  const agentRuntime = new CursorAcpRuntime(workspaceRoot, runtimeToolContext, (message, details) => {
+    logger.info(`[agent-runtime] ${message}`, details);
+  });
   const buildZendeskClient = async (workspaceId: string): Promise<ZendeskClient> => {
     const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
     const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
@@ -74,6 +358,121 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       jobs: jobs.list()
     }
   }));
+
+  bus.register('agent.health.check', async () => {
+    const health = await agentRuntime.checkHealth('system');
+    return { ok: true, data: health };
+  });
+
+  bus.register('agent.session.create', async (payload: unknown, requestId) => {
+    const input = payload as AgentSessionCreateRequest;
+    try {
+      const workspaceId = input?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.session.create requires workspaceId');
+      }
+      if (!input.type) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.session.create requires type');
+      }
+      const session = agentRuntime.createSession(input);
+      logger.info('agent.session.create', { requestId, sessionId: session.id });
+      return { ok: true, data: session };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('agent.session.list', async (payload: unknown, requestId) => {
+    const input = payload as AgentSessionListRequest;
+    try {
+      const workspaceId = input?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.session.list requires workspaceId');
+      }
+      logger.info('agent.session.list', { requestId, workspaceId });
+      return {
+        ok: true,
+        data: {
+          workspaceId,
+          sessions: agentRuntime.listSessions(workspaceId, Boolean(input?.includeClosed))
+        } as AgentSessionListResponse
+      };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('agent.session.get', async (payload: unknown, requestId) => {
+    const input = payload as AgentSessionGetRequest;
+    try {
+      const session = input?.sessionId
+        ? agentRuntime.getSession(input.sessionId)
+        : null;
+      if (!session) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'session not found');
+      }
+      if (session.workspaceId !== input.workspaceId) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'session not found');
+      }
+      logger.info('agent.session.get', { requestId, workspaceId: input.workspaceId, sessionId: input.sessionId });
+      return { ok: true, data: session };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('agent.session.close', async (payload: unknown, requestId) => {
+    const input = payload as AgentSessionCloseRequest;
+    try {
+      const workspaceId = input?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.session.close requires workspaceId');
+      }
+      const session = agentRuntime.closeSession(input);
+      logger.info('agent.session.close', { requestId, workspaceId, sessionId: input.sessionId });
+      if (!session) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'session not found');
+      }
+      return { ok: true, data: session };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('agent.transcript.get', async (payload: unknown) => {
+    const input = payload as AgentTranscriptRequest;
+    try {
+      if (!input?.workspaceId || !input.sessionId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.transcript.get requires workspaceId and sessionId');
+      }
+      return { ok: true, data: await agentRuntime.getTranscripts(input) };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('agent.tool.calls', async (payload: unknown) => {
+    const input = payload as AgentSessionGetRequest;
+    try {
+      if (!input?.workspaceId || !input.sessionId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.tool.calls requires workspaceId and sessionId');
+      }
+      const session = agentRuntime.getSession(input.sessionId);
+      if (!session || session.workspaceId !== input.workspaceId) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'session not found');
+      }
+      return {
+        ok: true,
+        data: {
+          workspaceId: input.workspaceId,
+          sessionId: input.sessionId,
+          toolCalls: agentRuntime.listToolCallAudit(input.sessionId, input.workspaceId)
+        }
+      };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
 
   bus.register('workspace.create', async (payload, requestId) => {
     logger.info('command workspace.create begin', { requestId });
@@ -300,6 +699,71 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
     } catch (error) {
       if ((error as Error).message === 'Workspace not found') {
         return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.detail.get', async (payload) => {
+    try {
+      const input = payload as ArticleDetailRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.detail.get requires workspaceId');
+      }
+      if (!input.revisionId && !input.localeVariantId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.detail.get requires revisionId or localeVariantId');
+      }
+
+      const response = await workspaceRepository.getArticleDetail(input.workspaceId, input);
+      return { ok: true, data: response };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      if (
+        (error as Error).message === 'Revision or locale variant not found' ||
+        (error as Error).message === 'Article family not found'
+      ) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.preview.styles.get', async (payload) => {
+    try {
+      const stylePath = await resolveArticlePreviewStylePath((payload as { stylePath?: string })?.stylePath);
+      const fallbackCss = buildFallbackZendeskVariableCss();
+
+      if (!stylePath) {
+        return {
+          ok: true,
+          data: {
+            css: fallbackCss,
+            sourcePath: ''
+          }
+        };
+      }
+
+      const styleContent = await fs.readFile(stylePath, 'utf8');
+      const safeStyle = `${fallbackCss}\n${sanitizeZendeskStyles(styleContent)}`;
+
+      return {
+        ok: true,
+        data: {
+          css: safeStyle,
+          sourcePath: stylePath
+        }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return {
+          ok: true,
+          data: {
+            css: buildFallbackZendeskVariableCss(),
+            sourcePath: ''
+          }
+        };
       }
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
     }
@@ -716,6 +1180,222 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
     }
   });
 
+  bus.register('pbiBatch.import', async (payload) => {
+    try {
+      const input = payload as PBIBatchImportRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.import requires workspaceId');
+      }
+      if (!input.sourceFileName?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.import requires sourceFileName');
+      }
+      if (!input.sourcePath && !input.sourceContent) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.import requires sourcePath or sourceContent');
+      }
+      if (input.scope?.mode && !validPBIScopeModes.has(input.scope.mode)) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.import scope.mode must be all|selected_only');
+      }
+
+      const trimmedInput: PBIBatchImportRequest = {
+        ...input,
+        sourceFileName: input.sourceFileName.trim(),
+        batchName: input.batchName?.trim(),
+        scope: input.scope
+          ? {
+              mode: input.scope.mode,
+              selectedRows: input.scope.selectedRows,
+              selectedExternalIds: input.scope.selectedExternalIds
+            }
+          : undefined
+      };
+      const result = await pbiBatchImportService.importBatch(trimmedInput);
+      return { ok: true, data: result };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      if ((error as Error).message === 'No headers found in PBI source' || (error as Error).message === 'pbi.import requires sourcePath or sourceContent') {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.list', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.list requires workspaceId');
+      }
+      const batches = await workspaceRepository.listPBIBatches(workspaceId);
+      return { ok: true, data: { workspaceId, batches } };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.get', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      const batchId = (payload as { batchId?: string })?.batchId;
+      if (!workspaceId || !batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.get requires workspaceId and batchId');
+      }
+      const batch = await workspaceRepository.getPBIBatch(workspaceId, batchId);
+      return { ok: true, data: { workspaceId, batch } };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.rows.list', async (payload) => {
+    try {
+      const input = payload as PBIBatchRowsRequest | undefined;
+      if (!input?.workspaceId || !input?.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.rows.list requires workspaceId and batchId');
+      }
+      if (input.validationStatuses?.length && !input.validationStatuses.every((status) => validPBIValidationStatuses.has(status))) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.rows.list requires validationStatuses to be candidate|malformed|duplicate|ignored');
+      }
+      const rows = await workspaceRepository.getPBIRecords(input.workspaceId, input.batchId, input.validationStatuses);
+      return { ok: true, data: { workspaceId: input.workspaceId, batchId: input.batchId, rows } };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.scope.set', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      const batchId = (payload as { batchId?: string })?.batchId;
+      const mode = (payload as { mode?: PBIBatchScopeMode })?.mode;
+      const selectedRows = (payload as { selectedRows?: number[] })?.selectedRows;
+      const selectedExternalIds = (payload as { selectedExternalIds?: string[] })?.selectedExternalIds;
+
+      if (!workspaceId || !batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.scope.set requires workspaceId and batchId');
+      }
+      if (!mode) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.scope.set requires mode');
+      }
+      if (!validPBIScopeModes.has(mode)) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.scope.set mode must be all|selected_only');
+      }
+
+      const result = await workspaceRepository.setPBIBatchScope(
+        workspaceId,
+        batchId,
+        mode,
+        selectedRows ?? [],
+        selectedExternalIds ?? []
+      );
+      const batch = await workspaceRepository.getPBIBatch(workspaceId, batchId);
+
+      return {
+        ok: true,
+        data: {
+          batch,
+          scope: {
+            batchId,
+            workspaceId,
+            mode,
+            selectedRows: selectedRows ?? [],
+            selectedExternalIds: selectedExternalIds ?? [],
+            scopedRowNumbers: result.scopedSourceRows,
+            scopedCount: result.scopedRowCount,
+            updatedAtUtc: new Date().toISOString()
+          }
+        }
+      };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.setStatus', async (payload) => {
+    try {
+      const input = payload as PBIBatchStatusUpdateRequest | undefined;
+      const workspaceId = input?.workspaceId;
+      const batchId = input?.batchId;
+      const status = input?.status;
+
+      if (!workspaceId || !batchId || !status) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.setStatus requires workspaceId, batchId, and status');
+      }
+      if (status === 'proposed') {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.setStatus status must be imported|scoped|submitted|analyzed|review_in_progress|review_complete|archived');
+      }
+      const batchStatus = status as PBIBatchStatus;
+      if (!validPBIBatchStatuses.has(batchStatus)) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.setStatus status must be imported|scoped|submitted|analyzed|review_in_progress|review_complete|archived');
+      }
+
+      const batch = await workspaceRepository.setPBIBatchStatus(
+        workspaceId,
+        batchId,
+        batchStatus,
+        Boolean(input?.force)
+      );
+      return { ok: true, data: { batch } };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      if ((error as Error).message?.startsWith('Cannot transition batch status')) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.delete', async (payload) => {
+    try {
+      const input = payload as PBIBatchDeleteRequest | undefined;
+      const workspaceId = input?.workspaceId;
+      const batchId = input?.batchId;
+      if (!workspaceId || !batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.delete requires workspaceId and batchId');
+      }
+
+      await workspaceRepository.deletePBIBatch(workspaceId, batchId);
+      return { ok: true, data: { workspaceId, batchId } };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.getPreflight', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      const batchId = (payload as { batchId?: string })?.batchId;
+      if (!workspaceId || !batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.getPreflight requires workspaceId and batchId');
+      }
+      const preflight = await pbiBatchImportService.getBatchPreflight(workspaceId, batchId);
+      return { ok: true, data: preflight };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
   jobs.registerRunner('workspace.bootstrap', async (payload: JobRunContext, emit) => {
     emit({
       id: payload.jobId ?? 'bootstrap',
@@ -737,6 +1417,135 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       state: JobState.RUNNING,
       progress: 100,
       message: `Workspace path: ${path.resolve(workspaceRoot)}`
+    });
+  });
+
+  jobs.registerRunner('agent.analysis.run', async (payload: JobRunContext, emit, isCancelled) => {
+    const input = payload.input as unknown as AgentAnalysisRunRequest;
+    logger.info('[agent.analysis.run] request received', {
+      jobId: payload.jobId,
+      workspaceId: input?.workspaceId,
+      batchId: input?.batchId
+    });
+    if (!input?.workspaceId || !input.batchId) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'agent.analysis.run requires workspaceId and batchId'
+      });
+      return;
+    }
+    if (isCancelled()) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.CANCELED,
+        progress: 100,
+        message: 'analysis canceled'
+      });
+      return;
+    }
+    emit({
+      id: payload.jobId,
+      command: payload.command,
+      state: JobState.RUNNING,
+      progress: 15,
+      message: `Starting analysis session for batch ${input.batchId}`
+    });
+    logger.info('[agent.analysis.run] starting runtime', {
+      jobId: payload.jobId,
+      batchId: input.batchId,
+      workspaceId: input.workspaceId
+    });
+    const result = await agentRuntime.runBatchAnalysis(
+      input,
+      (stream: AgentStreamingPayload) => {
+        emit({
+          id: payload.jobId,
+          command: payload.command,
+          state: JobState.RUNNING,
+          progress: stream.kind === 'result' ? 100 : 35,
+          message: JSON.stringify(stream)
+        });
+      },
+      isCancelled
+    );
+    logger.info('[agent.analysis.run] runtime finished', {
+      jobId: payload.jobId,
+      batchId: input.batchId,
+      status: result.status,
+      toolCalls: result.toolCalls.length,
+      transcriptPath: result.transcriptPath
+    });
+    emit({
+      id: payload.jobId,
+      command: payload.command,
+      state:
+        result.status === 'error'
+          ? JobState.FAILED
+          : result.status === 'canceled'
+            ? JobState.CANCELED
+            : JobState.SUCCEEDED,
+      progress: 100,
+      message: result.message ?? 'analysis command complete'
+    });
+  });
+
+  jobs.registerRunner('agent.article_edit.run', async (payload: JobRunContext, emit, isCancelled) => {
+    const input = payload.input as unknown as AgentArticleEditRunRequest;
+    if (!input?.workspaceId || !input.localeVariantId) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'agent.article_edit.run requires workspaceId and localeVariantId'
+      });
+      return;
+    }
+    if (isCancelled()) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.CANCELED,
+        progress: 100,
+        message: 'article edit canceled'
+      });
+      return;
+    }
+    emit({
+      id: payload.jobId,
+      command: payload.command,
+      state: JobState.RUNNING,
+      progress: 20,
+      message: `Starting article edit session for variant ${input.localeVariantId}`
+    });
+    const result = await agentRuntime.runArticleEdit(
+      input,
+      (stream: AgentStreamingPayload) => {
+        emit({
+          id: payload.jobId,
+          command: payload.command,
+          state: JobState.RUNNING,
+          progress: stream.kind === 'result' ? 100 : 45,
+          message: JSON.stringify(stream)
+        });
+      },
+      isCancelled
+    );
+    emit({
+      id: payload.jobId,
+      command: payload.command,
+      state:
+        result.status === 'error'
+          ? JobState.FAILED
+          : result.status === 'canceled'
+            ? JobState.CANCELED
+            : JobState.SUCCEEDED,
+      progress: 100,
+      message: result.message ?? 'article edit command complete'
     });
   });
 
@@ -965,4 +1774,8 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
     }
   });
+
+  return {
+    agentRuntime
+  };
 }

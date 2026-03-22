@@ -283,6 +283,36 @@ export const migrations: Migration[] = [
 
       PRAGMA foreign_keys = ON;
     `
+  },
+  {
+    version: 4,
+    name: '0004_batch5_pbi_import_enhancements',
+    description: 'Extend batch model for PBI batch 5 import normalization, validation, and scoping metadata.',
+    sql: `
+      ALTER TABLE pbi_batches ADD COLUMN source_path TEXT NOT NULL DEFAULT '';
+      ALTER TABLE pbi_batches ADD COLUMN source_format TEXT NOT NULL DEFAULT 'csv';
+      ALTER TABLE pbi_batches ADD COLUMN candidate_row_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE pbi_batches ADD COLUMN ignored_row_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE pbi_batches ADD COLUMN malformed_row_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE pbi_batches ADD COLUMN duplicate_row_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE pbi_batches ADD COLUMN scoped_row_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE pbi_batches ADD COLUMN scope_mode TEXT NOT NULL DEFAULT 'all';
+      ALTER TABLE pbi_batches ADD COLUMN scope_payload TEXT;
+
+      ALTER TABLE pbi_records ADD COLUMN state TEXT;
+      ALTER TABLE pbi_records ADD COLUMN work_item_type TEXT;
+      ALTER TABLE pbi_records ADD COLUMN title1 TEXT;
+      ALTER TABLE pbi_records ADD COLUMN title2 TEXT;
+      ALTER TABLE pbi_records ADD COLUMN title3 TEXT;
+      ALTER TABLE pbi_records ADD COLUMN raw_description TEXT;
+      ALTER TABLE pbi_records ADD COLUMN raw_acceptance_criteria TEXT;
+      ALTER TABLE pbi_records ADD COLUMN description_text TEXT;
+      ALTER TABLE pbi_records ADD COLUMN acceptance_criteria_text TEXT;
+      ALTER TABLE pbi_records ADD COLUMN parent_external_id TEXT;
+      ALTER TABLE pbi_records ADD COLUMN parent_record_id TEXT;
+      ALTER TABLE pbi_records ADD COLUMN validation_status TEXT NOT NULL DEFAULT 'candidate';
+      ALTER TABLE pbi_records ADD COLUMN validation_reason TEXT;
+    `
   }
 ];
 
