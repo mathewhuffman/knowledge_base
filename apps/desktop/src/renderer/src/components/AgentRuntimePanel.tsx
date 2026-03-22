@@ -5,10 +5,17 @@ import type {
   AgentTranscriptLine,
   AgentToolCallAudit,
   AgentStreamingPayload,
+  KbAccessMode,
+  KbAccessHealth,
+  PersistedAgentAnalysisRun,
+  PersistedAgentAnalysisRunResponse,
+  WorkspaceSettingsRecord,
   RpcResponse,
 } from '@kb-vault/shared-types';
+import { CliHealthFailure } from '@kb-vault/shared-types';
 import { Badge } from './Badge';
 import { StatusChip } from './StatusChip';
+import { ProviderBadge, RuntimeIndicator, RunHistoryBadge } from './ProviderBadge';
 import { LoadingState } from './LoadingState';
 import { ErrorState } from './ErrorState';
 import { EmptyState } from './EmptyState';
@@ -28,8 +35,13 @@ import {
   IconWifiOff,
   IconChevronRight,
   IconZap,
+  IconServer,
 } from './icons';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
+
+function parseModeFromUnknown(value: unknown): KbAccessMode | null {
+  return value === 'mcp' || value === 'cli' ? value : null;
+}
 
 /* ---------- Helpers ---------- */
 
@@ -59,6 +71,118 @@ function sessionStatusChip(status: string): { status: 'active' | 'live' | 'pendi
     case 'error': return { status: 'conflicted', label: 'Error' };
     default: return { status: 'pending', label: status };
   }
+}
+
+function persistedRunStatusChip(status: string): { status: 'active' | 'live' | 'pending' | 'retired' | 'conflicted'; label: string } {
+  switch (status) {
+    case 'running': return { status: 'active', label: 'Running' };
+    case 'complete': return { status: 'live', label: 'Complete' };
+    case 'failed': return { status: 'conflicted', label: 'Failed' };
+    case 'canceled': return { status: 'retired', label: 'Canceled' };
+    default: return { status: 'pending', label: status };
+  }
+}
+
+function runtimeBadgeVariant(mode: KbAccessMode): 'primary' | 'warning' {
+  return mode === 'mcp' ? 'primary' : 'warning';
+}
+
+function runtimeBadgeLabel(mode: KbAccessMode, expanded = false): string {
+  if (mode === 'mcp') {
+    return expanded ? 'MCP Runtime' : 'MCP';
+  }
+  return expanded ? 'CLI Runtime' : 'CLI';
+}
+
+/* ---------- Failure copy & recovery guidance ---------- */
+
+function cliFailureMessage(code: CliHealthFailure | undefined): string {
+  switch (code) {
+    case CliHealthFailure.BINARY_NOT_FOUND:
+      return 'The KB CLI binary could not be found on this machine.';
+    case CliHealthFailure.BINARY_NOT_EXECUTABLE:
+      return 'The KB CLI binary exists but cannot be executed. Check file permissions.';
+    case CliHealthFailure.LOOPBACK_NOT_RUNNING:
+      return 'The CLI loopback service is not running. It may need to be started.';
+    case CliHealthFailure.LOOPBACK_UNREACHABLE:
+      return 'The CLI loopback service is running but not responding to connections.';
+    case CliHealthFailure.LOOPBACK_UNHEALTHY:
+      return 'The CLI loopback service is reachable but reporting an unhealthy state.';
+    case CliHealthFailure.AUTH_TOKEN_MISSING:
+      return 'Authentication token is missing. The loopback service requires a valid token.';
+    case CliHealthFailure.HEALTH_PROBE_TIMEOUT:
+      return 'Health check timed out waiting for a response from the CLI service.';
+    case CliHealthFailure.HEALTH_PROBE_FAILED:
+      return 'Health probe returned an unexpected error from the CLI service.';
+    case CliHealthFailure.HEALTH_PROBE_REJECTED:
+      return 'The CLI service rejected the health probe. Check authentication and configuration.';
+    default:
+      return '';
+  }
+}
+
+function cliFailureRecovery(code: CliHealthFailure | undefined): string[] {
+  switch (code) {
+    case CliHealthFailure.BINARY_NOT_FOUND:
+      return ['Verify the KB CLI is installed', 'Check that the binary path is correct in workspace settings'];
+    case CliHealthFailure.BINARY_NOT_EXECUTABLE:
+      return ['Run chmod +x on the CLI binary', 'Reinstall the KB CLI if permissions cannot be fixed'];
+    case CliHealthFailure.LOOPBACK_NOT_RUNNING:
+    case CliHealthFailure.LOOPBACK_UNREACHABLE:
+      return ['Restart the application to re-launch the loopback service', 'Check that no other process is using the loopback port'];
+    case CliHealthFailure.LOOPBACK_UNHEALTHY:
+      return ['Restart the application', 'Check application logs for service errors'];
+    case CliHealthFailure.AUTH_TOKEN_MISSING:
+      return ['Restart the application to regenerate the auth token', 'Check workspace configuration'];
+    case CliHealthFailure.HEALTH_PROBE_TIMEOUT:
+      return ['The service may be overloaded — wait a moment and re-check', 'Restart the application if timeouts persist'];
+    case CliHealthFailure.HEALTH_PROBE_FAILED:
+    case CliHealthFailure.HEALTH_PROBE_REJECTED:
+      return ['Re-check agent health after a few seconds', 'Restart the application if the issue persists'];
+    default:
+      return [];
+  }
+}
+
+function providerStatusSummary(health: KbAccessHealth): string {
+  if (health.ok) {
+    return health.message ?? 'Healthy and ready';
+  }
+  const failMsg = cliFailureMessage(health.failureCode);
+  if (failMsg && health.message && health.message !== failMsg) {
+    return `${failMsg} Details: ${health.message}`;
+  }
+  return failMsg || health.message || 'Unavailable — run a health check for details';
+}
+
+function acpTransportSummary(health: KbAccessHealth): { ok: boolean; detail: string } {
+  if (health.mode !== 'cli') {
+    return { ok: true, detail: 'Not applicable' };
+  }
+  if (health.acpReachable === true) {
+    return {
+      ok: true,
+      detail: health.baseUrl
+        ? `ACP transport reachable via ${health.baseUrl}`
+        : 'ACP transport reachable'
+    };
+  }
+  if (health.acpReachable === false) {
+    return {
+      ok: false,
+      detail: 'ACP transport not reachable'
+    };
+  }
+  if (health.ok) {
+    return {
+      ok: true,
+      detail: health.baseUrl ? `Loopback URL: ${health.baseUrl}` : 'Loopback URL not reported'
+    };
+  }
+  return {
+    ok: false,
+    detail: health.baseUrl ? `Loopback URL: ${health.baseUrl}` : 'No transport status reported'
+  };
 }
 
 function streamingKindBadge(kind: AgentStreamingPayload['kind']): 'primary' | 'success' | 'warning' | 'danger' | 'neutral' {
@@ -162,9 +286,25 @@ interface HealthStatusPanelProps {
   workspaceId: string;
 }
 
+interface LegacyAgentHealthCheckResponse {
+  checkedAtUtc: string;
+  cursorInstalled: boolean;
+  acpReachable: boolean;
+  mcpRunning: boolean;
+  requiredConfigPresent: boolean;
+  cursorBinaryPath?: string;
+  issues: string[];
+}
+
+function isProviderHealthResponse(
+  value: AgentHealthCheckResponse | LegacyAgentHealthCheckResponse | null
+): value is AgentHealthCheckResponse {
+  return Boolean(value && typeof value === 'object' && 'providers' in value && 'selectedMode' in value);
+}
+
 export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
-  const healthQuery = useIpc<AgentHealthCheckResponse>('agent.health.check');
-  const [lastCheck, setLastCheck] = useState<AgentHealthCheckResponse | null>(null);
+  const healthQuery = useIpc<AgentHealthCheckResponse | LegacyAgentHealthCheckResponse>('agent.health.check');
+  const [lastCheck, setLastCheck] = useState<AgentHealthCheckResponse | LegacyAgentHealthCheckResponse | null>(null);
 
   const runCheck = useCallback(() => {
     healthQuery.execute({ workspaceId }).then((data) => {
@@ -177,19 +317,32 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
   }, [runCheck]);
 
   const health = lastCheck;
-  const allGood = health && health.cursorInstalled && health.acpReachable && health.mcpRunning && health.requiredConfigPresent;
+  const providerHealth = health && isProviderHealthResponse(health) ? health : null;
+  const legacyHealth = health && !isProviderHealthResponse(health) ? health : null;
+  const allGood = providerHealth
+    ? providerHealth.providers.mcp.ok && providerHealth.providers.cli.ok
+    : legacyHealth
+      ? legacyHealth.cursorInstalled && legacyHealth.acpReachable && legacyHealth.mcpRunning && legacyHealth.requiredConfigPresent
+      : false;
+
+  const activeProvider = providerHealth ? providerHealth.providers[providerHealth.selectedMode] : null;
+  const inactiveProvider = providerHealth
+    ? providerHealth.providers[providerHealth.selectedMode === 'mcp' ? 'cli' : 'mcp']
+    : null;
 
   return (
-    <div className="card agent-health-card">
+    <div className="card agent-health-card" role="region" aria-label="Agent health status">
       <div className="card-header">
         <span className="card-header-title">
-          <IconActivity size={14} style={{ marginRight: 6 }} />
+          <span style={{ display: 'inline-flex', marginRight: 6 }} aria-hidden="true">
+            <IconActivity size={14} />
+          </span>
           Agent Health
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
           {health && (
             <Badge variant={allGood ? 'success' : 'warning'}>
-              {allGood ? 'All Systems Go' : 'Issues Detected'}
+              {allGood ? 'All Systems Go' : 'Attention Needed'}
             </Badge>
           )}
           <button
@@ -204,43 +357,96 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
         </div>
       </div>
 
-      <div className="card-body">
+      <div className="card-body" aria-live="polite" aria-atomic="true">
         {healthQuery.loading && !health ? (
-          <LoadingState message="Checking agent runtime..." />
+          <LoadingState message="Checking agent runtime health..." />
         ) : healthQuery.error && !health ? (
           <ErrorState
-            title="Health check failed"
-            description={healthQuery.error}
-            action={<button className="btn btn-primary btn-sm" onClick={runCheck}>Retry</button>}
+            title="Unable to check health"
+            description={`The health check could not complete: ${healthQuery.error}. This may be a temporary issue.`}
+            action={<button className="btn btn-primary btn-sm" onClick={runCheck}>Try Again</button>}
           />
         ) : health ? (
           <div className="agent-health-grid">
-            <HealthCheckItem
-              label="Cursor CLI"
-              ok={health.cursorInstalled}
-              detail={health.cursorBinaryPath ?? 'Not found'}
-            />
-            <HealthCheckItem
-              label="ACP Reachable"
-              ok={health.acpReachable}
-              detail={health.acpReachable ? 'Connected' : 'Cannot reach ACP transport'}
-            />
-            <HealthCheckItem
-              label="MCP Server"
-              ok={health.mcpRunning}
-              detail={health.mcpRunning ? 'Running' : 'Not running'}
-            />
-            <HealthCheckItem
-              label="Configuration"
-              ok={health.requiredConfigPresent}
-              detail={health.requiredConfigPresent ? 'All required config present' : 'Missing required configuration'}
-            />
+            {providerHealth ? (
+              <>
+                <KbAccessModeToggle
+                  workspaceId={workspaceId}
+                  currentMode={providerHealth.selectedMode}
+                  availableModes={providerHealth.availableModes}
+                  onModeChanged={runCheck}
+                />
+                {activeProvider && (
+                  <HealthCheckItem
+                    label={`${providerHealth.selectedMode.toUpperCase()} Provider (active)`}
+                    ok={activeProvider.ok}
+                    detail={providerStatusSummary(activeProvider)}
+                    failureCode={activeProvider.failureCode}
+                    recoverySteps={!activeProvider.ok ? cliFailureRecovery(activeProvider.failureCode) : []}
+                  />
+                )}
+                {activeProvider && activeProvider.mode === 'cli' && (
+                  <HealthCheckItem
+                    label="ACP Transport (active)"
+                    ok={acpTransportSummary(activeProvider).ok}
+                    detail={acpTransportSummary(activeProvider).detail}
+                    failureCode={acpTransportSummary(activeProvider).ok ? undefined : activeProvider.failureCode}
+                    recoverySteps={
+                      acpTransportSummary(activeProvider).ok
+                        ? []
+                        : cliFailureRecovery(activeProvider.failureCode)
+                    }
+                  />
+                )}
+                {inactiveProvider && (
+                  <HealthCheckItem
+                    label={`${inactiveProvider.mode.toUpperCase()} Provider (standby)`}
+                    ok={inactiveProvider.ok}
+                    detail={providerStatusSummary(inactiveProvider)}
+                    failureCode={inactiveProvider.failureCode}
+                    recoverySteps={[]}
+                  />
+                )}
+                {inactiveProvider && inactiveProvider.mode === 'cli' && inactiveProvider !== activeProvider && (
+                  <HealthCheckItem
+                    label="ACP Transport (standby)"
+                    ok={acpTransportSummary(inactiveProvider).ok}
+                    detail={acpTransportSummary(inactiveProvider).detail}
+                    failureCode={acpTransportSummary(inactiveProvider).ok ? undefined : inactiveProvider.failureCode}
+                    recoverySteps={[]}
+                  />
+                )}
+              </>
+            ) : legacyHealth ? (
+              <>
+                <HealthCheckItem
+                  label="Cursor CLI"
+                  ok={legacyHealth.cursorInstalled}
+                  detail={legacyHealth.cursorBinaryPath ?? 'Not found'}
+                />
+                <HealthCheckItem
+                  label="ACP Reachable"
+                  ok={legacyHealth.acpReachable}
+                  detail={legacyHealth.acpReachable ? 'Connected' : 'Cannot reach ACP transport'}
+                />
+                <HealthCheckItem
+                  label="MCP Server"
+                  ok={legacyHealth.mcpRunning}
+                  detail={legacyHealth.mcpRunning ? 'Running' : 'Not running'}
+                />
+                <HealthCheckItem
+                  label="Configuration"
+                  ok={legacyHealth.requiredConfigPresent}
+                  detail={legacyHealth.requiredConfigPresent ? 'All required config present' : 'Missing required configuration'}
+                />
+              </>
+            ) : null}
 
             {health.issues.length > 0 && (
-              <div className="agent-health-issues">
+              <div className="agent-health-issues" role="alert">
                 <div className="agent-health-issues-heading">
-                  <IconAlertCircle size={12} />
-                  Issues
+                  <span aria-hidden="true"><IconAlertCircle size={12} /></span>
+                  <span>{health.issues.length === 1 ? '1 Issue Detected' : `${health.issues.length} Issues Detected`}</span>
                 </div>
                 {health.issues.map((issue, i) => (
                   <div key={i} className="agent-health-issue-item">{issue}</div>
@@ -249,7 +455,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
             )}
 
             {health.checkedAtUtc && (
-              <div className="agent-health-timestamp">
+              <div className="agent-health-timestamp" aria-label={`Last health check at ${formatTimestamp(health.checkedAtUtc)}`}>
                 Last checked: {formatTimestamp(health.checkedAtUtc)}
               </div>
             )}
@@ -260,10 +466,228 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
   );
 }
 
-function HealthCheckItem({ label, ok, detail }: { label: string; ok: boolean; detail: string }) {
+/* ================================================================== */
+/* KbAccessModeToggle                                                  */
+/* ================================================================== */
+
+interface KbAccessModeToggleProps {
+  workspaceId: string;
+  currentMode: KbAccessMode;
+  availableModes: KbAccessMode[];
+  onModeChanged: () => void;
+}
+
+type ModeSwitchPhase = 'idle' | 'confirming' | 'switching' | 'verifying' | 'success' | 'failed';
+
+function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeChanged }: KbAccessModeToggleProps) {
+  const updateSettings = useIpcMutation<WorkspaceSettingsRecord>('workspace.settings.update');
+  const [pendingMode, setPendingMode] = useState<KbAccessMode | null>(null);
+  const [switchPhase, setSwitchPhase] = useState<ModeSwitchPhase>('idle');
+  const [switchError, setSwitchError] = useState<string | null>(null);
+
+  const modeDescriptions: Record<KbAccessMode, { label: string; helper: string; icon: string }> = {
+    mcp: {
+      label: 'MCP (Model Context Protocol)',
+      helper: 'Connects the AI agent directly to KB tools via the MCP server. Best for most workflows.',
+      icon: 'server',
+    },
+    cli: {
+      label: 'CLI (Command Line)',
+      helper: 'Routes KB access through the local CLI loopback service. Use when MCP is unavailable.',
+      icon: 'terminal',
+    },
+  };
+
+  const phaseLabel: Record<ModeSwitchPhase, string> = {
+    idle: '',
+    confirming: 'Confirm mode change',
+    switching: 'Saving new mode...',
+    verifying: 'Verifying provider health...',
+    success: 'Mode switched successfully',
+    failed: 'Mode switch failed',
+  };
+
+  const handleSelect = (mode: KbAccessMode) => {
+    if (mode === currentMode) return;
+    setPendingMode(mode);
+    setSwitchPhase('confirming');
+    setSwitchError(null);
+  };
+
+  const confirmSwitch = async () => {
+    if (!pendingMode) return;
+    setSwitchPhase('switching');
+    setSwitchError(null);
+    try {
+      await updateSettings.mutate({ workspaceId, kbAccessMode: pendingMode });
+      setSwitchPhase('verifying');
+      // Brief pause to let the health check re-run
+      await new Promise((r) => setTimeout(r, 600));
+      setSwitchPhase('success');
+      onModeChanged();
+      // Auto-dismiss success after a moment
+      setTimeout(() => {
+        setSwitchPhase('idle');
+        setPendingMode(null);
+      }, 1500);
+    } catch (err) {
+      setSwitchPhase('failed');
+      setSwitchError(err instanceof Error ? err.message : 'An unexpected error occurred while switching modes.');
+    }
+  };
+
+  const cancelSwitch = () => {
+    setSwitchPhase('idle');
+    setPendingMode(null);
+    setSwitchError(null);
+  };
+
+  const retrySwitch = () => {
+    setSwitchError(null);
+    void confirmSwitch();
+  };
+
+  const isBusy = switchPhase === 'switching' || switchPhase === 'verifying';
+
   return (
-    <div className="agent-health-item">
-      <div className="agent-health-item-indicator">
+    <div className="agent-mode-toggle" role="group" aria-label="KB access mode selector">
+      <div className="agent-mode-toggle-label" id="mode-toggle-label">
+        KB Access Mode
+      </div>
+
+      <div className="agent-mode-toggle-buttons" role="radiogroup" aria-labelledby="mode-toggle-label">
+        {(['mcp', 'cli'] as KbAccessMode[]).map((mode) => {
+          const isSelected = mode === currentMode;
+          const isAvailable = availableModes.includes(mode);
+          return (
+            <button
+              key={mode}
+              className={`btn agent-mode-btn ${isSelected ? 'btn-primary agent-mode-btn--active' : 'btn-secondary'}`}
+              role="radio"
+              aria-checked={isSelected}
+              aria-disabled={isBusy || undefined}
+              onClick={() => !isBusy && handleSelect(mode)}
+              disabled={isBusy}
+              title={modeDescriptions[mode].helper}
+            >
+              <span className="agent-mode-btn-icon" aria-hidden="true">
+                {mode === 'mcp' ? <IconServer size={12} /> : <IconTerminal size={12} />}
+              </span>
+              {mode.toUpperCase()}
+              {isSelected && (
+                <span className="agent-mode-btn-check" aria-hidden="true">
+                  <IconCheckCircle size={12} />
+                </span>
+              )}
+              {!isAvailable && (
+                <span className="agent-mode-btn-unavail">(offline)</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="agent-mode-toggle-helper">
+        {modeDescriptions[currentMode].helper}
+      </div>
+
+      {/* Transition panel — shown during confirm, switching, verifying, success, or failed */}
+      {switchPhase !== 'idle' && pendingMode && (
+        <div
+          className={`agent-mode-switch-panel agent-mode-switch-panel--${switchPhase}`}
+          role="alertdialog"
+          aria-label={phaseLabel[switchPhase]}
+          aria-live="assertive"
+        >
+          {/* Phase: confirming */}
+          {switchPhase === 'confirming' && (
+            <>
+              <div className="agent-mode-switch-header">
+                <span aria-hidden="true"><IconAlertCircle size={14} /></span>
+                <span className="agent-mode-switch-title">
+                  Switch to {modeDescriptions[pendingMode].label}?
+                </span>
+              </div>
+              <p className="agent-mode-switch-body">
+                Future agent sessions will use the {pendingMode.toUpperCase()} provider.
+                Any running sessions will keep their current mode until they finish.
+              </p>
+              {!availableModes.includes(pendingMode) && (
+                <div className="agent-mode-switch-warning" role="alert">
+                  <span aria-hidden="true"><IconAlertCircle size={12} /></span>
+                  <span>
+                    The {pendingMode.toUpperCase()} provider is currently offline.
+                    Sessions may fail until it becomes healthy. You can switch now and
+                    re-check health afterward, or wait until the provider is available.
+                  </span>
+                </div>
+              )}
+              <div className="agent-mode-switch-actions">
+                <button className="btn btn-secondary btn-sm" onClick={cancelSwitch}>Cancel</button>
+                <button className="btn btn-primary btn-sm" onClick={confirmSwitch}>
+                  Switch to {pendingMode.toUpperCase()}
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* Phase: switching / verifying */}
+          {(switchPhase === 'switching' || switchPhase === 'verifying') && (
+            <div className="agent-mode-switch-progress">
+              <div className="spinner" aria-hidden="true" />
+              <div className="agent-mode-switch-progress-text">
+                <span className="agent-mode-switch-progress-label">
+                  {switchPhase === 'switching' ? 'Saving mode preference...' : 'Verifying provider health...'}
+                </span>
+                <span className="agent-mode-switch-progress-sub">
+                  Switching to {pendingMode.toUpperCase()}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Phase: success */}
+          {switchPhase === 'success' && (
+            <div className="agent-mode-switch-result agent-mode-switch-result--success">
+              <span aria-hidden="true"><IconCheckCircle size={16} /></span>
+              <span>Switched to {pendingMode.toUpperCase()} mode. New sessions will use this provider.</span>
+            </div>
+          )}
+
+          {/* Phase: failed */}
+          {switchPhase === 'failed' && (
+            <>
+              <div className="agent-mode-switch-result agent-mode-switch-result--failed" role="alert">
+                <span aria-hidden="true"><IconXCircle size={16} /></span>
+                <div>
+                  <div className="agent-mode-switch-error-title">Could not switch modes</div>
+                  <div className="agent-mode-switch-error-detail">
+                    {switchError ?? 'The mode change did not complete. Your previous mode is still active.'}
+                  </div>
+                </div>
+              </div>
+              <div className="agent-mode-switch-actions">
+                <button className="btn btn-secondary btn-sm" onClick={cancelSwitch}>Dismiss</button>
+                <button className="btn btn-primary btn-sm" onClick={retrySwitch}>Try Again</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HealthCheckItem({ label, ok, detail, failureCode, recoverySteps }: {
+  label: string;
+  ok: boolean;
+  detail: string;
+  failureCode?: CliHealthFailure;
+  recoverySteps?: string[];
+}) {
+  return (
+    <div className={`agent-health-item ${!ok ? 'agent-health-item--failed' : ''}`} role="status" aria-label={`${label}: ${ok ? 'healthy' : 'unhealthy'}`}>
+      <div className="agent-health-item-indicator" aria-hidden="true">
         {ok ? (
           <IconCheckCircle size={16} className="agent-health-ok" />
         ) : (
@@ -273,6 +697,21 @@ function HealthCheckItem({ label, ok, detail }: { label: string; ok: boolean; de
       <div className="agent-health-item-content">
         <div className="agent-health-item-label">{label}</div>
         <div className="agent-health-item-detail">{detail}</div>
+        {!ok && failureCode && (
+          <div className="agent-health-item-failure-code">
+            Error: {failureCode}
+          </div>
+        )}
+        {recoverySteps && recoverySteps.length > 0 && (
+          <div className="agent-health-recovery" role="note" aria-label="Recovery steps">
+            <div className="agent-health-recovery-title">How to fix:</div>
+            <ol className="agent-health-recovery-steps">
+              {recoverySteps.map((step, i) => (
+                <li key={i}>{step}</li>
+              ))}
+            </ol>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -324,7 +763,7 @@ export function SessionListPanel({ workspaceId, onSelectSession }: SessionListPa
             />
             <span>Show closed</span>
           </label>
-          <button className="btn btn-ghost btn-icon" onClick={load} title="Refresh sessions">
+          <button className="btn btn-ghost btn-icon" onClick={load} title="Refresh sessions" aria-label="Refresh session list">
             <IconRefreshCw size={14} />
           </button>
         </div>
@@ -360,6 +799,11 @@ export function SessionListPanel({ workspaceId, onSelectSession }: SessionListPa
                       ) : (
                         <Badge variant="neutral">Article Edit</Badge>
                       )}
+                      <ProviderBadge
+                        mode={session.kbAccessMode}
+                        size="inline"
+                        live={session.status === 'running' || session.status === 'starting'}
+                      />
                     </div>
                     <StatusChip status={chipProps.status} label={chipProps.label} />
                   </div>
@@ -408,7 +852,7 @@ interface SessionDetailPanelProps {
 }
 
 export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDetailPanelProps) {
-  const [activeTab, setActiveTab] = useState<'transcript' | 'tools'>('transcript');
+  const [activeTab, setActiveTab] = useState<'transcript' | 'kb_tools' | 'acp_tools'>('transcript');
   const transcriptQuery = useIpc<{ workspaceId: string; sessionId: string; lines: AgentTranscriptLine[] }>('agent.transcript.get');
   const toolsQuery = useIpc<AgentToolCallAudit[]>('agent.tool.calls');
 
@@ -417,9 +861,16 @@ export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDeta
     toolsQuery.execute({ workspaceId, sessionId: session.id });
   }, [workspaceId, session.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (session.kbAccessMode !== 'mcp' && activeTab === 'kb_tools') {
+      setActiveTab('transcript');
+    }
+  }, [activeTab, session.kbAccessMode]);
+
   const chipProps = sessionStatusChip(session.status);
   const transcriptLines = transcriptQuery.data?.lines ?? [];
   const toolCalls = normalizeToolCalls(toolsQuery.data);
+  const acpToolCalls = useMemo(() => extractAcpToolCalls(transcriptLines), [transcriptLines]);
 
   return (
     <div className="agent-session-detail">
@@ -431,6 +882,12 @@ export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDeta
           <Badge variant={session.type === 'batch_analysis' ? 'primary' : 'neutral'}>
             {session.type === 'batch_analysis' ? 'Batch Analysis' : 'Article Edit'}
           </Badge>
+          <ProviderBadge
+            mode={session.kbAccessMode}
+            size="detail"
+            expanded
+            live={session.status === 'running' || session.status === 'starting'}
+          />
           <StatusChip status={chipProps.status} label={chipProps.label} />
         </div>
       </div>
@@ -453,6 +910,10 @@ export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDeta
           </div>
         )}
         <div className="agent-meta-pair">
+          <span className="agent-meta-label">Runtime</span>
+          <RuntimeIndicator mode={session.kbAccessMode} status={session.status} />
+        </div>
+        <div className="agent-meta-pair">
           <span className="agent-meta-label">Created</span>
           <span className="agent-meta-value">{formatTimestamp(session.createdAtUtc)}</span>
         </div>
@@ -467,20 +928,31 @@ export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDeta
           <IconTerminal size={12} />
           Transcript ({transcriptLines.length})
         </button>
+        {session.kbAccessMode === 'mcp' && (
+          <button
+            className={`tab-item ${activeTab === 'kb_tools' ? 'active' : ''}`}
+            onClick={() => setActiveTab('kb_tools')}
+          >
+            <IconTool size={12} />
+            KB Tools ({toolCalls.length})
+          </button>
+        )}
         <button
-          className={`tab-item ${activeTab === 'tools' ? 'active' : ''}`}
-          onClick={() => setActiveTab('tools')}
+          className={`tab-item ${activeTab === 'acp_tools' ? 'active' : ''}`}
+          onClick={() => setActiveTab('acp_tools')}
         >
           <IconTool size={12} />
-          Tool Calls ({toolCalls.length})
+          ACP Tools ({acpToolCalls.length})
         </button>
       </div>
 
       <div className="agent-session-detail-body">
         {activeTab === 'transcript' ? (
           <TranscriptView lines={transcriptLines} loading={transcriptQuery.loading} error={transcriptQuery.error} />
+        ) : activeTab === 'kb_tools' ? (
+          <ToolCallsView calls={toolCalls} loading={toolsQuery.loading} error={toolsQuery.error} mode={session.kbAccessMode} />
         ) : (
-          <ToolCallsView calls={toolCalls} loading={toolsQuery.loading} error={toolsQuery.error} />
+          <AcpToolCallsView calls={acpToolCalls} loading={transcriptQuery.loading} error={transcriptQuery.error} />
         )}
       </div>
     </div>
@@ -605,7 +1077,17 @@ function formatPayload(raw: string): string {
 /* ToolCallsView                                                       */
 /* ================================================================== */
 
-function ToolCallsView({ calls, loading, error }: { calls: AgentToolCallAudit[]; loading: boolean; error: string | null }) {
+function ToolCallsView({
+  calls,
+  loading,
+  error,
+  mode,
+}: {
+  calls: AgentToolCallAudit[];
+  loading: boolean;
+  error: string | null;
+  mode: KbAccessMode;
+}) {
   if (loading) return <LoadingState message="Loading tool calls..." />;
   if (error) return <ErrorState title="Tool calls unavailable" description={error} />;
   if (calls.length === 0) {
@@ -613,7 +1095,11 @@ function ToolCallsView({ calls, loading, error }: { calls: AgentToolCallAudit[];
       <EmptyState
         icon={<IconTool size={32} />}
         title="No tool calls"
-        description="MCP tool calls made by the agent will appear here."
+        description={
+          mode === 'mcp'
+            ? 'KB MCP tool calls made by the agent will appear here.'
+            : 'CLI runtime does not attach KB MCP tools. Inspect the transcript or ACP tools for `kb` command activity.'
+        }
       />
     );
   }
@@ -702,6 +1188,12 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const [liveToolCalls, setLiveToolCalls] = useState<AgentToolCallAudit[]>([]);
   const [sessionListData, setSessionListData] = useState<AgentSessionRecord[]>([]);
   const [resolvedSessionId, setResolvedSessionId] = useState<string | null>(null);
+  const [currentRunMode, setCurrentRunMode] = useState<KbAccessMode | null>(null);
+  const [stickyHistorySessionId, setStickyHistorySessionId] = useState<string | null>(null);
+  const [persistedRun, setPersistedRun] = useState<PersistedAgentAnalysisRun | null>(null);
+  const [persistedTranscriptLines, setPersistedTranscriptLines] = useState<AgentTranscriptLine[]>([]);
+  const [persistedHistoryLoading, setPersistedHistoryLoading] = useState(false);
+  const [persistedHistoryError, setPersistedHistoryError] = useState<string | null>(null);
   const jobIdRef = useRef<string | null>(null);
   const terminalStateHandledRef = useRef(false);
   const sessionListInFlightRef = useRef(false);
@@ -739,7 +1231,6 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
         window.kbv.invoke<{ workspaceId: string; sessionId: string; lines: AgentTranscriptLine[] }>('agent.transcript.get', {
           workspaceId,
           sessionId,
-          limit: 200,
         }) as Promise<RpcResponse<{ workspaceId: string; sessionId: string; lines: AgentTranscriptLine[] }>>,
         window.kbv.invoke<AgentToolCallAudit[]>('agent.tool.calls', {
           workspaceId,
@@ -772,14 +1263,48 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     }
   }, [workspaceId]);
 
+  const refreshPersistedHistory = useCallback(async () => {
+    setPersistedHistoryLoading(true);
+    setPersistedHistoryError(null);
+    try {
+      const response = await window.kbv.invoke<PersistedAgentAnalysisRunResponse>('agent.analysis.latest', {
+        workspaceId,
+        batchId,
+        limit: 0,
+      }) as RpcResponse<PersistedAgentAnalysisRunResponse>;
+
+      if (response.ok && response.data) {
+        setPersistedRun(response.data.run);
+        setPersistedTranscriptLines(response.data.lines ?? []);
+        return;
+      }
+
+      setPersistedRun(null);
+      setPersistedTranscriptLines([]);
+      setPersistedHistoryError(response.error?.message ?? 'Saved analysis unavailable');
+    } catch (err) {
+      setPersistedRun(null);
+      setPersistedTranscriptLines([]);
+      setPersistedHistoryError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPersistedHistoryLoading(false);
+    }
+  }, [batchId, workspaceId]);
+
   useEffect(() => {
     void refreshSessions();
+    void refreshPersistedHistory();
 
     const handler = (event: { id: string; command: string; state: string; progress: number; message?: string }) => {
       if (event.command !== 'agent.analysis.run') return;
       if (!jobIdRef.current || event.id !== jobIdRef.current) return;
       if (terminalStateHandledRef.current && (event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED')) {
         return;
+      }
+
+      const eventMode = parseModeFromUnknown((event as { metadata?: { kbAccessMode?: unknown } })?.metadata?.kbAccessMode);
+      if (eventMode) {
+        setCurrentRunMode(eventMode);
       }
 
       setJobState(event.state);
@@ -791,6 +1316,12 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
         try {
           const payload = JSON.parse(event.message) as AgentStreamingPayload;
           setEvents((prev) => [...prev, payload]);
+          if (payload.kind === 'session_started' && payload.data && typeof payload.data === 'object') {
+            const sessionPayload = (payload.data as { session?: { kbAccessMode?: KbAccessMode } }).session;
+            if (sessionPayload?.kbAccessMode === 'mcp' || sessionPayload?.kbAccessMode === 'cli') {
+              setCurrentRunMode(sessionPayload.kbAccessMode);
+            }
+          }
           if (payload.sessionId) {
             payloadSessionId = payload.sessionId;
             setResolvedSessionId(payload.sessionId);
@@ -824,7 +1355,11 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
 
       if (event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED') {
         terminalStateHandledRef.current = true;
+        if (payloadSessionId) {
+          setStickyHistorySessionId(payloadSessionId);
+        }
         void refreshSessions();
+        void refreshPersistedHistory();
         if (payloadSessionId) {
           void refreshHistory(payloadSessionId, true);
         }
@@ -837,14 +1372,39 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
         unsubscribe();
       }
     };
-  }, [refreshHistory, refreshSessions, workspaceId]);
+  }, [refreshHistory, refreshPersistedHistory, refreshSessions, workspaceId]);
 
   const latestBatchSession = useMemo(() => {
     const allSessions = sessionListData;
     const batchSessions = allSessions.filter((session) => session.type === 'batch_analysis' && session.batchId === batchId);
     return batchSessions.sort((a, b) => b.updatedAtUtc.localeCompare(a.updatedAtUtc))[0] ?? null;
   }, [batchId, sessionListData]);
-  const activeSessionId = resolvedSessionId ?? latestBatchSession?.id ?? null;
+  const activeLiveSessionId = resolvedSessionId ?? latestBatchSession?.id ?? null;
+  const activeSession = useMemo(
+    () => (activeLiveSessionId ? sessionListData.find((session) => session.id === activeLiveSessionId) ?? latestBatchSession : latestBatchSession),
+    [activeLiveSessionId, latestBatchSession, sessionListData]
+  );
+  const hasLiveHistory = liveTranscriptLines.length > 0 || liveToolCalls.length > 0;
+  const shouldUseLiveHistory = Boolean(
+    activeLiveSessionId
+      && activeSession
+      && (
+        activeSession.status === 'running'
+        || activeSession.status === 'starting'
+        || (stickyHistorySessionId === activeLiveSessionId && hasLiveHistory)
+      )
+  );
+  const displaySessionId = (shouldUseLiveHistory ? activeLiveSessionId : null) ?? persistedRun?.sessionId ?? persistedRun?.id ?? activeLiveSessionId ?? null;
+  const runtimeMode = (shouldUseLiveHistory ? activeSession?.kbAccessMode : null) ?? currentRunMode ?? persistedRun?.kbAccessMode ?? activeSession?.kbAccessMode ?? null;
+  const transcriptLines = shouldUseLiveHistory
+    ? liveTranscriptLines
+    : (persistedTranscriptLines.length > 0 ? persistedTranscriptLines : liveTranscriptLines);
+  const toolCalls = shouldUseLiveHistory
+    ? liveToolCalls
+    : ((persistedRun?.toolCalls?.length ?? 0) > 0 ? (persistedRun?.toolCalls ?? []) : liveToolCalls);
+  const historyLoadingState = shouldUseLiveHistory ? historyLoading : persistedHistoryLoading;
+  const historyErrorState = shouldUseLiveHistory ? historyError : persistedHistoryError;
+  const persistedRawOutput = persistedRun?.rawOutput ?? [];
 
   useEffect(() => {
     if (latestBatchSession?.id) {
@@ -853,15 +1413,22 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   }, [latestBatchSession]);
 
   useEffect(() => {
-    if (!activeSessionId) {
+    if (runtimeMode !== 'mcp' && historyTab === 'kb_tools') {
+      setHistoryTab('transcript');
+    }
+  }, [historyTab, runtimeMode]);
+
+  useEffect(() => {
+    if (!activeLiveSessionId) {
       setLiveTranscriptLines([]);
       setLiveToolCalls([]);
+      setStickyHistorySessionId(null);
       setHistoryError(null);
       setHistoryLoading(false);
       return;
     }
-    void refreshHistory(activeSessionId);
-  }, [activeSessionId, refreshHistory]);
+    void refreshHistory(activeLiveSessionId);
+  }, [activeLiveSessionId, refreshHistory]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -872,6 +1439,8 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const startJob = async () => {
     setError(null);
     setEvents([]);
+    setCurrentRunMode(null);
+    setStickyHistorySessionId(null);
     terminalStateHandledRef.current = false;
     setJobState('QUEUED');
     setProgress(0);
@@ -901,12 +1470,10 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
 
   const isRunning = jobState === 'RUNNING' || jobState === 'QUEUED';
   const isDone = jobState === 'SUCCEEDED' || jobState === 'FAILED' || jobState === 'CANCELED';
-  const transcriptLines = liveTranscriptLines;
-  const toolCalls = liveToolCalls;
   const acpToolCalls = useMemo(() => extractAcpToolCalls(transcriptLines), [transcriptLines]);
-  const hasHistory = Boolean(activeSessionId);
-  const canManuallyStart = !startOnOpen && !hasHistory;
-  const canCopy = transcriptLines.length > 0 || toolCalls.length > 0 || events.length > 0;
+  const hasHistory = Boolean(activeLiveSessionId || persistedRun);
+  const shouldShowStartButton = !isRunning && !(startOnOpen && !hasHistory && !isDone);
+  const canCopy = transcriptLines.length > 0 || toolCalls.length > 0 || events.length > 0 || persistedRawOutput.length > 0;
 
   useEffect(() => {
     if (!startOnOpen) {
@@ -935,14 +1502,30 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const copyText = useCallback(() => {
     const chunks: string[] = [];
     chunks.push(`Batch: ${batchId}`);
-    if (latestBatchSession) {
-      chunks.push(`Session: ${latestBatchSession.id}`);
-      chunks.push(`Status: ${sessionStatusChip(latestBatchSession.status).label}`);
-      if (latestBatchSession.createdAtUtc) {
-        chunks.push(`Created: ${formatTimestamp(latestBatchSession.createdAtUtc)}`);
+    if (activeSession) {
+      chunks.push(`Session: ${activeSession.id}`);
+      chunks.push(`Status: ${sessionStatusChip(activeSession.status).label}`);
+      chunks.push(`Runtime: ${runtimeBadgeLabel(activeSession.kbAccessMode, true)}`);
+      if (activeSession.createdAtUtc) {
+        chunks.push(`Created: ${formatTimestamp(activeSession.createdAtUtc)}`);
       }
-      if (latestBatchSession.updatedAtUtc) {
-        chunks.push(`Updated: ${formatTimestamp(latestBatchSession.updatedAtUtc)}`);
+      if (activeSession.updatedAtUtc) {
+        chunks.push(`Updated: ${formatTimestamp(activeSession.updatedAtUtc)}`);
+      }
+    } else if (persistedRun) {
+      chunks.push(`Saved run: ${persistedRun.id}`);
+      if (persistedRun.sessionId) {
+        chunks.push(`Session: ${persistedRun.sessionId}`);
+      }
+      chunks.push(`Status: ${persistedRunStatusChip(persistedRun.status).label}`);
+      if (persistedRun.kbAccessMode) {
+        chunks.push(`Runtime: ${runtimeBadgeLabel(persistedRun.kbAccessMode, true)}`);
+      }
+      if (persistedRun.startedAtUtc) {
+        chunks.push(`Started: ${formatTimestamp(persistedRun.startedAtUtc)}`);
+      }
+      if (persistedRun.endedAtUtc) {
+        chunks.push(`Ended: ${formatTimestamp(persistedRun.endedAtUtc)}`);
       }
     }
     if (jobState) {
@@ -961,6 +1544,17 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       transcriptLines.forEach((line) => {
         chunks.push(`[${formatTimestamp(line.atUtc)}] ${line.direction} ${line.event}`);
         chunks.push(formatPayload(line.payload));
+      });
+    }
+
+    chunks.push('');
+    chunks.push('Result Output');
+    chunks.push('--------------');
+    if (persistedRawOutput.length === 0) {
+      chunks.push('No persisted result output');
+    } else {
+      persistedRawOutput.forEach((line) => {
+        chunks.push(line);
       });
     }
 
@@ -993,7 +1587,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     }
 
     return chunks.join('\n');
-  }, [batchId, events, jobState, latestBatchSession, progress, toolCalls, transcriptLines]);
+  }, [activeSession, batchId, events, jobState, persistedRawOutput, persistedRun, progress, toolCalls, transcriptLines]);
 
   const copyAnalysisContents = useCallback(() => {
     if (!canCopy) {
@@ -1016,25 +1610,72 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
         <div className="agent-session-detail">
           <div className="agent-session-detail-header">
             <span className="agent-meta-pair">
-              <span className="agent-meta-label">Last analysis session</span>
-              <code className="agent-meta-value">{activeSessionId}</code>
+              <span className="agent-meta-label">Last saved analysis</span>
+              <code className="agent-meta-value">{displaySessionId}</code>
             </span>
-            <Badge variant={latestBatchSession?.status === 'running' || latestBatchSession?.status === 'idle' ? 'success' : 'neutral'}>
-              {latestBatchSession ? sessionStatusChip(latestBatchSession.status).label : 'Unknown'}
-            </Badge>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+              {runtimeMode && (
+                <ProviderBadge
+                  mode={runtimeMode}
+                  size="detail"
+                  expanded
+                  live={activeSession?.status === 'running' || activeSession?.status === 'starting'}
+                />
+              )}
+              <Badge
+                variant={
+                  activeSession
+                    ? (activeSession.status === 'running' || activeSession.status === 'idle' ? 'success' : 'neutral')
+                    : persistedRun?.status === 'complete'
+                      ? 'success'
+                      : persistedRun?.status === 'failed'
+                        ? 'danger'
+                        : persistedRun?.status === 'canceled'
+                          ? 'warning'
+                          : 'neutral'
+                }
+              >
+                {activeSession
+                  ? sessionStatusChip(activeSession.status).label
+                  : persistedRun
+                    ? persistedRunStatusChip(persistedRun.status).label
+                    : 'Unknown'}
+              </Badge>
+            </div>
           </div>
 
           <div className="agent-session-detail-meta">
-            {latestBatchSession?.createdAtUtc && (
+            {runtimeMode && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Runtime</span>
+                <RuntimeIndicator
+                  mode={runtimeMode}
+                  status={activeSession?.status ?? 'idle'}
+                />
+              </div>
+            )}
+            {activeSession?.createdAtUtc && (
               <div className="agent-meta-pair">
                 <span className="agent-meta-label">Created</span>
-                <span className="agent-meta-value">{formatTimestamp(latestBatchSession.createdAtUtc)}</span>
+                <span className="agent-meta-value">{formatTimestamp(activeSession.createdAtUtc)}</span>
+              </div>
+            )}
+            {!activeSession && persistedRun?.startedAtUtc && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Started</span>
+                <span className="agent-meta-value">{formatTimestamp(persistedRun.startedAtUtc)}</span>
               </div>
             )}
             {latestBatchSession?.updatedAtUtc && (
               <div className="agent-meta-pair">
                 <span className="agent-meta-label">Updated</span>
                 <span className="agent-meta-value">{formatTimestamp(latestBatchSession.updatedAtUtc)}</span>
+              </div>
+            )}
+            {!activeSession && persistedRun?.endedAtUtc && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Ended</span>
+                <span className="agent-meta-value">{formatTimestamp(persistedRun.endedAtUtc)}</span>
               </div>
             )}
           </div>
@@ -1047,19 +1688,21 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
               <IconTerminal size={12} />
               Transcript ({transcriptLines.length})
             </button>
-            <button
-              className={`tab-item ${historyTab === 'kb_tools' ? 'active' : ''}`}
-              onClick={() => setHistoryTab('kb_tools')}
-            >
-              <IconTool size={12} />
-              KB Tool Calls ({toolCalls.length})
-            </button>
+            {runtimeMode === 'mcp' && (
+              <button
+                className={`tab-item ${historyTab === 'kb_tools' ? 'active' : ''}`}
+                onClick={() => setHistoryTab('kb_tools')}
+              >
+                <IconTool size={12} />
+                KB Tools ({toolCalls.length})
+              </button>
+            )}
             <button
               className={`tab-item ${historyTab === 'acp_tools' ? 'active' : ''}`}
               onClick={() => setHistoryTab('acp_tools')}
             >
               <IconTool size={12} />
-              ACP Tool Calls ({acpToolCalls.length})
+              ACP Tools ({acpToolCalls.length})
             </button>
           </div>
 
@@ -1067,20 +1710,21 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
             {historyTab === 'transcript' ? (
               <TranscriptView
                 lines={transcriptLines}
-                loading={historyLoading || sessionListLoading}
-                error={historyError}
+                loading={historyLoadingState || sessionListLoading}
+                error={historyErrorState}
               />
             ) : historyTab === 'kb_tools' ? (
               <ToolCallsView
                 calls={toolCalls}
-                loading={historyLoading}
-                error={historyError}
+                loading={historyLoadingState}
+                error={historyErrorState}
+                mode={runtimeMode ?? 'mcp'}
               />
             ) : (
               <AcpToolCallsView
                 calls={acpToolCalls}
-                loading={historyLoading}
-                error={historyError}
+                loading={historyLoadingState}
+                error={historyErrorState}
               />
             )}
           </div>
@@ -1096,10 +1740,10 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
 
       {/* Controls */}
       <div className="agent-job-runner-controls">
-        {canManuallyStart && !isRunning && !isDone && (
+        {shouldShowStartButton && !autoStartPending && !isDone && (
           <button className="btn btn-primary" onClick={startJob}>
             <IconPlay size={14} />
-            Run Analysis
+            {hasHistory ? 'Run Again' : 'Run Analysis'}
           </button>
         )}
         {startOnOpen && !isRunning && !isDone && autoStartPending && (
@@ -1174,7 +1818,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
               </Badge>
               <span className="agent-job-event-time">{formatTimestamp(evt.atUtc)}</span>
               {evt.message && <span className="agent-job-event-msg">{evt.message}</span>}
-              {evt.kind === 'tool_call' && evt.data && (
+              {evt.kind === 'tool_call' && Boolean(evt.data) && (
                 <code className="agent-job-event-data">
                   {typeof evt.data === 'object' ? JSON.stringify(evt.data) : String(evt.data)}
                 </code>
@@ -1193,20 +1837,20 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
 
 export function CursorUnavailableBanner() {
   return (
-    <div className="agent-unavailable-banner">
-      <div className="agent-unavailable-icon">
+    <div className="agent-unavailable-banner" role="alert" aria-label="Cursor is not available">
+      <div className="agent-unavailable-icon" aria-hidden="true">
         <IconWifiOff size={24} />
       </div>
       <div className="agent-unavailable-content">
-        <div className="agent-unavailable-title">Cursor Not Available</div>
+        <div className="agent-unavailable-title">Cursor Is Not Available</div>
         <div className="agent-unavailable-desc">
-          KB Vault requires Cursor with ACP enabled to run AI analysis and editing.
-          Ensure Cursor is installed and the ACP transport is accessible.
+          KB Vault needs Cursor with ACP (Agent Control Protocol) enabled to run AI analysis and editing.
+          This is required for both MCP and CLI access modes.
         </div>
-        <div className="agent-unavailable-steps">
-          <div className="agent-unavailable-step">1. Install or update Cursor</div>
-          <div className="agent-unavailable-step">2. Enable ACP in Cursor settings</div>
-          <div className="agent-unavailable-step">3. Return here and re-check health</div>
+        <div className="agent-unavailable-steps" role="list" aria-label="Steps to resolve">
+          <div className="agent-unavailable-step" role="listitem">1. Install or update Cursor to the latest version</div>
+          <div className="agent-unavailable-step" role="listitem">2. Open Cursor Settings and enable ACP transport</div>
+          <div className="agent-unavailable-step" role="listitem">3. Return here and click "Re-check health" above</div>
         </div>
       </div>
     </div>

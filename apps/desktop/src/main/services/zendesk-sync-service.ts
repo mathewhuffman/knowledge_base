@@ -318,8 +318,8 @@ export class ZendeskSyncService {
     lastCursor?: string;
   }> {
     const workspace = await this.workspaceRepository.getWorkspace(workspaceId);
-    const sectionId = (article: { source_id?: number; category_id?: number }) => {
-      const value = article.source_id;
+    const sectionId = (article: { section_id?: number | null }) => {
+      const value = article.section_id;
       return value != null ? String(value) : undefined;
     };
     const categoryId = (article: { category_id?: number }) => {
@@ -376,8 +376,8 @@ export class ZendeskSyncService {
           const shouldRebindCategory = String(family.categoryId ?? '') !== (article.category_id != null ? String(article.category_id) : '');
 
           if (shouldRename || shouldRebindSection || shouldRebindCategory) {
-            const nextSectionId = shouldRebindSection ? sectionId(article) : undefined;
-            const nextCategoryId = shouldRebindCategory ? categoryId(article) : undefined;
+            const nextSectionId = shouldRebindSection ? (sectionId(article) ?? null) : undefined;
+            const nextCategoryId = shouldRebindCategory ? (categoryId(article) ?? null) : undefined;
             await this.workspaceRepository.updateArticleFamily({
               workspaceId,
               familyId: family.id,

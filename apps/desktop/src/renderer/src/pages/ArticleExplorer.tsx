@@ -368,6 +368,7 @@ export const ArticleExplorer = () => {
   const treeQuery = useIpc<{ workspaceId?: string; nodes: ExplorerNode[] }>('workspace.explorer.getTree');
   const searchQuery = useIpc<SearchResponse>('workspace.search');
   const latestSyncQuery = useIpc<ZendeskSyncRunRecord | null>('zendesk.sync.getLatest');
+  const latestSuccessfulSyncQuery = useIpc<ZendeskSyncRunRecord | null>('zendesk.sync.getLatestSuccessful');
   const previewStyleQuery = useIpc<PreviewStyleResponse>('article.preview.styles.get');
 
   const [activeFilter, setActiveFilter] = useState<Filter>('all');
@@ -391,7 +392,35 @@ export const ArticleExplorer = () => {
     if (activeWorkspace) {
       treeQuery.execute({ workspaceId: activeWorkspace.id });
       latestSyncQuery.execute({ workspaceId: activeWorkspace.id });
+      latestSuccessfulSyncQuery.execute({ workspaceId: activeWorkspace.id });
     }
+  }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!activeWorkspace) {
+      return;
+    }
+
+    const handler = (event: { command: string; state: string }) => {
+      if (event.command !== 'zendesk.sync.run') {
+        return;
+      }
+
+      if (event.state !== 'SUCCEEDED' && event.state !== 'FAILED' && event.state !== 'CANCELED') {
+        return;
+      }
+
+      treeQuery.execute({ workspaceId: activeWorkspace.id });
+      latestSyncQuery.execute({ workspaceId: activeWorkspace.id });
+      latestSuccessfulSyncQuery.execute({ workspaceId: activeWorkspace.id });
+    };
+
+    const unsubscribe = window.kbv.emitJobEvents(handler);
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -611,6 +640,15 @@ export const ArticleExplorer = () => {
     { id: 'conflicted', label: 'Conflicted', count: filterCounts.conflicted },
     { id: 'retired', label: 'Retired', count: filterCounts.retired },
   ];
+
+  const latestSyncAttempt = latestSyncQuery.data;
+  const latestSuccessfulSync = latestSuccessfulSyncQuery.data;
+  const latestFailedAfterSuccess = Boolean(
+    latestSyncAttempt?.state === 'FAILED' &&
+    latestSyncAttempt.endedAtUtc &&
+    latestSuccessfulSync?.endedAtUtc &&
+    latestSyncAttempt.endedAtUtc.localeCompare(latestSuccessfulSync.endedAtUtc) > 0
+  );
 
   const renderDetailContent = () => {
     if (detailPanel.loading) {
@@ -835,16 +873,19 @@ export const ArticleExplorer = () => {
           {/* Main content */}
           <div className="explorer-main">
             {/* Sync freshness banner */}
-            {latestSyncQuery.data && latestSyncQuery.data.endedAtUtc && (() => {
-              const info = formatSyncAge(latestSyncQuery.data!.endedAtUtc);
+            {latestSuccessfulSync && latestSuccessfulSync.endedAtUtc && (() => {
+              const info = formatSyncAge(latestSuccessfulSync.endedAtUtc);
               return (
                 <div className={`explorer-sync-banner explorer-sync-banner--${info.freshness}`}>
                   <IconRefreshCw size={12} />
                   <span>
-                    Last synced {info.label}
-                    {' '}({latestSyncQuery.data!.mode} &middot; {latestSyncQuery.data!.syncedArticles} articles)
+                    Last successful sync {info.label}
+                    {' '}({latestSuccessfulSync.mode} &middot; {latestSuccessfulSync.syncedArticles} articles)
                   </span>
-                  {latestSyncQuery.data!.state === 'FAILED' && (
+                  {latestFailedAfterSuccess && (
+                    <Badge variant="warning">Latest attempt failed</Badge>
+                  )}
+                  {latestSyncAttempt?.state === 'FAILED' && !latestSuccessfulSync && (
                     <Badge variant="danger">Sync failed</Badge>
                   )}
                 </div>

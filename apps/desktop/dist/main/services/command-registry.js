@@ -14,6 +14,8 @@ const workspace_repository_1 = require("./workspace-repository");
 const zendesk_sync_service_1 = require("./zendesk-sync-service");
 const pbi_batch_import_service_1 = require("./pbi-batch-import-service");
 const logger_1 = require("./logger");
+const kb_cli_loopback_service_1 = require("./kb-cli-loopback-service");
+const kb_cli_runtime_service_1 = require("./kb-cli-runtime-service");
 const ZENDESK_PREVIEW_STYLE_TOKENS = {
     base_font_size: '16px',
     bg_color: '#ffffff',
@@ -92,10 +94,40 @@ const resolveArticlePreviewStylePath = async (override) => {
     }
     return null;
 };
+const readTranscriptLines = async (transcriptPath, limit) => {
+    if (!transcriptPath) {
+        return [];
+    }
+    try {
+        const text = await promises_1.default.readFile(transcriptPath, 'utf8');
+        const parsed = text
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .map((line) => {
+            try {
+                return JSON.parse(line);
+            }
+            catch {
+                return {
+                    atUtc: new Date().toISOString(),
+                    direction: 'system',
+                    event: 'line_parse_error',
+                    payload: line
+                };
+            }
+        });
+        return typeof limit === 'number' && limit > 0 ? parsed.slice(-limit) : parsed;
+    }
+    catch {
+        return [];
+    }
+};
 function registerCoreCommands(bus, jobs, workspaceRoot) {
     const workspaceRepository = new workspace_repository_1.WorkspaceRepository(workspaceRoot);
     const zendeskSyncService = new zendesk_sync_service_1.ZendeskSyncService(workspaceRepository);
     const pbiBatchImportService = new pbi_batch_import_service_1.PBIBatchImportService(workspaceRepository);
+    const defaultKbAccessMode = 'mcp';
     const validRevisionStates = new Set(Object.values(shared_types_1.RevisionState));
     const validRevisionStatuses = new Set(Object.values(shared_types_1.RevisionStatus));
     const validPBIScopeModes = new Set([shared_types_1.PBIBatchScopeMode.ALL, shared_types_1.PBIBatchScopeMode.SELECTED_ONLY]);
@@ -260,9 +292,18 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             return { ok: true, ...created };
         }
     };
-    const agentRuntime = new agent_runtime_1.CursorAcpRuntime(workspaceRoot, runtimeToolContext, (message, details) => {
+    const kbCliLoopback = new kb_cli_loopback_service_1.KbCliLoopbackService(workspaceRepository);
+    const kbCliRuntime = new kb_cli_runtime_service_1.KbCliRuntimeService(kbCliLoopback, workspaceRepository);
+    const agentRuntime = new agent_runtime_1.CursorAcpRuntime(workspaceRoot, runtimeToolContext, {
+        getCliHealth: (workspaceId) => kbCliRuntime.checkHealth(workspaceId),
+        buildCliPromptSuffix: () => kbCliRuntime.buildPromptSuffix()
+    }, (message, details) => {
         logger_1.logger.info(`[agent-runtime] ${message}`, details);
     });
+    const resolveWorkspaceKbAccessMode = async (workspaceId) => {
+        const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
+        return settings.kbAccessMode || defaultKbAccessMode;
+    };
     const buildZendeskClient = async (workspaceId) => {
         const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
         const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
@@ -293,8 +334,42 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             jobs: jobs.list()
         }
     }));
-    bus.register('agent.health.check', async () => {
-        const health = await agentRuntime.checkHealth('system');
+    bus.register('agent.health.check', async (payload, requestId) => {
+        const workspaceId = payload?.workspaceId;
+        const requestedMode = payload?.kbAccessMode;
+        if (!workspaceId) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agent.health.check requires workspaceId');
+        }
+        const workspaceMode = await resolveWorkspaceKbAccessMode(workspaceId);
+        const selectedMode = requestedMode === 'mcp' || requestedMode === 'cli' ? requestedMode : workspaceMode;
+        logger_1.logger.info('agent.health.check', {
+            requestId,
+            workspaceId,
+            requestedMode,
+            workspaceMode,
+            selectedMode
+        });
+        const health = await agentRuntime.checkHealth(workspaceId, selectedMode, workspaceMode);
+        logger_1.logger.info('agent.health.check.result', {
+            requestId,
+            workspaceId,
+            selectedMode,
+            availableModes: health.availableModes,
+            issues: health.issues,
+            providers: {
+                mcp: {
+                    ok: health.providers.mcp.ok,
+                    failureCode: health.providers.mcp.failureCode,
+                    message: health.providers.mcp.message
+                },
+                cli: {
+                    ok: health.providers.cli.ok,
+                    failureCode: health.providers.cli.failureCode,
+                    message: health.providers.cli.message,
+                    acpReachable: health.providers.cli.acpReachable
+                }
+            }
+        });
         return { ok: true, data: health };
     });
     bus.register('agent.session.create', async (payload, requestId) => {
@@ -307,7 +382,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             if (!input.type) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agent.session.create requires type');
             }
-            const session = agentRuntime.createSession(input);
+            const kbAccessMode = input.kbAccessMode ?? (await resolveWorkspaceKbAccessMode(workspaceId));
+            const session = agentRuntime.createSession({ ...input, kbAccessMode });
             logger_1.logger.info('agent.session.create', { requestId, sessionId: session.id });
             return { ok: true, data: session };
         }
@@ -402,6 +478,26 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
                     toolCalls: agentRuntime.listToolCallAudit(input.sessionId, input.workspaceId)
                 }
             };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+        }
+    });
+    bus.register('agent.analysis.latest', async (payload) => {
+        const input = payload;
+        try {
+            if (!input?.workspaceId || !input.batchId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agent.analysis.latest requires workspaceId and batchId');
+            }
+            const run = await workspaceRepository.getLatestBatchAnalysisRun(input.workspaceId, input.batchId);
+            const lines = await readTranscriptLines(run?.transcriptPath, input.limit);
+            const response = {
+                workspaceId: input.workspaceId,
+                batchId: input.batchId,
+                run,
+                lines
+            };
+            return { ok: true, data: response };
         }
         catch (error) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
@@ -517,7 +613,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             if (input.zendeskSubdomain === undefined &&
                 input.zendeskBrandId === undefined &&
                 input.defaultLocale === undefined &&
-                input.enabledLocales === undefined) {
+                input.enabledLocales === undefined &&
+                input.kbAccessMode === undefined) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'workspace.settings.update requires at least one setting field');
             }
             if (typeof input.defaultLocale === 'string' && !input.defaultLocale.trim()) {
@@ -531,6 +628,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             }
             if (Array.isArray(input.enabledLocales) && input.enabledLocales.length && input.enabledLocales.some((locale) => !locale || !String(locale).trim())) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'enabledLocales must only contain non-empty values');
+            }
+            if (input.kbAccessMode !== undefined && input.kbAccessMode !== 'mcp' && input.kbAccessMode !== 'cli') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'kbAccessMode must be mcp or cli');
             }
             const updated = await workspaceRepository.updateWorkspaceSettings(input);
             return { ok: true, data: updated };
@@ -1330,25 +1430,49 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             });
             return;
         }
+        const workspaceMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
+        const kbAccessMode = input.kbAccessMode ?? workspaceMode;
+        const providerHealth = await agentRuntime.checkHealth(input.workspaceId, kbAccessMode, workspaceMode);
+        const selectedProvider = providerHealth.providers[kbAccessMode];
+        if (!selectedProvider.ok) {
+            emit({
+                id: payload.jobId,
+                command: payload.command,
+                state: shared_types_2.JobState.FAILED,
+                progress: 100,
+                message: `Selected runtime ${kbAccessMode.toUpperCase()} is not ready: ${selectedProvider.message || 'not ready'}`
+            });
+            return;
+        }
         emit({
             id: payload.jobId,
             command: payload.command,
             state: shared_types_2.JobState.RUNNING,
             progress: 15,
-            message: `Starting analysis session for batch ${input.batchId}`
+            message: `Starting analysis session for batch ${input.batchId}`,
+            metadata: {
+                batchId: input.batchId,
+                kbAccessMode
+            }
         });
         logger_1.logger.info('[agent.analysis.run] starting runtime', {
             jobId: payload.jobId,
             batchId: input.batchId,
             workspaceId: input.workspaceId
         });
-        const result = await agentRuntime.runBatchAnalysis(input, (stream) => {
+        const streamMetadata = {
+            batchId: input.batchId,
+            kbAccessMode,
+            workspaceId: input.workspaceId
+        };
+        const result = await agentRuntime.runBatchAnalysis({ ...input, kbAccessMode }, (stream) => {
             emit({
                 id: payload.jobId,
                 command: payload.command,
                 state: shared_types_2.JobState.RUNNING,
                 progress: stream.kind === 'result' ? 100 : 35,
-                message: JSON.stringify(stream)
+                message: JSON.stringify(stream),
+                metadata: streamMetadata
             });
         }, isCancelled);
         logger_1.logger.info('[agent.analysis.run] runtime finished', {
@@ -1358,6 +1482,28 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             toolCalls: result.toolCalls.length,
             transcriptPath: result.transcriptPath
         });
+        const persistedStatus = result.status === 'ok'
+            ? 'complete'
+            : result.status === 'canceled'
+                ? 'canceled'
+                : 'failed';
+        await workspaceRepository.recordBatchAnalysisRun({
+            workspaceId: input.workspaceId,
+            batchId: input.batchId,
+            sessionId: result.sessionId,
+            kbAccessMode,
+            status: persistedStatus,
+            startedAtUtc: result.startedAtUtc,
+            endedAtUtc: result.endedAtUtc,
+            promptTemplate: input.prompt,
+            transcriptPath: result.transcriptPath,
+            toolCalls: result.toolCalls,
+            rawOutput: result.rawOutput,
+            message: result.message
+        });
+        if (result.status === 'ok') {
+            await workspaceRepository.setPBIBatchStatus(input.workspaceId, input.batchId, shared_types_1.PBIBatchStatus.ANALYZED, true);
+        }
         emit({
             id: payload.jobId,
             command: payload.command,
@@ -1367,7 +1513,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
                     ? shared_types_2.JobState.CANCELED
                     : shared_types_2.JobState.SUCCEEDED,
             progress: 100,
-            message: result.message ?? 'analysis command complete'
+            message: result.message ?? 'analysis command complete',
+            metadata: {
+                ...streamMetadata,
+                status: result.status,
+                sessionId: result.sessionId
+            }
         });
     });
     jobs.registerRunner('agent.article_edit.run', async (payload, emit, isCancelled) => {
@@ -1399,7 +1550,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             progress: 20,
             message: `Starting article edit session for variant ${input.localeVariantId}`
         });
-        const result = await agentRuntime.runArticleEdit(input, (stream) => {
+        const kbAccessMode = input.kbAccessMode ?? (await resolveWorkspaceKbAccessMode(input.workspaceId));
+        const result = await agentRuntime.runArticleEdit({ ...input, kbAccessMode }, (stream) => {
             emit({
                 id: payload.jobId,
                 command: payload.command,
@@ -1587,6 +1739,25 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
         }
     });
+    bus.register('zendesk.sync.getLatestSuccessful', async (payload) => {
+        try {
+            const workspaceId = payload?.workspaceId;
+            if (!workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'zendesk.sync.getLatestSuccessful requires workspaceId');
+            }
+            const latest = await workspaceRepository.getLatestSuccessfulSyncRun(workspaceId);
+            return {
+                ok: true,
+                data: latest ?? null
+            };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, 'Workspace not found');
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
     jobs.registerRunner('zendesk.sync.run', async (payload, emit) => {
         const input = payload.input;
         if (!input?.workspaceId || !input.mode) {
@@ -1636,6 +1807,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
         }
     });
     return {
-        agentRuntime
+        agentRuntime,
+        kbCliLoopback,
+        kbCliRuntime
     };
 }

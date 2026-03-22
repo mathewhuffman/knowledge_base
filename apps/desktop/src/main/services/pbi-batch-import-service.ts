@@ -89,38 +89,24 @@ export class PBIBatchImportService {
     };
     const scopeMode = input.scope?.mode ?? PBIBatchScopeMode.ALL;
 
-      const duplicateBatch = await this.workspaceRepository.findDuplicatePBIBatch(
-        workspaceId,
-        input.sourceFileName,
-        records.length,
-        {
-          candidateRowCount: candidateRows.length,
-          malformedRowCount: malformedRows.length,
-          duplicateRowCount: duplicateRows.length,
-          ignoredRowCount: ignoredRows.length
-        }
-      );
+    const duplicateBatch = await this.workspaceRepository.findDuplicatePBIBatch(
+      workspaceId,
+      input.sourceFileName,
+      records.length,
+      {
+        candidateRowCount: candidateRows.length,
+        malformedRowCount: malformedRows.length,
+        duplicateRowCount: duplicateRows.length,
+        ignoredRowCount: ignoredRows.length
+      }
+    );
     if (duplicateBatch) {
-      const rows = await this.workspaceRepository.getPBIRecords(workspaceId, duplicateBatch.id);
-      const existingCandidateRows = rows.filter((row) => row.validationStatus === PBIValidationStatus.CANDIDATE);
-      const existingIgnoredRows = rows.filter((row) => row.validationStatus === PBIValidationStatus.IGNORED);
-      const existingMalformedRows = rows.filter((row) => row.validationStatus === PBIValidationStatus.MALFORMED);
-      const existingDuplicateRows = rows.filter((row) => row.validationStatus === PBIValidationStatus.DUPLICATE);
-      return {
-        batch: duplicateBatch,
-        rows,
-        summary: {
-          totalRows: rows.length,
-          candidateRowCount: existingCandidateRows.length,
-          malformedRowCount: existingMalformedRows.length,
-          duplicateRowCount: existingDuplicateRows.length,
-          ignoredRowCount: existingIgnoredRows.length,
-          scopedRowCount: duplicateBatch.scopedRowCount
-        },
-        invalidRows: [...existingMalformedRows, ...existingIgnoredRows],
-        duplicateRows: existingDuplicateRows,
-        ignoredRows: existingIgnoredRows
-      };
+      logger.warn('pbi.import.recent_duplicate_detected', {
+        workspaceId,
+        existingBatchId: duplicateBatch.id,
+        existingBatchName: duplicateBatch.name,
+        sourceFileName: input.sourceFileName
+      });
     }
 
     const createdBatch = await this.workspaceRepository.createPBIBatch(

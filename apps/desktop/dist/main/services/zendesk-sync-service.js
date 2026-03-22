@@ -163,7 +163,7 @@ class ZendeskSyncService {
     async syncLocale(workspaceId, locale, client, mode, since, emitProgress, retryPolicy, ensureActive) {
         const workspace = await this.workspaceRepository.getWorkspace(workspaceId);
         const sectionId = (article) => {
-            const value = article.source_id;
+            const value = article.section_id;
             return value != null ? String(value) : undefined;
         };
         const categoryId = (article) => {
@@ -210,8 +210,8 @@ class ZendeskSyncService {
                     const shouldRebindSection = String(family.sectionId ?? '') !== (article.section_id != null ? String(article.section_id) : '');
                     const shouldRebindCategory = String(family.categoryId ?? '') !== (article.category_id != null ? String(article.category_id) : '');
                     if (shouldRename || shouldRebindSection || shouldRebindCategory) {
-                        const nextSectionId = shouldRebindSection ? sectionId(article) : undefined;
-                        const nextCategoryId = shouldRebindCategory ? categoryId(article) : undefined;
+                        const nextSectionId = shouldRebindSection ? (sectionId(article) ?? null) : undefined;
+                        const nextCategoryId = shouldRebindCategory ? (categoryId(article) ?? null) : undefined;
                         await this.workspaceRepository.updateArticleFamily({
                             workspaceId,
                             familyId: family.id,

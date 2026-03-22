@@ -1,3 +1,5 @@
+import type { KbAccessMode } from './batch2';
+
 export type AgentSessionType = 'batch_analysis' | 'article_edit';
 
 export type AgentSessionStatus = 'starting' | 'running' | 'idle' | 'closed' | 'error';
@@ -10,6 +12,7 @@ export enum AgentCommand {
 export interface AgentSessionRecord {
   id: string;
   workspaceId: string;
+  kbAccessMode: KbAccessMode;
   type: AgentSessionType;
   status: AgentSessionStatus;
   batchId?: string;
@@ -25,6 +28,7 @@ export interface AgentSessionRecord {
 
 export interface AgentSessionCreateRequest {
   workspaceId: string;
+  kbAccessMode?: KbAccessMode;
   type: AgentSessionType;
   batchId?: string;
   locale?: string;
@@ -58,6 +62,7 @@ export interface AgentSessionGetRequest {
 export interface AgentAnalysisRunRequest {
   workspaceId: string;
   batchId: string;
+  kbAccessMode?: KbAccessMode;
   locale?: string;
   sessionId?: string;
   sessionType?: AgentSessionType;
@@ -71,6 +76,7 @@ export interface AgentAnalysisRunRequest {
 export interface AgentArticleEditRunRequest {
   workspaceId: string;
   localeVariantId: string;
+  kbAccessMode?: KbAccessMode;
   locale?: string;
   sessionId?: string;
   sessionType?: AgentSessionType;
@@ -78,14 +84,49 @@ export interface AgentArticleEditRunRequest {
   timeoutMs?: number;
 }
 
+export enum CliHealthFailure {
+  BINARY_NOT_FOUND = 'binary_not_found',
+  BINARY_NOT_EXECUTABLE = 'binary_not_executable',
+  LOOPBACK_NOT_RUNNING = 'loopback_not_running',
+  LOOPBACK_UNREACHABLE = 'loopback_unreachable',
+  LOOPBACK_UNHEALTHY = 'loopback_unhealthy',
+  AUTH_TOKEN_MISSING = 'auth_token_missing',
+  HEALTH_PROBE_TIMEOUT = 'health_probe_timeout',
+  HEALTH_PROBE_FAILED = 'health_probe_failed',
+  HEALTH_PROBE_REJECTED = 'health_probe_rejected'
+}
+
+export interface KbAccessHealth {
+  mode: KbAccessMode;
+  provider: KbAccessMode;
+  ok: boolean;
+  message?: string;
+  binaryPath?: string;
+  baseUrl?: string;
+  acpReachable?: boolean;
+  issues?: string[];
+  failureCode?: CliHealthFailure;
+}
+
+export interface KbAccessProviderDescriptor {
+  mode: KbAccessMode;
+  label: string;
+  description: string;
+  available: boolean;
+  health: KbAccessHealth;
+}
+
 export interface AgentHealthCheckResponse {
   checkedAtUtc: string;
-  cursorInstalled: boolean;
-  acpReachable: boolean;
-  mcpRunning: boolean;
-  requiredConfigPresent: boolean;
-  cursorBinaryPath?: string;
+  workspaceId?: string;
+  workspaceKbAccessMode?: KbAccessMode;
+  selectedMode: KbAccessMode;
+  providers: {
+    mcp: KbAccessHealth;
+    cli: KbAccessHealth;
+  };
   issues: string[];
+  availableModes: KbAccessMode[];
 }
 
 export interface AgentTranscriptRequest {
@@ -119,6 +160,7 @@ export interface AgentToolCallAudit {
 
 export interface AgentRunResult {
   sessionId: string;
+  kbAccessMode: KbAccessMode;
   status: 'ok' | 'error' | 'timeout' | 'canceled';
   transcriptPath: string;
   rawOutput: string[];
@@ -127,6 +169,30 @@ export interface AgentRunResult {
   endedAtUtc: string;
   durationMs: number;
   message?: string;
+}
+
+export interface PersistedAgentAnalysisRun {
+  id: string;
+  workspaceId: string;
+  batchId: string;
+  sessionId?: string;
+  kbAccessMode?: KbAccessMode;
+  status: 'running' | 'complete' | 'failed' | 'canceled';
+  startedAtUtc: string;
+  endedAtUtc?: string;
+  promptTemplate?: string;
+  transcriptPath?: string;
+  toolCalls: AgentToolCallAudit[];
+  rawOutput?: string[];
+  resultPayload?: unknown;
+  message?: string;
+}
+
+export interface PersistedAgentAnalysisRunResponse {
+  workspaceId: string;
+  batchId: string;
+  run: PersistedAgentAnalysisRun | null;
+  lines: AgentTranscriptLine[];
 }
 
 export interface AgentStreamingPayload {

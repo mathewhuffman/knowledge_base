@@ -30,6 +30,9 @@ No new tables were required for this batch. New in-memory runtime contracts were
   - `MCPRecordAgentNotesInput`
   - `MCPFindRelatedArticlesInput`
 - `MCPGetTemplateInput`
+- `WorkspaceMigrationHealth`
+- `WorkspaceMigrationHealthReport`
+- `KbAccessHealth`
 
 ## Runtime behavior introduced
 - Session registry with per-workspace isolation.
@@ -40,3 +43,4 @@ No new tables were required for this batch. New in-memory runtime contracts were
 - MCP tool registry in `@kb-vault/mcp-server` with the required tool names and JSON-RPC `tools/list`, `tools/call` support.
 - MCP `propose_*` calls now write proposal rows into local `proposals` (+ `proposal_pbi_links`) tables.
 - `list_categories` and `list_sections` MCP implementations resolve through workspace Zendesk credentials where available.
+- `system.migrations.health` now performs migration checks and repair attempts for workspace databases.

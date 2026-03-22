@@ -17,6 +17,28 @@
 }
 ```
 
+## `system.migrations.health` success (KB-5 hardening)
+```json
+{
+  "ok": true,
+  "data": {
+    "catalogVersion": 7,
+    "workspaceId": "ws-123",
+    "workspaces": [
+      {
+        "workspaceId": "ws-123",
+        "workspacePath": "/Users/.../kb-vault-workspaces/acme-help-center",
+        "catalogVersion": 7,
+        "workspaceDbPath": "/Users/.../acme-help-center/.meta/kb-vault.sqlite",
+        "workspaceDbVersion": 7,
+        "repaired": false,
+        "exists": true
+      }
+    ]
+  }
+}
+```
+
 ## `agent.session.create` success
 ```json
 {

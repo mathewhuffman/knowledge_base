@@ -61,6 +61,14 @@
 - Transcript retrieval is persisted per session/run, but live stream tailing is not yet implemented.
 - MCP-backed context can still error when workspace credentials are missing or invalid.
 
+## KB-5 hardening additions
+- Added regression and resilience tests to make CLI/MCP hardening explicit:
+  - `agent-runtime-provider-modes.spec.ts`: CLI prompt contract assertions verify CLI-mode instructions contain no MCP references and MCP mode still uses tool guidance.
+  - `repository-content-model.spec.ts`: workspace settings persistence check across repository reloads and migration-health repair coverage for recreated workspace DBs.
+  - `command-registry-content-model.spec.ts`: `system.migrations.health` command covered for normal + repaired status.
+  - `kb-cli-services.spec.ts`: CLI loopback batch APIs (`/batches/:batchId/context`, `/batches/:batchId/pbis`) and CLI binary probe failure coverage.
+- Updated batch-6 docs/contracts to include migration health payload shape and KB-5 hardening behaviors.
+
 ## Renderer hooks available for Claude
 - `window.kbv.invoke('agent.health.check', {})`
 - `window.kbv.invoke('agent.session.create', payload)`

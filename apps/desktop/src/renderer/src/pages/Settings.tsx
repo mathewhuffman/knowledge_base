@@ -56,6 +56,15 @@ function syncStateBadgeVariant(state: SyncJobState): 'primary' | 'success' | 'da
   }
 }
 
+function isUpToDateSyncMessage(message?: string | null): boolean {
+  if (!message) {
+    return false;
+  }
+
+  const normalized = message.trim().toLowerCase();
+  return normalized === 'article family update requires at least one field';
+}
+
 function formatRelativeTime(utc: string): string {
   const diff = Date.now() - new Date(utc).getTime();
   const mins = Math.floor(diff / 60000);
@@ -312,14 +321,20 @@ function ZendeskSyncSection({ workspaceId }: { workspaceId: string }) {
 
   const isRunning = syncState === 'RUNNING' || syncState === 'QUEUED';
   const latestSync = latestSyncQuery.data;
+  const currentSyncIsUpToDate = isUpToDateSyncMessage(syncMessage);
+  const latestSyncIsUpToDate = isUpToDateSyncMessage(latestSync?.remoteError);
+  const latestSyncBadgeVariant = latestSyncIsUpToDate
+    ? 'success'
+    : syncStateBadgeVariant((latestSync?.state as SyncJobState) ?? '');
+  const latestSyncBadgeLabel = latestSyncIsUpToDate ? 'UP TO DATE' : latestSync?.state;
 
   return (
     <div className="card" style={{ marginBottom: 'var(--space-4)' }}>
       <div className="card-header">
         <span className="card-header-title">Sync</span>
         {latestSync && (
-          <Badge variant={syncStateBadgeVariant(latestSync.state as SyncJobState)}>
-            {latestSync.state}
+          <Badge variant={latestSyncBadgeVariant}>
+            {latestSyncBadgeLabel}
           </Badge>
         )}
       </div>
@@ -352,7 +367,7 @@ function ZendeskSyncSection({ workspaceId }: { workspaceId: string }) {
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--space-1)' }}>
               <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
-                {syncMessage || syncState}
+                {currentSyncIsUpToDate ? 'You’re up to date' : (syncMessage || syncState)}
               </span>
               <span style={{ fontSize: 'var(--text-xs)', fontWeight: 'var(--weight-medium)' }}>
                 {syncProgress}%
@@ -363,7 +378,9 @@ function ZendeskSyncSection({ workspaceId }: { workspaceId: string }) {
                 className="progress-bar-fill"
                 style={{
                   width: `${syncProgress}%`,
-                  background: syncState === 'FAILED' || syncState === 'CANCELED'
+                  background: currentSyncIsUpToDate
+                    ? 'var(--color-success)'
+                    : syncState === 'FAILED' || syncState === 'CANCELED'
                     ? 'var(--color-danger)'
                     : syncState === 'SUCCEEDED'
                       ? 'var(--color-success)'
@@ -371,10 +388,16 @@ function ZendeskSyncSection({ workspaceId }: { workspaceId: string }) {
                 }}
               />
             </div>
-            {(syncState === 'FAILED' || syncState === 'CANCELED') && (
-              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-danger)', marginTop: 'var(--space-1)' }}>
-                {syncState === 'FAILED' ? 'Sync failed — check credentials and network connection' : 'Sync was canceled'}
+            {currentSyncIsUpToDate ? (
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-success)', marginTop: 'var(--space-1)' }}>
+                No article family changes were needed for this sync.
               </div>
+            ) : (
+              (syncState === 'FAILED' || syncState === 'CANCELED') && (
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-danger)', marginTop: 'var(--space-1)' }}>
+                  {syncState === 'FAILED' ? 'Sync failed — check credentials and network connection' : 'Sync was canceled'}
+                </div>
+              )
             )}
           </div>
         )}
@@ -407,13 +430,37 @@ function ZendeskSyncSection({ workspaceId }: { workspaceId: string }) {
               </div>
             )}
             {latestSync.remoteError && (
-              <div className="settings-error-banner" style={{ marginTop: 'var(--space-2)' }}>
-                <IconAlertCircle size={14} />
-                <div>
-                  <div style={{ fontWeight: 'var(--weight-medium)' }}>Remote error</div>
-                  <div>{latestSync.remoteError}</div>
+              latestSyncIsUpToDate ? (
+                <div
+                  style={{
+                    marginTop: 'var(--space-2)',
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 'var(--space-2)',
+                    padding: 'var(--space-3)',
+                    borderRadius: 'var(--radius-md)',
+                    background: 'rgba(34, 197, 94, 0.10)',
+                    border: '1px solid rgba(34, 197, 94, 0.35)',
+                    color: 'var(--color-text)'
+                  }}
+                >
+                  <IconCheckCircle size={14} />
+                  <div>
+                    <div style={{ fontWeight: 'var(--weight-medium)' }}>You&apos;re up to date</div>
+                    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                      No article family changes were needed for this sync.
+                    </div>
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div className="settings-error-banner" style={{ marginTop: 'var(--space-2)' }}>
+                  <IconAlertCircle size={14} />
+                  <div>
+                    <div style={{ fontWeight: 'var(--weight-medium)' }}>Remote error</div>
+                    <div>{latestSync.remoteError}</div>
+                  </div>
+                </div>
+              )
             )}
           </div>
         ) : (

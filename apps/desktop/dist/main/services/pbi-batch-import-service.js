@@ -81,26 +81,12 @@ class PBIBatchImportService {
             ignoredRowCount: ignoredRows.length
         });
         if (duplicateBatch) {
-            const rows = await this.workspaceRepository.getPBIRecords(workspaceId, duplicateBatch.id);
-            const existingCandidateRows = rows.filter((row) => row.validationStatus === shared_types_1.PBIValidationStatus.CANDIDATE);
-            const existingIgnoredRows = rows.filter((row) => row.validationStatus === shared_types_1.PBIValidationStatus.IGNORED);
-            const existingMalformedRows = rows.filter((row) => row.validationStatus === shared_types_1.PBIValidationStatus.MALFORMED);
-            const existingDuplicateRows = rows.filter((row) => row.validationStatus === shared_types_1.PBIValidationStatus.DUPLICATE);
-            return {
-                batch: duplicateBatch,
-                rows,
-                summary: {
-                    totalRows: rows.length,
-                    candidateRowCount: existingCandidateRows.length,
-                    malformedRowCount: existingMalformedRows.length,
-                    duplicateRowCount: existingDuplicateRows.length,
-                    ignoredRowCount: existingIgnoredRows.length,
-                    scopedRowCount: duplicateBatch.scopedRowCount
-                },
-                invalidRows: [...existingMalformedRows, ...existingIgnoredRows],
-                duplicateRows: existingDuplicateRows,
-                ignoredRows: existingIgnoredRows
-            };
+            logger_1.logger.warn('pbi.import.recent_duplicate_detected', {
+                workspaceId,
+                existingBatchId: duplicateBatch.id,
+                existingBatchName: duplicateBatch.name,
+                sourceFileName: input.sourceFileName
+            });
         }
         const createdBatch = await this.workspaceRepository.createPBIBatch(workspaceId, batchName, input.sourceFileName, preservedPath, sourceFormat, normalized.length, counts, scopeMode);
         await this.workspaceRepository.insertPBIRecords(workspaceId, createdBatch.id, normalized);

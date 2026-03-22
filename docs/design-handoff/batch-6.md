@@ -62,6 +62,12 @@
 - Health check could auto-run on workspace load (currently requires manual navigation to Settings > AI Runtime)
 - Session creation is implicit (via analysis run) — no explicit "create session" UI needed for batch 6
 
+## Backend hardening status for KB-5
+- `system.migrations.health` is now exercised in tests and can surface `repaired` status when workspace DB repair/migration occurs.
+- CLI health check covers binary missing/unexecutable/probe-failure/loopback-restart scenarios before UI consumption.
+- Loopback batch APIs for context and PBIs are now validated for health and auth behavior.
+- Prompt-engineering regression checks ensure CLI guidance remains MCP-free and MCP guidance remains in MCP mode.
+
 ## Requested Contract Changes
 
 None. All batch 6 Codex contracts consumed as-is.

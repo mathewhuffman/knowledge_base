@@ -85,6 +85,8 @@ export interface WorkspaceRecord {
   path: string;
 }
 
+export type KbAccessMode = 'mcp' | 'cli';
+
 export interface WorkspaceDefaultRequest {
   workspaceId: EntityId;
 }
@@ -104,6 +106,7 @@ export interface WorkspaceSettingsRecord {
   zendeskBrandId?: string;
   defaultLocale: string;
   enabledLocales: string[];
+  kbAccessMode: KbAccessMode;
 }
 
 export interface WorkspaceSettingsUpdateRequest {
@@ -112,6 +115,7 @@ export interface WorkspaceSettingsUpdateRequest {
   zendeskBrandId?: string;
   defaultLocale?: string;
   enabledLocales?: string[];
+  kbAccessMode?: KbAccessMode;
 }
 
 export interface WorkspaceListItem extends WorkspaceRecord {
@@ -183,8 +187,8 @@ export interface ArticleFamilyUpdateRequest {
   workspaceId: EntityId;
   familyId: EntityId;
   title?: string;
-  sectionId?: string;
-  categoryId?: string;
+  sectionId?: string | null;
+  categoryId?: string | null;
   retiredAtUtc?: string | null;
 }
 

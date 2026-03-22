@@ -301,6 +301,7 @@ interface WizardState {
     candidateTitles: string[];
   } | null;
   submitting: boolean;
+  submitError: string | null;
 }
 
 const WIZARD_INITIAL: WizardState = {
@@ -317,6 +318,7 @@ const WIZARD_INITIAL: WizardState = {
   preflightError: null,
   preflightData: null,
   submitting: false,
+  submitError: null,
 };
 
 /* ---------- Main Component ---------- */
@@ -348,6 +350,8 @@ export const PBI = () => {
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const openWizard = useCallback(() => {
+    setAnalysisBatch(null);
+    setAnalysisAutoRun(false);
     setWizard({ ...WIZARD_INITIAL, open: true });
   }, []);
 
@@ -570,7 +574,7 @@ export const PBI = () => {
   const handleSubmitBatch = useCallback(async () => {
     if (!activeWorkspace || !wizard.importResult) return;
 
-    setWizard((s) => ({ ...s, submitting: true }));
+    setWizard((s) => ({ ...s, submitting: true, submitError: null }));
 
     try {
       const res = await window.kbv.invoke<{ batch: PBIBatchRecord }>('pbiBatch.setStatus', {
@@ -579,15 +583,27 @@ export const PBI = () => {
         status: PBIBatchStatus.SUBMITTED,
       });
 
-      if (res.ok) {
-        closeWizard();
+      if (res.ok && res.data?.batch) {
+        const submittedBatch = res.data.batch;
+        setWizard(WIZARD_INITIAL);
+        batchListQuery.execute({ workspaceId: activeWorkspace.id });
+        sessionListQuery.execute({ workspaceId: activeWorkspace.id, includeClosed: true });
+        openAnalysis(submittedBatch, true);
       } else {
-        setWizard((s) => ({ ...s, submitting: false }));
+        setWizard((s) => ({
+          ...s,
+          submitting: false,
+          submitError: res.error?.message ?? 'Failed to submit batch for analysis',
+        }));
       }
-    } catch {
-      setWizard((s) => ({ ...s, submitting: false }));
+    } catch (err) {
+      setWizard((s) => ({
+        ...s,
+        submitting: false,
+        submitError: err instanceof Error ? err.message : 'Failed to submit batch for analysis',
+      }));
     }
-  }, [activeWorkspace, wizard.importResult, closeWizard]);
+  }, [activeWorkspace, batchListQuery, openAnalysis, sessionListQuery, wizard.importResult]);
 
   // ---- Wizard step navigation ----
   const goToStep = useCallback((step: WizardStep) => {
@@ -701,15 +717,23 @@ export const PBI = () => {
         if (wizard.preflightError) return <ErrorState title="Preflight failed" description={wizard.preflightError} />;
         if (!wizard.preflightData) return null;
         return (
-          <PreflightPanel
-            batch={wizard.preflightData.batch}
-            candidateCount={wizard.preflightData.candidateRows.length}
-            invalidCount={wizard.preflightData.invalidRows.length}
-            duplicateCount={wizard.preflightData.duplicateRows.length}
-            ignoredCount={wizard.preflightData.ignoredRows.length}
-            scopedCount={wizard.preflightData.scopePayload.scopedCount ?? 0}
-            candidateTitles={wizard.preflightData.candidateTitles}
-          />
+          <>
+            {wizard.submitError && (
+              <div className="preflight-warning-banner" style={{ marginBottom: 'var(--space-4)' }}>
+                <IconAlertCircle size={14} />
+                <span>{wizard.submitError}</span>
+              </div>
+            )}
+            <PreflightPanel
+              batch={wizard.preflightData.batch}
+              candidateCount={wizard.preflightData.candidateRows.length}
+              invalidCount={wizard.preflightData.invalidRows.length}
+              duplicateCount={wizard.preflightData.duplicateRows.length}
+              ignoredCount={wizard.preflightData.ignoredRows.length}
+              scopedCount={wizard.preflightData.scopePayload.scopedCount ?? 0}
+              candidateTitles={wizard.preflightData.candidateTitles}
+            />
+          </>
         );
 
       default:

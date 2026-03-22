@@ -32,18 +32,69 @@ test.describe('workspace repository content model', () => {
     expect(firstGet.workspaceId).toBe(created.id);
     expect(firstGet.defaultLocale).toBe('en-us');
     expect(firstGet.enabledLocales).toEqual(['en-us', 'fr-fr']);
+    expect(firstGet.kbAccessMode).toBe('mcp');
 
     const updated = await repository.updateWorkspaceSettings({
       workspaceId: created.id,
       defaultLocale: 'fr-fr',
-      enabledLocales: ['fr-fr']
+      enabledLocales: ['fr-fr'],
+      kbAccessMode: 'cli'
     });
     expect(updated.defaultLocale).toBe('fr-fr');
     expect(updated.enabledLocales).toEqual(['fr-fr']);
+    expect(updated.kbAccessMode).toBe('cli');
 
     const secondGet = await repository.getWorkspaceSettings(created.id);
     expect(secondGet.defaultLocale).toBe('fr-fr');
     expect(secondGet.enabledLocales).toEqual(['fr-fr']);
+    expect(secondGet.kbAccessMode).toBe('cli');
+  });
+
+  test('persists workspace settings updates across repository instances', async () => {
+    const created = await repository.createWorkspace({
+      name: 'Settings Persistence Workspace',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us', 'fr-fr'],
+      path: path.join(workspaceRoot, 'settings-persistence')
+    });
+
+    await repository.updateWorkspaceSettings({
+      workspaceId: created.id,
+      defaultLocale: 'fr-fr',
+      enabledLocales: ['fr-fr'],
+      kbAccessMode: 'cli'
+    });
+
+    const reloadedRepository = new WorkspaceRepository(workspaceRoot);
+    const reloadedSettings = await reloadedRepository.getWorkspaceSettings(created.id);
+    expect(reloadedSettings.defaultLocale).toBe('fr-fr');
+    expect(reloadedSettings.enabledLocales).toEqual(['fr-fr']);
+    expect(reloadedSettings.kbAccessMode).toBe('cli');
+  });
+
+  test('repairs missing workspace database during migration health check', async () => {
+    const created = await repository.createWorkspace({
+      name: 'Migration Repair Workspace',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us', 'es-es'],
+      path: path.join(workspaceRoot, 'migration-repair')
+    });
+
+    const before = await repository.getMigrationHealth(created.id);
+    expect(before.workspaces[0].exists).toBe(true);
+    expect(before.workspaces[0].repaired).toBe(false);
+
+    const workspaceDbPath = before.workspaces[0].workspaceDbPath;
+    await rm(workspaceDbPath, { force: true });
+
+    const after = await repository.getMigrationHealth(created.id);
+    const repairedEntry = after.workspaces.find((entry) => entry.workspaceId === created.id);
+    expect(repairedEntry).toBeTruthy();
+    expect(repairedEntry?.repaired).toBe(true);
+    expect(repairedEntry?.exists).toBe(true);
+    expect(repairedEntry?.workspaceDbVersion).toBeGreaterThanOrEqual(7);
   });
 
   test('rejects invalid workspace settings updates', async () => {
@@ -75,6 +126,13 @@ test.describe('workspace repository content model', () => {
         defaultLocale: ''
       })
     ).rejects.toThrow('defaultLocale cannot be empty');
+
+    await expect(
+      repository.updateWorkspaceSettings({
+        workspaceId: created.id,
+        kbAccessMode: 'broken' as 'mcp'
+      })
+    ).rejects.toThrow('kbAccessMode must be mcp or cli');
   });
 
   test('manages article family CRUD and validation', async () => {
@@ -255,5 +313,58 @@ test.describe('workspace repository content model', () => {
 
     const afterDelete = await repository.listRevisions(created.id, variant.id);
     expect(afterDelete.some((revision) => revision.id === revisionOne.id)).toBe(false);
+  });
+
+  test('uses the newest of the locale sync timestamp and revision timestamp in explorer tree rows', async () => {
+    const created = await repository.createWorkspace({
+      name: `ExplorerSync-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'sync-guide',
+      title: 'Sync Guide'
+    });
+    const variant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'en-us'
+    });
+
+    const revision = await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      revisionType: 'live',
+      filePath: '/tmp/sync-guide.html',
+      revisionNumber: 1,
+      status: 'promoted',
+      updatedAtUtc: '2026-03-20T10:00:00.000Z'
+    });
+
+    await repository.upsertSyncCheckpoint(
+      created.id,
+      'en-us',
+      1,
+      '2026-03-22T15:30:00.000Z'
+    );
+
+    const tree = await repository.getExplorerTree(created.id);
+    expect(tree).toHaveLength(1);
+    expect(tree[0].familyId).toBe(family.id);
+    expect(tree[0].locales).toHaveLength(1);
+    expect(tree[0].locales[0].localeVariantId).toBe(variant.id);
+    expect(tree[0].locales[0].revision.revisionId).toBe(revision.id);
+    expect(tree[0].locales[0].revision.updatedAtUtc).toBe('2026-03-22T15:30:00.000Z');
+
+    await repository.updateRevision({
+      workspaceId: created.id,
+      revisionId: revision.id,
+      updatedAtUtc: '2026-03-22T16:45:00.000Z'
+    });
+
+    const refreshedTree = await repository.getExplorerTree(created.id);
+    expect(refreshedTree[0].locales[0].revision.updatedAtUtc).toBe('2026-03-22T16:45:00.000Z');
   });
 });

@@ -95,6 +95,37 @@
 }
 ```
 
+### `system.migrations.health` (hardening validation; existing command surfaced in batch-2)
+```ts
+{
+  workspaceId?: string
+}
+```
+
+Success:
+```ts
+{
+  ok: true,
+  data: {
+    catalogVersion: number;
+    workspaceId: string | null;
+    workspaces: Array<{
+      workspaceId: string;
+      workspacePath: string;
+      catalogVersion: number;
+      workspaceDbPath: string;
+      workspaceDbVersion: number;
+      repaired: boolean;
+      exists: boolean;
+    }>;
+  }
+}
+```
+
+- `workspaceId` can be omitted for a global health sweep.
+- `repaired` is true when the workspace database was recreated/upgraded during health check.
+- `exists` is true when the workspace database is present after the check.
+
 ## Job event payloads (streaming)
 Job progress uses `JobEvent` with the `message` field containing JSON payload:
 ```json

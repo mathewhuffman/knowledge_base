@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { appendFile, mkdir, unlink } from 'node:fs/promises';
+import { appendFile, mkdir } from 'node:fs/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -20,6 +20,7 @@ import type {
   AgentTranscriptRequest,
   AgentTranscriptResponse,
   AgentRunResult,
+  KbAccessMode,
   MCPGetArticleFamilyInput,
   MCPGetArticleInput,
   MCPGetArticleHistoryInput,
@@ -33,9 +34,34 @@ import type {
   MCPGetTemplateInput,
   MCPRecordAgentNotesInput,
   MCPFindRelatedArticlesInput,
-  ExplorerNode
+  ExplorerNode,
+  KbAccessHealth
 } from '@kb-vault/shared-types';
+import { CliHealthFailure } from '@kb-vault/shared-types';
 
+const DEFAULT_AGENT_ACCESS_MODE: KbAccessMode = 'mcp';
+const KB_CLI_BINARY_ENV = 'KBV_KB_CLI_BINARY';
+const KBV_CURSOR_BINARY_ENV = 'KBV_CURSOR_BINARY';
+const DEFAULT_CURSOR_BINARY = 'cursor';
+const DEFAULT_CURSOR_ARGS = ['agent', 'acp'];
+const DEFAULT_CLI_BINARY = 'kb';
+
+function resolveDefaultCursorBinary(): string {
+  const candidates = process.platform === 'darwin'
+    ? [
+        '/Applications/Cursor.app/Contents/Resources/app/bin/cursor',
+        '/Applications/Cursor.app/Contents/MacOS/Cursor'
+      ]
+    : [];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return DEFAULT_CURSOR_BINARY;
+}
 interface JsonRpcEnvelope {
   jsonrpc: '2.0';
   id: string;
@@ -73,7 +99,8 @@ type TranscriptAppender = (line: Omit<AgentTranscriptLine, 'atUtc'>) => Promise<
 interface AcpRuntimeConfig {
   workspaceRoot: string;
   acpCwd: string;
-  cursorBinary: string;
+  mcpBinary: string;
+  cliBinary: string;
   cursorArgs: string[];
   requestTimeoutMs: number;
 }
@@ -97,7 +124,39 @@ interface MCPToolImplementation {
 type RuntimeDebugLogger = (message: string, details?: unknown) => void;
 type AcpMcpServerConfig = Record<string, unknown>;
 
-function buildTaskPrompt(
+type KbAccessPromptBuilder = (
+  session: AgentSessionRecord,
+  taskPayload: Record<string, unknown>,
+  extras?: {
+    batchContext?: unknown;
+    uploadedPbis?: unknown;
+    articleDirectory?: string;
+  }
+) => string;
+
+interface KbRuntimeOptions {
+  getCliHealth?: (workspaceId?: string) => Promise<KbAccessHealth>;
+  buildCliPromptSuffix?: () => string;
+}
+
+interface KbAccessProvider {
+  mode: KbAccessMode;
+  provider: 'mcp' | 'cli';
+  terminalEnabled: boolean;
+  buildSessionCreateParams: () => {
+    cwd: string;
+    mcpServers?: AcpMcpServerConfig[];
+    config: { mode: 'agent' };
+  };
+  getPromptTaskBuilder: (
+    session: AgentSessionRecord,
+    taskPayload: Record<string, unknown>,
+    extras?: { batchContext?: unknown; uploadedPbis?: unknown; articleDirectory?: string }
+  ) => string;
+  getHealth: (workspaceId?: string) => Promise<KbAccessHealth>;
+}
+
+function buildMcpTaskPrompt(
   session: AgentSessionRecord,
   taskPayload: Record<string, unknown>,
   extras?: {
@@ -186,6 +245,99 @@ function buildTaskPrompt(
   return JSON.stringify({ session, task: taskPayload });
 }
 
+function buildCliTaskPrompt(
+  session: AgentSessionRecord,
+  taskPayload: Record<string, unknown>,
+  extras?: {
+    batchContext?: unknown;
+    uploadedPbis?: unknown;
+    articleDirectory?: string;
+  }
+): string {
+  const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
+  const locale = typeof taskPayload.locale === 'string' ? taskPayload.locale : session.locale ?? 'default';
+  const explicitPrompt = typeof taskPayload.prompt === 'string' ? taskPayload.prompt.trim() : '';
+  const cliGuidance = [
+    'KB Vault CLI guidance:',
+    '- Use only the `kb` CLI and data returned by its JSON output.',
+    '- Use the terminal only for `kb` commands.',
+    '- Always include `--json` in every `kb` command.',
+    '- Use as many `kb` commands as needed to complete the task.',
+    '- Do NOT use Read File.',
+    '- Do NOT use grep.',
+    '- If an exact `kb` command is unavailable, call `kb --help` to confirm current syntax.',
+    '- If you need KB evidence, prefer direct `kb` output over local inference.',
+    '- If you need batch context, load batch context first with `kb`.',
+    '- If you need article text, load article variants and related entries with `kb` before proposing edits.',
+    '- Preferred commands for this environment:',
+    '- `kb batch-context --workspace-id <workspace-id> --batch-id <batch-id> --json`',
+    '- `kb find-related-articles --workspace-id <workspace-id> --batch-id <batch-id> --json`',
+    '- `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`'
+  ].join('\n');
+  const extraSections = [
+    extras?.batchContext !== undefined ? `Preloaded batch context summary:\n${summarizeBatchContext(extras.batchContext)}` : '',
+    extras?.uploadedPbis !== undefined ? `Preloaded uploaded PBI JSON:\n${JSON.stringify(extras.uploadedPbis, null, 2)}` : '',
+    extras?.articleDirectory ? `KB article directory and file-style index:\n${extras.articleDirectory}` : ''
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  if (taskPayload.task === 'analyze_batch') {
+    return [
+      'You are running inside KB Vault to analyze one imported PBI batch.',
+      `Workspace ID: ${session.workspaceId}`,
+      `Batch ID: ${batchId}`,
+      `Locale: ${locale}`,
+      '',
+      'Your job:',
+      '1. Load the batch context and relevant PBI records for this batch.',
+      '2. Review the existing KB/article context for the affected topics.',
+      '3. Produce KB-focused analysis outcomes for the batch.',
+      '4. If the batch is already analyzed, summarize the existing analysis state instead of redoing generic exploration.',
+      '',
+      'Tool rules:',
+      '- Use kb commands and structured batch/article data only.',
+      '- Do NOT use generic terminal, grep, codebase search, find, or filesystem exploration unless the user explicitly asks for that.',
+      '- Do NOT inspect the repository or sqlite schema to infer application behavior.',
+      '- Prefer returning a concise analysis/summary over exploratory investigation.',
+      '- The preloaded prompt context is for orientation; use CLI output directly when you need to confirm or inspect source records.',
+      '',
+      cliGuidance,
+      '',
+      explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
+      '',
+      extraSections,
+      '',
+      'Session context JSON:',
+      JSON.stringify({ session, task: taskPayload })
+    ].filter(Boolean).join('\n');
+  }
+
+  if (taskPayload.task === 'edit_article') {
+    return [
+      'You are running inside KB Vault to edit one article revision.',
+      `Workspace ID: ${session.workspaceId}`,
+      `Locale: ${locale}`,
+      '',
+      'Tool rules:',
+      '- Use kb commands and structured article/template data only.',
+      '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
+      '- The preloaded prompt context is for orientation; use CLI output directly when you need to confirm or inspect source records.',
+      '',
+      cliGuidance,
+      '',
+      explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
+      '',
+      extraSections,
+      '',
+      'Session context JSON:',
+      JSON.stringify({ session, task: taskPayload })
+    ].filter(Boolean).join('\n');
+  }
+
+  return JSON.stringify({ session, task: taskPayload });
+}
+
 export interface AgentRuntimeToolContext {
   searchKb: (input: MCPFindRelatedArticlesInput & { workspaceId: string }) => Promise<unknown>;
   getExplorerTree: (workspaceId: string) => Promise<ExplorerNode[]>;
@@ -208,8 +360,6 @@ export interface AgentRuntimeToolContext {
 }
 
 const DEFAULT_TRANSCRIPT_DIR = '.meta/agent-transcripts';
-const DEFAULT_CURSOR_BINARY = process.env.KBV_CURSOR_BINARY ?? 'agent';
-const DEFAULT_CURSOR_ARGS = ['acp'];
 
 function loadConfiguredMcpServers(): AcpMcpServerConfig[] {
   const raw = process.env.KBV_MCP_TOOLS?.trim();
@@ -269,6 +419,7 @@ class CursorTransport {
     private readonly binary: string,
     private readonly args: string[],
     private readonly cwd: string,
+    private readonly terminalEnabled: boolean,
     private readonly logger: (sessionId: string, line: Omit<AgentTranscriptLine, 'atUtc'>) => void,
     private readonly notificationHandler?: (message: JsonRpcResponseMessage) => void
   ) {}
@@ -372,6 +523,20 @@ class CursorTransport {
     });
   }
 
+  abortPromptSession(sessionId: string, reason: string): void {
+    if (!sessionId) {
+      return;
+    }
+
+    for (const [requestId, pending] of this.pending.entries()) {
+      if (pending.method !== 'session/prompt' || pending.watchedSessionId !== sessionId) {
+        continue;
+      }
+      this.pending.delete(requestId);
+      pending.reject(new Error(reason));
+    }
+  }
+
   async ensureInitialized(timeoutMs: number): Promise<boolean> {
     if (this.initialized) {
       return true;
@@ -389,7 +554,7 @@ class CursorTransport {
             readTextFile: false,
             writeTextFile: false
           },
-          terminal: false
+          terminal: this.terminalEnabled
         }
       },
       timeoutMs
@@ -504,39 +669,37 @@ export class CursorAcpRuntime {
     reason?: string;
   }> = [];
   private readonly mcpServer: McpToolServer;
-  private readonly transport: CursorTransport;
-  private readonly cursorSessionIds = new Map<string, string>();
-  private readonly cursorSessionLookup = new Map<string, string>();
+  private readonly transports = new Map<KbAccessMode, CursorTransport>();
+  private readonly cursorSessionIds = new Map<string, { mode: KbAccessMode; acpSessionId: string }>();
+  private readonly cursorSessionLookup = new Map<string, { localSessionId: string; mode: KbAccessMode }>();
   private readonly activeStreamEmitters = new Map<string, (payload: Omit<AgentStreamingPayload, 'sessionId' | 'atUtc'>) => void>();
   private readonly debugLogger: RuntimeDebugLogger;
   private readonly configuredMcpServers: AcpMcpServerConfig[];
+  private runtimeMcpServers: AcpMcpServerConfig[] = [];
   private readonly toolContext: AgentRuntimeToolContext;
+  private readonly runtimeOptions: KbRuntimeOptions;
 
-  constructor(workspaceRoot: string, toolContext: AgentRuntimeToolContext, debugLogger?: RuntimeDebugLogger) {
+  constructor(
+    workspaceRoot: string,
+    toolContext: AgentRuntimeToolContext,
+    runtimeOptions: KbRuntimeOptions = {},
+    debugLogger?: RuntimeDebugLogger
+  ) {
     const acpCwd = process.env.KBV_ACP_CWD?.trim() || process.cwd();
+    const cursorBinary = process.env[KBV_CURSOR_BINARY_ENV]?.trim() || resolveDefaultCursorBinary();
     this.config = {
       workspaceRoot,
       acpCwd,
-      cursorBinary: DEFAULT_CURSOR_BINARY,
+      mcpBinary: cursorBinary,
+      cliBinary: cursorBinary || DEFAULT_CLI_BINARY,
       cursorArgs: DEFAULT_CURSOR_ARGS,
       requestTimeoutMs: 45_000
     };
     this.mcpServer = new McpToolServer();
     this.toolContext = toolContext;
+    this.runtimeOptions = runtimeOptions;
     this.debugLogger = debugLogger ?? (() => undefined);
     this.configuredMcpServers = loadConfiguredMcpServers();
-    this.transport = new CursorTransport(
-      this.config.cursorBinary,
-      this.config.cursorArgs,
-      this.config.acpCwd,
-      (sessionId, line) => {
-        const targetSessionId = sessionId?.trim() || 'system';
-        void this.appendTranscriptLine(targetSessionId, line.direction, line.event, line.payload);
-      },
-      (message) => {
-        void this.handleTransportNotification(message);
-      }
-    );
     this.registerToolImplementations(this.mcpServer, toolContext);
   }
 
@@ -546,6 +709,10 @@ export class CursorAcpRuntime {
 
   getSession(sessionId: string) {
     return this.sessions.get(sessionId) ?? null;
+  }
+
+  setMcpServerConfigs(configs: ReadonlyArray<Record<string, unknown>>): void {
+    this.runtimeMcpServers = configs.filter((entry): entry is AcpMcpServerConfig => Boolean(entry) && typeof entry === 'object');
   }
 
   listSessions(workspaceId: string, includeClosed = false): AgentSessionRecord[] {
@@ -563,6 +730,7 @@ export class CursorAcpRuntime {
     const session: AgentSessionRecord = {
       id,
       workspaceId: input.workspaceId,
+      kbAccessMode: input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
       type: input.type,
       status: 'idle',
       batchId: input.batchId,
@@ -586,68 +754,102 @@ export class CursorAcpRuntime {
     return session;
   }
 
-  async checkHealth(workspaceId: string): Promise<AgentHealthCheckResponse> {
-    const issues: string[] = [];
-    const cursorInstalled = this.isCursorAvailable();
-    let acpReachable = false;
-    let mcpRunning = false;
-    if (cursorInstalled) {
-      acpReachable = await this.canReachCursor();
-      if (!acpReachable) {
-        issues.push('Cursor ACP command did not initialize');
-      }
-    } else {
-      issues.push('Cursor binary not found');
+  async checkHealth(workspaceId: string, selectedMode: KbAccessMode = DEFAULT_AGENT_ACCESS_MODE, workspaceKbAccessMode?: KbAccessMode): Promise<AgentHealthCheckResponse> {
+    this.log('agent.runtime.health_check_start', {
+      workspaceId,
+      selectedMode,
+      workspaceKbAccessMode: workspaceKbAccessMode ?? selectedMode
+    });
+    const [mcp, cli] = await Promise.all([
+      this.getProviderHealth('mcp'),
+      this.getProviderHealth('cli', workspaceId)
+    ]);
+    const aggregatedIssues = Array.from(
+      new Set([
+        ...(mcp.issues ?? []),
+        ...(cli.issues ?? []),
+        ...(!mcp.ok && mcp.message && !(mcp.issues ?? []).includes(mcp.message) ? [mcp.message] : []),
+        ...(!cli.ok && cli.message && !(cli.issues ?? []).includes(cli.message) ? [cli.message] : [])
+      ].filter(Boolean))
+    );
+
+    const availableModes = [mcp, cli].filter((provider) => provider.ok).map((provider) => provider.mode);
+
+    // If the selected mode is unavailable but the workspace preference is, flag an issue
+    if (!availableModes.includes(selectedMode) && availableModes.length > 0) {
+      aggregatedIssues.push(`Selected mode "${selectedMode}" is unavailable; available: ${availableModes.join(', ')}`);
     }
 
-    mcpRunning = this.mcpServer.toolCount() > 0;
-    const requiredConfigPresent = Boolean(process.env.KBV_CURSOR_BINARY || process.env.KBV_MCP_TOOLS);
-
-    return {
+    const result: AgentHealthCheckResponse = {
       checkedAtUtc: new Date().toISOString(),
-      cursorInstalled,
-      acpReachable,
-      mcpRunning,
-      requiredConfigPresent,
-      cursorBinaryPath: cursorInstalled ? this.config.cursorBinary : undefined,
-      issues
+      workspaceId,
+      workspaceKbAccessMode: workspaceKbAccessMode ?? selectedMode,
+      selectedMode,
+      providers: {
+        mcp,
+        cli
+      },
+      issues: aggregatedIssues,
+      availableModes
     };
+    this.log('agent.runtime.health_check_result', {
+      workspaceId,
+      selectedMode,
+      workspaceKbAccessMode: workspaceKbAccessMode ?? selectedMode,
+      availableModes,
+      issues: aggregatedIssues,
+      providers: {
+        mcp: {
+          ok: mcp.ok,
+          failureCode: mcp.failureCode,
+          message: mcp.message,
+          acpReachable: mcp.acpReachable
+        },
+        cli: {
+          ok: cli.ok,
+          failureCode: cli.failureCode,
+          message: cli.message,
+          acpReachable: cli.acpReachable
+        }
+      }
+    });
+    return result;
   }
 
-  private async ensureAcpSession(sessionId: string): Promise<string> {
-    const existing = this.cursorSessionIds.get(sessionId);
-    if (existing) {
-      return existing;
+  private async ensureAcpSession(session: AgentSessionRecord): Promise<string> {
+    const mode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
+    const existing = this.cursorSessionIds.get(session.id);
+    if (existing?.mode === mode) {
+      return existing.acpSessionId;
     }
-    this.log('agent.runtime.session_new_start', { sessionId });
-    const response = await this.transport.request(
+    if (existing && existing.mode !== mode) {
+      this.resetCursorSession(session.id);
+    }
+    const provider = this.getProvider(mode);
+    const transport = this.getTransport(mode);
+    this.log('agent.runtime.session_new_start', { sessionId: session.id, mode });
+    const response = await transport.request(
       'session/new',
-      this.buildSessionCreateParams(),
+      provider.buildSessionCreateParams(),
       this.config.requestTimeoutMs,
-      sessionId
+      session.id
     );
     if (response.error) {
+      this.log('agent.runtime.session_new_failed', {
+        sessionId: session.id,
+        mode,
+        error: response.error
+      });
       throw new Error(response.error.message);
     }
     const result = response.result as { sessionId?: string } | undefined;
     if (!result?.sessionId) {
       throw new Error('Cursor ACP did not return a sessionId');
     }
-    this.log('agent.runtime.session_new_success', { sessionId, acpSessionId: result.sessionId });
-    this.cursorSessionIds.set(sessionId, result.sessionId);
-    this.cursorSessionLookup.set(result.sessionId, sessionId);
+    this.log('agent.runtime.session_new_success', { sessionId: session.id, acpSessionId: result.sessionId, mode });
+    this.cursorSessionIds.set(session.id, { mode, acpSessionId: result.sessionId });
+    this.cursorSessionLookup.set(result.sessionId, { localSessionId: session.id, mode });
     return result.sessionId;
-  }
-
-  private buildSessionCreateParams(): { cwd: string; mcpServers?: AcpMcpServerConfig[]; config: { mode: 'agent' } } {
-    const mcpServers = this.configuredMcpServers.length > 0 ? this.configuredMcpServers : buildBridgeMcpServerConfig();
-    return {
-      cwd: this.config.acpCwd,
-      ...(mcpServers.length > 0 ? { mcpServers } : {}),
-      config: {
-        mode: 'agent'
-      }
-    };
   }
 
   async handleMcpJsonMessage(raw: string | Record<string, unknown>): Promise<string | null> {
@@ -693,6 +895,7 @@ export class CursorAcpRuntime {
       const endedAt = new Date().toISOString();
       return {
         sessionId: session.id,
+        kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
         status: isCancelled() ? 'canceled' : 'ok',
         transcriptPath,
         rawOutput,
@@ -711,6 +914,7 @@ export class CursorAcpRuntime {
       const endedAt = new Date().toISOString();
       return {
         sessionId: session.id,
+        kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
         status: 'error',
         transcriptPath,
         rawOutput,
@@ -768,6 +972,7 @@ export class CursorAcpRuntime {
       const endedAt = new Date().toISOString();
       return {
         sessionId: session.id,
+        kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
         status: isCancelled() ? 'canceled' : 'ok',
         transcriptPath,
         rawOutput,
@@ -786,6 +991,7 @@ export class CursorAcpRuntime {
       const endedAt = new Date().toISOString();
       return {
         sessionId: session.id,
+        kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
         status: 'error',
         transcriptPath,
         rawOutput,
@@ -859,7 +1065,7 @@ export class CursorAcpRuntime {
   }
 
   async stop(): Promise<void> {
-    await this.transport.stop();
+    await Promise.all(Array.from(this.transports.values()).map((transport) => transport.stop()));
   }
 
   private async resolveSession(input: AgentAnalysisRunRequest | AgentArticleEditRunRequest): Promise<AgentSessionRecord> {
@@ -871,6 +1077,7 @@ export class CursorAcpRuntime {
       }
       const createRequest: AgentSessionCreateRequest = {
         workspaceId: input.workspaceId,
+        kbAccessMode: input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
         type: 'localeVariantId' in input ? 'article_edit' : 'batch_analysis',
         batchId: 'batchId' in input ? input.batchId : undefined,
         locale: input.locale,
@@ -879,9 +1086,15 @@ export class CursorAcpRuntime {
           'localeVariantScope' in input && input.localeVariantScope ? { localeVariantIds: input.localeVariantScope } : undefined
       };
       session = this.createSession(createRequest);
+    } else if (input.kbAccessMode && input.kbAccessMode !== session.kbAccessMode) {
+      this.resetCursorSession(session.id);
+      session.kbAccessMode = input.kbAccessMode;
     }
     if (session.status === 'closed') {
       throw new Error('Cannot run request against closed session');
+    }
+    if (!session.kbAccessMode) {
+      session.kbAccessMode = input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
     }
     session.status = 'running';
     session.updatedAtUtc = new Date().toISOString();
@@ -896,6 +1109,8 @@ export class CursorAcpRuntime {
     isCancelled: () => boolean,
     timeoutMs: number
   ): Promise<void> {
+    const mode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
+    const provider = this.getProvider(mode);
     const requestEnvelope = {
       session,
       task: taskPayload
@@ -903,7 +1118,14 @@ export class CursorAcpRuntime {
 
     this.activeStreamEmitters.set(session.id, emit);
     try {
-      emit({ kind: 'session_started', data: requestEnvelope, message: 'Session started' });
+      // Log runtime mode in transcript so CLI-mode runs are identifiable in history
+      await this.appendTranscriptLine(
+        session.id,
+        'system',
+        'runtime_mode',
+        JSON.stringify({ kbAccessMode: mode, provider: provider.provider, terminalEnabled: provider.terminalEnabled })
+      );
+      emit({ kind: 'session_started', data: { ...requestEnvelope, kbAccessMode: mode }, message: 'Session started' });
       const requestEnvelopeString = JSON.stringify(requestEnvelope);
       const promptText = await this.buildPromptText(session, taskPayload);
 
@@ -916,19 +1138,22 @@ export class CursorAcpRuntime {
       const transcriptPath = this.transcripts.get(session.id) ?? '';
       const response = await this.executeWithRetry(
         async () => {
+          const transport = this.getTransport(provider.mode);
           this.log('agent.runtime.ensure_initialized_start', {
             workspaceId: session.workspaceId,
-            sessionId: session.id
+            sessionId: session.id,
+            kbAccessMode: provider.mode
           });
-          const initialized = await this.transport.ensureInitialized(timeoutMs);
+          const initialized = await transport.ensureInitialized(timeoutMs);
           if (!initialized) {
             throw new Error('Cursor ACP initialize failed');
           }
           this.log('agent.runtime.ensure_initialized_success', {
             workspaceId: session.workspaceId,
-            sessionId: session.id
+            sessionId: session.id,
+            kbAccessMode: provider.mode
           });
-          const acpSessionId = await this.ensureAcpSession(session.id);
+          const acpSessionId = await this.ensureAcpSession(session);
           const requestPayload = {
             sessionId: acpSessionId,
             prompt: [
@@ -943,9 +1168,10 @@ export class CursorAcpRuntime {
             sessionId: session.id,
             acpSessionId,
             task: taskPayload.task,
+            kbAccessMode: provider.mode,
             promptLength: promptText.length
           });
-          const response = await this.transport.request(
+          const response = await transport.request(
             'session/prompt',
             requestPayload,
             timeoutMs,
@@ -977,13 +1203,14 @@ export class CursorAcpRuntime {
   }
 
   private async buildPromptText(session: AgentSessionRecord, taskPayload: Record<string, unknown>): Promise<string> {
+    const provider = this.getProvider(session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE);
     if (taskPayload.task !== 'analyze_batch') {
-      return buildTaskPrompt(session, taskPayload);
+      return provider.getPromptTaskBuilder(session, taskPayload);
     }
 
     const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
     if (!batchId) {
-      return buildTaskPrompt(session, taskPayload);
+      return provider.getPromptTaskBuilder(session, taskPayload);
     }
 
     let batchContext: unknown;
@@ -1015,7 +1242,7 @@ export class CursorAcpRuntime {
       articleDirectory = '';
     }
 
-    return buildTaskPrompt(session, taskPayload, {
+    return provider.getPromptTaskBuilder(session, taskPayload, {
       batchContext,
       uploadedPbis,
       articleDirectory
@@ -1060,14 +1287,62 @@ export class CursorAcpRuntime {
       return;
     }
 
-    const params = message.params as { sessionId?: string; update?: { sessionUpdate?: string } };
-    const localSessionId = typeof params.sessionId === 'string' ? this.cursorSessionLookup.get(params.sessionId) : undefined;
-    if (!localSessionId) {
+    const params = message.params as {
+      sessionId?: string;
+      update?: {
+        sessionUpdate?: string;
+        toolCallId?: string;
+        title?: string;
+        kind?: string;
+        status?: string;
+        rawInput?: unknown;
+      };
+    };
+    const sessionInfo = typeof params.sessionId === 'string' ? this.cursorSessionLookup.get(params.sessionId) : undefined;
+    if (!sessionInfo) {
       return;
     }
+    const localSessionId = sessionInfo.localSessionId;
 
     const payload = JSON.stringify(message.params);
     await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
+
+    // Audit and enforce CLI-mode tool calls from ACP session updates so they appear in tool call history
+    if (sessionInfo.mode === 'cli' && params.update?.toolCallId && params.update.title) {
+      const session = this.sessions.get(localSessionId);
+      if (session) {
+        const policy = this.evaluateCliToolPolicy(params.update.title, params.update.kind);
+        this.toolCallAudit.push({
+          workspaceId: session.workspaceId,
+          sessionId: localSessionId,
+          toolName: params.update.title,
+          args: params.update.rawInput ?? { kind: params.update.kind },
+          calledAtUtc: new Date().toISOString(),
+          allowed: policy.allowed,
+          reason: policy.reason
+        });
+        if (!policy.allowed && typeof params.sessionId === 'string') {
+          this.log('agent.runtime.cli_tool_policy_violation', {
+            sessionId: localSessionId,
+            acpSessionId: params.sessionId,
+            toolName: params.update.title,
+            kind: params.update.kind,
+            reason: policy.reason
+          });
+          await this.appendTranscriptLine(
+            localSessionId,
+            'system',
+            'cli_tool_policy_violation',
+            JSON.stringify({
+              toolName: params.update.title,
+              kind: params.update.kind,
+              reason: policy.reason
+            })
+          );
+          this.getTransport('cli').abortPromptSession(params.sessionId, policy.reason);
+        }
+      }
+    }
 
     const emit = this.activeStreamEmitters.get(localSessionId);
     if (!emit) {
@@ -1090,8 +1365,12 @@ export class CursorAcpRuntime {
     return filePath;
   }
 
-  private isCursorAvailable(): boolean {
-    const checkPaths = [this.config.cursorBinary, 'cursor', 'cursor.exe'];
+  private resolveBinary(mode: KbAccessMode): string {
+    return mode === 'cli' ? this.config.cliBinary : this.config.mcpBinary;
+  }
+
+  private isCursorAvailable(mode: KbAccessMode): boolean {
+    const checkPaths = [this.resolveBinary(mode), 'cursor', 'cursor.exe'];
     return checkPaths.some((binary) => {
       if (!binary) {
         return false;
@@ -1111,13 +1390,229 @@ export class CursorAcpRuntime {
     });
   }
 
-  private async canReachCursor(): Promise<boolean> {
+  private async canReachCursor(mode: KbAccessMode): Promise<boolean> {
     try {
-      const response = await this.transport.ensureInitialized(1000);
+      const response = await this.getTransport(mode).ensureInitialized(1000);
       return response;
-    } catch {
+    } catch (error) {
+      this.log('agent.runtime.acp_transport_unreachable', {
+        mode,
+        message: error instanceof Error ? error.message : String(error)
+      });
       return false;
     }
+  }
+
+  private getTransport(mode: KbAccessMode): CursorTransport {
+    const existing = this.transports.get(mode);
+    if (existing) {
+      return existing;
+    }
+    const provider = this.getProvider(mode);
+    const transportBinary = this.resolveBinary(mode);
+    const transport = new CursorTransport(
+      transportBinary,
+      this.config.cursorArgs,
+      this.config.acpCwd,
+      provider.terminalEnabled,
+      (sessionId, line) => {
+        const targetSessionId = sessionId?.trim() || 'system';
+        void this.appendTranscriptLine(targetSessionId, line.direction, line.event, line.payload);
+      },
+      (message) => {
+        void this.handleTransportNotification(message);
+      }
+    );
+    this.transports.set(mode, transport);
+    return transport;
+  }
+
+  private evaluateCliToolPolicy(toolName: string, kind?: string): { allowed: boolean; reason: string } {
+    const normalizedToolName = toolName.trim().toLowerCase();
+    const normalizedKind = kind?.trim().toLowerCase() ?? 'unknown';
+
+    if (normalizedToolName === 'read file') {
+      return {
+        allowed: false,
+        reason: 'CLI mode forbids Read File; use kb CLI output instead'
+      };
+    }
+
+    if (normalizedToolName === 'grep') {
+      return {
+        allowed: false,
+        reason: 'CLI mode forbids grep; use kb CLI output instead'
+      };
+    }
+
+    return {
+      allowed: true,
+      reason: `CLI mode ACP tool call allowed: ${toolName} (${normalizedKind})`
+    };
+  }
+
+  private resolveMcpServerConfigs(): AcpMcpServerConfig[] {
+    if (this.runtimeMcpServers.length > 0) {
+      return this.runtimeMcpServers;
+    }
+    if (this.configuredMcpServers.length > 0) {
+      return this.configuredMcpServers;
+    }
+    return buildBridgeMcpServerConfig();
+  }
+
+  private getProvider(mode: KbAccessMode): KbAccessProvider {
+    if (mode === 'cli') {
+      return {
+        mode: 'cli',
+        provider: 'cli',
+        terminalEnabled: true,
+        buildSessionCreateParams: () => ({
+          cwd: this.config.acpCwd,
+          mcpServers: [],
+          config: { mode: 'agent' }
+        }),
+        getPromptTaskBuilder: (session, taskPayload, extras) => {
+          const prompt = buildCliTaskPrompt(session, taskPayload, extras);
+          const suffix = this.runtimeOptions.buildCliPromptSuffix?.();
+          const trimmedSuffix = suffix?.trim();
+          return trimmedSuffix ? `${prompt}\n\n${trimmedSuffix}` : prompt;
+        },
+        getHealth: (workspaceId?: string) => this.getCliHealth(workspaceId)
+      };
+    }
+
+    return {
+      mode: 'mcp',
+      provider: 'mcp',
+      terminalEnabled: false,
+      buildSessionCreateParams: () => {
+        const mcpServers = this.resolveMcpServerConfigs();
+        return {
+          cwd: this.config.acpCwd,
+          ...(mcpServers.length > 0 ? { mcpServers } : {}),
+          config: { mode: 'agent' }
+        };
+      },
+      getPromptTaskBuilder: (session, taskPayload, extras) => buildMcpTaskPrompt(session, taskPayload, extras),
+      getHealth: (_workspaceId?: string) => this.getMcpHealth()
+    };
+  }
+
+  private async getProviderHealth(mode: KbAccessMode, workspaceId?: string): Promise<KbAccessHealth> {
+    return this.getProvider(mode).getHealth(workspaceId);
+  }
+
+  private async getMcpHealth(): Promise<KbAccessHealth> {
+    const issues: string[] = [];
+    const cursorInstalled = this.isCursorAvailable('mcp');
+    if (!cursorInstalled) {
+      issues.push('Cursor binary not found');
+    }
+    const acpReachable = cursorInstalled ? await this.canReachCursor('mcp') : false;
+    if (cursorInstalled && !acpReachable) {
+      issues.push('Cursor ACP command did not initialize');
+    }
+    const mcpServers = this.resolveMcpServerConfigs();
+    if (mcpServers.length === 0) {
+      issues.push('MCP server configuration is unavailable');
+    }
+    if (this.mcpServer.toolCount() === 0) {
+      issues.push('KB Vault MCP tool server has no registered tools');
+    }
+
+    const ok = cursorInstalled && acpReachable && mcpServers.length > 0 && this.mcpServer.toolCount() > 0;
+    const result: KbAccessHealth = {
+      mode: 'mcp',
+      provider: 'mcp',
+      ok,
+      acpReachable,
+      binaryPath: cursorInstalled ? this.config.mcpBinary : undefined,
+      message: ok ? 'MCP access ready' : issues[0] ?? 'MCP access unavailable',
+      issues
+    };
+    this.log('agent.runtime.mcp_health_result', {
+      ok: result.ok,
+      acpReachable: result.acpReachable,
+      binaryPath: result.binaryPath,
+      message: result.message,
+      issues: result.issues
+    });
+    return result;
+  }
+
+  private async getCliHealth(workspaceId?: string): Promise<KbAccessHealth> {
+    if (!this.runtimeOptions.getCliHealth) {
+      return {
+        mode: 'cli',
+        provider: 'cli',
+        ok: false,
+        acpReachable: false,
+        message: 'CLI runtime service unavailable',
+        issues: ['CLI runtime service is not configured']
+      };
+    }
+
+    try {
+      const health = await this.runtimeOptions.getCliHealth(workspaceId);
+      const issues = [...(health.issues ?? [])];
+      const acpReachable = await this.canReachCursor('cli');
+      if (!acpReachable) {
+        issues.push('Cursor ACP transport is not reachable');
+      }
+      const ok = Boolean(health.ok && acpReachable);
+      const healthReady = health.ok && !acpReachable ? 'Cursor ACP transport is not reachable' : undefined;
+      const message = ok
+        ? (health.message ?? 'CLI access ready')
+        : (healthReady ?? health.message ?? issues[0] ?? 'CLI access unavailable');
+      const result: KbAccessHealth = {
+        ...health,
+        mode: 'cli',
+        provider: 'cli',
+        acpReachable,
+        ok,
+        issues,
+        message,
+        binaryPath: health.binaryPath || this.resolveBinary('cli'),
+        failureCode: ok ? undefined : (health.ok ? CliHealthFailure.HEALTH_PROBE_REJECTED : health.failureCode)
+      };
+      this.log('agent.runtime.cli_health_result', {
+        workspaceId,
+        ok: result.ok,
+        baseHealthOk: health.ok,
+        acpReachable: result.acpReachable,
+        binaryPath: result.binaryPath,
+        failureCode: result.failureCode,
+        message: result.message,
+        issues: result.issues
+      });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const result: KbAccessHealth = {
+        mode: 'cli',
+        provider: 'cli',
+        ok: false,
+        acpReachable: false,
+        message,
+        issues: [message]
+      };
+      this.log('agent.runtime.cli_health_failed', {
+        workspaceId,
+        message,
+        stack: error instanceof Error ? error.stack : undefined
+      });
+      return result;
+    }
+  }
+
+  private resetCursorSession(sessionId: string): void {
+    const existing = this.cursorSessionIds.get(sessionId);
+    if (!existing) {
+      return;
+    }
+    this.cursorSessionIds.delete(sessionId);
+    this.cursorSessionLookup.delete(existing.acpSessionId);
   }
 
   private async appendTranscriptLine(

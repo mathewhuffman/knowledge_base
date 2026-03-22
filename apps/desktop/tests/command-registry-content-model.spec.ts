@@ -57,18 +57,21 @@ test.describe('command registry content model transitions', () => {
       payload: { workspaceId: workspace.id }
     });
     expect(getResp.ok).toBe(true);
-    expect((getResp.data as { zendeskSubdomain: string }).zendeskSubdomain).toBe('support');
+    expect((getResp.data as { zendeskSubdomain: string; kbAccessMode: string }).zendeskSubdomain).toBe('support');
+    expect((getResp.data as { kbAccessMode: string }).kbAccessMode).toBe('mcp');
 
     const updateResp = await bus.execute({
       method: 'workspace.settings.update',
       payload: {
         workspaceId: workspace.id,
         defaultLocale: 'es-es',
-        enabledLocales: ['es-es']
+        enabledLocales: ['es-es'],
+        kbAccessMode: 'cli'
       }
     });
     expect(updateResp.ok).toBe(true);
-    expect((updateResp.data as { enabledLocales: string[] }).enabledLocales).toEqual(['es-es']);
+    expect((updateResp.data as { enabledLocales: string[]; kbAccessMode: string }).enabledLocales).toEqual(['es-es']);
+    expect((updateResp.data as { kbAccessMode: string }).kbAccessMode).toBe('cli');
 
     const invalidNoPayload = await bus.execute({
       method: 'workspace.settings.update',
@@ -76,6 +79,57 @@ test.describe('command registry content model transitions', () => {
     });
     expect(invalidNoPayload.ok).toBe(false);
     expect(invalidNoPayload.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+  });
+
+  test('returns provider-aware health payload for the selected workspace mode', async () => {
+    const workspace = await createWorkspace();
+
+    const settingsResp = await bus.execute({
+      method: 'workspace.settings.update',
+      payload: {
+        workspaceId: workspace.id,
+        kbAccessMode: 'cli'
+      }
+    });
+    expect(settingsResp.ok).toBe(true);
+
+    const healthResp = await bus.execute({
+      method: 'agent.health.check',
+      payload: { workspaceId: workspace.id }
+    });
+
+    expect(healthResp.ok).toBe(true);
+    expect((healthResp.data as { selectedMode: string }).selectedMode).toBe('cli');
+    expect((healthResp.data as { providers: { cli: { mode: string }; mcp: { mode: string } } }).providers.cli.mode).toBe('cli');
+    expect((healthResp.data as { providers: { cli: { mode: string }; mcp: { mode: string } } }).providers.mcp.mode).toBe('mcp');
+  });
+
+  test('reports migration health and repair status for workspace DBs', async () => {
+    const workspace = await createWorkspace();
+
+    const first = await bus.execute({ method: 'system.migrations.health', payload: { workspaceId: workspace.id } });
+    expect(first.ok).toBe(true);
+    const firstData = first.data as {
+      workspaces: Array<{ workspaceId: string; workspaceDbPath: string; exists: boolean; repaired: boolean }>;
+    };
+    expect(firstData.workspaces).toHaveLength(1);
+    expect(firstData.workspaces[0].exists).toBe(true);
+    expect(firstData.workspaces[0].repaired).toBe(false);
+
+    const dbPath = firstData.workspaces[0].workspaceDbPath;
+    await rm(dbPath, { force: true });
+
+    const second = await bus.execute({ method: 'system.migrations.health', payload: { workspaceId: workspace.id } });
+    expect(second.ok).toBe(true);
+    const secondData = second.data as {
+      workspaceId: string | null;
+      catalogVersion: number;
+      workspaces: Array<{ workspaceId: string; exists: boolean; repaired: boolean; workspaceDbVersion: number }>;
+    };
+    expect(secondData.workspaceId).toBe(workspace.id);
+    expect(secondData.workspaces[0].repaired).toBe(true);
+    expect(secondData.workspaces[0].exists).toBe(true);
+    expect(secondData.workspaces[0].workspaceDbVersion).toBeGreaterThan(0);
   });
 
   test('handles articleFamily command lifecycle', async () => {

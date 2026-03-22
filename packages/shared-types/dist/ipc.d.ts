@@ -36,6 +36,7 @@ export interface JobStatus {
     message?: string;
     startedAt?: string;
     endedAt?: string;
+    metadata?: Record<string, unknown>;
 }
 export interface JobEvent extends JobStatus, JobRecord {
 }

@@ -13,6 +13,7 @@ const shared_types_1 = require("@kb-vault/shared-types");
 const db_1 = require("@kb-vault/db");
 const logger_1 = require("./logger");
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
+const DEFAULT_KB_ACCESS_MODE = 'mcp';
 const CATALOG_DB_PATH = node_path_1.default.join('.meta', 'catalog.sqlite');
 const PBIBATCH_STATUS_SEQUENCE = [
     shared_types_1.PBIBatchStatus.IMPORTED,
@@ -72,6 +73,7 @@ class WorkspaceRepository {
             const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
             try {
                 const settings = workspaceDb.get(`SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
+            , kb_access_mode
            FROM workspace_settings WHERE workspace_id = @workspaceId`, { workspaceId: id });
                 if (settings) {
                     return {
@@ -79,20 +81,22 @@ class WorkspaceRepository {
                         zendeskSubdomain: settings.zendesk_subdomain,
                         zendeskBrandId: settings.zendesk_brand_id ?? undefined,
                         defaultLocale: settings.default_locale,
-                        enabledLocales: safeParseLocales(settings.enabled_locales)
+                        enabledLocales: safeParseLocales(settings.enabled_locales),
+                        kbAccessMode: normalizeKbAccessMode(settings.kb_access_mode)
                     };
                 }
                 const enabledLocales = safeParseLocales(row.enabled_locales);
                 workspaceDb.run(`INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @updatedAt
           )`, {
                     workspaceId: id,
                     zendeskSubdomain: row.zendesk_subdomain,
                     zendeskBrandId: row.zendesk_brand_id,
                     defaultLocale: row.default_locale,
                     enabledLocales: JSON.stringify(enabledLocales),
+                    kbAccessMode: DEFAULT_KB_ACCESS_MODE,
                     updatedAt: new Date().toISOString()
                 });
                 return {
@@ -100,7 +104,8 @@ class WorkspaceRepository {
                     zendeskSubdomain: row.zendesk_subdomain,
                     zendeskBrandId: row.zendesk_brand_id ?? undefined,
                     defaultLocale: row.default_locale,
-                    enabledLocales
+                    enabledLocales,
+                    kbAccessMode: DEFAULT_KB_ACCESS_MODE
                 };
             }
             finally {
@@ -123,6 +128,7 @@ class WorkspaceRepository {
             const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
             try {
                 const existing = workspaceDb.get(`SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
+            , kb_access_mode
            FROM workspace_settings WHERE workspace_id = @workspaceId`, { workspaceId: payload.workspaceId });
                 const fallbackDefaultLocale = existing?.default_locale ?? row.default_locale;
                 const fallbackSubdomain = existing?.zendesk_subdomain ?? row.zendesk_subdomain;
@@ -131,8 +137,13 @@ class WorkspaceRepository {
                 if (payload.zendeskSubdomain === undefined &&
                     payload.zendeskBrandId === undefined &&
                     payload.defaultLocale === undefined &&
-                    payload.enabledLocales === undefined) {
+                    payload.enabledLocales === undefined &&
+                    payload.kbAccessMode === undefined) {
                     throw new Error('No settings provided');
+                }
+                if (payload.kbAccessMode !== undefined &&
+                    !isValidKbAccessMode(payload.kbAccessMode)) {
+                    throw new Error('kbAccessMode must be mcp or cli');
                 }
                 if (payload.defaultLocale !== undefined && !payload.defaultLocale.trim()) {
                     throw new Error('defaultLocale cannot be empty');
@@ -149,6 +160,7 @@ class WorkspaceRepository {
                 const nextDefaultLocale = payload.defaultLocale ?? fallbackDefaultLocale;
                 const nextSubdomain = payload.zendeskSubdomain ?? fallbackSubdomain;
                 const nextBrand = payload.zendeskBrandId !== undefined ? payload.zendeskBrandId : fallbackBrand;
+                const nextKbAccessMode = normalizeKbAccessMode(payload.kbAccessMode ?? existing?.kb_access_mode);
                 if (!nextSubdomain) {
                     throw new Error('zendeskSubdomain cannot be empty');
                 }
@@ -164,15 +176,16 @@ class WorkspaceRepository {
                 const normalizedEnabledLocales = normalizeLocales(enabledLocales);
                 const now = new Date().toISOString();
                 workspaceDb.run(`INSERT OR REPLACE INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @updatedAt
           )`, {
                     workspaceId: payload.workspaceId,
                     zendeskSubdomain: nextSubdomain,
                     zendeskBrandId: nextBrand,
                     defaultLocale: nextDefaultLocale,
                     enabledLocales: JSON.stringify(normalizedEnabledLocales),
+                    kbAccessMode: nextKbAccessMode,
                     updatedAt: now
                 });
                 catalog.run(`UPDATE workspaces
@@ -194,7 +207,8 @@ class WorkspaceRepository {
                     zendeskSubdomain: nextSubdomain,
                     zendeskBrandId: nextBrand ?? undefined,
                     defaultLocale: nextDefaultLocale,
-                    enabledLocales: normalizedEnabledLocales
+                    enabledLocales: normalizedEnabledLocales,
+                    kbAccessMode: nextKbAccessMode
                 };
             }
             finally {
@@ -264,15 +278,16 @@ class WorkspaceRepository {
             const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
             try {
                 workspaceDb.run(`INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @updatedAt
           )`, {
                     workspaceId: id,
                     zendeskSubdomain: payload.zendeskSubdomain,
                     zendeskBrandId: payload.zendeskBrandId ?? null,
                     defaultLocale: payload.defaultLocale,
                     enabledLocales: JSON.stringify(enabledLocales),
+                    kbAccessMode: DEFAULT_KB_ACCESS_MODE,
                     updatedAt: now
                 });
             }
@@ -517,8 +532,12 @@ class WorkspaceRepository {
             if (payload.title !== undefined && !title.trim()) {
                 throw new Error('Article family title cannot be empty');
             }
-            const sectionId = payload.sectionId ?? existing.sectionId ?? undefined;
-            const categoryId = payload.categoryId ?? existing.categoryId ?? undefined;
+            const sectionId = payload.sectionId !== undefined
+                ? (payload.sectionId ?? undefined)
+                : (existing.sectionId ?? undefined);
+            const categoryId = payload.categoryId !== undefined
+                ? (payload.categoryId ?? undefined)
+                : (existing.categoryId ?? undefined);
             const retiredAt = payload.retiredAtUtc === null ? null : (payload.retiredAtUtc ?? existing.retiredAtUtc ?? null);
             workspaceDb.run(`UPDATE article_families
          SET title = @title,
@@ -1053,13 +1072,22 @@ class WorkspaceRepository {
         FROM revisions
       `);
             const branches = workspaceDb.all(`SELECT locale_variant_id, COUNT(*) AS total FROM draft_branches GROUP BY locale_variant_id`);
+            const syncCheckpoints = workspaceDb.all(`SELECT locale, last_synced_at as lastSyncedAtUtc, updated_at as updatedAtUtc
+         FROM zendesk_sync_checkpoints
+         WHERE workspace_id = @workspaceId`, { workspaceId });
             const branchCounts = new Map(branches.map((row) => [row.locale_variant_id, row.total]));
+            const syncTimestampByLocale = new Map(syncCheckpoints.map((checkpoint) => [
+                checkpoint.locale,
+                checkpoint.lastSyncedAtUtc ?? checkpoint.updatedAtUtc
+            ]));
             const latestByVariant = getLatestRevisions(revisions);
             return families.map((family) => {
                 const locales = variants
                     .filter((variant) => variant.familyId === family.id)
                     .map((variant) => {
                     const latest = latestByVariant.get(variant.id);
+                    const syncUpdatedAtUtc = syncTimestampByLocale.get(variant.locale);
+                    const explorerUpdatedAtUtc = latestTimestamp(syncUpdatedAtUtc, latest?.updatedAtUtc) ?? new Date().toISOString();
                     return {
                         locale: variant.locale,
                         localeVariantId: variant.id,
@@ -1067,7 +1095,7 @@ class WorkspaceRepository {
                             revisionId: latest?.revisionId ?? '',
                             revisionNumber: latest?.revisionNumber ?? 0,
                             state: latest?.revisionType ?? variant.status ?? shared_types_1.RevisionState.LIVE,
-                            updatedAtUtc: latest?.updatedAtUtc ?? new Date().toISOString(),
+                            updatedAtUtc: explorerUpdatedAtUtc,
                             draftCount: branchCounts.get(variant.id) ?? 0
                         },
                         hasConflicts: variant.status === shared_types_1.RevisionState.OBSOLETE
@@ -1314,6 +1342,10 @@ class WorkspaceRepository {
             }
             workspaceDb.exec('BEGIN IMMEDIATE');
             try {
+                workspaceDb.run(`DELETE FROM proposal_pbi_links
+            WHERE proposal_id IN (SELECT id FROM proposals WHERE batch_id = @batchId)`, { batchId });
+                workspaceDb.run(`DELETE FROM proposals WHERE batch_id = @batchId`, { batchId });
+                workspaceDb.run(`DELETE FROM ai_runs WHERE batch_id = @batchId`, { batchId });
                 workspaceDb.run(`DELETE FROM pbi_records WHERE batch_id = @batchId`, { batchId });
                 workspaceDb.run(`DELETE FROM pbi_batches WHERE id = @batchId AND workspace_id = @workspaceId`, { batchId, workspaceId });
                 workspaceDb.exec('COMMIT');
@@ -1502,6 +1534,122 @@ class WorkspaceRepository {
                 validation_status as validationStatus, validation_reason as validationReason
          FROM pbi_records
          WHERE batch_id = @batchId AND source_row_number IN (${placeholders})`, params);
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async recordBatchAnalysisRun(params) {
+        const workspace = await this.getWorkspace(params.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const id = (0, node_crypto_1.randomUUID)();
+            workspaceDb.run(`INSERT INTO ai_runs (
+          id, workspace_id, batch_id, status, started_at, ended_at, prompt_template, transcript_path,
+          session_id, kb_access_mode, tool_calls_json, raw_output_json, message
+        ) VALUES (
+          @id, @workspaceId, @batchId, @status, @startedAt, @endedAt, @promptTemplate, @transcriptPath,
+          @sessionId, @kbAccessMode, @toolCallsJson, @rawOutputJson, @message
+        )`, {
+                id,
+                workspaceId: params.workspaceId,
+                batchId: params.batchId,
+                status: params.status,
+                startedAt: params.startedAtUtc,
+                endedAt: params.endedAtUtc ?? null,
+                promptTemplate: params.promptTemplate ?? null,
+                transcriptPath: params.transcriptPath ?? null,
+                sessionId: params.sessionId ?? null,
+                kbAccessMode: params.kbAccessMode ?? 'mcp',
+                toolCallsJson: JSON.stringify(params.toolCalls ?? []),
+                rawOutputJson: params.rawOutput ? JSON.stringify(params.rawOutput) : null,
+                message: params.message ?? null
+            });
+            return {
+                id,
+                workspaceId: params.workspaceId,
+                batchId: params.batchId,
+                sessionId: params.sessionId,
+                kbAccessMode: params.kbAccessMode ?? 'mcp',
+                status: params.status,
+                startedAtUtc: params.startedAtUtc,
+                endedAtUtc: params.endedAtUtc,
+                promptTemplate: params.promptTemplate,
+                transcriptPath: params.transcriptPath,
+                toolCalls: params.toolCalls ?? [],
+                rawOutput: params.rawOutput,
+                message: params.message
+            };
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async getLatestBatchAnalysisRun(workspaceId, batchId) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const row = workspaceDb.get(`SELECT id,
+                workspace_id as workspaceId,
+                batch_id as batchId,
+                session_id as sessionId,
+                kb_access_mode as kbAccessMode,
+                status,
+                started_at as startedAtUtc,
+                ended_at as endedAtUtc,
+                prompt_template as promptTemplate,
+                transcript_path as transcriptPath,
+                tool_calls_json as toolCallsJson,
+                raw_output_json as rawOutputJson,
+                message
+           FROM ai_runs
+          WHERE workspace_id = @workspaceId AND batch_id = @batchId
+          ORDER BY started_at DESC
+          LIMIT 1`, { workspaceId, batchId });
+            if (!row) {
+                return null;
+            }
+            let toolCalls = [];
+            if (row.toolCallsJson) {
+                try {
+                    const parsed = JSON.parse(row.toolCallsJson);
+                    if (Array.isArray(parsed)) {
+                        toolCalls = parsed;
+                    }
+                }
+                catch {
+                    toolCalls = [];
+                }
+            }
+            let rawOutput = [];
+            if (row.rawOutputJson) {
+                try {
+                    const parsed = JSON.parse(row.rawOutputJson);
+                    if (Array.isArray(parsed)) {
+                        rawOutput = parsed;
+                    }
+                }
+                catch {
+                    rawOutput = [];
+                }
+            }
+            return {
+                id: row.id,
+                workspaceId: row.workspaceId,
+                batchId: row.batchId,
+                sessionId: row.sessionId ?? undefined,
+                kbAccessMode: row.kbAccessMode ?? 'mcp',
+                status: row.status,
+                startedAtUtc: row.startedAtUtc,
+                endedAtUtc: row.endedAtUtc ?? undefined,
+                promptTemplate: row.promptTemplate ?? undefined,
+                transcriptPath: row.transcriptPath ?? undefined,
+                toolCalls,
+                rawOutput,
+                message: row.message ?? undefined
+            };
         }
         finally {
             workspaceDb.close();
@@ -2081,6 +2229,12 @@ class WorkspaceRepository {
         }
     }
     async getLatestSyncRun(workspaceId) {
+        return this.getLatestSyncRunWithFilter(workspaceId);
+    }
+    async getLatestSuccessfulSyncRun(workspaceId) {
+        return this.getLatestSyncRunWithFilter(workspaceId, 'SUCCEEDED');
+    }
+    async getLatestSyncRunWithFilter(workspaceId, state) {
         const workspace = await this.getWorkspace(workspaceId);
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
@@ -2089,8 +2243,9 @@ class WorkspaceRepository {
                 created_families, created_variants, created_revisions, cursor_summary, remote_error
          FROM zendesk_sync_runs
          WHERE workspace_id = @workspaceId
+           ${state ? 'AND state = @state' : ''}
          ORDER BY started_at DESC
-         LIMIT 1`, { workspaceId });
+         LIMIT 1`, state ? { workspaceId, state } : { workspaceId });
             if (!row) {
                 return null;
             }
@@ -2357,7 +2512,20 @@ class WorkspaceRepository {
         const dbPath = node_path_1.default.join(workspacePath, '.meta', DEFAULT_DB_FILE);
         await promises_1.default.mkdir(node_path_1.default.dirname(dbPath), { recursive: true });
         this.repairWorkspaceDb(dbPath);
+        this.ensureKbAccessModeColumn(dbPath);
         return dbPath;
+    }
+    ensureKbAccessModeColumn(dbPath) {
+        const db = (0, db_1.openWorkspaceDatabase)(dbPath);
+        try {
+            const columns = db.all(`PRAGMA table_info(workspace_settings)`).map((c) => c.name);
+            if (!columns.includes('kb_access_mode')) {
+                db.exec(`ALTER TABLE workspace_settings ADD COLUMN kb_access_mode TEXT NOT NULL DEFAULT 'mcp'`);
+            }
+        }
+        finally {
+            db.close();
+        }
     }
     async prepareWorkspaceFilesystem(workspacePath) {
         const dirs = [
@@ -2525,6 +2693,17 @@ function workspacePath(inputPath, root, name) {
 }
 function normalizeLocales(locales) {
     return locales && locales.length > 0 ? locales : ['en-us'];
+}
+function isValidKbAccessMode(value) {
+    return value === 'mcp' || value === 'cli';
+}
+function normalizeKbAccessMode(value) {
+    return isValidKbAccessMode(value ?? '') ? value : DEFAULT_KB_ACCESS_MODE;
+}
+function latestTimestamp(...values) {
+    return values
+        .filter((value) => Boolean(value))
+        .sort((left, right) => right.localeCompare(left))[0];
 }
 function safeParseLocales(value) {
     try {

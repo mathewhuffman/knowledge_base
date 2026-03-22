@@ -309,6 +309,33 @@ exports.migrations = [
       ALTER TABLE pbi_records ADD COLUMN validation_status TEXT NOT NULL DEFAULT 'candidate';
       ALTER TABLE pbi_records ADD COLUMN validation_reason TEXT;
     `
+    },
+    {
+        version: 5,
+        name: '0005_agent_access_mode',
+        description: 'Track workspace kb access mode and default to MCP.',
+        sql: `
+      ALTER TABLE workspace_settings ADD COLUMN kb_access_mode TEXT NOT NULL DEFAULT 'mcp';
+    `
+    },
+    {
+        version: 6,
+        name: '0006_persist_agent_analysis_runs',
+        description: 'Persist batch analysis session details and tool-call audit for restart-safe history.',
+        sql: `
+      ALTER TABLE ai_runs ADD COLUMN session_id TEXT;
+      ALTER TABLE ai_runs ADD COLUMN kb_access_mode TEXT NOT NULL DEFAULT 'mcp';
+      ALTER TABLE ai_runs ADD COLUMN tool_calls_json TEXT;
+      ALTER TABLE ai_runs ADD COLUMN message TEXT;
+    `
+    },
+    {
+        version: 7,
+        name: '0007_agent_run_raw_output',
+        description: 'Persist raw agent run output for non-MCP runtime inspection.',
+        sql: `
+      ALTER TABLE ai_runs ADD COLUMN raw_output_json TEXT;
+    `
     }
 ];
 function getMigrationStatements() {
