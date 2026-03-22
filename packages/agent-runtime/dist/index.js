@@ -18,6 +18,8 @@ const KBV_CURSOR_BINARY_ENV = 'KBV_CURSOR_BINARY';
 const DEFAULT_CURSOR_BINARY = 'cursor';
 const DEFAULT_CURSOR_ARGS = ['agent', 'acp'];
 const DEFAULT_CLI_BINARY = 'kb';
+const ACP_HEALTH_INIT_TIMEOUT_MS = 4_000;
+const ACP_HEALTH_INIT_ATTEMPTS = 2;
 function resolveDefaultCursorBinary() {
     const candidates = node_process_1.default.platform === 'darwin'
         ? [
@@ -1070,17 +1072,31 @@ class CursorAcpRuntime {
         });
     }
     async canReachCursor(mode) {
-        try {
-            const response = await this.getTransport(mode).ensureInitialized(1000);
-            return response;
-        }
-        catch (error) {
+        let lastError;
+        for (let attempt = 1; attempt <= ACP_HEALTH_INIT_ATTEMPTS; attempt += 1) {
+            const transport = this.getTransport(mode);
+            try {
+                const response = await transport.ensureInitialized(ACP_HEALTH_INIT_TIMEOUT_MS);
+                if (response) {
+                    return true;
+                }
+                lastError = new Error('Cursor ACP initialize returned false');
+            }
+            catch (error) {
+                lastError = error;
+            }
             this.log('agent.runtime.acp_transport_unreachable', {
                 mode,
-                message: error instanceof Error ? error.message : String(error)
+                attempt,
+                maxAttempts: ACP_HEALTH_INIT_ATTEMPTS,
+                message: lastError instanceof Error ? lastError.message : String(lastError)
             });
-            return false;
+            if (attempt < ACP_HEALTH_INIT_ATTEMPTS) {
+                await transport.stop();
+                this.transports.delete(mode);
+            }
         }
+        return false;
     }
     getTransport(mode) {
         const existing = this.transports.get(mode);

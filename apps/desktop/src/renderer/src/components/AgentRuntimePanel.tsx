@@ -227,6 +227,50 @@ interface AcpToolCallRecord {
   rawOutput?: unknown;
 }
 
+function summarizeAcpToolInput(title: string, rawInput: unknown): string {
+  if (!rawInput || typeof rawInput !== 'object') {
+    return title;
+  }
+
+  const input = rawInput as Record<string, unknown>;
+  const candidateString = (
+    input.command
+    ?? input.cmd
+    ?? input.commandLine
+    ?? input.filePath
+    ?? input.path
+    ?? input.uri
+    ?? input.target
+  );
+
+  if (typeof candidateString === 'string' && candidateString.trim()) {
+    return candidateString.trim();
+  }
+
+  if (typeof input.args === 'string' && input.args.trim()) {
+    return `${title}: ${input.args.trim()}`;
+  }
+
+  if (Array.isArray(input.args) && input.args.length > 0) {
+    const joined = input.args
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .join(' ');
+    if (joined) {
+      return `${title}: ${joined}`;
+    }
+  }
+
+  if (typeof input.pattern === 'string' && input.pattern.trim()) {
+    return `${title}: ${input.pattern.trim()}`;
+  }
+
+  if (typeof input.query === 'string' && input.query.trim()) {
+    return `${title}: ${input.query.trim()}`;
+  }
+
+  return title;
+}
+
 function extractAcpToolCalls(lines: AgentTranscriptLine[]): AcpToolCallRecord[] {
   const toolCalls = new Map<string, AcpToolCallRecord>();
 
@@ -302,18 +346,74 @@ function isProviderHealthResponse(
   return Boolean(value && typeof value === 'object' && 'providers' in value && 'selectedMode' in value);
 }
 
+const INITIAL_HEALTH_RETRY_ATTEMPTS = 3;
+const INITIAL_HEALTH_RETRY_DELAY_MS = 700;
+
+function shouldRetryInitialHealthCheck(health: AgentHealthCheckResponse | LegacyAgentHealthCheckResponse | null): boolean {
+  if (!health) {
+    return true;
+  }
+
+  if (isProviderHealthResponse(health)) {
+    return !health.providers.mcp.ok && !health.providers.cli.ok;
+  }
+
+  return !health.cursorInstalled && !health.acpReachable && !health.mcpRunning && !health.requiredConfigPresent;
+}
+
 export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
   const healthQuery = useIpc<AgentHealthCheckResponse | LegacyAgentHealthCheckResponse>('agent.health.check');
   const [lastCheck, setLastCheck] = useState<AgentHealthCheckResponse | LegacyAgentHealthCheckResponse | null>(null);
+  const [initialCheckPending, setInitialCheckPending] = useState(true);
+  const healthRequestIdRef = useRef(0);
+  const mountedRef = useRef(true);
 
-  const runCheck = useCallback(() => {
-    healthQuery.execute({ workspaceId }).then((data) => {
-      if (data) setLastCheck(data);
-    });
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const runCheck = useCallback(async (withStartupRetries = false) => {
+    const requestId = healthRequestIdRef.current + 1;
+    healthRequestIdRef.current = requestId;
+    if (withStartupRetries && mountedRef.current) {
+      setInitialCheckPending(true);
+    }
+
+    const maxAttempts = withStartupRetries ? INITIAL_HEALTH_RETRY_ATTEMPTS : 1;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const data = await healthQuery.execute({ workspaceId });
+      if (!mountedRef.current || requestId !== healthRequestIdRef.current) {
+        return;
+      }
+
+      if (data) {
+        setLastCheck(data);
+      }
+
+      const needsRetry = withStartupRetries
+        && attempt < maxAttempts - 1
+        && shouldRetryInitialHealthCheck(data);
+      if (!needsRetry) {
+        break;
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, INITIAL_HEALTH_RETRY_DELAY_MS));
+      if (!mountedRef.current || requestId !== healthRequestIdRef.current) {
+        return;
+      }
+    }
+
+    if (withStartupRetries && mountedRef.current && requestId === healthRequestIdRef.current) {
+      setInitialCheckPending(false);
+    }
   }, [workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    runCheck();
+    setLastCheck(null);
+    void runCheck(true);
   }, [runCheck]);
 
   const health = lastCheck;
@@ -358,7 +458,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
       </div>
 
       <div className="card-body" aria-live="polite" aria-atomic="true">
-        {healthQuery.loading && !health ? (
+        {(initialCheckPending || (healthQuery.loading && !health)) ? (
           <LoadingState message="Checking agent runtime health..." />
         ) : healthQuery.error && !health ? (
           <ErrorState
@@ -1141,7 +1241,7 @@ function AcpToolCallsView({ calls, loading, error }: { calls: AcpToolCallRecord[
       {calls.map((call) => (
         <div key={call.toolCallId} className="agent-tool-call-item">
           <div className="agent-tool-call-header">
-            <code className="agent-tool-call-name">{call.title}</code>
+            <code className="agent-tool-call-name">{summarizeAcpToolInput(call.title, call.rawInput)}</code>
             <Badge variant={call.status === 'completed' ? 'success' : call.status === 'in_progress' ? 'primary' : 'neutral'}>
               {call.status}
             </Badge>

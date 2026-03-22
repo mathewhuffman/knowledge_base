@@ -15,6 +15,20 @@ const logger_1 = require("./logger");
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
 const DEFAULT_KB_ACCESS_MODE = 'mcp';
 const CATALOG_DB_PATH = node_path_1.default.join('.meta', 'catalog.sqlite');
+const WORKSPACE_SCOPED_DB_TABLES = [
+    'article_families',
+    'revisions',
+    'draft_branches',
+    'pbi_batches',
+    'ai_runs',
+    'proposals',
+    'publish_jobs',
+    'assets',
+    'template_packs',
+    'zendesk_credentials',
+    'zendesk_sync_checkpoints',
+    'zendesk_sync_runs',
+];
 const PBIBATCH_STATUS_SEQUENCE = [
     shared_types_1.PBIBatchStatus.IMPORTED,
     shared_types_1.PBIBatchStatus.SCOPED,
@@ -240,7 +254,8 @@ class WorkspaceRepository {
             const totalExisting = catalog.get('SELECT COUNT(*) AS total FROM workspaces');
             const shouldBeDefault = (totalExisting?.total ?? 0) === 0;
             await this.prepareWorkspaceFilesystem(resolvedPath);
-            await this.ensureWorkspaceDb(resolvedPath);
+            const workspaceDbPath = await this.ensureWorkspaceDb(resolvedPath);
+            this.normalizeWorkspaceDbIdentity(workspaceDbPath, id);
             const workspaceRecord = {
                 id,
                 name: payload.name,
@@ -274,7 +289,6 @@ class WorkspaceRepository {
                 state: shared_types_1.WorkspaceState.ACTIVE,
                 isDefault: shouldBeDefault ? 1 : 0
             });
-            const workspaceDbPath = node_path_1.default.join(resolvedPath, '.meta', DEFAULT_DB_FILE);
             const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
             try {
                 workspaceDb.run(`INSERT INTO workspace_settings (
@@ -2514,6 +2528,50 @@ class WorkspaceRepository {
         this.repairWorkspaceDb(dbPath);
         this.ensureKbAccessModeColumn(dbPath);
         return dbPath;
+    }
+    normalizeWorkspaceDbIdentity(dbPath, workspaceId) {
+        const db = this.openWorkspaceDbWithRecovery(dbPath);
+        try {
+            const staleWorkspaceIds = new Set();
+            for (const tableName of WORKSPACE_SCOPED_DB_TABLES) {
+                const rows = db.all(`SELECT DISTINCT workspace_id as workspaceId
+           FROM ${tableName}
+           WHERE workspace_id IS NOT NULL AND workspace_id != @workspaceId`, { workspaceId });
+                for (const row of rows) {
+                    if (row.workspaceId) {
+                        staleWorkspaceIds.add(row.workspaceId);
+                    }
+                }
+            }
+            if (staleWorkspaceIds.size === 0) {
+                db.run(`DELETE FROM workspace_settings WHERE workspace_id != @workspaceId`, { workspaceId });
+                return;
+            }
+            const now = new Date().toISOString();
+            db.exec('BEGIN IMMEDIATE TRANSACTION');
+            for (const staleWorkspaceId of staleWorkspaceIds) {
+                for (const tableName of WORKSPACE_SCOPED_DB_TABLES) {
+                    db.run(`UPDATE ${tableName}
+             SET workspace_id = @workspaceId
+             WHERE workspace_id = @staleWorkspaceId`, { workspaceId, staleWorkspaceId });
+                }
+            }
+            db.run(`DELETE FROM workspace_settings WHERE workspace_id != @workspaceId`, { workspaceId });
+            db.run(`UPDATE draft_branches SET updated_at = @updatedAt WHERE workspace_id = @workspaceId`, { workspaceId, updatedAt: now });
+            db.exec('COMMIT');
+        }
+        catch (error) {
+            try {
+                db.exec('ROLLBACK');
+            }
+            catch {
+                // no-op
+            }
+            throw error;
+        }
+        finally {
+            db.close();
+        }
     }
     ensureKbAccessModeColumn(dbPath) {
         const db = (0, db_1.openWorkspaceDatabase)(dbPath);
