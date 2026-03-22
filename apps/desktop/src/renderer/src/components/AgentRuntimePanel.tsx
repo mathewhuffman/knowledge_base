@@ -584,12 +584,36 @@ function mergeTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine
       continue;
     }
 
-    previousParsed.update.content.text = `${previousText}${contentText}`;
+    previousParsed.update.content.text = appendStreamingText(previousText, contentText);
     previous.payload = JSON.stringify(previousParsed);
     previous.atUtc = line.atUtc;
   }
 
   return merged;
+}
+
+function appendStreamingText(existing: string, next: string): string {
+  if (!next) {
+    return existing;
+  }
+  if (!existing) {
+    return next;
+  }
+  if (existing.endsWith(next)) {
+    return existing;
+  }
+  if (next.startsWith(existing)) {
+    return next;
+  }
+
+  const maxOverlap = Math.min(existing.length, next.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    if (existing.slice(-overlap) === next.slice(0, overlap)) {
+      return `${existing}${next.slice(overlap)}`;
+    }
+  }
+
+  return `${existing}${next}`;
 }
 
 function formatPayload(raw: string): string {
@@ -902,6 +926,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const isRunning = jobState === 'RUNNING' || jobState === 'QUEUED';
   const isDone = jobState === 'SUCCEEDED' || jobState === 'FAILED' || jobState === 'CANCELED';
   const transcriptLines = liveTranscriptLines;
+  const mergedTranscriptLines = useMemo(() => mergeTranscriptLines(transcriptLines), [transcriptLines]);
   const toolCalls = liveToolCalls;
   const acpToolCalls = useMemo(() => extractAcpToolCalls(transcriptLines), [transcriptLines]);
   const hasHistory = Boolean(activeSessionId);
@@ -955,10 +980,10 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     chunks.push('');
     chunks.push('Transcript');
     chunks.push('----------');
-    if (transcriptLines.length === 0) {
+    if (mergedTranscriptLines.length === 0) {
       chunks.push('No transcript lines');
     } else {
-      transcriptLines.forEach((line) => {
+      mergedTranscriptLines.forEach((line) => {
         chunks.push(`[${formatTimestamp(line.atUtc)}] ${line.direction} ${line.event}`);
         chunks.push(formatPayload(line.payload));
       });
@@ -993,7 +1018,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     }
 
     return chunks.join('\n');
-  }, [batchId, events, jobState, latestBatchSession, progress, toolCalls, transcriptLines]);
+  }, [batchId, events, jobState, latestBatchSession, mergedTranscriptLines, progress, toolCalls]);
 
   const copyAnalysisContents = useCallback(() => {
     if (!canCopy) {

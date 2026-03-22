@@ -60,6 +60,8 @@ export declare enum PublishStatus {
     FAILED = "failed",
     CANCELED = "canceled"
 }
+export type WorkspaceModelReasoningPreference = 'inherit' | 'low' | 'medium' | 'high';
+export type WorkspaceModelThinkingPreference = 'inherit' | 'on' | 'off';
 export interface WorkspaceRecord {
     id: EntityId;
     name: string;
@@ -90,6 +92,10 @@ export interface WorkspaceSettingsRecord {
     zendeskBrandId?: string;
     defaultLocale: string;
     enabledLocales: string[];
+    agentRuntimeMode?: 'mcp_only' | 'app_runtime';
+    agentModelId?: string;
+    agentReasoning?: WorkspaceModelReasoningPreference;
+    agentThinking?: WorkspaceModelThinkingPreference;
 }
 export interface WorkspaceSettingsUpdateRequest {
     workspaceId: EntityId;
@@ -97,6 +103,10 @@ export interface WorkspaceSettingsUpdateRequest {
     zendeskBrandId?: string;
     defaultLocale?: string;
     enabledLocales?: string[];
+    agentRuntimeMode?: 'mcp_only' | 'app_runtime';
+    agentModelId?: string;
+    agentReasoning?: WorkspaceModelReasoningPreference;
+    agentThinking?: WorkspaceModelThinkingPreference;
 }
 export interface WorkspaceListItem extends WorkspaceRecord {
     isDefaultWorkspace: boolean;

@@ -309,6 +309,24 @@ exports.migrations = [
       ALTER TABLE pbi_records ADD COLUMN validation_status TEXT NOT NULL DEFAULT 'candidate';
       ALTER TABLE pbi_records ADD COLUMN validation_reason TEXT;
     `
+    },
+    {
+        version: 5,
+        name: '0005_workspace_agent_runtime_mode',
+        description: 'Persist workspace agent runtime mode selection.',
+        sql: `
+      ALTER TABLE workspace_settings ADD COLUMN agent_runtime_mode TEXT NOT NULL DEFAULT 'mcp_only';
+    `
+    },
+    {
+        version: 6,
+        name: '0006_workspace_agent_runtime_preferences',
+        description: 'Persist workspace AI model and runtime preference settings.',
+        sql: `
+      ALTER TABLE workspace_settings ADD COLUMN agent_model_id TEXT;
+      ALTER TABLE workspace_settings ADD COLUMN agent_reasoning TEXT;
+      ALTER TABLE workspace_settings ADD COLUMN agent_thinking TEXT;
+    `
     }
 ];
 function getMigrationStatements() {

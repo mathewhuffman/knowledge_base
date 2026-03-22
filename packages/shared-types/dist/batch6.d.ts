@@ -46,6 +46,30 @@ export interface AgentSessionGetRequest {
     workspaceId: string;
     sessionId: string;
 }
+export interface AgentRuntimeOptionsRequest {
+    workspaceId: string;
+}
+export interface AgentRuntimeModelCost {
+    inputUsdPerMillion: number;
+    cacheWriteUsdPerMillion: number | null;
+    cacheReadUsdPerMillion: number | null;
+    outputUsdPerMillion: number;
+}
+export interface AgentRuntimeModelOption {
+    id: string;
+    provider: string;
+    name: string;
+    costs: AgentRuntimeModelCost;
+}
+export interface AgentRuntimeOptionsResponse {
+    workspaceId: string;
+    currentModelId?: string;
+    availableModels?: string[];
+    currentModeId?: string;
+    availableModes?: string[];
+    modelCatalog?: AgentRuntimeModelOption[];
+    configOptions?: unknown;
+}
 export interface AgentAnalysisRunRequest {
     workspaceId: string;
     batchId: string;

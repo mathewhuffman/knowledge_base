@@ -23,6 +23,34 @@ const PBIBATCH_STATUS_SEQUENCE = [
     shared_types_1.PBIBatchStatus.REVIEW_COMPLETE,
     shared_types_1.PBIBatchStatus.ARCHIVED
 ];
+const DEFAULT_MODEL_PREFERENCE_VALUES = new Set(['inherit', 'low', 'medium', 'high']);
+const DEFAULT_THINKING_PREFERENCE_VALUES = new Set(['inherit', 'on', 'off']);
+function normalizeReasoningPref(value) {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+    const next = value.trim();
+    if (!DEFAULT_MODEL_PREFERENCE_VALUES.has(next)) {
+        return undefined;
+    }
+    if (next === 'low' || next === 'medium' || next === 'high' || next === 'inherit') {
+        return next;
+    }
+    return undefined;
+}
+function normalizeThinkingPref(value) {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+    const next = value.trim();
+    if (!DEFAULT_THINKING_PREFERENCE_VALUES.has(next)) {
+        return undefined;
+    }
+    if (next === 'on' || next === 'off' || next === 'inherit') {
+        return next;
+    }
+    return undefined;
+}
 class WorkspaceRepository {
     workspaceRoot;
     catalogDbPath;
@@ -71,7 +99,7 @@ class WorkspaceRepository {
             const workspaceDbPath = node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE);
             const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
             try {
-                const settings = workspaceDb.get(`SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
+                const settings = workspaceDb.get(`SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, agent_runtime_mode, agent_model_id, agent_reasoning, agent_thinking
            FROM workspace_settings WHERE workspace_id = @workspaceId`, { workspaceId: id });
                 if (settings) {
                     return {
@@ -79,20 +107,30 @@ class WorkspaceRepository {
                         zendeskSubdomain: settings.zendesk_subdomain,
                         zendeskBrandId: settings.zendesk_brand_id ?? undefined,
                         defaultLocale: settings.default_locale,
-                        enabledLocales: safeParseLocales(settings.enabled_locales)
+                        enabledLocales: safeParseLocales(settings.enabled_locales),
+                        agentRuntimeMode: settings.agent_runtime_mode ?? 'mcp_only',
+                        agentModelId: settings.agent_model_id?.trim() ? settings.agent_model_id.trim() : undefined,
+                        agentReasoning: normalizeReasoningPref(settings.agent_reasoning),
+                        agentThinking: normalizeThinkingPref(settings.agent_thinking)
                     };
                 }
                 const enabledLocales = safeParseLocales(row.enabled_locales);
                 workspaceDb.run(`INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, agent_runtime_mode,
+            agent_model_id, agent_reasoning, agent_thinking, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @agentRuntimeMode,
+            @agentModelId, @agentReasoning, @agentThinking, @updatedAt
           )`, {
                     workspaceId: id,
                     zendeskSubdomain: row.zendesk_subdomain,
                     zendeskBrandId: row.zendesk_brand_id,
                     defaultLocale: row.default_locale,
                     enabledLocales: JSON.stringify(enabledLocales),
+                    agentRuntimeMode: 'mcp_only',
+                    agentModelId: null,
+                    agentReasoning: null,
+                    agentThinking: null,
                     updatedAt: new Date().toISOString()
                 });
                 return {
@@ -100,7 +138,8 @@ class WorkspaceRepository {
                     zendeskSubdomain: row.zendesk_subdomain,
                     zendeskBrandId: row.zendesk_brand_id ?? undefined,
                     defaultLocale: row.default_locale,
-                    enabledLocales
+                    enabledLocales,
+                    agentRuntimeMode: 'mcp_only'
                 };
             }
             finally {
@@ -122,16 +161,24 @@ class WorkspaceRepository {
             const workspaceDbPath = node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE);
             const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
             try {
-                const existing = workspaceDb.get(`SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
+                const existing = workspaceDb.get(`SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, agent_runtime_mode, agent_model_id, agent_reasoning, agent_thinking
            FROM workspace_settings WHERE workspace_id = @workspaceId`, { workspaceId: payload.workspaceId });
                 const fallbackDefaultLocale = existing?.default_locale ?? row.default_locale;
                 const fallbackSubdomain = existing?.zendesk_subdomain ?? row.zendesk_subdomain;
                 const fallbackBrand = existing?.zendesk_brand_id ?? row.zendesk_brand_id;
                 const fallbackEnabledLocales = safeParseLocales(existing?.enabled_locales ?? row.enabled_locales);
+                const fallbackAgentRuntimeMode = existing?.agent_runtime_mode ?? 'mcp_only';
+                const fallbackAgentModelId = existing?.agent_model_id ?? undefined;
+                const fallbackAgentReasoning = normalizeReasoningPref(existing?.agent_reasoning);
+                const fallbackAgentThinking = normalizeThinkingPref(existing?.agent_thinking);
                 if (payload.zendeskSubdomain === undefined &&
                     payload.zendeskBrandId === undefined &&
                     payload.defaultLocale === undefined &&
-                    payload.enabledLocales === undefined) {
+                    payload.enabledLocales === undefined &&
+                    payload.agentRuntimeMode === undefined &&
+                    payload.agentModelId === undefined &&
+                    payload.agentReasoning === undefined &&
+                    payload.agentThinking === undefined) {
                     throw new Error('No settings provided');
                 }
                 if (payload.defaultLocale !== undefined && !payload.defaultLocale.trim()) {
@@ -146,9 +193,13 @@ class WorkspaceRepository {
                 const enabledLocales = payload.enabledLocales?.length
                     ? normalizeLocales(payload.enabledLocales)
                     : fallbackEnabledLocales;
+                const nextAgentRuntimeMode = payload.agentRuntimeMode ?? fallbackAgentRuntimeMode;
                 const nextDefaultLocale = payload.defaultLocale ?? fallbackDefaultLocale;
                 const nextSubdomain = payload.zendeskSubdomain ?? fallbackSubdomain;
                 const nextBrand = payload.zendeskBrandId !== undefined ? payload.zendeskBrandId : fallbackBrand;
+                const nextAgentModelId = payload.agentModelId !== undefined ? payload.agentModelId : fallbackAgentModelId;
+                const nextAgentReasoning = payload.agentReasoning !== undefined ? payload.agentReasoning : fallbackAgentReasoning;
+                const nextAgentThinking = payload.agentThinking !== undefined ? payload.agentThinking : fallbackAgentThinking;
                 if (!nextSubdomain) {
                     throw new Error('zendeskSubdomain cannot be empty');
                 }
@@ -164,15 +215,21 @@ class WorkspaceRepository {
                 const normalizedEnabledLocales = normalizeLocales(enabledLocales);
                 const now = new Date().toISOString();
                 workspaceDb.run(`INSERT OR REPLACE INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, agent_runtime_mode,
+            agent_model_id, agent_reasoning, agent_thinking, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @agentRuntimeMode,
+            @agentModelId, @agentReasoning, @agentThinking, @updatedAt
           )`, {
                     workspaceId: payload.workspaceId,
                     zendeskSubdomain: nextSubdomain,
                     zendeskBrandId: nextBrand,
                     defaultLocale: nextDefaultLocale,
                     enabledLocales: JSON.stringify(normalizedEnabledLocales),
+                    agentRuntimeMode: nextAgentRuntimeMode,
+                    agentModelId: nextAgentModelId ?? null,
+                    agentReasoning: nextAgentReasoning ?? null,
+                    agentThinking: nextAgentThinking ?? null,
                     updatedAt: now
                 });
                 catalog.run(`UPDATE workspaces
@@ -194,7 +251,11 @@ class WorkspaceRepository {
                     zendeskSubdomain: nextSubdomain,
                     zendeskBrandId: nextBrand ?? undefined,
                     defaultLocale: nextDefaultLocale,
-                    enabledLocales: normalizedEnabledLocales
+                    enabledLocales: normalizedEnabledLocales,
+                    agentRuntimeMode: nextAgentRuntimeMode,
+                    agentModelId: nextAgentModelId,
+                    agentReasoning: nextAgentReasoning,
+                    agentThinking: nextAgentThinking
                 };
             }
             finally {
@@ -264,15 +325,21 @@ class WorkspaceRepository {
             const workspaceDb = this.openWorkspaceDbWithRecovery(workspaceDbPath);
             try {
                 workspaceDb.run(`INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, agent_runtime_mode,
+            agent_model_id, agent_reasoning, agent_thinking, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @agentRuntimeMode,
+            @agentModelId, @agentReasoning, @agentThinking, @updatedAt
           )`, {
                     workspaceId: id,
                     zendeskSubdomain: payload.zendeskSubdomain,
                     zendeskBrandId: payload.zendeskBrandId ?? null,
                     defaultLocale: payload.defaultLocale,
                     enabledLocales: JSON.stringify(enabledLocales),
+                    agentRuntimeMode: 'mcp_only',
+                    agentModelId: null,
+                    agentReasoning: null,
+                    agentThinking: null,
                     updatedAt: now
                 });
             }

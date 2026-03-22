@@ -7,6 +7,10 @@ import type {
   ZendeskCategoryRecord,
   ZendeskSectionRecord,
   ZendeskSearchArticleRecord,
+  AgentRuntimeOptionsResponse,
+  AgentRuntimeModelOption,
+  WorkspaceModelReasoningPreference,
+  WorkspaceModelThinkingPreference,
 } from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
@@ -654,6 +658,15 @@ function ZendeskTaxonomyBrowser({ workspaceId }: { workspaceId: string }) {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Model cost formatting helper                                        */
+/* ------------------------------------------------------------------ */
+function formatModelCost(model: AgentRuntimeModelOption): string {
+  const fmt = (v: number | null) => (v == null ? '-' : `$${v.toFixed(2)}`);
+  const c = model.costs;
+  return `In ${fmt(c.inputUsdPerMillion)} · CW ${fmt(c.cacheWriteUsdPerMillion)} · CR ${fmt(c.cacheReadUsdPerMillion)} · Out ${fmt(c.outputUsdPerMillion)} /M tok`;
+}
+
 /* ================================================================== */
 /* Main Settings page                                                  */
 /* ================================================================== */
@@ -667,9 +680,15 @@ export const Settings = () => {
   const [activeSection, setActiveSection] = useState('zendesk');
   const [selectedSession, setSelectedSession] = useState<AgentSessionRecord | null>(null);
 
+  const runtimeOptionsQuery = useIpc<AgentRuntimeOptionsResponse>('agent.runtime.options.get');
+
   // Form state for locale settings
   const [defaultLocale, setDefaultLocale] = useState('');
   const [enabledLocales, setEnabledLocales] = useState<string[]>([]);
+  const [agentRuntimeMode, setAgentRuntimeMode] = useState<'mcp_only' | 'app_runtime'>('mcp_only');
+  const [agentModelId, setAgentModelId] = useState('');
+  const [agentReasoning, setAgentReasoning] = useState<WorkspaceModelReasoningPreference>('inherit');
+  const [agentThinking, setAgentThinking] = useState<WorkspaceModelThinkingPreference>('inherit');
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   useEffect(() => {
@@ -677,6 +696,7 @@ export const Settings = () => {
       settingsQuery.execute({ workspaceId: activeWorkspace.id });
       repoQuery.execute({ workspaceId: activeWorkspace.id });
       credentialsQuery.execute({ workspaceId: activeWorkspace.id });
+      runtimeOptionsQuery.execute({ workspaceId: activeWorkspace.id });
     }
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -684,8 +704,21 @@ export const Settings = () => {
     if (settingsQuery.data) {
       setDefaultLocale(settingsQuery.data.defaultLocale);
       setEnabledLocales(settingsQuery.data.enabledLocales);
+      setAgentRuntimeMode(settingsQuery.data.agentRuntimeMode ?? 'mcp_only');
+      setAgentModelId(settingsQuery.data.agentModelId ?? '');
+      setAgentReasoning(settingsQuery.data.agentReasoning ?? 'inherit');
+      setAgentThinking(settingsQuery.data.agentThinking ?? 'inherit');
     }
   }, [settingsQuery.data]);
+
+  // When runtime options load, default model to currentModelId if settings don't have one saved
+  useEffect(() => {
+    const opts = runtimeOptionsQuery.data;
+    if (!opts || settingsQuery.data?.agentModelId) return;
+    // Prefer currentModelId; fall back to first catalog entry
+    const fallback = opts.currentModelId ?? opts.modelCatalog?.[0]?.id;
+    if (fallback) setAgentModelId(fallback);
+  }, [runtimeOptionsQuery.data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleToggleLocale = (locale: string) => {
     if (locale === defaultLocale) return;
@@ -711,6 +744,63 @@ export const Settings = () => {
   const handleCredentialsSaved = () => {
     if (activeWorkspace) {
       credentialsQuery.execute({ workspaceId: activeWorkspace.id });
+    }
+  };
+
+  const [runtimeValidationError, setRuntimeValidationError] = useState('');
+
+  const handleSaveAgentRuntime = async () => {
+    if (!activeWorkspace) return;
+    setRuntimeValidationError('');
+    setSaveSuccess(false);
+
+    const VALID_REASONING: WorkspaceModelReasoningPreference[] = ['inherit', 'low', 'medium', 'high'];
+    const VALID_THINKING: WorkspaceModelThinkingPreference[] = ['inherit', 'on', 'off'];
+    if (!VALID_REASONING.includes(agentReasoning)) {
+      setRuntimeValidationError('Invalid reasoning value.');
+      return;
+    }
+    if (!VALID_THINKING.includes(agentThinking)) {
+      setRuntimeValidationError('Invalid thinking value.');
+      return;
+    }
+
+    // Build payload with only changed fields
+    const saved = settingsQuery.data;
+    const payload: Record<string, unknown> = { workspaceId: activeWorkspace.id };
+
+    if (agentRuntimeMode !== (saved?.agentRuntimeMode ?? 'mcp_only')) {
+      payload.agentRuntimeMode = agentRuntimeMode;
+    }
+    if (agentModelId !== (saved?.agentModelId ?? '')) {
+      payload.agentModelId = agentModelId || undefined;
+    }
+    if (agentReasoning !== (saved?.agentReasoning ?? 'inherit')) {
+      payload.agentReasoning = agentReasoning;
+    }
+    if (agentThinking !== (saved?.agentThinking ?? 'inherit')) {
+      payload.agentThinking = agentThinking;
+    }
+
+    // Nothing changed besides workspaceId — skip network call
+    if (Object.keys(payload).length <= 1) {
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 2000);
+      return;
+    }
+
+    const result = await settingsMutation.mutate(payload);
+    if (result) {
+      // Refresh local form state from response
+      settingsQuery.execute({ workspaceId: activeWorkspace.id });
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 2000);
+    }
+  };
+
+  const handleRefreshRuntimeOptions = () => {
+    if (activeWorkspace) {
+      runtimeOptionsQuery.execute({ workspaceId: activeWorkspace.id });
     }
   };
 
@@ -846,6 +936,119 @@ export const Settings = () => {
           {activeSection === 'ai' && (
             <div>
               <h3 className="settings-heading">AI Runtime</h3>
+              <div className="card card-padded" style={{ marginBottom: 'var(--space-4)' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+                  <div>
+                    <label className="settings-label">Batch analysis mode</label>
+                    <select
+                      className="select"
+                      value={agentRuntimeMode}
+                      onChange={(e) => setAgentRuntimeMode(e.target.value as 'mcp_only' | 'app_runtime')}
+                    >
+                      <option value="mcp_only">MCP only</option>
+                      <option value="app_runtime">App runtime</option>
+                    </select>
+                    <div className="settings-hint">
+                      `MCP only` requires Cursor ACP to expose KB Vault MCP tools. `App runtime` gathers KB data inside KB Vault first, then sends curated context to the model.
+                    </div>
+                  </div>
+
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-1)' }}>
+                      <label className="settings-label" style={{ marginBottom: 0 }}>Preferred model</label>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={handleRefreshRuntimeOptions}
+                        disabled={runtimeOptionsQuery.loading}
+                        title="Refresh available models"
+                      >
+                        <IconRefreshCw size={12} />
+                      </button>
+                    </div>
+                    {runtimeOptionsQuery.loading ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', padding: 'var(--space-2) 0' }}>
+                        <span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                        <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>Loading models...</span>
+                      </div>
+                    ) : runtimeOptionsQuery.data?.modelCatalog && runtimeOptionsQuery.data.modelCatalog.length > 0 ? (
+                      <>
+                        <select
+                          className="select"
+                          value={agentModelId}
+                          onChange={(e) => setAgentModelId(e.target.value)}
+                        >
+                          <option value="">— none —</option>
+                          {runtimeOptionsQuery.data.modelCatalog.map((m) => (
+                            <option key={m.id} value={m.id}>{m.provider} – {m.name}</option>
+                          ))}
+                        </select>
+                        {/* Cost sublabel for selected model */}
+                        {agentModelId && (() => {
+                          const sel = runtimeOptionsQuery.data!.modelCatalog!.find((m) => m.id === agentModelId);
+                          return sel ? (
+                            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', marginTop: 'var(--space-1)', fontFamily: 'var(--font-mono)' }}>
+                              {formatModelCost(sel)}
+                            </div>
+                          ) : null;
+                        })()}
+                      </>
+                    ) : (
+                      <select className="select" disabled>
+                        <option>No runtime models available</option>
+                      </select>
+                    )}
+                    {!runtimeOptionsQuery.loading && runtimeOptionsQuery.error && (
+                      <div className="settings-hint">
+                        Could not fetch available models. Check agent runtime health.
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="settings-label">Reasoning</label>
+                    <select
+                      className="select"
+                      value={agentReasoning}
+                      onChange={(e) => setAgentReasoning(e.target.value as WorkspaceModelReasoningPreference)}
+                    >
+                      <option value="inherit">Inherit</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                    </select>
+                    <div className="settings-hint">Controls the depth of reasoning the model uses during analysis.</div>
+                  </div>
+
+                  <div>
+                    <label className="settings-label">Thinking</label>
+                    <select
+                      className="select"
+                      value={agentThinking}
+                      onChange={(e) => setAgentThinking(e.target.value as WorkspaceModelThinkingPreference)}
+                    >
+                      <option value="inherit">Inherit</option>
+                      <option value="on">On</option>
+                      <option value="off">Off</option>
+                    </select>
+                    <div className="settings-hint">Toggle extended thinking (chain-of-thought) for the agent model.</div>
+                  </div>
+
+                  {runtimeValidationError && (
+                    <span className="settings-inline-error">{runtimeValidationError}</span>
+                  )}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                    <button className="btn btn-primary" onClick={handleSaveAgentRuntime} disabled={settingsMutation.loading}>
+                      {settingsMutation.loading ? 'Saving...' : 'Save AI Runtime'}
+                    </button>
+                    {saveSuccess && (
+                      <span className="settings-inline-success">
+                        <IconCheckCircle size={14} /> Saved
+                      </span>
+                    )}
+                    {settingsMutation.error && <span className="settings-inline-error">{settingsMutation.error}</span>}
+                  </div>
+                </div>
+              </div>
               <HealthStatusPanel workspaceId={activeWorkspace.id} />
               {selectedSession ? (
                 <SessionDetailPanel

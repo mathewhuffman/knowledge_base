@@ -15,6 +15,7 @@ function buildTaskPrompt(session, taskPayload, extras) {
     const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
     const locale = typeof taskPayload.locale === 'string' ? taskPayload.locale : session.locale ?? 'default';
     const explicitPrompt = typeof taskPayload.prompt === 'string' ? taskPayload.prompt.trim() : '';
+    const runtimeMode = extras?.runtimeMode ?? 'mcp_only';
     const mcpGuidance = [
         'KB Vault MCP guidance:',
         '- Use only these exact KB Vault MCP tool names when needed: get_batch_context, get_pbi_subset, get_pbi, get_article, get_article_family, get_locale_variant, get_article_history, find_related_articles, search_kb, list_article_templates, get_template, propose_create_kb, propose_edit_kb, propose_retire_kb, record_agent_notes.',
@@ -36,6 +37,38 @@ function buildTaskPrompt(session, taskPayload, extras) {
         .filter(Boolean)
         .join('\n\n');
     if (taskPayload.task === 'analyze_batch') {
+        if (runtimeMode === 'app_runtime') {
+            return [
+                'You are running inside KB Vault App Runtime for one imported PBI batch.',
+                `Workspace ID: ${session.workspaceId}`,
+                `Batch ID: ${batchId}`,
+                `Locale: ${locale}`,
+                '',
+                'Batch context and uploaded PBI rows are already loaded below.',
+                'Do not call get_batch_context unless the user explicitly says the batch changed.',
+                'Do not output analysis, planning, or commentary before your JSON response.',
+                'Your first response must be exactly one JSON object.',
+                'If you need more evidence, request exactly one tool.',
+                'If the preloaded evidence is already sufficient, return final immediately.',
+                '',
+                'Allowed tool names: get_pbi_subset, get_pbi, get_article, get_article_family, get_locale_variant, get_article_history, find_related_articles, search_kb, list_article_templates, get_template, record_agent_notes, propose_create_kb, propose_edit_kb, propose_retire_kb.',
+                'Allowed response shapes only:',
+                '  {"type":"tool_call","tool":"get_article","input":{"localeVariantId":"..."}}',
+                '  {"type":"tool_call","tool":"search_kb","input":{"query":"..."}}',
+                '  {"type":"tool_call","tool":"get_pbi_subset","input":{"batchId":"..."}}',
+                '  {"type":"final","content":"..."}',
+                'Reply with JSON only.',
+                'Do not wrap JSON in markdown fences.',
+                'Do not explain your choice.',
+                '',
+                explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
+                '',
+                extraSections,
+                '',
+                'Session context JSON:',
+                JSON.stringify({ session, task: taskPayload })
+            ].filter(Boolean).join('\n');
+        }
         return [
             'You are running inside KB Vault to analyze one imported PBI batch.',
             `Workspace ID: ${session.workspaceId}`,
@@ -74,9 +107,13 @@ function buildTaskPrompt(session, taskPayload, extras) {
             'Tool rules:',
             '- Use KB Vault tools and structured article/template data only.',
             '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
-            '- The preloaded prompt context is for orientation; use KB Vault MCP tools directly when you need to confirm or inspect source records.',
+            runtimeMode === 'app_runtime'
+                ? '- You are in App Runtime mode. KB Vault has an active harness for approved KB tool requests. When you emit a valid tool_call JSON object, KB Vault will execute it, return the result, and continue the lifecycle with you. If a tool request is unrecognized or fails, KB Vault will return that outcome and re-engage you so you can decide the next step. Do not discuss tool availability or missing MCP tools.'
+                : '- The preloaded prompt context is for orientation; use KB Vault MCP tools directly when you need to confirm or inspect source records.',
             '',
-            mcpGuidance,
+            runtimeMode === 'mcp_only'
+                ? mcpGuidance
+                : 'App Runtime guidance:\n- Reply with JSON only.\n- Use {"type":"tool_call",...} to request KB Vault data or {"type":"final","content":"..."} to finish.\n- The KB Vault harness is active in this session. Valid tool_call requests will be executed and their results will be returned to you.\n- If a tool_call is unrecognized or execution fails, KB Vault will return that outcome and re-engage you so you can choose the next step.\n- Do not mention missing tools or speculate about tool exposure.',
             '',
             explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
             '',
@@ -354,6 +391,9 @@ class CursorAcpRuntime {
     cursorSessionIds = new Map();
     cursorSessionLookup = new Map();
     activeStreamEmitters = new Map();
+    sessionMessageBuffers = new Map();
+    appRuntimeSessions = new Set();
+    appRuntimeNativeToolUsage = new Map();
     debugLogger;
     configuredMcpServers;
     toolContext;
@@ -445,7 +485,7 @@ class CursorAcpRuntime {
             issues
         };
     }
-    async ensureAcpSession(sessionId) {
+    async ensureAcpSession(sessionId, _sessionConfig) {
         const existing = this.cursorSessionIds.get(sessionId);
         if (existing) {
             return existing;
@@ -464,20 +504,48 @@ class CursorAcpRuntime {
         this.cursorSessionLookup.set(result.sessionId, sessionId);
         return result.sessionId;
     }
-    buildSessionCreateParams() {
-        const mcpServers = this.configuredMcpServers.length > 0 ? this.configuredMcpServers : buildBridgeMcpServerConfig();
+    buildSessionCreateParams(sessionConfig) {
+        const isAppRuntime = sessionConfig?.appRuntime === true;
+        const mcpServers = isAppRuntime
+            ? []
+            : this.configuredMcpServers.length > 0
+                ? this.configuredMcpServers
+                : buildBridgeMcpServerConfig();
         return {
             cwd: this.config.acpCwd,
             ...(mcpServers.length > 0 ? { mcpServers } : {}),
             config: {
-                mode: 'agent'
+                mode: isAppRuntime ? 'ask' : 'agent'
             }
+        };
+    }
+    async getRuntimeOptions(workspaceId) {
+        const response = await this.transport.request('session/new', this.buildSessionCreateParams(), this.config.requestTimeoutMs, `runtime-options:${workspaceId}`);
+        if (response.error) {
+            throw new Error(response.error.message);
+        }
+        const result = response.result;
+        if (result?.sessionId) {
+            try {
+                await this.transport.request('session/close', { sessionId: result.sessionId }, this.config.requestTimeoutMs, `runtime-options:${workspaceId}`);
+            }
+            catch {
+                // Ignore best-effort close errors for runtime option probe.
+            }
+        }
+        return {
+            workspaceId,
+            currentModelId: typeof result?.currentModelId === 'string' ? result.currentModelId : undefined,
+            availableModels: Array.isArray(result?.availableModels) ? result.availableModels.filter((value) => typeof value === 'string') : undefined,
+            currentModeId: typeof result?.currentModeId === 'string' ? result.currentModeId : undefined,
+            availableModes: Array.isArray(result?.availableModes) ? result.availableModes.filter((value) => typeof value === 'string') : undefined,
+            configOptions: result?.configOptions
         };
     }
     async handleMcpJsonMessage(raw) {
         return this.mcpServer.handleJsonMessage(raw);
     }
-    async runBatchAnalysis(request, emit, isCancelled) {
+    async runBatchAnalysis(request, emit, isCancelled, runtimeMode = 'mcp_only', runtimeConfig) {
         const session = await this.resolveSession(request);
         const startedAt = new Date().toISOString();
         const runId = (0, node_crypto_1.randomUUID)();
@@ -487,20 +555,30 @@ class CursorAcpRuntime {
         this.log('agent.runtime.batch_analysis_begin', {
             workspaceId: request.workspaceId,
             batchId: request.batchId,
+            runtimeMode,
             locale: request.locale,
             timeoutMs: request.timeoutMs ?? this.config.requestTimeoutMs
         });
         try {
-            await this.transit(session, {
-                task: 'analyze_batch',
-                batchId: request.batchId,
-                prompt: request.prompt,
-                locale: request.locale,
-                templatePackId: request.templatePackId
-            }, (event) => {
-                rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
-                emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
-            }, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs);
+            if (runtimeMode === 'app_runtime') {
+                await this.runAppRuntimeBatchAnalysis(session, request, (event) => {
+                    rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                    emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+                }, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs, runtimeConfig);
+            }
+            else {
+                await this.transit(session, {
+                    task: 'analyze_batch',
+                    batchId: request.batchId,
+                    prompt: request.prompt,
+                    locale: request.locale,
+                    templatePackId: request.templatePackId,
+                    runtimeMode
+                }, runtimeConfig, (event) => {
+                    rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                    emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+                }, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs);
+            }
             const endedAt = new Date().toISOString();
             return {
                 sessionId: session.id,
@@ -543,7 +621,7 @@ class CursorAcpRuntime {
             });
         }
     }
-    async runArticleEdit(request, emit, isCancelled) {
+    async runArticleEdit(request, emit, isCancelled, runtimeMode = 'mcp_only', runtimeConfig) {
         const session = await this.resolveSession(request);
         const startedAt = new Date().toISOString();
         const runId = (0, node_crypto_1.randomUUID)();
@@ -560,8 +638,9 @@ class CursorAcpRuntime {
                 task: 'edit_article',
                 localeVariantId: request.localeVariantId,
                 prompt: request.prompt,
-                locale: request.locale
-            }, (event) => {
+                locale: request.locale,
+                runtimeMode
+            }, runtimeConfig, (event) => {
                 rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
                 emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
             }, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs);
@@ -681,7 +760,7 @@ class CursorAcpRuntime {
         session.updatedAtUtc = new Date().toISOString();
         return session;
     }
-    async transit(session, taskPayload, emit, toolCalls, isCancelled, timeoutMs) {
+    async transit(session, taskPayload, _runtimeConfig, emit, toolCalls, isCancelled, timeoutMs) {
         const requestEnvelope = {
             session,
             task: taskPayload
@@ -710,7 +789,7 @@ class CursorAcpRuntime {
                     workspaceId: session.workspaceId,
                     sessionId: session.id
                 });
-                const acpSessionId = await this.ensureAcpSession(session.id);
+                const acpSessionId = await this.ensureAcpSession(session.id, _runtimeConfig);
                 const requestPayload = {
                     sessionId: acpSessionId,
                     prompt: [
@@ -747,11 +826,13 @@ class CursorAcpRuntime {
     }
     async buildPromptText(session, taskPayload) {
         if (taskPayload.task !== 'analyze_batch') {
-            return buildTaskPrompt(session, taskPayload);
+            const runtimeMode = taskPayload.runtimeMode === 'app_runtime' ? 'app_runtime' : 'mcp_only';
+            return buildTaskPrompt(session, taskPayload, { runtimeMode });
         }
         const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
+        const runtimeMode = taskPayload.runtimeMode === 'app_runtime' ? 'app_runtime' : 'mcp_only';
         if (!batchId) {
-            return buildTaskPrompt(session, taskPayload);
+            return buildTaskPrompt(session, taskPayload, { runtimeMode });
         }
         let batchContext;
         let uploadedPbis;
@@ -784,7 +865,8 @@ class CursorAcpRuntime {
         return buildTaskPrompt(session, taskPayload, {
             batchContext,
             uploadedPbis,
-            articleDirectory
+            articleDirectory,
+            runtimeMode
         });
     }
     async executeWithRetry(fn, maxAttempts, isCancelled) {
@@ -825,8 +907,30 @@ class CursorAcpRuntime {
         if (!localSessionId) {
             return;
         }
+        const update = params && typeof params === 'object' && 'update' in params
+            ? params.update
+            : undefined;
         const payload = JSON.stringify(message.params);
-        await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
+        const isAppRuntimeSession = this.appRuntimeSessions.has(localSessionId);
+        const isNativeToolUpdate = update?.sessionUpdate === 'tool_call' || update?.sessionUpdate === 'tool_call_update';
+        if (isAppRuntimeSession && isNativeToolUpdate) {
+            const title = update && typeof update === 'object' && 'title' in update && typeof update.title === 'string'
+                ? update.title ?? 'unknown'
+                : 'unknown';
+            const usage = this.appRuntimeNativeToolUsage.get(localSessionId) ?? [];
+            usage.push(title);
+            this.appRuntimeNativeToolUsage.set(localSessionId, usage);
+        }
+        else {
+            await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
+        }
+        if (update?.sessionUpdate === 'agent_message_chunk' &&
+            update.content?.type === 'text' &&
+            typeof update.content.text === 'string') {
+            const current = this.sessionMessageBuffers.get(localSessionId) ?? '';
+            const next = normalizeAppRuntimeMessageBuffer(current, update.content.text);
+            this.sessionMessageBuffers.set(localSessionId, next);
+        }
         const emit = this.activeStreamEmitters.get(localSessionId);
         if (!emit) {
             return;
@@ -836,6 +940,19 @@ class CursorAcpRuntime {
             data: message.params,
             message: params.update?.sessionUpdate ? `session/update:${params.update.sessionUpdate}` : 'session/update'
         });
+    }
+    clearSessionMessageBuffer(sessionId) {
+        this.sessionMessageBuffers.set(sessionId, '');
+    }
+    consumeSessionMessageBuffer(sessionId) {
+        const message = this.sessionMessageBuffers.get(sessionId) ?? '';
+        this.sessionMessageBuffers.set(sessionId, '');
+        return message.trim();
+    }
+    consumeAppRuntimeNativeToolUsage(sessionId) {
+        const usage = [...(this.appRuntimeNativeToolUsage.get(sessionId) ?? [])];
+        this.appRuntimeNativeToolUsage.set(sessionId, []);
+        return usage;
     }
     async ensureTranscriptPath(sessionId, runId) {
         const transcriptDir = node_path_1.default.resolve(this.config.workspaceRoot, DEFAULT_TRANSCRIPT_DIR, sessionId);
@@ -885,6 +1002,184 @@ class CursorAcpRuntime {
             event,
             payload
         })}\n`, 'utf8');
+    }
+    async runAppRuntimeBatchAnalysis(session, request, emit, toolCalls, isCancelled, timeoutMs, runtimeConfig) {
+        const acpSessionId = await this.ensureAppRuntimeInitialized(session, timeoutMs, runtimeConfig);
+        this.appRuntimeSessions.add(session.id);
+        let promptText = await this.buildPromptText(session, {
+            task: 'analyze_batch',
+            batchId: request.batchId,
+            prompt: request.prompt,
+            locale: request.locale,
+            templatePackId: request.templatePackId,
+            runtimeMode: 'app_runtime'
+        });
+        const maxIterations = 10;
+        try {
+            for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+                if (isCancelled()) {
+                    throw new Error('Run canceled');
+                }
+                this.clearSessionMessageBuffer(session.id);
+                this.appRuntimeNativeToolUsage.set(session.id, []);
+                const response = await this.transport.request('session/prompt', {
+                    sessionId: acpSessionId,
+                    prompt: [
+                        {
+                            type: 'text',
+                            text: promptText
+                        }
+                    ]
+                }, timeoutMs, session.id);
+                if (response.error) {
+                    throw new Error(response.error.message);
+                }
+                const messageText = this.consumeSessionMessageBuffer(session.id);
+                const nativeToolUsage = this.consumeAppRuntimeNativeToolUsage(session.id);
+                const envelope = parseAppRuntimeEnvelope(messageText);
+                if (!envelope) {
+                    promptText = [
+                        'KB Vault could not recover a valid JSON envelope from your last response.',
+                        nativeToolUsage.length
+                            ? `Native Cursor tools were ignored in App Runtime mode: ${nativeToolUsage.join(', ')}.`
+                            : '',
+                        'Do not analyze or explain.',
+                        'Reply with exactly one JSON object and nothing else.',
+                        'Emit either {"type":"tool_call",...} to request one tool or {"type":"final","content":"..."} to finish.'
+                    ]
+                        .filter(Boolean)
+                        .join('\n');
+                    continue;
+                }
+                if (envelope.type === 'final') {
+                    emit({
+                        kind: 'result',
+                        data: {
+                            content: envelope.content
+                        },
+                        message: envelope.content
+                    });
+                    return;
+                }
+                const toolResult = await this.executeAppRuntimeTool(session, envelope, toolCalls);
+                emit({
+                    kind: 'progress',
+                    data: {
+                        mode: 'app_runtime',
+                        tool: envelope.tool,
+                        input: envelope.input ?? {},
+                        result: toolResult
+                    },
+                    message: `app_runtime_tool:${envelope.tool}`
+                });
+                promptText = [
+                    'Tool result:',
+                    JSON.stringify({
+                        tool: envelope.tool,
+                        input: envelope.input ?? {},
+                        result: toolResult
+                    }, null, 2),
+                    '',
+                    nativeToolUsage.length
+                        ? `Native Cursor tools were ignored in App Runtime mode: ${nativeToolUsage.join(', ')}. Do not use grep, shell, or other native tools here.`
+                        : '',
+                    'Do not analyze or explain.',
+                    'If you need more evidence, emit exactly one valid tool_call.',
+                    'If you have enough evidence, emit exactly one final JSON object.',
+                    'Reply with JSON only using either {"type":"tool_call",...} or {"type":"final","content":"..."}'
+                ]
+                    .filter(Boolean)
+                    .join('\n');
+            }
+        }
+        finally {
+            this.appRuntimeSessions.delete(session.id);
+            this.appRuntimeNativeToolUsage.delete(session.id);
+        }
+        throw new Error('App runtime exceeded maximum tool iterations');
+    }
+    async ensureAppRuntimeInitialized(session, timeoutMs, runtimeConfig) {
+        this.log('agent.runtime.ensure_initialized_start', {
+            workspaceId: session.workspaceId,
+            sessionId: session.id,
+            runtimeMode: 'app_runtime'
+        });
+        const initialized = await this.transport.ensureInitialized(timeoutMs);
+        if (!initialized) {
+            throw new Error('Cursor ACP initialize failed');
+        }
+        this.log('agent.runtime.ensure_initialized_success', {
+            workspaceId: session.workspaceId,
+            sessionId: session.id,
+            runtimeMode: 'app_runtime'
+        });
+        return this.ensureAcpSession(session.id, {
+            ...runtimeConfig,
+            agentReasoning: runtimeConfig?.agentReasoning ?? 'low',
+            agentThinking: 'off',
+            appRuntime: true
+        });
+    }
+    async executeAppRuntimeTool(session, envelope, toolCalls) {
+        const input = {
+            ...(envelope.input ?? {}),
+            workspaceId: session.workspaceId
+        };
+        const calledAtUtc = new Date().toISOString();
+        const auditRecord = {
+            workspaceId: session.workspaceId,
+            sessionId: session.id,
+            toolName: envelope.tool,
+            args: input,
+            calledAtUtc,
+            allowed: true
+        };
+        this.toolCallAudit.push(auditRecord);
+        toolCalls.push(auditRecord);
+        await this.appendTranscriptLine(session.id, 'system', 'app_runtime_tool_call', JSON.stringify({ tool: envelope.tool, input }));
+        switch (envelope.tool) {
+            case 'get_batch_context':
+                return this.toolContext.getBatchContext(input);
+            case 'get_pbi_subset':
+                return this.toolContext.getPBISubset(input);
+            case 'get_pbi':
+                return this.toolContext.getPBI(input);
+            case 'get_article':
+                return this.toolContext.getArticle(input);
+            case 'get_article_family':
+                return this.toolContext.getArticleFamily(input);
+            case 'get_locale_variant':
+                return this.toolContext.getLocaleVariant(input);
+            case 'get_article_history':
+                return this.toolContext.getArticleHistory(input);
+            case 'find_related_articles':
+                return this.toolContext.findRelatedArticles(input);
+            case 'search_kb':
+                return this.toolContext.searchKb(input);
+            case 'list_article_templates':
+                return this.toolContext.listArticleTemplates(input);
+            case 'get_template':
+                return this.toolContext.getTemplate(input);
+            case 'record_agent_notes':
+                return this.toolContext.recordAgentNotes(input);
+            case 'propose_create_kb':
+                return this.toolContext.proposeCreateKb(input, this.getScopedContextForSession(session.id) ?? this.fallbackScopedContext(session));
+            case 'propose_edit_kb':
+                return this.toolContext.proposeEditKb(input, this.getScopedContextForSession(session.id) ?? this.fallbackScopedContext(session));
+            case 'propose_retire_kb':
+                return this.toolContext.proposeRetireKb(input, this.getScopedContextForSession(session.id) ?? this.fallbackScopedContext(session));
+            default:
+                throw new Error(`Unsupported app runtime tool: ${envelope.tool}`);
+        }
+    }
+    fallbackScopedContext(session) {
+        return {
+            workspaceId: session.workspaceId,
+            allowedLocaleVariantIds: session.scope?.localeVariantIds,
+            allowedFamilyIds: session.scope?.familyIds,
+            batchId: session.batchId,
+            sessionId: session.id
+        };
     }
     registerToolImplementations(server, toolContext) {
         const enforceScope = (input, context, scope) => {
@@ -1226,4 +1521,137 @@ function slugifyForPrompt(input) {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-+|-+$/g, '') || 'article';
+}
+function appendStreamingText(existing, next) {
+    if (!next) {
+        return existing;
+    }
+    if (!existing) {
+        return next;
+    }
+    if (existing.endsWith(next)) {
+        return existing;
+    }
+    if (next.startsWith(existing)) {
+        return next;
+    }
+    const maxOverlap = Math.min(existing.length, next.length);
+    for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+        if (existing.slice(-overlap) === next.slice(0, overlap)) {
+            return `${existing}${next.slice(overlap)}`;
+        }
+    }
+    return `${existing}${next}`;
+}
+function normalizeAppRuntimeMessageBuffer(existing, next) {
+    const trimmedNext = next.trim();
+    const nextEnvelope = parseAppRuntimeEnvelope(trimmedNext);
+    if (nextEnvelope) {
+        return JSON.stringify(nextEnvelope);
+    }
+    const combined = appendStreamingText(existing, next);
+    const combinedEnvelope = parseAppRuntimeEnvelope(combined);
+    if (combinedEnvelope) {
+        return JSON.stringify(combinedEnvelope);
+    }
+    if (existing && next) {
+        const maxOverlap = Math.min(existing.length, next.length);
+        for (let overlap = maxOverlap; overlap >= 24; overlap -= 1) {
+            const suffix = existing.slice(-overlap);
+            const index = next.indexOf(suffix);
+            if (index !== -1) {
+                const candidate = `${existing}${next.slice(index + overlap)}`;
+                const candidateEnvelope = parseAppRuntimeEnvelope(candidate);
+                if (candidateEnvelope) {
+                    return JSON.stringify(candidateEnvelope);
+                }
+                return candidate;
+            }
+        }
+    }
+    return combined;
+}
+function parseAppRuntimeEnvelope(messageText) {
+    const trimmed = messageText.trim();
+    if (!trimmed) {
+        return null;
+    }
+    const direct = coerceAppRuntimeEnvelope(trimmed);
+    if (direct) {
+        return direct;
+    }
+    const candidates = extractJsonObjectCandidates(trimmed);
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+        const envelope = coerceAppRuntimeEnvelope(candidates[index]);
+        if (envelope) {
+            return envelope;
+        }
+    }
+    return null;
+}
+function coerceAppRuntimeEnvelope(candidate) {
+    try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === 'object' && parsed.type === 'tool_call' && typeof parsed.tool === 'string') {
+            return {
+                type: 'tool_call',
+                tool: parsed.tool,
+                input: parsed.input && typeof parsed.input === 'object' ? parsed.input : {}
+            };
+        }
+        if (parsed && typeof parsed === 'object' && parsed.type === 'final' && typeof parsed.content === 'string') {
+            return {
+                type: 'final',
+                content: parsed.content
+            };
+        }
+    }
+    catch {
+        return null;
+    }
+    return null;
+}
+function extractJsonObjectCandidates(input) {
+    const candidates = [];
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < input.length; index += 1) {
+        const char = input[index];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            }
+            else if (char === '\\') {
+                escaped = true;
+            }
+            else if (char === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (char === '"') {
+            inString = true;
+            continue;
+        }
+        if (char === '{') {
+            if (depth === 0) {
+                start = index;
+            }
+            depth += 1;
+            continue;
+        }
+        if (char === '}') {
+            if (depth === 0) {
+                continue;
+            }
+            depth -= 1;
+            if (depth === 0 && start !== -1) {
+                candidates.push(input.slice(start, index + 1));
+                start = -1;
+            }
+        }
+    }
+    return candidates;
 }

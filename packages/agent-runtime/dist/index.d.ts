@@ -1,4 +1,11 @@
-import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentHealthCheckResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRunResult, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode } from '@kb-vault/shared-types';
+import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentHealthCheckResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRuntimeOptionsResponse, AgentRunResult, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode } from '@kb-vault/shared-types';
+type AgentRuntimeMode = 'mcp_only' | 'app_runtime';
+interface RuntimeSessionConfig {
+    agentModelId?: string;
+    agentReasoning?: string;
+    agentThinking?: string;
+    appRuntime?: boolean;
+}
 interface ScopedToolContext {
     workspaceId: string;
     allowedLocaleVariantIds?: string[];
@@ -41,6 +48,9 @@ export declare class CursorAcpRuntime {
     private readonly cursorSessionIds;
     private readonly cursorSessionLookup;
     private readonly activeStreamEmitters;
+    private readonly sessionMessageBuffers;
+    private readonly appRuntimeSessions;
+    private readonly appRuntimeNativeToolUsage;
     private readonly debugLogger;
     private readonly configuredMcpServers;
     private readonly toolContext;
@@ -53,9 +63,10 @@ export declare class CursorAcpRuntime {
     checkHealth(workspaceId: string): Promise<AgentHealthCheckResponse>;
     private ensureAcpSession;
     private buildSessionCreateParams;
+    getRuntimeOptions(workspaceId: string): Promise<AgentRuntimeOptionsResponse>;
     handleMcpJsonMessage(raw: string | Record<string, unknown>): Promise<string | null>;
-    runBatchAnalysis(request: AgentAnalysisRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean): Promise<AgentRunResult>;
-    runArticleEdit(request: AgentArticleEditRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean): Promise<AgentRunResult>;
+    runBatchAnalysis(request: AgentAnalysisRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean, runtimeMode?: AgentRuntimeMode, runtimeConfig?: RuntimeSessionConfig): Promise<AgentRunResult>;
+    runArticleEdit(request: AgentArticleEditRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean, runtimeMode?: AgentRuntimeMode, runtimeConfig?: RuntimeSessionConfig): Promise<AgentRunResult>;
     getTranscripts(input: AgentTranscriptRequest): Promise<AgentTranscriptResponse>;
     listToolCallAudit(sessionId: string, workspaceId: string): {
         workspaceId: string;
@@ -72,10 +83,17 @@ export declare class CursorAcpRuntime {
     private buildPromptText;
     private executeWithRetry;
     private handleTransportNotification;
+    private clearSessionMessageBuffer;
+    private consumeSessionMessageBuffer;
+    private consumeAppRuntimeNativeToolUsage;
     private ensureTranscriptPath;
     private isCursorAvailable;
     private canReachCursor;
     private appendTranscriptLine;
+    private runAppRuntimeBatchAnalysis;
+    private ensureAppRuntimeInitialized;
+    private executeAppRuntimeTool;
+    private fallbackScopedContext;
     private registerToolImplementations;
     private getActiveSessionForWorkspace;
     private getScopedContextForSession;

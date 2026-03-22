@@ -14,6 +14,349 @@ const workspace_repository_1 = require("./workspace-repository");
 const zendesk_sync_service_1 = require("./zendesk-sync-service");
 const pbi_batch_import_service_1 = require("./pbi-batch-import-service");
 const logger_1 = require("./logger");
+const RUNTIME_MODEL_CATALOG = [
+    {
+        id: 'Anthropic - Claude 4 Sonnet',
+        provider: 'Anthropic',
+        name: 'Claude 4 Sonnet',
+        costs: {
+            inputUsdPerMillion: 3,
+            cacheWriteUsdPerMillion: 3.75,
+            cacheReadUsdPerMillion: 0.3,
+            outputUsdPerMillion: 15
+        }
+    },
+    {
+        id: 'Anthropic - Claude 4 Sonnet 1M',
+        provider: 'Anthropic',
+        name: 'Claude 4 Sonnet 1M',
+        costs: {
+            inputUsdPerMillion: 6,
+            cacheWriteUsdPerMillion: 7.5,
+            cacheReadUsdPerMillion: 0.6,
+            outputUsdPerMillion: 22.5
+        }
+    },
+    {
+        id: 'Anthropic - Claude 4.5 Haiku',
+        provider: 'Anthropic',
+        name: 'Claude 4.5 Haiku',
+        costs: {
+            inputUsdPerMillion: 1,
+            cacheWriteUsdPerMillion: 1.25,
+            cacheReadUsdPerMillion: 0.1,
+            outputUsdPerMillion: 5
+        }
+    },
+    {
+        id: 'Anthropic - Claude 4.5 Opus',
+        provider: 'Anthropic',
+        name: 'Claude 4.5 Opus',
+        costs: {
+            inputUsdPerMillion: 5,
+            cacheWriteUsdPerMillion: 6.25,
+            cacheReadUsdPerMillion: 0.5,
+            outputUsdPerMillion: 25
+        }
+    },
+    {
+        id: 'Anthropic - Claude 4.5 Sonnet',
+        provider: 'Anthropic',
+        name: 'Claude 4.5 Sonnet',
+        costs: {
+            inputUsdPerMillion: 3,
+            cacheWriteUsdPerMillion: 3.75,
+            cacheReadUsdPerMillion: 0.3,
+            outputUsdPerMillion: 15
+        }
+    },
+    {
+        id: 'Anthropic - Claude 4.6 Opus',
+        provider: 'Anthropic',
+        name: 'Claude 4.6 Opus',
+        costs: {
+            inputUsdPerMillion: 5,
+            cacheWriteUsdPerMillion: 6.25,
+            cacheReadUsdPerMillion: 0.5,
+            outputUsdPerMillion: 25
+        }
+    },
+    {
+        id: 'Anthropic - Claude 4.6 Opus (Fast mode)',
+        provider: 'Anthropic',
+        name: 'Claude 4.6 Opus (Fast mode)',
+        costs: {
+            inputUsdPerMillion: 30,
+            cacheWriteUsdPerMillion: 37.5,
+            cacheReadUsdPerMillion: 3,
+            outputUsdPerMillion: 150
+        }
+    },
+    {
+        id: 'Anthropic - Claude 4.6 Sonnet',
+        provider: 'Anthropic',
+        name: 'Claude 4.6 Sonnet',
+        costs: {
+            inputUsdPerMillion: 3,
+            cacheWriteUsdPerMillion: 3.75,
+            cacheReadUsdPerMillion: 0.3,
+            outputUsdPerMillion: 15
+        }
+    },
+    {
+        id: 'Cursor - Composer 1',
+        provider: 'Cursor',
+        name: 'Composer 1',
+        costs: {
+            inputUsdPerMillion: 1.25,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.125,
+            outputUsdPerMillion: 10
+        }
+    },
+    {
+        id: 'Cursor - Composer 1.5',
+        provider: 'Cursor',
+        name: 'Composer 1.5',
+        costs: {
+            inputUsdPerMillion: 3.5,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.35,
+            outputUsdPerMillion: 17.5
+        }
+    },
+    {
+        id: 'Cursor - Composer 2',
+        provider: 'Cursor',
+        name: 'Composer 2',
+        costs: {
+            inputUsdPerMillion: 0.5,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.2,
+            outputUsdPerMillion: 2.5
+        }
+    },
+    {
+        id: 'Google - Gemini 2.5 Flash',
+        provider: 'Google',
+        name: 'Gemini 2.5 Flash',
+        costs: {
+            inputUsdPerMillion: 0.3,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.03,
+            outputUsdPerMillion: 2.5
+        }
+    },
+    {
+        id: 'Google - Gemini 3 Flash',
+        provider: 'Google',
+        name: 'Gemini 3 Flash',
+        costs: {
+            inputUsdPerMillion: 0.5,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.05,
+            outputUsdPerMillion: 3
+        }
+    },
+    {
+        id: 'Google - Gemini 3 Pro',
+        provider: 'Google',
+        name: 'Gemini 3 Pro',
+        costs: {
+            inputUsdPerMillion: 2,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.2,
+            outputUsdPerMillion: 12
+        }
+    },
+    {
+        id: 'Google - Gemini 3 Pro Image Preview',
+        provider: 'Google',
+        name: 'Gemini 3 Pro Image Preview',
+        costs: {
+            inputUsdPerMillion: 2,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.2,
+            outputUsdPerMillion: 12
+        }
+    },
+    {
+        id: 'Google - Gemini 3.1 Pro',
+        provider: 'Google',
+        name: 'Gemini 3.1 Pro',
+        costs: {
+            inputUsdPerMillion: 2,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.2,
+            outputUsdPerMillion: 12
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5',
+        provider: 'OpenAI',
+        name: 'GPT-5',
+        costs: {
+            inputUsdPerMillion: 1.25,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.125,
+            outputUsdPerMillion: 10
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5 Fast',
+        provider: 'OpenAI',
+        name: 'GPT-5 Fast',
+        costs: {
+            inputUsdPerMillion: 2.5,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.25,
+            outputUsdPerMillion: 20
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5 Mini',
+        provider: 'OpenAI',
+        name: 'GPT-5 Mini',
+        costs: {
+            inputUsdPerMillion: 0.25,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.025,
+            outputUsdPerMillion: 2
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5-Codex',
+        provider: 'OpenAI',
+        name: 'GPT-5-Codex',
+        costs: {
+            inputUsdPerMillion: 1.25,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.125,
+            outputUsdPerMillion: 10
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.1 Codex',
+        provider: 'OpenAI',
+        name: 'GPT-5.1 Codex',
+        costs: {
+            inputUsdPerMillion: 1.25,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.125,
+            outputUsdPerMillion: 10
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.1 Codex Max',
+        provider: 'OpenAI',
+        name: 'GPT-5.1 Codex Max',
+        costs: {
+            inputUsdPerMillion: 1.25,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.125,
+            outputUsdPerMillion: 10
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.1 Codex Mini',
+        provider: 'OpenAI',
+        name: 'GPT-5.1 Codex Mini',
+        costs: {
+            inputUsdPerMillion: 0.25,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.025,
+            outputUsdPerMillion: 2
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.2',
+        provider: 'OpenAI',
+        name: 'GPT-5.2',
+        costs: {
+            inputUsdPerMillion: 1.75,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.175,
+            outputUsdPerMillion: 14
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.2 Codex',
+        provider: 'OpenAI',
+        name: 'GPT-5.2 Codex',
+        costs: {
+            inputUsdPerMillion: 1.75,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.175,
+            outputUsdPerMillion: 14
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.3 Codex',
+        provider: 'OpenAI',
+        name: 'GPT-5.3 Codex',
+        costs: {
+            inputUsdPerMillion: 1.75,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.175,
+            outputUsdPerMillion: 14
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.4',
+        provider: 'OpenAI',
+        name: 'GPT-5.4',
+        costs: {
+            inputUsdPerMillion: 2.5,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.25,
+            outputUsdPerMillion: 15
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.4 Mini',
+        provider: 'OpenAI',
+        name: 'GPT-5.4 Mini',
+        costs: {
+            inputUsdPerMillion: 0.75,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.075,
+            outputUsdPerMillion: 4.5
+        }
+    },
+    {
+        id: 'OpenAI - GPT-5.4 Nano',
+        provider: 'OpenAI',
+        name: 'GPT-5.4 Nano',
+        costs: {
+            inputUsdPerMillion: 0.2,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.02,
+            outputUsdPerMillion: 1.25
+        }
+    },
+    {
+        id: 'xAI - Grok 4.20',
+        provider: 'xAI',
+        name: 'Grok 4.20',
+        costs: {
+            inputUsdPerMillion: 2,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.2,
+            outputUsdPerMillion: 6
+        }
+    },
+    {
+        id: 'Moonshot - Kimi K2.5',
+        provider: 'Moonshot',
+        name: 'Kimi K2.5',
+        costs: {
+            inputUsdPerMillion: 0.6,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: 0.1,
+            outputUsdPerMillion: 3
+        }
+    }
+];
 const ZENDESK_PREVIEW_STYLE_TOKENS = {
     base_font_size: '16px',
     bg_color: '#ffffff',
@@ -260,9 +603,17 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             return { ok: true, ...created };
         }
     };
+    const validThinkingModes = new Set(['inherit', 'on', 'off']);
+    const validReasoningModes = new Set(['inherit', 'low', 'medium', 'high']);
+    const buildRuntimeConfigFromSettings = (settings) => ({
+        agentModelId: settings.agentModelId?.trim() || undefined,
+        agentReasoning: settings.agentReasoning === 'inherit' ? undefined : settings.agentReasoning,
+        agentThinking: settings.agentThinking === 'inherit' ? undefined : settings.agentThinking
+    });
     const agentRuntime = new agent_runtime_1.CursorAcpRuntime(workspaceRoot, runtimeToolContext, (message, details) => {
         logger_1.logger.info(`[agent-runtime] ${message}`, details);
     });
+    const agentRuntimeApi = agentRuntime;
     const buildZendeskClient = async (workspaceId) => {
         const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
         const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
@@ -517,7 +868,11 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             if (input.zendeskSubdomain === undefined &&
                 input.zendeskBrandId === undefined &&
                 input.defaultLocale === undefined &&
-                input.enabledLocales === undefined) {
+                input.enabledLocales === undefined &&
+                input.agentRuntimeMode === undefined &&
+                input.agentModelId === undefined &&
+                input.agentReasoning === undefined &&
+                input.agentThinking === undefined) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'workspace.settings.update requires at least one setting field');
             }
             if (typeof input.defaultLocale === 'string' && !input.defaultLocale.trim()) {
@@ -531,6 +886,22 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             }
             if (Array.isArray(input.enabledLocales) && input.enabledLocales.length && input.enabledLocales.some((locale) => !locale || !String(locale).trim())) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'enabledLocales must only contain non-empty values');
+            }
+            if (input.agentRuntimeMode !== undefined &&
+                input.agentRuntimeMode !== 'mcp_only' &&
+                input.agentRuntimeMode !== 'app_runtime') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agentRuntimeMode must be mcp_only or app_runtime');
+            }
+            if (input.agentReasoning !== undefined &&
+                !validReasoningModes.has(input.agentReasoning)) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agentReasoning must be inherit, low, medium, or high');
+            }
+            if (input.agentThinking !== undefined &&
+                !validThinkingModes.has(input.agentThinking)) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agentThinking must be inherit, on, or off');
+            }
+            if (typeof input.agentModelId === 'string' && !input.agentModelId.trim()) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agentModelId cannot be empty');
             }
             const updated = await workspaceRepository.updateWorkspaceSettings(input);
             return { ok: true, data: updated };
@@ -547,6 +918,30 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, error.message);
             }
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('agent.runtime.options.get', async (payload) => {
+        try {
+            const workspaceId = payload?.workspaceId;
+            if (!workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agent.runtime.options.get requires workspaceId');
+            }
+            await workspaceRepository.getWorkspace(workspaceId);
+            const options = await agentRuntime.getRuntimeOptions(workspaceId);
+            return {
+                ok: true,
+                data: {
+                    ...options,
+                    workspaceId,
+                    modelCatalog: RUNTIME_MODEL_CATALOG
+                }
+            };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, 'Workspace not found');
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
         }
     });
     bus.register('workspace.open', async (payload) => {
@@ -1342,6 +1737,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             batchId: input.batchId,
             workspaceId: input.workspaceId
         });
+        const workspaceSettings = await workspaceRepository.getWorkspaceSettings(input.workspaceId);
+        const runtimeMode = workspaceSettings.agentRuntimeMode ?? 'mcp_only';
+        const runtimeConfig = buildRuntimeConfigFromSettings(workspaceSettings);
         const result = await agentRuntime.runBatchAnalysis(input, (stream) => {
             emit({
                 id: payload.jobId,
@@ -1350,10 +1748,11 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
                 progress: stream.kind === 'result' ? 100 : 35,
                 message: JSON.stringify(stream)
             });
-        }, isCancelled);
+        }, isCancelled, runtimeMode, runtimeConfig);
         logger_1.logger.info('[agent.analysis.run] runtime finished', {
             jobId: payload.jobId,
             batchId: input.batchId,
+            runtimeMode,
             status: result.status,
             toolCalls: result.toolCalls.length,
             transcriptPath: result.transcriptPath
@@ -1399,6 +1798,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             progress: 20,
             message: `Starting article edit session for variant ${input.localeVariantId}`
         });
+        const workspaceSettings = await workspaceRepository.getWorkspaceSettings(input.workspaceId);
+        const runtimeMode = workspaceSettings.agentRuntimeMode ?? 'mcp_only';
+        const runtimeConfig = buildRuntimeConfigFromSettings(workspaceSettings);
         const result = await agentRuntime.runArticleEdit(input, (stream) => {
             emit({
                 id: payload.jobId,
@@ -1407,7 +1809,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
                 progress: stream.kind === 'result' ? 100 : 45,
                 message: JSON.stringify(stream)
             });
-        }, isCancelled);
+        }, isCancelled, runtimeMode, runtimeConfig);
         emit({
             id: payload.jobId,
             command: payload.command,
