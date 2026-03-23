@@ -45,7 +45,7 @@ const KBV_CURSOR_BINARY_ENV = 'KBV_CURSOR_BINARY';
 const DEFAULT_CURSOR_BINARY = 'cursor';
 const DEFAULT_CURSOR_ARGS = ['agent', 'acp'];
 const DEFAULT_CLI_BINARY = 'kb';
-const ACP_HEALTH_INIT_TIMEOUT_MS = 4_000;
+const ACP_HEALTH_INIT_TIMEOUT_MS = 15_000;
 const ACP_HEALTH_INIT_ATTEMPTS = 2;
 
 function resolveDefaultCursorBinary(): string {
@@ -64,6 +64,27 @@ function resolveDefaultCursorBinary(): string {
 
   return DEFAULT_CURSOR_BINARY;
 }
+
+function resolveCursorArgs(binary: string): string[] {
+  const basename = path.basename(binary).toLowerCase().replace(/\.exe$/, '');
+  if (basename === 'agent') {
+    return ['acp'];
+  }
+  return DEFAULT_CURSOR_ARGS;
+}
+
+function getSessionUpdateType(params: unknown): string | null {
+  if (!params || typeof params !== 'object') {
+    return null;
+  }
+  const update = (params as { update?: { sessionUpdate?: unknown } }).update;
+  return typeof update?.sessionUpdate === 'string' ? update.sessionUpdate : null;
+}
+
+function isHiddenAgentThoughtUpdate(params: unknown): boolean {
+  return getSessionUpdateType(params) === 'agent_thought_chunk';
+}
+
 interface JsonRpcEnvelope {
   jsonrpc: '2.0';
   id: string;
@@ -158,6 +179,34 @@ interface KbAccessProvider {
   getHealth: (workspaceId?: string) => Promise<KbAccessHealth>;
 }
 
+function buildBatchAnalysisPhaseGuidance(providerLabel: 'MCP' | 'CLI'): string {
+  return [
+    'Required execution phases for batch analysis:',
+    '1. Research phase.',
+    'Review the user prompt, batch context, uploaded PBIs, and article directory first.',
+    `Use ${providerLabel} tools to inspect only the article records that are plausible candidates for change or creation.`,
+    'Do not spend long unstructured time exploring unrelated articles.',
+    '2. Plan phase.',
+    'Produce a short internal plan that names the existing articles to edit, the new articles to create, any retire/no-impact decisions, and the evidence supporting each.',
+    'Stop researching once the plan is specific enough to act.',
+    '3. Execute phase.',
+    'Create the proposal records for the planned create/edit/retire actions.',
+    'For create/edit proposals, include the full final article HTML in proposal metadata as `proposedHtml` whenever you are proposing article content.',
+    'Do not delay proposal creation once the evidence is sufficient.',
+    '4. Finish phase.',
+    'Return a concise summary of proposals created, no-impact areas, and blockers or uncertainties.',
+    'Output discipline:',
+    '- Do not narrate your internal reasoning, shell strategy, escaping strategy, or alternate approaches.',
+    '- Do not emit stream-of-consciousness progress updates.',
+    '- If you send an external progress update, keep it to one or two short sentences about completed work only.',
+    '- Never talk about HEREDOCs, quoting, JSON escaping, Python helpers, or command construction unless the user explicitly asks.',
+    'Efficiency rules:',
+    '- Prefer a small number of targeted article lookups over broad repeated searches.',
+    '- If two or three focused retrieval steps confirm an action, move on to planning/execution.',
+    '- If evidence stays ambiguous, make the best-supported decision, note the uncertainty, and continue.'
+  ].join('\n');
+}
+
 function buildMcpTaskPrompt(
   session: AgentSessionRecord,
   taskPayload: Record<string, unknown>,
@@ -180,6 +229,12 @@ function buildMcpTaskPrompt(
     '- To read the uploaded PBI rows, call get_pbi_subset for the batch or get_pbi for a single record.',
     '- To read KB article contents, use get_article with a localeVariantId or revisionId from the article directory listing below.',
     '- To understand an article family before reading content, use get_article_family and get_locale_variant.',
+    '- If the batch implies KB changes, you must persist structured proposals with propose_create_kb, propose_edit_kb, and/or propose_retire_kb instead of only describing them in prose.',
+    '- Use propose_create_kb for net-new KB coverage, propose_edit_kb for updates to existing KB content, and propose_retire_kb for content that should be retired or replaced.',
+    '- Always include a human-readable article title for the proposal. Put it in proposal metadata as `targetTitle` when possible, and make the note/rationale lead with that title.',
+    '- When proposing article content, include the full final article HTML in proposal metadata as `proposedHtml`.',
+    '- Include the relevant pbiIds, rationale, and clear notes in each proposal so Proposal Review has actionable context.',
+    '- Your final response should summarize what proposals you created, note any no-impact areas, and call out blockers only if proposal creation was not possible.',
     '- If you need KB evidence, prefer direct KB tool calls over reasoning from the preloaded prompt context alone.',
     '- Do not invent alternate tool names. If a tool name is not listed above, assume it is unavailable.'
   ].join('\n');
@@ -198,17 +253,23 @@ function buildMcpTaskPrompt(
       `Batch ID: ${batchId}`,
       `Locale: ${locale}`,
       '',
+      buildBatchAnalysisPhaseGuidance('MCP'),
+      '',
       'Your job:',
       '1. Load the batch context and relevant PBI records for this batch.',
       '2. Review the existing KB/article context for the affected topics.',
-      '3. Produce KB-focused analysis outcomes for the batch.',
-      '4. If the batch is already analyzed, summarize the existing analysis state instead of redoing generic exploration.',
+      '3. Decide which outcomes are no-impact versus KB create, edit, or retire work.',
+      '4. Persist structured proposal records for every KB create/edit/retire recommendation.',
+      '5. Return a concise execution summary that lists the proposals you created and any blockers or confirmed no-impact areas.',
+      '6. If the batch is already analyzed, summarize the existing analysis/proposal state instead of redoing generic exploration.',
       '',
       'Tool rules:',
       '- Use KB Vault tools and structured batch/article data only.',
       '- Do NOT use generic terminal, grep, codebase search, find, or filesystem exploration unless the user explicitly asked for that.',
       '- Do NOT inspect the repository or sqlite schema to infer application behavior.',
-      '- Prefer returning a concise analysis/summary over exploratory investigation.',
+      '- Proposal creation is the primary output for batch analysis. Do not stop after exploratory investigation or prose summary when a KB action is warranted.',
+      '- If you conclude there is no KB impact, say that explicitly in the final response and explain why no proposal was created.',
+      '- Prefer concise execution summaries over long exploratory writeups.',
       '- The preloaded prompt context is for orientation; use KB Vault MCP tools directly when you need to confirm or inspect source records.',
       '',
       mcpGuidance,
@@ -262,7 +323,7 @@ function buildCliTaskPrompt(
   const cliGuidance = [
     'KB Vault CLI guidance:',
     '- Use only the `kb` CLI and data returned by its JSON output.',
-    '- Use the terminal only for `kb` commands.',
+    '- Use the terminal only for `kb` commands, except for minimal temporary-file creation needed to pass large proposal metadata via `--metadata-file`.',
     '- Always include `--json` in every `kb` command.',
     '- Use as many `kb` commands as needed to complete the task.',
     '- Do NOT use Read File.',
@@ -271,10 +332,20 @@ function buildCliTaskPrompt(
     '- If you need KB evidence, prefer direct `kb` output over local inference.',
     '- If you need batch context, load batch context first with `kb`.',
     '- If you need article text, load article variants and related entries with `kb` before proposing edits.',
+    '- Batch analysis is not complete until you have created proposal records for every warranted KB create/edit/retire action, or explicitly concluded the batch is no-impact.',
+    '- Use `kb --help` and subcommand help to discover the CLI proposal commands for create/edit/retire if they are not already obvious.',
+    '- Always name the article in the proposal output. Include the title in `--metadata` as `targetTitle` when you can, and make the note/rationale start with that title.',
+    '- For create/edit proposals, include the full final article HTML in metadata as `proposedHtml`.',
+    '- If proposal commands are available, call them through `kb` and create the proposal records instead of only describing recommended actions in prose.',
+    '- If the metadata payload is large, prefer `--metadata-file <path>` over inline JSON arguments.',
+    '- Do not spend time describing shell quoting, escaping, temporary-file strategy, or alternate command shapes in your visible updates.',
+    '- If this CLI build truly does not expose proposal commands, state that clearly as a blocker in the final response instead of pretending the batch is complete.',
+    '- Your final response should summarize proposals created, confirmed no-impact areas, and blockers.',
     '- Preferred commands for this environment:',
     '- `kb batch-context --workspace-id <workspace-id> --batch-id <batch-id> --json`',
     '- `kb find-related-articles --workspace-id <workspace-id> --batch-id <batch-id> --json`',
-    '- `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`'
+    '- `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`',
+    '- `kb --help` (and relevant subcommand help) to locate proposal-creation commands when needed'
   ].join('\n');
   const extraSections = [
     extras?.batchContext !== undefined ? `Preloaded batch context summary:\n${summarizeBatchContext(extras.batchContext)}` : '',
@@ -291,17 +362,23 @@ function buildCliTaskPrompt(
       `Batch ID: ${batchId}`,
       `Locale: ${locale}`,
       '',
+      buildBatchAnalysisPhaseGuidance('CLI'),
+      '',
       'Your job:',
       '1. Load the batch context and relevant PBI records for this batch.',
       '2. Review the existing KB/article context for the affected topics.',
-      '3. Produce KB-focused analysis outcomes for the batch.',
-      '4. If the batch is already analyzed, summarize the existing analysis state instead of redoing generic exploration.',
+      '3. Decide which outcomes are no-impact versus KB create, edit, or retire work.',
+      '4. Create proposal records through the `kb` CLI for every KB create/edit/retire recommendation.',
+      '5. Return a concise execution summary that lists the proposals you created and any blockers or confirmed no-impact areas.',
+      '6. If the batch is already analyzed, summarize the existing analysis/proposal state instead of redoing generic exploration.',
       '',
       'Tool rules:',
       '- Use kb commands and structured batch/article data only.',
       '- Do NOT use generic terminal, grep, codebase search, find, or filesystem exploration unless the user explicitly asks for that.',
       '- Do NOT inspect the repository or sqlite schema to infer application behavior.',
-      '- Prefer returning a concise analysis/summary over exploratory investigation.',
+      '- Proposal creation is the primary output for batch analysis. Do not stop after exploratory investigation or prose summary when a KB action is warranted.',
+      '- If you conclude there is no KB impact, say that explicitly in the final response and explain why no proposal was created.',
+      '- Prefer concise execution summaries over long exploratory writeups.',
       '- The preloaded prompt context is for orientation; use CLI output directly when you need to confirm or inspect source records.',
       '',
       cliGuidance,
@@ -590,7 +667,9 @@ class CursorTransport {
       return;
     }
     if (message.method === 'session/update' && message.params) {
-      this.logger('system', { direction: 'from_agent', event: 'session_update', payload: JSON.stringify(message.params) });
+      if (!isHiddenAgentThoughtUpdate(message.params)) {
+        this.logger('system', { direction: 'from_agent', event: 'session_update', payload: JSON.stringify(message.params) });
+      }
       this.bumpPromptTimeouts(message.params);
     }
     this.notificationHandler?.(message);
@@ -694,7 +773,7 @@ export class CursorAcpRuntime {
       acpCwd,
       mcpBinary: cursorBinary,
       cliBinary: cursorBinary || DEFAULT_CLI_BINARY,
-      cursorArgs: DEFAULT_CURSOR_ARGS,
+      cursorArgs: resolveCursorArgs(cursorBinary),
       requestTimeoutMs: 45_000
     };
     this.mcpServer = new McpToolServer();
@@ -1307,7 +1386,9 @@ export class CursorAcpRuntime {
     const localSessionId = sessionInfo.localSessionId;
 
     const payload = JSON.stringify(message.params);
-    await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
+    if (!isHiddenAgentThoughtUpdate(message.params)) {
+      await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
+    }
 
     // Audit and enforce CLI-mode tool calls from ACP session updates so they appear in tool call history
     if (sessionInfo.mode === 'cli' && params.update?.toolCallId && params.update.title) {

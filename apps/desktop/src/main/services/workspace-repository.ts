@@ -8,6 +8,8 @@ import {
   PBIBatchScopeMode,
   ProposalAction,
   ProposalDecision,
+  ProposalReviewDecision,
+  ProposalReviewStatus,
   type WorkspaceCreateRequest,
   type WorkspaceSettingsRecord,
   type WorkspaceSettingsUpdateRequest,
@@ -44,8 +46,20 @@ import {
   type RevisionUpdateRequest,
   type ExplorerNode,
   type ZendeskCredentialRecord,
-  type ZendeskSyncCheckpoint
+  type ZendeskSyncCheckpoint,
+  type ProposalPlacementSuggestion,
+  type ProposalReviewDecisionRequest,
+  type ProposalReviewBatchListResponse,
+  type ProposalReviewBatchSummary,
+  type ProposalReviewDecisionResponse,
+  type ProposalReviewDetailResponse,
+  type ProposalReviewGroup,
+  type ProposalReviewListResponse,
+  type ProposalReviewQueueItem,
+  type ProposalReviewRecord,
+  type ProposalReviewSummaryCounts
 } from '@kb-vault/shared-types';
+import { diffHtml } from '@kb-vault/diff-engine';
 import {
   applyWorkspaceMigrations,
   ensureCatalogSchema,
@@ -105,6 +119,35 @@ interface SearchSourceMatch {
   context: 'title' | 'body' | 'metadata';
   snippet: string;
   scoreBoost: number;
+}
+
+interface ProposalDbRow {
+  id: string;
+  workspaceId: string;
+  batchId: string;
+  action: ProposalAction;
+  localeVariantId: string | null;
+  branchId: string | null;
+  status: string | null;
+  rationale: string | null;
+  generatedAtUtc: string;
+  updatedAtUtc: string;
+  reviewStatus: string | null;
+  queueOrder: number | null;
+  familyId: string | null;
+  sourceRevisionId: string | null;
+  targetTitle: string | null;
+  targetLocale: string | null;
+  confidenceScore: number | null;
+  rationaleSummary: string | null;
+  aiNotes: string | null;
+  suggestedPlacementJson: string | null;
+  sourceHtmlPath: string | null;
+  proposedHtmlPath: string | null;
+  metadataJson: string | null;
+  decisionPayloadJson: string | null;
+  decidedAtUtc: string | null;
+  sessionId: string | null;
 }
 
 export interface WorkspaceMigrationHealth {
@@ -1903,6 +1946,60 @@ export class WorkspaceRepository {
     }
   }
 
+  async listProposalReviewBatches(workspaceId: string): Promise<ProposalReviewBatchListResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const rows = workspaceDb.all<Array<ProposalReviewBatchSummary & {
+        totalCount: number;
+        pendingCount: number;
+        acceptedCount: number;
+        deniedCount: number;
+        deferredCount: number;
+        appliedCount: number;
+        archivedCount: number;
+      }>[number]>(`
+        SELECT b.id as batchId,
+               b.name as batchName,
+               b.source_file_name as sourceFileName,
+               b.imported_at as importedAtUtc,
+               b.status as batchStatus,
+               COUNT(p.id) as totalCount,
+               SUM(CASE WHEN COALESCE(p.review_status, 'pending_review') = 'pending_review' THEN 1 ELSE 0 END) as pendingCount,
+               SUM(CASE WHEN p.review_status = 'accepted' THEN 1 ELSE 0 END) as acceptedCount,
+               SUM(CASE WHEN p.review_status = 'denied' THEN 1 ELSE 0 END) as deniedCount,
+               SUM(CASE WHEN p.review_status = 'deferred' THEN 1 ELSE 0 END) as deferredCount,
+               SUM(CASE WHEN p.review_status = 'applied_to_branch' THEN 1 ELSE 0 END) as appliedCount,
+               SUM(CASE WHEN p.review_status = 'archived' THEN 1 ELSE 0 END) as archivedCount
+        FROM pbi_batches b
+        JOIN proposals p ON p.batch_id = b.id
+        WHERE b.workspace_id = @workspaceId
+        GROUP BY b.id, b.name, b.source_file_name, b.imported_at, b.status
+        ORDER BY b.imported_at DESC
+      `, { workspaceId });
+
+      return {
+        workspaceId,
+        batches: rows.map((row) => ({
+          batchId: row.batchId,
+          batchName: row.batchName,
+          sourceFileName: row.sourceFileName,
+          importedAtUtc: row.importedAtUtc,
+          batchStatus: row.batchStatus,
+          proposalCount: row.totalCount,
+          pendingReviewCount: row.pendingCount,
+          acceptedCount: row.acceptedCount,
+          deniedCount: row.deniedCount,
+          deferredCount: row.deferredCount,
+          appliedToBranchCount: row.appliedCount,
+          archivedCount: row.archivedCount,
+        })),
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async getPBIBatch(workspaceId: string, batchId: string): Promise<PBIBatchRecord> {
     const workspace = await this.getWorkspace(workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
@@ -2183,32 +2280,94 @@ export class WorkspaceRepository {
     batchId: string;
     action: ProposalAction;
     _sessionId?: string;
+    familyId?: string;
     localeVariantId?: string;
+    sourceRevisionId?: string;
+    targetTitle?: string;
+    targetLocale?: string;
+    confidenceScore?: number;
     note?: string;
     rationale?: string;
+    rationaleSummary?: string;
+    aiNotes?: string;
+    suggestedPlacement?: ProposalPlacementSuggestion;
+    sourceHtml?: string;
+    proposedHtml?: string;
     relatedPbiIds?: string[];
     metadata?: unknown;
-  }): Promise<{
-    proposalId: string;
-    workspaceId: string;
-    batchId: string;
-    action: ProposalAction;
-    localeVariantId?: string;
-    status: ProposalDecision;
-  }> {
+  }): Promise<ProposalReviewRecord> {
     const workspace = await this.getWorkspace(params.workspaceId);
     await this.ensureWorkspaceDb(workspace.path);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
       const proposalId = randomUUID();
       const now = new Date().toISOString();
-      const rationale = params.rationale ?? params.note ?? (params.metadata ? JSON.stringify(params.metadata) : undefined);
+      const metadata = normalizeProposalMetadata(params.metadata);
+      const hasStructuredContent = Boolean(
+        params.sourceHtml?.trim()
+        || params.proposedHtml?.trim()
+        || extractString(metadata.sourceHtml)
+        || extractString(metadata.proposedHtml)
+      );
+      const hasMeaningfulContext = Boolean(
+        params.note?.trim()
+        || params.rationale?.trim()
+        || params.rationaleSummary?.trim()
+        || params.aiNotes?.trim()
+        || Object.keys(metadata).length > 0
+        || params.relatedPbiIds?.length
+        || hasStructuredContent
+      );
+      if (!hasMeaningfulContext) {
+        throw new Error('Proposal must include notes, rationale, metadata, linked PBIs, or HTML content');
+      }
+      const identity = await this.resolveProposalIdentity(workspaceDb, {
+        workspaceId: params.workspaceId,
+        action: params.action,
+        localeVariantId: params.localeVariantId,
+        familyId: params.familyId,
+        targetTitle: params.targetTitle,
+        targetLocale: params.targetLocale,
+        note: params.note,
+        rationale: params.rationale,
+        metadata
+      });
+      const rationale = params.rationale ?? params.note ?? undefined;
+      const rationaleSummary = params.rationaleSummary ?? extractString(metadata.rationaleSummary) ?? rationale;
+      const aiNotes = params.aiNotes ?? params.note ?? extractString(metadata.aiNotes) ?? undefined;
+      const targetTitle = identity.targetTitle;
+      const targetLocale = identity.targetLocale;
+      if (params.action === ProposalAction.CREATE && !targetTitle) {
+        throw new Error('Create proposals must include a targetTitle or note/rationale text that clearly names the article');
+      }
+      const suggestedPlacement = params.suggestedPlacement ?? normalizePlacement(metadata.suggestedPlacement);
+      const confidenceScore = normalizeConfidenceScore(params.confidenceScore ?? metadata.confidenceScore);
+      const reviewStatus = ProposalReviewStatus.PENDING_REVIEW;
       const status: ProposalDecision = ProposalDecision.DEFER;
+      const queueOrder = (
+        workspaceDb.get<{ nextOrder: number }>(
+          `SELECT COALESCE(MAX(queue_order), 0) + 1 as nextOrder
+           FROM proposals
+           WHERE batch_id = @batchId`,
+          { batchId: params.batchId }
+        )?.nextOrder ?? 1
+      );
+      const artifacts = await this.persistProposalArtifacts(workspace.path, proposalId, {
+        sourceHtml: params.sourceHtml ?? extractString(metadata.sourceHtml) ?? '',
+        proposedHtml: params.proposedHtml ?? extractString(metadata.proposedHtml) ?? '',
+        metadata
+      });
       workspaceDb.run(
         `INSERT INTO proposals (
-          id, workspace_id, batch_id, action, locale_variant_id, branch_id, status, rationale, generated_at, updated_at
+          id, workspace_id, batch_id, action, locale_variant_id, branch_id, status, rationale, generated_at, updated_at,
+          review_status, queue_order, family_id, source_revision_id, target_title, target_locale, confidence_score,
+          rationale_summary, ai_notes, suggested_placement_json, source_html_path, proposed_html_path, metadata_json,
+          decision_payload_json, decided_at, agent_session_id
         ) VALUES (
-          @id, @workspaceId, @batchId, @action, @localeVariantId, @branchId, @status, @rationale, @generatedAt, @updatedAt
+          @id, @workspaceId, @batchId, @action, @localeVariantId, @branchId, @status, @rationale, @generatedAt, @updatedAt,
+          @reviewStatus, @queueOrder, @familyId, @sourceRevisionId, @targetTitle, @targetLocale, @confidenceScore,
+          @rationaleSummary, @aiNotes, @suggestedPlacementJson, @sourceHtmlPath, @proposedHtmlPath, @metadataJson,
+          @decisionPayloadJson, @decidedAt, @sessionId
         )`,
         {
           id: proposalId,
@@ -2220,7 +2379,23 @@ export class WorkspaceRepository {
           status,
           rationale,
           generatedAt: now,
-          updatedAt: now
+          updatedAt: now,
+          reviewStatus,
+          queueOrder,
+          familyId: identity.familyId ?? null,
+          sourceRevisionId: params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null,
+          targetTitle: targetTitle ?? null,
+          targetLocale: targetLocale ?? null,
+          confidenceScore: confidenceScore ?? null,
+          rationaleSummary: rationaleSummary ?? null,
+          aiNotes: aiNotes ?? null,
+          suggestedPlacementJson: suggestedPlacement ? JSON.stringify(suggestedPlacement) : null,
+          sourceHtmlPath: artifacts.sourceHtmlPath ?? null,
+          proposedHtmlPath: artifacts.proposedHtmlPath ?? null,
+          metadataJson: Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null,
+          decisionPayloadJson: null,
+          decidedAt: null,
+          sessionId: params._sessionId ?? null
         }
       );
 
@@ -2239,13 +2414,373 @@ export class WorkspaceRepository {
         }
       }
 
-      return {
-        proposalId,
+      await this.syncBatchReviewStatus(workspaceDb, params.workspaceId, params.batchId);
+
+      return this.mapProposalRow({
+        id: proposalId,
         workspaceId: params.workspaceId,
         batchId: params.batchId,
         action: params.action,
-        localeVariantId: params.localeVariantId,
-        status
+        localeVariantId: params.localeVariantId ?? null,
+        branchId: null,
+        status,
+        rationale: rationale ?? null,
+        generatedAtUtc: now,
+        updatedAtUtc: now,
+        reviewStatus,
+        queueOrder,
+        familyId: identity.familyId ?? null,
+        sourceRevisionId: params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null,
+        targetTitle: targetTitle ?? null,
+        targetLocale: targetLocale ?? null,
+        confidenceScore: confidenceScore ?? null,
+        rationaleSummary: rationaleSummary ?? null,
+        aiNotes: aiNotes ?? null,
+        suggestedPlacementJson: suggestedPlacement ? JSON.stringify(suggestedPlacement) : null,
+        sourceHtmlPath: artifacts.sourceHtmlPath ?? null,
+        proposedHtmlPath: artifacts.proposedHtmlPath ?? null,
+        metadataJson: Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null,
+        decisionPayloadJson: null,
+        decidedAtUtc: null,
+        sessionId: params._sessionId ?? null
+      });
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async listProposalReviewQueue(workspaceId: string, batchId: string): Promise<ProposalReviewListResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const batch = await this.getPBIBatch(workspaceId, batchId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const rows = workspaceDb.all<ProposalDbRow>(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.workspace_id = @workspaceId AND p.batch_id = @batchId
+        ORDER BY p.queue_order ASC, p.generated_at ASC
+      `, { workspaceId, batchId });
+
+      const relatedCounts = workspaceDb.all<{ proposalId: string; count: number }>(`
+        SELECT proposal_id as proposalId, COUNT(*) as count
+        FROM proposal_pbi_links
+        WHERE proposal_id IN (SELECT id FROM proposals WHERE batch_id = @batchId)
+        GROUP BY proposal_id
+      `, { batchId });
+      const relatedCountMap = new Map(relatedCounts.map((entry) => [entry.proposalId, entry.count]));
+
+      const records = rows.map((row) => this.hydrateProposalDisplayFields(this.mapProposalRow(row), workspaceDb));
+      const queue = records.map<ProposalReviewQueueItem>((proposal) => {
+        const article = deriveProposalArticleDescriptor(proposal);
+        return {
+          proposalId: proposal.id,
+          queueOrder: proposal.queueOrder,
+          action: proposal.action,
+          reviewStatus: proposal.reviewStatus,
+          articleKey: article.articleKey,
+          articleLabel: article.articleLabel,
+          locale: article.locale,
+          confidenceScore: proposal.confidenceScore,
+          rationaleSummary: proposal.rationaleSummary,
+          relatedPbiCount: relatedCountMap.get(proposal.id) ?? 0
+        };
+      });
+
+      const groupMap = new Map<string, ProposalReviewGroup>();
+      for (const item of queue) {
+        const existing = groupMap.get(item.articleKey);
+        if (existing) {
+          existing.proposalIds.push(item.proposalId);
+          existing.total += 1;
+          if (!existing.actions.includes(item.action)) {
+            existing.actions.push(item.action);
+          }
+        } else {
+          groupMap.set(item.articleKey, {
+            articleKey: item.articleKey,
+            articleLabel: item.articleLabel,
+            locale: item.locale,
+            proposalIds: [item.proposalId],
+            total: 1,
+            actions: [item.action]
+          });
+        }
+      }
+
+      return {
+        workspaceId,
+        batchId,
+        batchStatus: batch.status,
+        summary: summarizeProposalStatuses(records),
+        queue,
+        groups: Array.from(groupMap.values())
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getProposalReviewDetail(workspaceId: string, proposalId: string): Promise<ProposalReviewDetailResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<ProposalDbRow>(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.workspace_id = @workspaceId AND p.id = @proposalId
+      `, { workspaceId, proposalId });
+      if (!row) {
+        throw new Error('Proposal not found');
+      }
+
+      const proposal = this.hydrateProposalDisplayFields(this.mapProposalRow(row), workspaceDb);
+      const batch = await this.getPBIBatch(workspaceId, proposal.batchId);
+      const relatedPbis = workspaceDb.all<PBIRecord>(`
+        SELECT p.id, p.batch_id as batchId, p.source_row_number as sourceRowNumber, p.external_id as externalId, p.title,
+               p.description, p.priority, p.state, p.work_item_type as workItemType, p.title1, p.title2, p.title3,
+               p.raw_description as rawDescription, p.raw_acceptance_criteria as rawAcceptanceCriteria,
+               p.description_text as descriptionText, p.acceptance_criteria_text as acceptanceCriteriaText,
+               p.parent_external_id as parentExternalId, p.parent_record_id as parentRecordId,
+               p.validation_status as validationStatus, p.validation_reason as validationReason
+        FROM pbi_records p
+        JOIN proposal_pbi_links l ON l.pbi_id = p.id
+        WHERE l.proposal_id = @proposalId
+        ORDER BY p.source_row_number ASC
+      `, { proposalId });
+
+      const queueRows = workspaceDb.all<{ id: string }>(`
+        SELECT id
+        FROM proposals
+        WHERE batch_id = @batchId
+        ORDER BY queue_order ASC, generated_at ASC
+      `, { batchId: proposal.batchId });
+      const currentIndex = Math.max(0, queueRows.findIndex((entry) => entry.id === proposalId));
+      const hydrated = await this.ensureProposalReviewArtifacts(
+        workspace.path,
+        workspaceDb,
+        proposal,
+        relatedPbis
+      );
+      const beforeHtml = hydrated.beforeHtml;
+      const afterHtml = hydrated.afterHtml;
+      const diff = diffHtml(beforeHtml, afterHtml);
+
+      return {
+        workspaceId,
+        batchId: hydrated.proposal.batchId,
+        batchStatus: batch.status,
+        proposal: hydrated.proposal,
+        relatedPbis,
+        diff: {
+          beforeHtml: diff.beforeHtml,
+          afterHtml: diff.afterHtml,
+          sourceDiff: {
+            lines: diff.sourceLines.map((line) => ({
+              kind: line.kind,
+              lineNumberBefore: line.beforeLineNumber,
+              lineNumberAfter: line.afterLineNumber,
+              content: line.content
+            }))
+          },
+          renderedDiff: {
+            blocks: diff.renderedBlocks.map((block) => ({
+              kind: block.kind,
+              beforeText: block.beforeText,
+              afterText: block.afterText
+            }))
+          },
+          changeRegions: diff.changeRegions.map((region) => ({
+            id: region.id,
+            kind: region.kind,
+            label: region.label,
+            beforeText: region.beforeText,
+            afterText: region.afterText,
+            beforeLineStart: region.beforeLineStart,
+            beforeLineEnd: region.beforeLineEnd,
+            afterLineStart: region.afterLineStart,
+            afterLineEnd: region.afterLineEnd
+          })),
+          gutter: diff.gutter.map((item) => ({
+            lineNumber: item.lineNumber,
+            kind: item.kind,
+            regionId: item.regionId,
+            side: item.side
+          }))
+        },
+        navigation: {
+          currentIndex,
+          total: queueRows.length,
+          previousProposalId: currentIndex > 0 ? queueRows[currentIndex - 1]?.id : undefined,
+          nextProposalId: currentIndex < queueRows.length - 1 ? queueRows[currentIndex + 1]?.id : undefined
+        }
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async decideProposalReview(input: ProposalReviewDecisionRequest): Promise<ProposalReviewDecisionResponse> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const existing = workspaceDb.get<ProposalDbRow>(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.workspace_id = @workspaceId AND p.id = @proposalId
+      `, { workspaceId: input.workspaceId, proposalId: input.proposalId });
+      if (!existing) {
+        throw new Error('Proposal not found');
+      }
+
+      const mappedStatus = mapReviewDecisionToStatus(input.decision);
+      const legacyStatus = mapReviewDecisionToLegacyStatus(input.decision);
+      const decidedAt = new Date().toISOString();
+      const nextPlacement = input.placementOverride
+        ? JSON.stringify(input.placementOverride)
+        : existing.suggestedPlacementJson;
+
+      workspaceDb.run(
+        `UPDATE proposals
+         SET review_status = @reviewStatus,
+             status = @status,
+             branch_id = COALESCE(@branchId, branch_id),
+             suggested_placement_json = @suggestedPlacementJson,
+             decision_payload_json = @decisionPayloadJson,
+             decided_at = @decidedAt,
+             updated_at = @updatedAt
+         WHERE id = @proposalId AND workspace_id = @workspaceId`,
+        {
+          reviewStatus: mappedStatus,
+          status: legacyStatus,
+          branchId: input.branchId ?? null,
+          suggestedPlacementJson: nextPlacement ?? null,
+          decisionPayloadJson: JSON.stringify({
+            decision: input.decision,
+            branchId: input.branchId,
+            note: input.note,
+            placementOverride: input.placementOverride
+          }),
+          decidedAt,
+          updatedAt: decidedAt,
+          proposalId: input.proposalId,
+          workspaceId: input.workspaceId
+        }
+      );
+
+      const batchStatus = await this.syncBatchReviewStatus(workspaceDb, input.workspaceId, existing.batchId);
+      const queueRows = workspaceDb.all<ProposalDbRow>(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.batch_id = @batchId
+      `, { batchId: existing.batchId });
+
+      return {
+        workspaceId: input.workspaceId,
+        batchId: existing.batchId,
+        proposalId: input.proposalId,
+        reviewStatus: mappedStatus,
+        batchStatus,
+        summary: summarizeProposalStatuses(queueRows.map((row) => this.mapProposalRow(row)))
       };
     } finally {
       workspaceDb.close();
@@ -3388,6 +3923,375 @@ export class WorkspaceRepository {
       return '';
     }
   }
+
+  private async persistProposalArtifacts(
+    workspacePath: string,
+    proposalId: string,
+    payload: {
+      sourceHtml?: string;
+      proposedHtml?: string;
+      metadata?: Record<string, unknown>;
+    }
+  ): Promise<{ sourceHtmlPath?: string; proposedHtmlPath?: string }> {
+    const proposalDir = path.join(workspacePath, 'proposals', proposalId);
+    await fs.mkdir(proposalDir, { recursive: true });
+
+    const sourceHtml = payload.sourceHtml?.trim();
+    const proposedHtml = payload.proposedHtml?.trim();
+    const metadata = payload.metadata && Object.keys(payload.metadata).length > 0
+      ? JSON.stringify(payload.metadata, null, 2)
+      : '';
+
+    let sourceHtmlPath: string | undefined;
+    let proposedHtmlPath: string | undefined;
+    if (sourceHtml) {
+      sourceHtmlPath = path.join('proposals', proposalId, 'source.html');
+      await fs.writeFile(path.join(workspacePath, sourceHtmlPath), sourceHtml, 'utf8');
+    }
+    if (proposedHtml) {
+      proposedHtmlPath = path.join('proposals', proposalId, 'proposed.html');
+      await fs.writeFile(path.join(workspacePath, proposedHtmlPath), proposedHtml, 'utf8');
+    }
+    if (metadata) {
+      await fs.writeFile(path.join(proposalDir, 'metadata.json'), metadata, 'utf8');
+    }
+
+    return { sourceHtmlPath, proposedHtmlPath };
+  }
+
+  private async ensureProposalReviewArtifacts(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord,
+    relatedPbis: PBIRecord[]
+  ): Promise<{ proposal: ProposalReviewRecord; beforeHtml: string; afterHtml: string }> {
+    let beforeHtml = await this.readProposalArtifact(workspacePath, proposal.sourceHtmlPath);
+    let afterHtml = await this.readProposalArtifact(workspacePath, proposal.proposedHtmlPath);
+
+    if (beforeHtml && afterHtml) {
+      return { proposal, beforeHtml, afterHtml };
+    }
+
+    if (!beforeHtml) {
+      beforeHtml = await this.resolveProposalSourceHtml(workspacePath, workspaceDb, proposal);
+    }
+
+    if (!afterHtml) {
+      afterHtml = this.buildFallbackProposalHtml(proposal, relatedPbis, beforeHtml);
+    }
+
+    if (!beforeHtml && !afterHtml) {
+      return { proposal, beforeHtml: '', afterHtml: '' };
+    }
+
+    const artifacts = await this.persistProposalArtifacts(workspacePath, proposal.id, {
+      sourceHtml: beforeHtml,
+      proposedHtml: afterHtml,
+      metadata: normalizeProposalMetadata(proposal.metadata)
+    });
+
+    const nextSourceHtmlPath = artifacts.sourceHtmlPath ?? proposal.sourceHtmlPath ?? null;
+    const nextProposedHtmlPath = artifacts.proposedHtmlPath ?? proposal.proposedHtmlPath ?? null;
+
+    workspaceDb.run(
+      `UPDATE proposals
+       SET source_html_path = @sourceHtmlPath,
+           proposed_html_path = @proposedHtmlPath,
+           updated_at = @updatedAt
+       WHERE id = @proposalId`,
+      {
+        proposalId: proposal.id,
+        sourceHtmlPath: nextSourceHtmlPath,
+        proposedHtmlPath: nextProposedHtmlPath,
+        updatedAt: new Date().toISOString()
+      }
+    );
+
+    return {
+      proposal: {
+        ...proposal,
+        targetTitle: proposal.targetTitle,
+        sourceHtmlPath: nextSourceHtmlPath ?? undefined,
+        proposedHtmlPath: nextProposedHtmlPath ?? undefined,
+        updatedAtUtc: new Date().toISOString()
+      },
+      beforeHtml,
+      afterHtml
+    };
+  }
+
+  private async resolveProposalSourceHtml(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord
+  ): Promise<string> {
+    const revision = proposal.sourceRevisionId
+      ? workspaceDb.get<{ filePath: string }>(
+          `SELECT file_path as filePath
+           FROM revisions
+           WHERE id = @revisionId
+           LIMIT 1`,
+          { revisionId: proposal.sourceRevisionId }
+        ) ?? null
+      : proposal.localeVariantId
+        ? workspaceDb.get<{ filePath: string }>(
+            `SELECT file_path as filePath
+             FROM revisions
+             WHERE locale_variant_id = @localeVariantId
+               AND revision_type = 'live'
+             ORDER BY revision_number DESC
+             LIMIT 1`,
+            { localeVariantId: proposal.localeVariantId }
+          ) ?? workspaceDb.get<{ filePath: string }>(
+            `SELECT file_path as filePath
+             FROM revisions
+             WHERE locale_variant_id = @localeVariantId
+             ORDER BY revision_number DESC
+             LIMIT 1`,
+            { localeVariantId: proposal.localeVariantId }
+          ) ?? null
+        : null;
+
+    if (!revision?.filePath) {
+      return '';
+    }
+
+    return this.readRevisionSource(resolveRevisionPath(workspacePath, revision.filePath));
+  }
+
+  private hydrateProposalDisplayFields(
+    proposal: ProposalReviewRecord,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>
+  ): ProposalReviewRecord {
+    if (proposal.targetTitle && proposal.targetTitle.trim()) {
+      return proposal;
+    }
+
+    let familyId = proposal.familyId;
+    let targetLocale = proposal.targetLocale;
+    let targetTitle = proposal.targetTitle;
+
+    if (proposal.localeVariantId) {
+      const localeVariant = workspaceDb.get<{ familyId: string; locale: string; familyTitle: string }>(
+        `SELECT lv.family_id as familyId,
+                lv.locale as locale,
+                af.title as familyTitle
+         FROM locale_variants lv
+         JOIN article_families af ON af.id = lv.family_id
+         WHERE lv.id = @localeVariantId
+         LIMIT 1`,
+        { localeVariantId: proposal.localeVariantId }
+      );
+      if (localeVariant) {
+        familyId = familyId ?? localeVariant.familyId;
+        targetLocale = targetLocale ?? localeVariant.locale;
+        targetTitle = targetTitle ?? localeVariant.familyTitle;
+      }
+    }
+
+    if (!targetTitle && familyId) {
+      const family = workspaceDb.get<{ title: string }>(
+        `SELECT title
+         FROM article_families
+         WHERE id = @familyId
+         LIMIT 1`,
+        { familyId }
+      );
+      targetTitle = family?.title?.trim() || targetTitle;
+    }
+
+    if (!targetTitle) {
+      targetTitle = inferProposalTitleFromText(
+        proposal.action,
+        proposal.rationaleSummary ?? proposal.aiNotes
+      );
+    }
+
+    return {
+      ...proposal,
+      familyId,
+      targetLocale,
+      targetTitle: targetTitle || undefined
+    };
+  }
+
+  private async resolveProposalIdentity(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    payload: {
+      workspaceId: string;
+      action: ProposalAction;
+      localeVariantId?: string;
+      familyId?: string;
+      targetTitle?: string;
+      targetLocale?: string;
+      note?: string;
+      rationale?: string;
+      metadata: Record<string, unknown>;
+    }
+  ): Promise<{ familyId?: string; targetTitle?: string; targetLocale?: string }> {
+    const localeVariantId = payload.localeVariantId?.trim() || undefined;
+    let familyId = payload.familyId?.trim() || extractString(payload.metadata.familyId);
+    let targetLocale = payload.targetLocale
+      ?? extractString(payload.metadata.targetLocale)
+      ?? extractString(payload.metadata.locale);
+    let targetTitle = payload.targetTitle
+      ?? extractString(payload.metadata.targetTitle)
+      ?? extractString(payload.metadata.articleTitle)
+      ?? extractString(payload.metadata.articleName)
+      ?? extractString(payload.metadata.proposedTitle)
+      ?? extractString(payload.metadata.title)
+      ?? extractString(payload.metadata.name);
+
+    if (localeVariantId) {
+      const localeVariant = workspaceDb.get<{ familyId: string; locale: string; familyTitle: string }>(
+        `SELECT lv.family_id as familyId,
+                lv.locale as locale,
+                af.title as familyTitle
+         FROM locale_variants lv
+         JOIN article_families af ON af.id = lv.family_id
+         WHERE lv.id = @localeVariantId
+         LIMIT 1`,
+        { localeVariantId }
+      );
+      if (localeVariant) {
+        familyId = familyId ?? localeVariant.familyId;
+        targetLocale = targetLocale ?? localeVariant.locale;
+        targetTitle = targetTitle ?? localeVariant.familyTitle;
+      }
+    }
+
+    if (!targetTitle && familyId) {
+      const family = workspaceDb.get<{ title: string }>(
+        `SELECT title
+         FROM article_families
+         WHERE id = @familyId
+         LIMIT 1`,
+        { familyId }
+      );
+      targetTitle = family?.title?.trim() || targetTitle;
+    }
+
+    targetTitle = targetTitle
+      ?? inferProposalTitleFromText(payload.action, payload.note)
+      ?? inferProposalTitleFromText(payload.action, payload.rationale);
+
+    return {
+      familyId: familyId || undefined,
+      targetTitle: targetTitle || undefined,
+      targetLocale: targetLocale || undefined
+    };
+  }
+
+  private buildFallbackProposalHtml(
+    proposal: ProposalReviewRecord,
+    relatedPbis: PBIRecord[],
+    sourceHtml: string
+  ): string {
+    const title = escapeHtml(proposal.targetTitle ?? deriveProposalArticleDescriptor(proposal).articleLabel);
+    const action = escapeHtml(proposal.action.replace(/_/g, ' '));
+    const rationale = escapeHtml(proposal.rationaleSummary ?? proposal.aiNotes ?? 'No proposal summary was provided.');
+    const notes = proposal.aiNotes && proposal.aiNotes !== proposal.rationaleSummary
+      ? `<p><strong>AI notes:</strong> ${escapeHtml(proposal.aiNotes)}</p>`
+      : '';
+    const pbiList = relatedPbis.length > 0
+      ? `<ul>${relatedPbis
+          .slice(0, 8)
+          .map((pbi) => `<li>${escapeHtml(pbi.externalId ?? pbi.id)}: ${escapeHtml(pbi.title ?? 'Untitled PBI')}</li>`)
+          .join('')}</ul>`
+      : '<p>No linked PBIs were persisted for this proposal.</p>';
+
+    const summaryBlock = [
+      '<section data-kbv-fallback="proposal-summary" style="border:1px solid #d7dde5;border-radius:8px;padding:16px;margin-bottom:16px;background:#f8fafc;">',
+      `<p style="margin:0 0 8px 0;font-size:12px;text-transform:uppercase;letter-spacing:0.04em;color:#51606f;">Fallback proposal preview</p>`,
+      `<h1 style="margin:0 0 12px 0;font-size:24px;">${title}</h1>`,
+      `<p><strong>Action:</strong> ${action}</p>`,
+      `<p><strong>Summary:</strong> ${rationale}</p>`,
+      notes,
+      '<p><strong>Triggering PBIs</strong></p>',
+      pbiList,
+      '</section>'
+    ].join('');
+
+    if (proposal.action === ProposalAction.EDIT && sourceHtml) {
+      return `${summaryBlock}\n${sourceHtml}`;
+    }
+
+    if (proposal.action === ProposalAction.RETIRE && sourceHtml) {
+      return `${summaryBlock}\n${sourceHtml}`;
+    }
+
+    return summaryBlock;
+  }
+
+  private async readProposalArtifact(workspacePath: string, artifactPath?: string): Promise<string> {
+    if (!artifactPath) {
+      return '';
+    }
+    try {
+      return await fs.readFile(resolveRevisionPath(workspacePath, artifactPath), 'utf8');
+    } catch {
+      return '';
+    }
+  }
+
+  private mapProposalRow(row: ProposalDbRow): ProposalReviewRecord {
+    return {
+      id: row.id,
+      workspaceId: row.workspaceId,
+      batchId: row.batchId,
+      sessionId: row.sessionId ?? undefined,
+      action: row.action,
+      reviewStatus: normalizeReviewStatus(row.reviewStatus),
+      legacyStatus: row.status ?? undefined,
+      familyId: row.familyId ?? undefined,
+      localeVariantId: row.localeVariantId ?? undefined,
+      sourceRevisionId: row.sourceRevisionId ?? undefined,
+      branchId: row.branchId ?? undefined,
+      targetTitle: row.targetTitle ?? undefined,
+      targetLocale: row.targetLocale ?? undefined,
+      confidenceScore: row.confidenceScore ?? undefined,
+      rationaleSummary: row.rationaleSummary ?? row.rationale ?? undefined,
+      aiNotes: row.aiNotes ?? undefined,
+      suggestedPlacement: safeParseJson<ProposalPlacementSuggestion>(row.suggestedPlacementJson) ?? undefined,
+      sourceHtmlPath: row.sourceHtmlPath ?? undefined,
+      proposedHtmlPath: row.proposedHtmlPath ?? undefined,
+      metadata: safeParseJson(row.metadataJson) ?? undefined,
+      queueOrder: row.queueOrder ?? 0,
+      generatedAtUtc: row.generatedAtUtc,
+      updatedAtUtc: row.updatedAtUtc,
+      decidedAtUtc: row.decidedAtUtc ?? undefined
+    };
+  }
+
+  private async syncBatchReviewStatus(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    batchId: string
+  ): Promise<PBIBatchStatus> {
+    const rows = workspaceDb.all<{ reviewStatus: string }>(
+      `SELECT review_status as reviewStatus
+       FROM proposals
+       WHERE workspace_id = @workspaceId AND batch_id = @batchId`,
+      { workspaceId, batchId }
+    );
+
+    const normalized = rows.map((row) => normalizeReviewStatus(row.reviewStatus));
+    let nextStatus = PBIBatchStatus.ANALYZED;
+    if (normalized.length > 0) {
+      nextStatus = normalized.some((status) => status === ProposalReviewStatus.PENDING_REVIEW)
+        ? PBIBatchStatus.REVIEW_IN_PROGRESS
+        : PBIBatchStatus.REVIEW_COMPLETE;
+    }
+
+    workspaceDb.run(
+      `UPDATE pbi_batches
+       SET status = @status
+       WHERE id = @batchId AND workspace_id = @workspaceId`,
+      { status: nextStatus, batchId, workspaceId }
+    );
+
+    return nextStatus;
+  }
 }
 
 function normalizeSearchScope(scope: SearchContext['scope'] | undefined): SearchContext['scope'] {
@@ -3395,6 +4299,239 @@ function normalizeSearchScope(scope: SearchContext['scope'] | undefined): Search
     return scope;
   }
   return 'all';
+}
+
+function normalizeReviewStatus(value: string | null | undefined): ProposalReviewStatus {
+  switch (value) {
+    case ProposalReviewStatus.ACCEPTED:
+    case ProposalReviewStatus.DENIED:
+    case ProposalReviewStatus.DEFERRED:
+    case ProposalReviewStatus.APPLIED_TO_BRANCH:
+    case ProposalReviewStatus.ARCHIVED:
+    case ProposalReviewStatus.PENDING_REVIEW:
+      return value;
+    default:
+      return ProposalReviewStatus.PENDING_REVIEW;
+  }
+}
+
+function mapReviewDecisionToStatus(decision: ProposalReviewDecision): ProposalReviewStatus {
+  switch (decision) {
+    case ProposalReviewDecision.ACCEPT:
+      return ProposalReviewStatus.ACCEPTED;
+    case ProposalReviewDecision.DENY:
+      return ProposalReviewStatus.DENIED;
+    case ProposalReviewDecision.APPLY_TO_BRANCH:
+      return ProposalReviewStatus.APPLIED_TO_BRANCH;
+    case ProposalReviewDecision.ARCHIVE:
+      return ProposalReviewStatus.ARCHIVED;
+    case ProposalReviewDecision.DEFER:
+    default:
+      return ProposalReviewStatus.DEFERRED;
+  }
+}
+
+function mapReviewDecisionToLegacyStatus(decision: ProposalReviewDecision): ProposalDecision {
+  switch (decision) {
+    case ProposalReviewDecision.ACCEPT:
+      return ProposalDecision.ACCEPT;
+    case ProposalReviewDecision.DENY:
+      return ProposalDecision.DENY;
+    case ProposalReviewDecision.APPLY_TO_BRANCH:
+      return ProposalDecision.APPLY_TO_BRANCH;
+    case ProposalReviewDecision.ARCHIVE:
+      return ProposalDecision.DEFER;
+    case ProposalReviewDecision.DEFER:
+    default:
+      return ProposalDecision.DEFER;
+  }
+}
+
+function summarizeProposalStatuses(records: ProposalReviewRecord[]): ProposalReviewSummaryCounts {
+  const summary: ProposalReviewSummaryCounts = {
+    total: records.length,
+    pendingReview: 0,
+    accepted: 0,
+    denied: 0,
+    deferred: 0,
+    appliedToBranch: 0,
+    archived: 0
+  };
+
+  for (const record of records) {
+    switch (record.reviewStatus) {
+      case ProposalReviewStatus.ACCEPTED:
+        summary.accepted += 1;
+        break;
+      case ProposalReviewStatus.DENIED:
+        summary.denied += 1;
+        break;
+      case ProposalReviewStatus.DEFERRED:
+        summary.deferred += 1;
+        break;
+      case ProposalReviewStatus.APPLIED_TO_BRANCH:
+        summary.appliedToBranch += 1;
+        break;
+      case ProposalReviewStatus.ARCHIVED:
+        summary.archived += 1;
+        break;
+      case ProposalReviewStatus.PENDING_REVIEW:
+      default:
+        summary.pendingReview += 1;
+        break;
+    }
+  }
+
+  return summary;
+}
+
+function deriveProposalArticleDescriptor(proposal: ProposalReviewRecord): {
+  articleKey: string;
+  articleLabel: string;
+  locale?: string;
+} {
+  const inferredLabel = proposal.targetTitle
+    ?? inferProposalTitleFromText(proposal.action, proposal.rationaleSummary ?? proposal.aiNotes)
+    ?? proposal.suggestedPlacement?.articleTitle
+    ?? friendlyProposalLabel(proposal.action);
+
+  if (proposal.localeVariantId) {
+    return {
+      articleKey: `locale:${proposal.localeVariantId}`,
+      articleLabel: inferredLabel,
+      locale: proposal.targetLocale
+    };
+  }
+  if (proposal.familyId) {
+    return {
+      articleKey: `family:${proposal.familyId}:${proposal.targetLocale ?? 'default'}`,
+      articleLabel: inferredLabel,
+      locale: proposal.targetLocale
+    };
+  }
+  return {
+    articleKey: `new:${inferredLabel}:${proposal.targetLocale ?? 'default'}`,
+    articleLabel: inferredLabel,
+    locale: proposal.targetLocale
+  };
+}
+
+function inferProposalTitleFromText(action: ProposalAction, value?: string): string | undefined {
+  const text = extractString(value);
+  if (!text) {
+    return undefined;
+  }
+
+  const prefixedPatterns = [
+    /^(?:kb\s+)?(?:edit|update|revise)\s+(?:article\s+)?(.+?)(?::|\s+-\s+|\s+\(|$)/i,
+    /^(?:kb\s+)?(?:create|new article|new kb article)\s+(?:article\s+)?(.+?)(?::|\s+-\s+|\s+\(|$)/i,
+    /^(?:kb\s+)?(?:retire|remove|archive)\s+(?:article\s+)?(.+?)(?::|\s+-\s+|\s+\(|$)/i,
+    /^(?:kb\s+)?(?:edit|update|revise)\s*:\s*(?:article\s+)?(.+?)(?::|\s+-\s+|\s+\(|$)/i,
+    /^(?:kb\s+)?(?:create|new article|new kb article)\s*:\s*(?:article\s+)?(.+?)(?::|\s+-\s+|\s+\(|$)/i,
+    /^(?:kb\s+)?(?:retire|remove|archive)\s*:\s*(?:article\s+)?(.+?)(?::|\s+-\s+|\s+\(|$)/i
+  ];
+
+  for (const pattern of prefixedPatterns) {
+    const match = text.match(pattern);
+    const candidate = match?.[1]?.trim();
+    if (candidate) {
+      return cleanProposalTitleCandidate(candidate);
+    }
+  }
+
+  if (action === ProposalAction.CREATE) {
+    const quoted = text.match(/[“"']([^"”']{3,120})[”"']/);
+    const candidate = quoted?.[1]?.trim();
+    if (candidate) {
+      return cleanProposalTitleCandidate(candidate);
+    }
+  }
+
+  return undefined;
+}
+
+function cleanProposalTitleCandidate(value: string): string | undefined {
+  const cleaned = value
+    .replace(/^[\s:;,.!-]+|[\s:;,.!-]+$/g, '')
+    .replace(/\b(article|kb article|documentation)\b$/i, '')
+    .trim();
+  return cleaned || undefined;
+}
+
+function friendlyProposalLabel(action: ProposalAction): string {
+  switch (action) {
+    case ProposalAction.CREATE:
+      return 'New article proposal';
+    case ProposalAction.EDIT:
+      return 'Article update proposal';
+    case ProposalAction.RETIRE:
+      return 'Article retirement proposal';
+    case ProposalAction.NO_IMPACT:
+    default:
+      return 'No-impact proposal';
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function normalizeProposalMetadata(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+function extractString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeConfidenceScore(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (value > 1) {
+      return Math.max(0, Math.min(1, value / 100));
+    }
+    return Math.max(0, Math.min(1, value));
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isNaN(parsed)) {
+      return normalizeConfidenceScore(parsed);
+    }
+  }
+  return undefined;
+}
+
+function normalizePlacement(value: unknown): ProposalPlacementSuggestion | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const input = value as Record<string, unknown>;
+  const placement: ProposalPlacementSuggestion = {
+    categoryId: extractString(input.categoryId),
+    sectionId: extractString(input.sectionId),
+    articleTitle: extractString(input.articleTitle),
+    parentArticleId: extractString(input.parentArticleId),
+    notes: extractString(input.notes)
+  };
+  return Object.values(placement).some(Boolean) ? placement : undefined;
+}
+
+function safeParseJson<T = unknown>(value: string | null | undefined): T | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
 }
 
 function variantToDraftCount(map: Map<string, number>, localeVariantId: string): number {

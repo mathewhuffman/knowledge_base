@@ -200,6 +200,56 @@ function streamingKindBadge(kind: AgentStreamingPayload['kind']): 'primary' | 's
   }
 }
 
+function parseSessionUpdatePayload(raw: string): {
+  updateType: string | null;
+  contentType: string | null;
+  contentText: string | null;
+  parsed: any;
+} | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      updateType: typeof parsed?.update?.sessionUpdate === 'string' ? parsed.update.sessionUpdate : null,
+      contentType: typeof parsed?.update?.content?.type === 'string' ? parsed.update.content.type : null,
+      contentText: typeof parsed?.update?.content?.text === 'string' ? parsed.update.content.text : null,
+      parsed,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isHiddenSessionUpdateType(updateType: string | null): boolean {
+  return updateType === 'agent_thought_chunk';
+}
+
+function shouldDisplayTranscriptLine(line: AgentTranscriptLine): boolean {
+  if (line.event !== 'session_update') {
+    return true;
+  }
+
+  const parsed = parseSessionUpdatePayload(line.payload);
+  if (!parsed) {
+    return true;
+  }
+
+  return !isHiddenSessionUpdateType(parsed.updateType);
+}
+
+function shouldDisplayStreamingEvent(evt: AgentStreamingPayload): boolean {
+  if (evt.kind !== 'progress' || !evt.data) {
+    return true;
+  }
+
+  try {
+    const parsed = evt.data as { update?: { sessionUpdate?: unknown } };
+    const updateType = typeof parsed?.update?.sessionUpdate === 'string' ? parsed.update.sessionUpdate : null;
+    return !isHiddenSessionUpdateType(updateType);
+  } catch {
+    return true;
+  }
+}
+
 type AgentToolCallListResponse = {
   workspaceId?: string;
   sessionId?: string;
@@ -391,6 +441,9 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
 
       if (data) {
         setLastCheck(data);
+        if (withStartupRetries) {
+          setInitialCheckPending(false);
+        }
       }
 
       const needsRetry = withStartupRetries
@@ -420,7 +473,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
   const providerHealth = health && isProviderHealthResponse(health) ? health : null;
   const legacyHealth = health && !isProviderHealthResponse(health) ? health : null;
   const allGood = providerHealth
-    ? providerHealth.providers.mcp.ok && providerHealth.providers.cli.ok
+    ? providerHealth.availableModes.includes(providerHealth.selectedMode)
     : legacyHealth
       ? legacyHealth.cursorInstalled && legacyHealth.acpReachable && legacyHealth.mcpRunning && legacyHealth.requiredConfigPresent
       : false;
@@ -447,7 +500,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
           )}
           <button
             className="btn btn-ghost btn-icon"
-            onClick={runCheck}
+            onClick={() => void runCheck()}
             disabled={healthQuery.loading}
             title="Re-check health"
             aria-label="Re-check agent health"
@@ -464,7 +517,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
           <ErrorState
             title="Unable to check health"
             description={`The health check could not complete: ${healthQuery.error}. This may be a temporary issue.`}
-            action={<button className="btn btn-primary btn-sm" onClick={runCheck}>Try Again</button>}
+            action={<button className="btn btn-primary btn-sm" onClick={() => void runCheck()}>Try Again</button>}
           />
         ) : health ? (
           <div className="agent-health-grid">
@@ -1065,7 +1118,10 @@ export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDeta
 
 function TranscriptView({ lines, loading, error }: { lines: AgentTranscriptLine[]; loading: boolean; error: string | null }) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const mergedLines = useMemo(() => mergeTranscriptLines(lines), [lines]);
+  const mergedLines = useMemo(
+    () => mergeTranscriptLines(lines).filter((line) => shouldDisplayTranscriptLine(line)),
+    [lines],
+  );
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -1114,17 +1170,13 @@ function mergeTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine
       continue;
     }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(line.payload);
-    } catch {
+    const parsedPayload = parseSessionUpdatePayload(line.payload);
+    if (!parsedPayload) {
       merged.push(line);
       continue;
     }
 
-    const updateType = parsed?.update?.sessionUpdate;
-    const contentType = parsed?.update?.content?.type;
-    const contentText = typeof parsed?.update?.content?.text === 'string' ? parsed.update.content.text : '';
+    const { parsed, updateType, contentType, contentText } = parsedPayload;
     const mergeable = (updateType === 'agent_thought_chunk' || updateType === 'agent_message_chunk') && contentType === 'text';
 
     if (!mergeable || !contentText) {
@@ -1138,18 +1190,16 @@ function mergeTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine
       continue;
     }
 
-    let previousParsed: any;
-    try {
-      previousParsed = JSON.parse(previous.payload);
-    } catch {
+    const previousParsedPayload = parseSessionUpdatePayload(previous.payload);
+    if (!previousParsedPayload) {
       merged.push(line);
       continue;
     }
 
-    const previousType = previousParsed?.update?.sessionUpdate;
-    const previousContentType = previousParsed?.update?.content?.type;
-    const previousText =
-      typeof previousParsed?.update?.content?.text === 'string' ? previousParsed.update.content.text : null;
+    const previousParsed = previousParsedPayload.parsed;
+    const previousType = previousParsedPayload.updateType;
+    const previousContentType = previousParsedPayload.contentType;
+    const previousText = previousParsedPayload.contentText;
 
     if (previousType !== updateType || previousContentType !== 'text' || previousText === null) {
       merged.push(line);
@@ -1415,7 +1465,9 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       if (event.message) {
         try {
           const payload = JSON.parse(event.message) as AgentStreamingPayload;
-          setEvents((prev) => [...prev, payload]);
+          if (shouldDisplayStreamingEvent(payload)) {
+            setEvents((prev) => [...prev, payload]);
+          }
           if (payload.kind === 'session_started' && payload.data && typeof payload.data === 'object') {
             const sessionPayload = (payload.data as { session?: { kbAccessMode?: KbAccessMode } }).session;
             if (sessionPayload?.kbAccessMode === 'mcp' || sessionPayload?.kbAccessMode === 'cli') {
@@ -1428,19 +1480,21 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
           }
           if (payload.kind === 'progress' && payload.data) {
             const sessionUpdatePayload = JSON.stringify(payload.data);
-            setLiveTranscriptLines((prev) => {
-              const nextLine: AgentTranscriptLine = {
-                atUtc: payload.atUtc,
-                direction: 'from_agent',
-                event: 'session_update',
-                payload: sessionUpdatePayload,
-              };
-              const lastLine = prev[prev.length - 1];
-              if (lastLine && lastLine.event === nextLine.event && lastLine.payload === nextLine.payload) {
-                return prev;
-              }
-              return [...prev, nextLine];
-            });
+            const nextLine: AgentTranscriptLine = {
+              atUtc: payload.atUtc,
+              direction: 'from_agent',
+              event: 'session_update',
+              payload: sessionUpdatePayload,
+            };
+            if (shouldDisplayTranscriptLine(nextLine)) {
+              setLiveTranscriptLines((prev) => {
+                const lastLine = prev[prev.length - 1];
+                if (lastLine && lastLine.event === nextLine.event && lastLine.payload === nextLine.payload) {
+                  return prev;
+                }
+                return [...prev, nextLine];
+              });
+            }
           }
         } catch {
           // Non-JSON message, still useful
@@ -1571,9 +1625,18 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const isRunning = jobState === 'RUNNING' || jobState === 'QUEUED';
   const isDone = jobState === 'SUCCEEDED' || jobState === 'FAILED' || jobState === 'CANCELED';
   const acpToolCalls = useMemo(() => extractAcpToolCalls(transcriptLines), [transcriptLines]);
+  const visibleTranscriptLines = useMemo(
+    () => mergeTranscriptLines(transcriptLines).filter((line) => shouldDisplayTranscriptLine(line)),
+    [transcriptLines],
+  );
+  const visibleEvents = useMemo(
+    () => events.filter((evt) => shouldDisplayStreamingEvent(evt)),
+    [events],
+  );
   const hasHistory = Boolean(activeLiveSessionId || persistedRun);
   const shouldShowStartButton = !isRunning && !(startOnOpen && !hasHistory && !isDone);
-  const canCopy = transcriptLines.length > 0 || toolCalls.length > 0 || events.length > 0 || persistedRawOutput.length > 0;
+  const canCopy =
+    visibleTranscriptLines.length > 0 || toolCalls.length > 0 || visibleEvents.length > 0 || persistedRawOutput.length > 0;
 
   useEffect(() => {
     if (!startOnOpen) {
@@ -1638,10 +1701,10 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     chunks.push('');
     chunks.push('Transcript');
     chunks.push('----------');
-    if (transcriptLines.length === 0) {
+    if (visibleTranscriptLines.length === 0) {
       chunks.push('No transcript lines');
     } else {
-      transcriptLines.forEach((line) => {
+      visibleTranscriptLines.forEach((line) => {
         chunks.push(`[${formatTimestamp(line.atUtc)}] ${line.direction} ${line.event}`);
         chunks.push(formatPayload(line.payload));
       });
@@ -1677,17 +1740,17 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     chunks.push('');
     chunks.push('Events');
     chunks.push('----------');
-    if (events.length === 0) {
+    if (visibleEvents.length === 0) {
       chunks.push('No events yet');
     } else {
-      events.forEach((evt) => {
+      visibleEvents.forEach((evt) => {
         const suffix = evt.message ? `: ${evt.message}` : '';
         chunks.push(`[${formatTimestamp(evt.atUtc)}] ${evt.kind}${suffix}`);
       });
     }
 
     return chunks.join('\n');
-  }, [activeSession, batchId, events, jobState, persistedRawOutput, persistedRun, progress, toolCalls, transcriptLines]);
+  }, [activeSession, batchId, jobState, persistedRawOutput, persistedRun, progress, toolCalls, visibleEvents, visibleTranscriptLines]);
 
   const copyAnalysisContents = useCallback(() => {
     if (!canCopy) {
@@ -1909,9 +1972,9 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       )}
 
       {/* Streaming event log */}
-      {events.length > 0 && (
+      {visibleEvents.length > 0 && (
         <div className="agent-job-event-log analysis-copyable" ref={scrollRef}>
-          {events.map((evt, i) => (
+          {visibleEvents.map((evt, i) => (
             <div key={i} className="agent-job-event">
               <Badge variant={streamingKindBadge(evt.kind)}>
                 {evt.kind}

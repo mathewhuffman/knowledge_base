@@ -1,172 +1,1146 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  ProposalReviewStatus,
+  ProposalReviewDecision,
+  type ProposalReviewBatchListResponse,
+  type ProposalReviewBatchSummary,
+  type ProposalReviewListResponse,
+  type ProposalReviewDetailResponse,
+  type ProposalReviewDecisionResponse,
+  type ProposalReviewQueueItem,
+  type ProposalReviewSummaryCounts,
+  type ProposalSourceLineChange,
+  type ProposalRenderedBlockChange,
+  type ProposalChangeRegion,
+  type ProposalPlacementSuggestion,
+  type PBIRecord,
+  ProposalAction,
+} from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
+import { LoadingState } from '../components/LoadingState';
+import { ErrorState } from '../components/ErrorState';
 import { Badge } from '../components/Badge';
 import { Kbd } from '../components/Kbd';
-import { IconCheckCircle } from '../components/icons';
+import { Modal } from '../components/Modal';
+import {
+  IconCheckCircle,
+  IconChevronLeft,
+  IconChevronRight,
+  IconArchive,
+  IconMapPin,
+  IconGitBranch,
+  IconEye,
+  IconCode,
+  IconFileText,
+} from '../components/icons';
+import { useWorkspace } from '../context/WorkspaceContext';
+import { useIpc, useIpcMutation } from '../hooks/useIpc';
+
+type ContentTab = 'preview' | 'diff' | 'source' | 'regions';
+
+const ACTION_LABEL: Record<string, string> = {
+  create: 'Create',
+  edit: 'Edit',
+  retire: 'Retire',
+  no_impact: 'No Impact',
+};
+
+const ACTION_VARIANT: Record<string, 'success' | 'primary' | 'danger' | 'neutral'> = {
+  create: 'success',
+  edit: 'primary',
+  retire: 'danger',
+  no_impact: 'neutral',
+};
+
+const STATUS_LABEL: Record<string, string> = {
+  pending_review: 'Pending',
+  accepted: 'Accepted',
+  denied: 'Denied',
+  deferred: 'Deferred',
+  applied_to_branch: 'Applied',
+  archived: 'Archived',
+};
+
+const STATUS_VARIANT: Record<string, 'neutral' | 'primary' | 'success' | 'warning' | 'danger'> = {
+  pending_review: 'neutral',
+  accepted: 'success',
+  denied: 'danger',
+  deferred: 'warning',
+  applied_to_branch: 'primary',
+  archived: 'neutral',
+};
+
+const BATCH_STATUS_LABEL: Record<string, string> = {
+  imported: 'Imported',
+  scoped: 'Scoped',
+  submitted: 'Submitted',
+  analyzed: 'Analyzed',
+  review_in_progress: 'In Review',
+  review_complete: 'Complete',
+  archived: 'Archived',
+  proposed: 'Proposed',
+};
+
+function batchStatusVariant(status: string): 'neutral' | 'primary' | 'success' | 'warning' | 'danger' {
+  switch (status) {
+    case 'review_complete':
+      return 'success';
+    case 'review_in_progress':
+      return 'warning';
+    case 'analyzed':
+    case 'submitted':
+    case 'proposed':
+    case 'scoped':
+      return 'primary';
+    default:
+      return 'neutral';
+  }
+}
+
+function formatDate(utc: string): string {
+  try {
+    return new Date(utc).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  } catch {
+    return utc;
+  }
+}
+
+function confidenceClass(score: number | undefined): string {
+  if (!score) return 'confidence-value--medium';
+  if (score >= 0.8) return 'confidence-value--high';
+  if (score >= 0.5) return 'confidence-value--medium';
+  return 'confidence-value--low';
+}
+
+function formatConfidence(score: number | undefined): string {
+  if (score == null) return '—';
+  return `${Math.round(score * 100)}%`;
+}
+
+function formatPBIValidationStatus(status?: string): string {
+  if (!status) return '—';
+  return status
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function PBIDetailModal({
+  pbi,
+  open,
+  onClose,
+}: {
+  pbi: PBIRecord | null;
+  open: boolean;
+  onClose: () => void;
+}) {
+  if (!pbi) return null;
+
+  const detailRows = [
+    { label: 'External ID', value: pbi.externalId || pbi.id },
+    { label: 'Work item type', value: pbi.workItemType },
+    { label: 'Priority', value: pbi.priority },
+    { label: 'Validation', value: formatPBIValidationStatus(pbi.validationStatus ?? pbi.state) },
+    { label: 'Source row', value: String(pbi.sourceRowNumber) },
+    { label: 'Parent PBI', value: pbi.parentExternalId },
+  ].filter((row) => row.value && row.value !== '—');
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={pbi.title || pbi.externalId || 'PBI details'}
+      className="pbi-detail-modal"
+      footer={<button className="btn btn-primary" onClick={onClose}>Close</button>}
+    >
+      <div className="pbi-detail-modal__content">
+        <div className="pbi-detail-modal__header">
+          <div className="pbi-detail-modal__eyebrow">Proposal evidence</div>
+          <div className="pbi-detail-modal__title-row">
+            <span className="pbi-detail-modal__id">{pbi.externalId || pbi.id}</span>
+            {pbi.priority && <Badge variant="warning">{pbi.priority}</Badge>}
+            {pbi.workItemType && <Badge variant="neutral">{pbi.workItemType}</Badge>}
+          </div>
+        </div>
+
+        {detailRows.length > 0 && (
+          <div className="pbi-detail-modal__grid">
+            {detailRows.map((row) => (
+              <div key={row.label} className="pbi-detail-modal__field">
+                <div className="pbi-detail-modal__label">{row.label}</div>
+                <div className="pbi-detail-modal__value">{row.value}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {pbi.description && (
+          <section className="pbi-detail-modal__section">
+            <div className="pbi-detail-modal__section-label">Description</div>
+            <p className="pbi-detail-modal__copy">{pbi.description}</p>
+          </section>
+        )}
+
+        {pbi.descriptionText && pbi.descriptionText !== pbi.description && (
+          <section className="pbi-detail-modal__section">
+            <div className="pbi-detail-modal__section-label">Parsed Description</div>
+            <p className="pbi-detail-modal__copy">{pbi.descriptionText}</p>
+          </section>
+        )}
+
+        {pbi.acceptanceCriteriaText && (
+          <section className="pbi-detail-modal__section">
+            <div className="pbi-detail-modal__section-label">Acceptance Criteria</div>
+            <p className="pbi-detail-modal__copy">{pbi.acceptanceCriteriaText}</p>
+          </section>
+        )}
+
+        {pbi.validationReason && (
+          <section className="pbi-detail-modal__section">
+            <div className="pbi-detail-modal__section-label">Validation Notes</div>
+            <p className="pbi-detail-modal__copy">{pbi.validationReason}</p>
+          </section>
+        )}
+
+        {pbi.rawDescription && pbi.rawDescription !== pbi.description && (
+          <section className="pbi-detail-modal__section">
+            <div className="pbi-detail-modal__section-label">Raw Description</div>
+            <pre className="pbi-detail-modal__pre">{pbi.rawDescription}</pre>
+          </section>
+        )}
+
+        {pbi.rawAcceptanceCriteria && (
+          <section className="pbi-detail-modal__section">
+            <div className="pbi-detail-modal__section-label">Raw Acceptance Criteria</div>
+            <pre className="pbi-detail-modal__pre">{pbi.rawAcceptanceCriteria}</pre>
+          </section>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function SummaryBar({ summary }: { summary: ProposalReviewSummaryCounts }) {
+  return (
+    <div className="review-summary-bar">
+      <div className="review-summary-stat">
+        <span className="review-summary-stat-count">{summary.total}</span> total
+      </div>
+      <div className="review-summary-stat">
+        <span className="review-summary-stat-count">{summary.pendingReview}</span> pending
+      </div>
+      {summary.accepted > 0 && (
+        <div className="review-summary-stat">
+          <span className="review-summary-stat-count">{summary.accepted}</span> accepted
+        </div>
+      )}
+      {summary.denied > 0 && (
+        <div className="review-summary-stat">
+          <span className="review-summary-stat-count">{summary.denied}</span> denied
+        </div>
+      )}
+      {summary.deferred > 0 && (
+        <div className="review-summary-stat">
+          <span className="review-summary-stat-count">{summary.deferred}</span> deferred
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QueueItem({
+  item,
+  isActive,
+  onClick,
+}: {
+  item: ProposalReviewQueueItem;
+  isActive: boolean;
+  onClick: () => void;
+}) {
+  const decided = item.reviewStatus !== ProposalReviewStatus.PENDING_REVIEW;
+  return (
+    <div
+      className={[
+        'review-queue-item',
+        isActive && 'review-queue-item--active',
+        decided && 'review-queue-item--decided',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+      onClick={onClick}
+    >
+      <div className="review-queue-item-header">
+        <Badge variant={ACTION_VARIANT[item.action] ?? 'neutral'}>
+          {ACTION_LABEL[item.action] ?? item.action}
+        </Badge>
+        {decided && (
+          <Badge variant={STATUS_VARIANT[item.reviewStatus] ?? 'neutral'}>
+            {STATUS_LABEL[item.reviewStatus] ?? item.reviewStatus}
+          </Badge>
+        )}
+      </div>
+      <div className="review-queue-item-title">{item.articleLabel}</div>
+      <div className="review-queue-item-meta">
+        {item.confidenceScore != null && <span>{Math.round(item.confidenceScore * 100)}%</span>}
+        {item.relatedPbiCount > 0 && <span>{item.relatedPbiCount} PBI{item.relatedPbiCount !== 1 ? 's' : ''}</span>}
+        {item.locale && <span>{item.locale}</span>}
+      </div>
+    </div>
+  );
+}
+
+function PreviewPanel({ html }: { html: string }) {
+  if (!html) {
+    return (
+      <div className="html-preview" style={{ textAlign: 'center', color: 'var(--color-text-muted)' }}>
+        No content available
+      </div>
+    );
+  }
+  return <div className="html-preview" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function SourceDiffPanel({ lines }: { lines: ProposalSourceLineChange[] }) {
+  if (!lines || lines.length === 0) {
+    return (
+      <div className="diff-view" style={{ padding: 'var(--space-4)', textAlign: 'center', color: 'var(--color-text-muted)' }}>
+        No diff data available
+      </div>
+    );
+  }
+  return (
+    <div className="diff-view">
+      {lines.map((line, i) => (
+        <div key={i} className={`diff-line diff-line--${line.kind}`}>
+          <div className={`diff-gutter diff-gutter--${line.kind}`}>
+            {line.kind === 'removed'
+              ? line.lineNumberBefore ?? ''
+              : line.kind === 'added'
+                ? line.lineNumberAfter ?? ''
+                : line.lineNumberBefore ?? ''}
+          </div>
+          <div className="diff-content">
+            {line.kind === 'added' ? '+ ' : line.kind === 'removed' ? '- ' : '  '}
+            {line.content}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RenderedDiffPanel({ blocks }: { blocks: ProposalRenderedBlockChange[] }) {
+  if (!blocks || blocks.length === 0) {
+    return (
+      <div style={{ padding: 'var(--space-4)', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 'var(--text-sm)' }}>
+        No rendered diff available
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column' }}>
+      {blocks.map((block, i) => (
+        <div key={i} className={`rendered-diff-block rendered-diff-block--${block.kind}`}>
+          {block.kind === 'removed' && block.beforeText}
+          {block.kind === 'added' && block.afterText}
+          {block.kind === 'unchanged' && (block.beforeText || block.afterText)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SourcePanel({ html }: { html: string }) {
+  return <pre className="source-view">{html || 'No source HTML'}</pre>;
+}
+
+function ChangeRegionsPanel({ regions }: { regions: ProposalChangeRegion[] }) {
+  if (!regions || regions.length === 0) {
+    return (
+      <div style={{ padding: 'var(--space-4)', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 'var(--text-sm)' }}>
+        No change regions
+      </div>
+    );
+  }
+  return (
+    <div className="change-regions">
+      {regions.map((region) => (
+        <div key={region.id} className={`change-region change-region--${region.kind}`}>
+          <div className="change-region-label">
+            <Badge variant={region.kind === 'added' ? 'success' : region.kind === 'removed' ? 'danger' : 'warning'}>
+              {region.kind}
+            </Badge>
+            {region.label}
+          </div>
+          {region.beforeText && region.kind !== 'added' && (
+            <div className="change-region-text" style={{ textDecoration: region.kind === 'removed' ? 'line-through' : undefined }}>
+              {region.beforeText}
+            </div>
+          )}
+          {region.afterText && region.kind !== 'removed' && (
+            <div className="change-region-text">{region.afterText}</div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ConfidenceCard({ score }: { score: number | undefined }) {
+  return (
+    <div className="card card-padded">
+      <div className="review-section-label">Confidence</div>
+      <div className="confidence-bar">
+        <div className="progress-bar" style={{ flex: 1 }}>
+          <div className="progress-bar-fill" style={{ width: `${(score ?? 0) * 100}%` }} />
+        </div>
+        <span className={`confidence-value ${confidenceClass(score)}`}>{formatConfidence(score)}</span>
+      </div>
+    </div>
+  );
+}
+
+function AISummaryCard({
+  rationaleSummary,
+  aiNotes,
+}: {
+  rationaleSummary?: string;
+  aiNotes?: string;
+}) {
+  if (!rationaleSummary && !aiNotes) return null;
+  return (
+    <div className="card card-padded">
+      <div className="review-section-label">AI Summary</div>
+      <div className="review-scroll-card-body">
+        {rationaleSummary && (
+          <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text)', lineHeight: 'var(--leading-normal)', margin: 0 }}>
+            {rationaleSummary}
+          </p>
+        )}
+        {aiNotes && (
+          <p style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', lineHeight: 'var(--leading-normal)', marginTop: 'var(--space-2)' }}>
+            {aiNotes}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PBIEvidenceCard({
+  pbis,
+  onSelectPBI,
+}: {
+  pbis: PBIRecord[];
+  onSelectPBI: (pbi: PBIRecord) => void;
+}) {
+  return (
+    <div className="card card-padded">
+      <div className="review-section-label">Triggering PBIs ({pbis.length})</div>
+      <div className="review-scroll-card-body">
+        {pbis.length === 0 ? (
+          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>No linked PBIs</div>
+        ) : (
+          <div className="pbi-evidence-list">
+            {pbis.map((pbi) => (
+              <button
+                key={pbi.id}
+                type="button"
+                className="pbi-evidence-item"
+                onClick={() => onSelectPBI(pbi)}
+                aria-label={`Open details for PBI ${pbi.externalId ?? pbi.id}`}
+              >
+                <div className="pbi-evidence-item-id">{pbi.externalId ?? pbi.id}</div>
+                <div className="pbi-evidence-item-title">{pbi.title}</div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PlacementCard({ placement }: { placement?: ProposalPlacementSuggestion }) {
+  if (!placement) return null;
+  const hasContent = placement.categoryId || placement.sectionId || placement.articleTitle || placement.notes;
+  if (!hasContent) return null;
+
+  return (
+    <div className="card card-padded">
+      <div className="review-section-label">
+        <IconMapPin size={12} /> Suggested Placement
+      </div>
+      <div className="placement-info">
+        {placement.articleTitle && (
+          <div className="placement-info-row">
+            <span className="placement-info-label">Title</span>
+            <span>{placement.articleTitle}</span>
+          </div>
+        )}
+        {placement.sectionId && (
+          <div className="placement-info-row">
+            <span className="placement-info-label">Section</span>
+            <span>{placement.sectionId}</span>
+          </div>
+        )}
+        {placement.categoryId && (
+          <div className="placement-info-row">
+            <span className="placement-info-label">Category</span>
+            <span>{placement.categoryId}</span>
+          </div>
+        )}
+        {placement.notes && (
+          <div className="placement-info-row">
+            <span className="placement-info-label">Notes</span>
+            <span>{placement.notes}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProposalBatchRow({
+  batch,
+  onOpen,
+}: {
+  batch: ProposalReviewBatchSummary;
+  onOpen: () => void;
+}) {
+  const reviewedCount = batch.proposalCount - batch.pendingReviewCount;
+  const progress = batch.proposalCount > 0 ? (reviewedCount / batch.proposalCount) * 100 : 0;
+
+  return (
+    <tr
+      className="proposal-batch-table-row"
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      role="button"
+      tabIndex={0}
+    >
+      <td style={{ fontWeight: 'var(--weight-medium)' }}>
+        <div>{batch.batchName}</div>
+        <div className="proposal-batch-secondary">{batch.sourceFileName}</div>
+      </td>
+      <td style={{ color: 'var(--color-text-secondary)' }}>{formatDate(batch.importedAtUtc)}</td>
+      <td>{batch.proposalCount}</td>
+      <td>
+        <div className="proposal-batch-progress">
+          <span>{reviewedCount} / {batch.proposalCount}</span>
+          <div className="progress-bar proposal-batch-progress-bar">
+            <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
+          </div>
+        </div>
+      </td>
+      <td>
+        {batch.pendingReviewCount > 0 ? (
+          <span>{batch.pendingReviewCount} pending</span>
+        ) : (
+          <span className="proposal-batch-empty-note">All reviewed</span>
+        )}
+      </td>
+      <td>
+        <Badge variant={batchStatusVariant(batch.batchStatus)}>
+          {BATCH_STATUS_LABEL[batch.batchStatus] ?? batch.batchStatus}
+        </Badge>
+      </td>
+      <td className="proposal-batch-actions-cell">
+        <button
+          className="btn btn-primary btn-xs"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpen();
+          }}
+        >
+          {batch.pendingReviewCount > 0 ? 'Review' : 'Open'}
+        </button>
+      </td>
+    </tr>
+  );
+}
 
 export const ProposalReview = () => {
-  const [currentIndex] = useState(0);
+  const { activeWorkspace } = useWorkspace();
 
-  const proposals = [
-    {
-      id: 'prop-001',
-      type: 'EDIT_ARTICLE',
-      article: 'Create & Edit Chat Channels',
-      confidence: 0.87,
-      pbiCount: 3,
-      summary: 'Update steps 4-6 to reflect new channel creation flow with Team Dashboard integration.',
-    },
-    {
-      id: 'prop-002',
-      type: 'CREATE_ARTICLE',
-      article: 'Team Dashboard Tile Assignment',
-      confidence: 0.92,
-      pbiCount: 2,
-      summary: 'New article covering tile assignment and customization in the redesigned Team Dashboard.',
-    },
-    {
-      id: 'prop-003',
-      type: 'NO_IMPACT',
-      article: 'Getting Started Guide',
-      confidence: 0.95,
-      pbiCount: 1,
-      summary: 'Backend optimization PBI — no user-facing documentation changes needed.',
-    },
-  ];
+  const batchListIpc = useIpc<ProposalReviewBatchListResponse>('proposal.review.batchList');
+  const listIpc = useIpc<ProposalReviewListResponse>('proposal.review.list');
+  const detailIpc = useIpc<ProposalReviewDetailResponse>('proposal.review.get');
+  const decideMutation = useIpcMutation<ProposalReviewDecisionResponse>('proposal.review.decide');
+  const { execute: executeBatchList, reset: resetBatchList } = batchListIpc;
+  const { execute: executeList, reset: resetList } = listIpc;
+  const { execute: executeDetail, reset: resetDetail } = detailIpc;
+  const { mutate: mutateDecision } = decideMutation;
 
-  const typeVariant = (t: string) => {
-    if (t === 'CREATE_ARTICLE') return 'success' as const;
-    if (t === 'EDIT_ARTICLE') return 'primary' as const;
-    if (t === 'RETIRE_ARTICLE') return 'danger' as const;
-    return 'neutral' as const;
-  };
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+  const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ContentTab>('preview');
+  const [decidingAs, setDecidingAs] = useState<ProposalReviewDecision | null>(null);
+  const [selectedPBI, setSelectedPBI] = useState<PBIRecord | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
-  const typeLabel = (t: string) => {
-    if (t === 'CREATE_ARTICLE') return 'Create';
-    if (t === 'EDIT_ARTICLE') return 'Edit';
-    if (t === 'RETIRE_ARTICLE') return 'Retire';
-    return 'No Impact';
-  };
+  const batchSummaries = batchListIpc.data?.batches ?? [];
+  const listData = listIpc.data;
+  const detail = detailIpc.data;
+  const queue = listData?.queue ?? [];
+  const groups = listData?.groups ?? [];
+  const summary = listData?.summary;
+  const proposal = detail?.proposal;
+  const diff = detail?.diff;
+  const navigation = detail?.navigation;
+  const relatedPbis = detail?.relatedPbis ?? [];
+  const selectedQueueItem = queue.find((item) => item.proposalId === selectedProposalId);
+  const selectedBatchSummary = batchSummaries.find((batch) => batch.batchId === selectedBatchId) ?? null;
+  const allReviewed = summary ? summary.pendingReview === 0 : false;
 
-  const current = proposals[currentIndex];
+  const loadBatchSummaries = useCallback(async () => {
+    if (!activeWorkspace) return;
+    await executeBatchList({ workspaceId: activeWorkspace.id });
+  }, [activeWorkspace?.id, executeBatchList]);
+
+  const openBatch = useCallback((batchId: string) => {
+    setSelectedBatchId(batchId);
+    setSelectedProposalId(null);
+    setSelectedPBI(null);
+    setActiveTab('preview');
+    resetDetail();
+  }, [resetDetail]);
+
+  const closeBatch = useCallback(() => {
+    setSelectedBatchId(null);
+    setSelectedProposalId(null);
+    setSelectedPBI(null);
+    setActiveTab('preview');
+    resetList();
+    resetDetail();
+  }, [resetDetail, resetList]);
+
+  useEffect(() => {
+    if (!activeWorkspace) return;
+    setSelectedBatchId(null);
+    setSelectedProposalId(null);
+    setSelectedPBI(null);
+    setActiveTab('preview');
+    resetBatchList();
+    resetList();
+    resetDetail();
+    void loadBatchSummaries();
+  }, [activeWorkspace?.id, resetBatchList, resetList, resetDetail, loadBatchSummaries]);
+
+  useEffect(() => {
+    if (!activeWorkspace || !selectedBatchId) return;
+    void executeList({ workspaceId: activeWorkspace.id, batchId: selectedBatchId });
+  }, [activeWorkspace?.id, selectedBatchId, executeList]);
+
+  useEffect(() => {
+    if (!activeWorkspace || !selectedProposalId) return;
+    void executeDetail({ workspaceId: activeWorkspace.id, proposalId: selectedProposalId });
+  }, [activeWorkspace?.id, selectedProposalId, executeDetail]);
+
+  useEffect(() => {
+    setSelectedPBI(null);
+  }, [selectedProposalId]);
+
+  useEffect(() => {
+    if (queue.length === 0 || selectedProposalId) return;
+    const firstPending = queue.find((item) => item.reviewStatus === ProposalReviewStatus.PENDING_REVIEW);
+    setSelectedProposalId(firstPending?.proposalId ?? queue[0].proposalId);
+  }, [queue, selectedProposalId]);
+
+  const navigateNext = useCallback(() => {
+    if (navigation?.nextProposalId) {
+      setSelectedProposalId(navigation.nextProposalId);
+    }
+  }, [navigation?.nextProposalId]);
+
+  const navigatePrevious = useCallback(() => {
+    if (navigation?.previousProposalId) {
+      setSelectedProposalId(navigation.previousProposalId);
+    }
+  }, [navigation?.previousProposalId]);
+
+  const refreshCurrentBatch = useCallback(async () => {
+    if (!activeWorkspace || !selectedBatchId) return;
+    await Promise.all([
+      executeList({ workspaceId: activeWorkspace.id, batchId: selectedBatchId }),
+      loadBatchSummaries(),
+    ]);
+  }, [activeWorkspace?.id, selectedBatchId, executeList, loadBatchSummaries]);
+
+  const handleDecision = useCallback(async (decision: ProposalReviewDecision) => {
+    if (!activeWorkspace || !selectedProposalId) return;
+    setDecidingAs(decision);
+    try {
+      const result = await mutateDecision({
+        workspaceId: activeWorkspace.id,
+        proposalId: selectedProposalId,
+        decision,
+      });
+      if (!result) return;
+
+      await refreshCurrentBatch();
+
+      if (navigation?.nextProposalId) {
+        setSelectedProposalId(navigation.nextProposalId);
+      } else {
+        await executeDetail({ workspaceId: activeWorkspace.id, proposalId: selectedProposalId });
+      }
+    } finally {
+      setDecidingAs(null);
+    }
+  }, [activeWorkspace?.id, selectedProposalId, mutateDecision, refreshCurrentBatch, navigation?.nextProposalId, executeDetail]);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!selectedBatchId) return;
+      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+
+      switch (e.key.toLowerCase()) {
+        case 'a':
+          if (!e.metaKey && !e.ctrlKey) void handleDecision(ProposalReviewDecision.ACCEPT);
+          break;
+        case 'd':
+          if (!e.metaKey && !e.ctrlKey) void handleDecision(ProposalReviewDecision.DENY);
+          break;
+        case 'arrowdown':
+        case 'j':
+          e.preventDefault();
+          navigateNext();
+          break;
+        case 'arrowup':
+        case 'k':
+          e.preventDefault();
+          navigatePrevious();
+          break;
+        case '1':
+          setActiveTab('preview');
+          break;
+        case '2':
+          setActiveTab('diff');
+          break;
+        case '3':
+          setActiveTab('source');
+          break;
+        case '4':
+          setActiveTab('regions');
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [selectedBatchId, handleDecision, navigateNext, navigatePrevious]);
+
+  const isEditProposal = proposal?.action === ProposalAction.EDIT;
+  const hasDiff = !!diff?.sourceDiff?.lines?.length;
+
+  if (!activeWorkspace) {
+    return (
+      <>
+        <PageHeader title="Proposal Review" subtitle="No workspace selected" />
+        <div className="route-content">
+          <EmptyState
+            icon={<IconCheckCircle size={48} />}
+            title="No workspace open"
+            description="Open or create a workspace to review generated proposal batches."
+          />
+        </div>
+      </>
+    );
+  }
+
+  if (!selectedBatchId) {
+    return (
+      <>
+        <PageHeader title="Proposal Review" subtitle="Browse generated proposal batches before opening the reviewer workbench" />
+        <div className="route-content">
+          {batchListIpc.loading && !batchListIpc.data ? (
+            <LoadingState message="Loading proposal batches..." />
+          ) : batchListIpc.error && !batchListIpc.data ? (
+            <ErrorState
+              title="Failed to load proposal batches"
+              description={batchListIpc.error}
+              action={
+                <button className="btn btn-primary" onClick={() => void loadBatchSummaries()}>
+                  Retry
+                </button>
+              }
+            />
+          ) : batchSummaries.length === 0 ? (
+            <EmptyState
+              icon={<IconCheckCircle size={48} />}
+              title="No generated proposals yet"
+              description="Run analysis on a PBI batch to generate proposals that can be reviewed here."
+            />
+          ) : (
+            <div className="table-wrapper">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Proposal Set</th>
+                    <th>Imported</th>
+                    <th>Proposals</th>
+                    <th>Reviewed</th>
+                    <th>Pending</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {batchSummaries.map((batch) => (
+                    <ProposalBatchRow key={batch.batchId} batch={batch} onOpen={() => openBatch(batch.batchId)} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </>
+    );
+  }
+
+  if (listIpc.loading && !listData) {
+    return (
+      <>
+        <PageHeader
+          title="Proposal Review"
+          subtitle={selectedBatchSummary?.batchName ?? 'Loading proposal set'}
+          actions={
+            <button className="btn btn-ghost proposal-review-back-btn" onClick={closeBatch}>
+              <IconChevronLeft size={14} />
+              Back to Proposal Sets
+            </button>
+          }
+        />
+        <div className="route-content">
+          <LoadingState message="Loading proposals..." />
+        </div>
+      </>
+    );
+  }
+
+  if (listIpc.error && !listData) {
+    return (
+      <>
+        <PageHeader
+          title="Proposal Review"
+          subtitle={selectedBatchSummary?.batchName ?? 'Proposal set'}
+          actions={
+            <button className="btn btn-ghost proposal-review-back-btn" onClick={closeBatch}>
+              <IconChevronLeft size={14} />
+              Back to Proposal Sets
+            </button>
+          }
+        />
+        <div className="route-content">
+          <ErrorState
+            title="Failed to load proposals"
+            description={listIpc.error}
+            action={
+              <button
+                className="btn btn-secondary"
+                onClick={() => activeWorkspace && void listIpc.execute({ workspaceId: activeWorkspace.id, batchId: selectedBatchId })}
+              >
+                Retry
+              </button>
+            }
+          />
+        </div>
+      </>
+    );
+  }
+
+  if (!listData || queue.length === 0) {
+    return (
+      <>
+        <PageHeader
+          title="Proposal Review"
+          subtitle={selectedBatchSummary?.batchName ?? 'Proposal set'}
+          actions={
+            <button className="btn btn-ghost proposal-review-back-btn" onClick={closeBatch}>
+              <IconChevronLeft size={14} />
+              Back to Proposal Sets
+            </button>
+          }
+        />
+        <div className="route-content">
+          <EmptyState
+            icon={<IconCheckCircle size={48} />}
+            title="No proposals in this batch"
+            description="This proposal set does not currently contain any reviewable proposals."
+          />
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
       <PageHeader
         title="Proposal Review"
-        subtitle={`Sprint 42 PBIs — ${proposals.length} proposals`}
+        subtitle={selectedBatchSummary?.batchName ?? `${summary?.total ?? queue.length} proposals`}
         actions={
-          <div className="flex items-center gap-3">
-            <span style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>
-              {currentIndex + 1} of {proposals.length}
-            </span>
-            <div className="progress-bar" style={{ width: 100 }}>
-              <div className="progress-bar-fill" style={{ width: `${((currentIndex + 1) / proposals.length) * 100}%` }} />
-            </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+            <button className="btn btn-ghost proposal-review-back-btn" onClick={closeBatch}>
+              <IconChevronLeft size={14} />
+              Back to Proposal Sets
+            </button>
+            {summary && (
+              <>
+                <span style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>
+                  {summary.total - summary.pendingReview} / {summary.total} reviewed
+                </span>
+                <div className="progress-bar" style={{ width: 120 }}>
+                  <div
+                    className="progress-bar-fill"
+                    style={{
+                      width: `${((summary.total - summary.pendingReview) / Math.max(summary.total, 1)) * 100}%`,
+                    }}
+                  />
+                </div>
+              </>
+            )}
           </div>
         }
       />
-      <div className="route-content">
-        {proposals.length === 0 ? (
-          <EmptyState
-            icon={<IconCheckCircle size={48} />}
-            title="No proposals to review"
-            description="Import a PBI batch and run analysis to generate proposals for your KB articles."
-          />
-        ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr 280px', gap: 'var(--space-4)', height: '100%' }}>
-            {/* Left: proposal queue */}
-            <div className="card" style={{ overflow: 'auto' }}>
-              <div className="card-header">
-                <span className="card-header-title">Proposals</span>
-              </div>
-              <div style={{ padding: 'var(--space-2)' }}>
-                {proposals.map((p, i) => (
-                  <div
-                    key={p.id}
-                    style={{
-                      padding: 'var(--space-3)',
-                      borderRadius: 'var(--radius-md)',
-                      background: i === currentIndex ? 'var(--color-primary-subtle)' : 'transparent',
-                      cursor: 'pointer',
-                      marginBottom: 2,
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginBottom: 'var(--space-1)' }}>
-                      <Badge variant={typeVariant(p.type)}>{typeLabel(p.type)}</Badge>
+      <div className="route-content" ref={containerRef}>
+        <div className="review-layout">
+          <div className="card review-queue">
+            <div className="card-header">
+              <span className="card-header-title">Proposals</span>
+            </div>
+            {summary && <SummaryBar summary={summary} />}
+            <div className="review-queue-list">
+              {groups.length > 0
+                ? groups.map((group) => (
+                    <div key={group.articleKey}>
+                      <div className="review-queue-group">
+                        {group.articleLabel}
+                        <span style={{ fontWeight: 'var(--weight-normal)', marginLeft: 'var(--space-1)' }}>
+                          ({group.total})
+                        </span>
+                      </div>
+                      {queue
+                        .filter((item) => group.proposalIds.includes(item.proposalId))
+                        .map((item) => (
+                          <QueueItem
+                            key={item.proposalId}
+                            item={item}
+                            isActive={item.proposalId === selectedProposalId}
+                            onClick={() => setSelectedProposalId(item.proposalId)}
+                          />
+                        ))}
                     </div>
-                    <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-medium)' }}>{p.article}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Center: preview area */}
-            <div className="card">
-              <div className="card-header">
-                <span className="card-header-title">{current.article}</span>
-                <Badge variant={typeVariant(current.type)}>{typeLabel(current.type)}</Badge>
-              </div>
-              <div className="card-body">
-                <div className="panel" style={{ minHeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <span style={{ color: 'var(--color-text-muted)', fontSize: 'var(--text-sm)' }}>
-                    Article preview / diff will render here
-                  </span>
-                </div>
-
-                <div className="tab-bar" style={{ marginTop: 'var(--space-4)' }}>
-                  <div className="tab-item active">Preview</div>
-                  <div className="tab-item">Diff</div>
-                  <div className="tab-item">Source</div>
-                </div>
-              </div>
-            </div>
-
-            {/* Right: evidence + actions */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
-              <div className="card card-padded">
-                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: 'var(--space-2)' }}>Confidence</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-                  <div className="progress-bar" style={{ flex: 1 }}>
-                    <div className="progress-bar-fill" style={{ width: `${current.confidence * 100}%` }} />
-                  </div>
-                  <span style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-semibold)' }}>
-                    {Math.round(current.confidence * 100)}%
-                  </span>
-                </div>
-              </div>
-
-              <div className="card card-padded">
-                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: 'var(--space-2)' }}>AI Summary</div>
-                <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text)', lineHeight: 'var(--leading-normal)' }}>
-                  {current.summary}
-                </p>
-              </div>
-
-              <div className="card card-padded">
-                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: 'var(--space-2)' }}>
-                  Triggering PBIs ({current.pbiCount})
-                </div>
-                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
-                  PBI evidence will display here
-                </div>
-              </div>
-
-              <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
-                <button className="btn btn-primary" style={{ width: '100%' }}>Accept</button>
-                <button className="btn btn-danger" style={{ width: '100%' }}>Deny</button>
-                <button className="btn btn-secondary" style={{ width: '100%' }}>Defer</button>
-                <div style={{ display: 'flex', justifyContent: 'center', gap: 'var(--space-3)', marginTop: 'var(--space-2)' }}>
-                  <Kbd keys="A" /> <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>accept</span>
-                  <Kbd keys="D" /> <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>deny</span>
-                  <Kbd keys="S" /> <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>skip</span>
-                </div>
-              </div>
+                  ))
+                : queue.map((item) => (
+                    <QueueItem
+                      key={item.proposalId}
+                      item={item}
+                      isActive={item.proposalId === selectedProposalId}
+                      onClick={() => setSelectedProposalId(item.proposalId)}
+                    />
+                  ))}
             </div>
           </div>
-        )}
+
+          <div className="card review-center">
+            {detailIpc.loading && !detail ? (
+              <LoadingState message="Loading proposal..." />
+            ) : detailIpc.error && !detail ? (
+              <ErrorState title="Failed to load proposal" description={detailIpc.error} />
+            ) : !proposal ? (
+              <EmptyState title="Select a proposal" description="Choose a proposal from the queue to review." />
+            ) : (
+              <>
+                <div className="review-center-header">
+                  <div className="review-center-title">
+                    <Badge variant={ACTION_VARIANT[proposal.action] ?? 'neutral'}>
+                      {ACTION_LABEL[proposal.action] ?? proposal.action}
+                    </Badge>
+                    <span className="review-center-title-text">
+                      {proposal.targetTitle || selectedQueueItem?.articleLabel || 'Proposal'}
+                    </span>
+                    {proposal.reviewStatus !== ProposalReviewStatus.PENDING_REVIEW && (
+                      <Badge variant={STATUS_VARIANT[proposal.reviewStatus] ?? 'neutral'}>
+                        {STATUS_LABEL[proposal.reviewStatus] ?? proposal.reviewStatus}
+                      </Badge>
+                    )}
+                  </div>
+                  {navigation && (
+                    <div className="review-center-nav">
+                      <button
+                        className="review-center-nav-btn"
+                        disabled={!navigation.previousProposalId}
+                        onClick={navigatePrevious}
+                        title="Previous (K / Up)"
+                      >
+                        <IconChevronLeft size={16} />
+                      </button>
+                      <span className="review-center-nav-pos">
+                        {navigation.currentIndex + 1} / {navigation.total}
+                      </span>
+                      <button
+                        className="review-center-nav-btn"
+                        disabled={!navigation.nextProposalId}
+                        onClick={navigateNext}
+                        title="Next (J / Down)"
+                      >
+                        <IconChevronRight size={16} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <div className="review-tab-bar">
+                  <div className={`review-tab ${activeTab === 'preview' ? 'review-tab--active' : ''}`} onClick={() => setActiveTab('preview')}>
+                    <span className="review-tab-icon">
+                      <IconEye size={14} />
+                    </span>
+                    Preview
+                  </div>
+                  {(isEditProposal || hasDiff) && (
+                    <div className={`review-tab ${activeTab === 'diff' ? 'review-tab--active' : ''}`} onClick={() => setActiveTab('diff')}>
+                      <span className="review-tab-icon">
+                        <IconFileText size={14} />
+                      </span>
+                      Diff
+                    </div>
+                  )}
+                  <div className={`review-tab ${activeTab === 'source' ? 'review-tab--active' : ''}`} onClick={() => setActiveTab('source')}>
+                    <span className="review-tab-icon">
+                      <IconCode size={14} />
+                    </span>
+                    Source
+                  </div>
+                  {diff?.changeRegions && diff.changeRegions.length > 0 && (
+                    <div className={`review-tab ${activeTab === 'regions' ? 'review-tab--active' : ''}`} onClick={() => setActiveTab('regions')}>
+                      Changes ({diff.changeRegions.length})
+                    </div>
+                  )}
+                </div>
+
+                <div className="review-content-body">
+                  {activeTab === 'preview' && (
+                    <>
+                      {isEditProposal && diff && (diff.renderedDiff?.blocks?.length ?? 0) > 0 ? (
+                        <RenderedDiffPanel blocks={diff.renderedDiff?.blocks ?? []} />
+                      ) : (
+                        <PreviewPanel html={diff?.afterHtml ?? ''} />
+                      )}
+                    </>
+                  )}
+                  {activeTab === 'diff' && diff && <SourceDiffPanel lines={diff.sourceDiff?.lines ?? []} />}
+                  {activeTab === 'source' && <SourcePanel html={diff?.afterHtml ?? ''} />}
+                  {activeTab === 'regions' && diff && <ChangeRegionsPanel regions={diff.changeRegions ?? []} />}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="review-right">
+            {proposal && (
+              <>
+                <ConfidenceCard score={proposal.confidenceScore} />
+                <AISummaryCard rationaleSummary={proposal.rationaleSummary} aiNotes={proposal.aiNotes} />
+                <PBIEvidenceCard pbis={relatedPbis} onSelectPBI={setSelectedPBI} />
+                <PlacementCard placement={proposal.suggestedPlacement} />
+
+                <div className="review-actions">
+                  {proposal.reviewStatus === ProposalReviewStatus.PENDING_REVIEW ? (
+                    <>
+                      <div className="review-actions-row">
+                        <button
+                          className="btn btn-primary review-actions-accept"
+                          onClick={() => void handleDecision(ProposalReviewDecision.ACCEPT)}
+                          disabled={!!decidingAs}
+                        >
+                          {decidingAs === ProposalReviewDecision.ACCEPT ? 'Accepting...' : 'Accept'}
+                        </button>
+                        <button
+                          className="btn btn-danger"
+                          onClick={() => void handleDecision(ProposalReviewDecision.DENY)}
+                          disabled={!!decidingAs}
+                        >
+                          {decidingAs === ProposalReviewDecision.DENY ? 'Denying...' : 'Deny'}
+                        </button>
+                      </div>
+                      {isEditProposal && (
+                        <button
+                          className="btn btn-ghost"
+                          style={{ width: '100%' }}
+                          onClick={() => void handleDecision(ProposalReviewDecision.APPLY_TO_BRANCH)}
+                          disabled={!!decidingAs}
+                        >
+                          <span className="review-action-icon">
+                            <IconGitBranch size={14} />
+                          </span>
+                          Apply to Branch
+                        </button>
+                      )}
+                      {proposal.action === ProposalAction.NO_IMPACT && (
+                        <button
+                          className="btn btn-ghost"
+                          style={{ width: '100%' }}
+                          onClick={() => void handleDecision(ProposalReviewDecision.ARCHIVE)}
+                          disabled={!!decidingAs}
+                        >
+                          <span className="review-action-icon">
+                            <IconArchive size={14} />
+                          </span>
+                          Archive
+                        </button>
+                      )}
+
+                      <div className="review-keyboard-hints">
+                        <span className="review-keyboard-hint">
+                          <Kbd keys="A" /> accept
+                        </span>
+                        <span className="review-keyboard-hint">
+                          <Kbd keys="D" /> deny
+                        </span>
+                        <span className="review-keyboard-hint">
+                          <Kbd keys="J" /> next
+                        </span>
+                        <span className="review-keyboard-hint">
+                          <Kbd keys="K" /> prev
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: 'var(--space-3)' }}>
+                      <Badge variant={STATUS_VARIANT[proposal.reviewStatus] ?? 'neutral'}>
+                        {STATUS_LABEL[proposal.reviewStatus] ?? proposal.reviewStatus}
+                      </Badge>
+                      {proposal.decidedAtUtc && (
+                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', marginTop: 'var(--space-2)' }}>
+                          Decided {new Date(proposal.decidedAtUtc).toLocaleString()}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+
+            {allReviewed && !proposal && (
+              <div className="card card-padded" style={{ textAlign: 'center' }}>
+                <IconCheckCircle size={32} className="text-success" />
+                <h3 style={{ margin: 'var(--space-2) 0', fontSize: 'var(--text-base)' }}>All Reviewed</h3>
+                <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-muted)' }}>
+                  {summary?.accepted} accepted, {summary?.denied} denied, {summary?.deferred} deferred
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
+      <PBIDetailModal pbi={selectedPBI} open={selectedPBI != null} onClose={() => setSelectedPBI(null)} />
     </>
   );
 };

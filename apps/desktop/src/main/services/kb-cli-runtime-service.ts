@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { CliHealthFailure, type KbAccessHealth } from '@kb-vault/shared-types';
@@ -7,36 +8,420 @@ import { WorkspaceRepository } from './workspace-repository';
 import { KbCliLoopbackService } from './kb-cli-loopback-service';
 import { logger } from './logger';
 
-const KB_CLI_BINARY_ENV = 'KBV_KB_CLI_BINARY';
+const KB_CLI_SHIM_DIR = path.join(os.tmpdir(), 'kb-vault-cli-shim');
 
-function resolveBinaryOnPath(binary: string): string | null {
-  if (!binary) {
+function buildKbCliShimSource(): string {
+  const createProposalExample = JSON.stringify(
+    `kb proposal create --workspace-id <workspaceId> --batch-id <batchId> --session-id <sessionId> --note "Create Duplicate Food Lists and Food Items (Portal)" --rationale "No duplicate-specific article exists; create one for the portal duplicate flow." --pbi-ids 102,103 --metadata '{"targetTitle":"Duplicate Food Lists and Food Items (Portal)","proposedHtml":"<h1>Duplicate Food Lists and Food Items (Portal)</h1><p>...</p>"}' --json`
+  );
+  const editProposalExample = JSON.stringify(
+    `kb proposal edit --workspace-id <workspaceId> --batch-id <batchId> --session-id <sessionId> --locale-variant-id <localeVariantId> --note "Edit Create a Food List" --rationale "Add the new management flow." --pbi-ids 101 --metadata '{"targetTitle":"Create a Food List","proposedHtml":"<h1>Create a Food List</h1><p>...</p>"}' --json`
+  );
+  const editProposalFileExample = JSON.stringify(
+    `kb proposal edit --workspace-id <workspaceId> --batch-id <batchId> --session-id <sessionId> --locale-variant-id <localeVariantId> --note "Edit Create a Food List" --rationale "Add the new management flow." --pbi-ids 101 --metadata-file /tmp/create-food-list-metadata.json --json`
+  );
+  return `#!/usr/bin/env node
+'use strict';
+
+const process = require('node:process');
+const fs = require('node:fs');
+const { URLSearchParams } = require('node:url');
+
+function normalizeKey(key) {
+  return String(key || '')
+    .replace(/^--/, '')
+    .replace(/-([a-z])/g, (_, char) => char.toUpperCase());
+}
+
+function parseArgv(argv) {
+  const positionals = [];
+  const options = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      positionals.push(token);
+      continue;
+    }
+    const key = normalizeKey(token);
+    const next = argv[index + 1];
+    if (!next || next.startsWith('--')) {
+      options[key] = true;
+      continue;
+    }
+    index += 1;
+    const existing = options[key];
+    if (existing === undefined) {
+      options[key] = next;
+      continue;
+    }
+    options[key] = Array.isArray(existing) ? [...existing, next] : [existing, next];
+  }
+  return { positionals, options };
+}
+
+function write(payload, jsonMode) {
+  if (jsonMode || typeof payload === 'object') {
+    process.stdout.write(JSON.stringify(payload, null, 2) + '\\n');
+    return;
+  }
+  process.stdout.write(String(payload) + '\\n');
+}
+
+function fail(command, message, code, jsonMode) {
+  const payload = { ok: false, command, error: { code: code || 'VALIDATION_ERROR', message } };
+  write(payload, jsonMode);
+  process.exit(1);
+}
+
+function requireOption(options, key, command, jsonMode) {
+  const value = options[key];
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+  fail(command, '--' + key.replace(/[A-Z]/g, (char) => '-' + char.toLowerCase()) + ' is required', 'VALIDATION_ERROR', jsonMode);
+}
+
+function getString(options, ...keys) {
+  for (const key of keys) {
+    const value = options[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function getCsvList(options, ...keys) {
+  for (const key of keys) {
+    const value = options[key];
+    if (Array.isArray(value)) {
+      return value.flatMap((item) => String(item).split(',')).map((item) => item.trim()).filter(Boolean);
+    }
+    if (typeof value === 'string') {
+      return value.split(',').map((item) => item.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function getJsonMetadata(options, command, jsonMode) {
+  const metadata = getString(options, 'metadata');
+  const metadataFile = getString(options, 'metadataFile');
+
+  if (metadata && metadataFile) {
+    fail(command, 'Use only one of --metadata or --metadata-file', 'VALIDATION_ERROR', jsonMode);
+  }
+
+  if (metadataFile) {
+    try {
+      const raw = fs.readFileSync(metadataFile, 'utf8');
+      return JSON.parse(raw);
+    } catch (error) {
+      fail(
+        command,
+        error instanceof Error ? 'Unable to read --metadata-file: ' + error.message : 'Unable to read --metadata-file',
+        'VALIDATION_ERROR',
+        jsonMode
+      );
+    }
+  }
+
+  if (metadata) {
+    try {
+      return JSON.parse(metadata);
+    } catch (error) {
+      fail(
+        command,
+        error instanceof Error ? 'Unable to parse --metadata: ' + error.message : 'Unable to parse --metadata',
+        'VALIDATION_ERROR',
+        jsonMode
+      );
+    }
+  }
+
+  return undefined;
+}
+
+function getBaseUrl() {
+  return process.env.KB_AGENT_API_BASE_URL
+    || process.env.KBV_KB_CLI_BASE_URL
+    || process.env.KBV_KB_BASE_URL
+    || process.env.KBV_KB_API_BASE_URL
+    || '';
+}
+
+function getAuthToken() {
+  return process.env.KBV_KB_CLI_AUTH_TOKEN
+    || process.env.KBV_KB_TOKEN
+    || process.env.KBV_KB_API_TOKEN
+    || '';
+}
+
+async function requestJson(method, pathname, query, body) {
+  const baseUrl = getBaseUrl();
+  const authToken = getAuthToken();
+  if (!baseUrl) {
+    throw new Error('KB CLI base URL is not configured');
+  }
+  if (!authToken) {
+    throw new Error('KB CLI auth token is not configured');
+  }
+
+  const url = new URL(pathname, baseUrl);
+  if (query) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined || value === null || value === '') {
+        continue;
+      }
+      params.set(key, String(value));
+    }
+    const search = params.toString();
+    if (search) {
+      url.search = search;
+    }
+  }
+
+  const response = await fetch(url, {
+    method,
+    headers: {
+      accept: 'application/json',
+      authorization: 'Bearer ' + authToken,
+      ...(body ? { 'content-type': 'application/json' } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+
+  const text = await response.text();
+  let payload = null;
+  if (text.trim()) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error('Loopback response was not valid JSON');
+    }
+  }
+
+  if (!response.ok) {
+    const message = payload && typeof payload.error === 'string'
+      ? payload.error
+      : 'HTTP ' + response.status;
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+function buildRootHelp() {
+  return {
+    usage: 'kb <command> [options] --json',
+    commands: [
+      'health',
+      'batch-context',
+      'find-related-articles',
+      'search-kb',
+      'get-article',
+      'get-article-manual',
+      'get-article-family',
+      'proposal create',
+      'proposal edit',
+      'proposal retire',
+      'help'
+    ]
+  };
+}
+
+function buildProposalHelp() {
+  return {
+    usage: 'kb proposal <create|edit|retire> --workspace-id <workspaceId> --batch-id <batchId> [options] --json',
+    subcommands: ['create', 'edit', 'retire'],
+    options: [
+      '--workspace-id',
+      '--batch-id',
+      '--session-id',
+      '--locale-variant-id',
+      '--note',
+      '--rationale',
+      '--pbi-ids',
+      '--metadata',
+      '--metadata-file'
+    ],
+    examples: [
+      ${createProposalExample},
+      ${editProposalExample},
+      ${editProposalFileExample}
+    ]
+  };
+}
+
+function pickBestSearchResult(results, query) {
+  if (!Array.isArray(results) || results.length === 0) {
     return null;
   }
+  const normalized = String(query || '').trim().toLowerCase();
+  return results.find((item) => String(item.title || '').trim().toLowerCase() === normalized)
+    || results.find((item) => String(item.familyExternalKey || '').trim().toLowerCase() === normalized)
+    || results[0];
+}
 
-  if (path.isAbsolute(binary)) {
-    return fs.existsSync(binary) ? binary : null;
+async function resolveArticle(workspaceId, options, command, jsonMode) {
+  const localeVariantId = getString(options, 'localeVariantId', 'articleId');
+  if (localeVariantId) {
+    return requestJson('GET', '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/variants/' + encodeURIComponent(localeVariantId));
   }
 
-  const searchPath = process.env.PATH ?? '';
-  for (const dir of searchPath.split(path.delimiter)) {
-    if (!dir) {
-      continue;
+  const familyId = getString(options, 'familyId', 'articleFamilyId');
+  if (familyId) {
+    const familyPayload = await requestJson('GET', '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/families/' + encodeURIComponent(familyId));
+    const firstVariantId = Array.isArray(familyPayload.variants) && familyPayload.variants[0] && familyPayload.variants[0].id;
+    if (!firstVariantId) {
+      fail(command, 'No locale variants found for article family', 'NOT_FOUND', jsonMode);
     }
-    const candidate = path.join(dir, binary);
-    const candidateWithExt = path.extname(candidate) ? candidate : `${candidate}.exe`;
-    if (process.platform === 'win32') {
-      if (fs.existsSync(candidateWithExt) || fs.existsSync(candidate)) {
-        return fs.existsSync(candidateWithExt) ? candidateWithExt : candidate;
+    return requestJson('GET', '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/variants/' + encodeURIComponent(firstVariantId));
+  }
+
+  const query = getString(options, 'query', 'title', 'q', 'externalKey', 'file');
+  if (!query) {
+    fail(command, 'Provide --locale-variant-id, --family-id, or --query', 'VALIDATION_ERROR', jsonMode);
+  }
+
+  const searchPayload = await requestJson(
+    'GET',
+    '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/search',
+    { query }
+  );
+  const chosen = pickBestSearchResult(searchPayload.results, query);
+  if (!chosen || !chosen.localeVariantId) {
+    fail(command, 'Article not found for query: ' + query, 'NOT_FOUND', jsonMode);
+  }
+  return requestJson(
+    'GET',
+    '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/variants/' + encodeURIComponent(chosen.localeVariantId)
+  );
+}
+
+(async () => {
+  const argv = process.argv.slice(2);
+  const { positionals, options } = parseArgv(argv);
+  const jsonMode = options.json === true;
+  const command = positionals[0] || 'help';
+  const subcommand = positionals[1];
+
+  if (command === 'help' || options.help === true || command === '--help') {
+    if (positionals[0] === 'proposal' || subcommand === 'proposal') {
+      write({ ok: true, command: 'help', data: buildProposalHelp() }, jsonMode);
+      return;
+    }
+    write({ ok: true, command: 'help', data: buildRootHelp() }, jsonMode);
+    return;
+  }
+
+  if (command === 'proposal' && !subcommand) {
+    write({ ok: true, command: 'help', data: buildProposalHelp() }, jsonMode);
+    return;
+  }
+
+  try {
+    switch (command) {
+      case 'health': {
+        const payload = await requestJson('GET', '/health', { token: getAuthToken() });
+        write({ ok: true, command: 'health', data: payload }, true);
+        return;
       }
-      continue;
+      case 'batch-context': {
+        const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
+        const batchId = requireOption(options, 'batchId', command, jsonMode);
+        const payload = await requestJson(
+          'GET',
+          '/workspaces/' + encodeURIComponent(workspaceId) + '/batches/' + encodeURIComponent(batchId) + '/context'
+        );
+        write({ ok: true, command, data: payload }, true);
+        return;
+      }
+      case 'find-related-articles': {
+        const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
+        const batchId = getString(options, 'batchId');
+        const articleId = getString(options, 'articleId', 'localeVariantId');
+        if (!batchId && !articleId) {
+          fail(command, '--batch-id or --article-id is required', 'VALIDATION_ERROR', jsonMode);
+        }
+        const limit = getString(options, 'limit');
+        const payload = await requestJson(
+          'POST',
+          '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/related',
+          undefined,
+          {
+            ...(batchId ? { batchId } : {}),
+            ...(articleId ? { articleId } : {}),
+            ...(limit ? { limit: Number(limit) } : {})
+          }
+        );
+        write({ ok: true, command, data: payload }, true);
+        return;
+      }
+      case 'search-kb': {
+        const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
+        const query = requireOption(options, 'query', command, jsonMode);
+        const payload = await requestJson(
+          'GET',
+          '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/search',
+          { query }
+        );
+        write({ ok: true, command, data: payload }, true);
+        return;
+      }
+      case 'get-article':
+      case 'get-article-manual': {
+        const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
+        const payload = await resolveArticle(workspaceId, options, command, jsonMode);
+        write({ ok: true, command, data: payload }, true);
+        return;
+      }
+      case 'get-article-family': {
+        const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
+        const familyId = requireOption(options, 'familyId', command, jsonMode);
+        const payload = await requestJson(
+          'GET',
+          '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/families/' + encodeURIComponent(familyId)
+        );
+        write({ ok: true, command, data: payload }, true);
+        return;
+      }
+      case 'proposal': {
+        const action = subcommand;
+        if (!action || !['create', 'edit', 'retire'].includes(action)) {
+          fail(command, 'proposal subcommand must be create, edit, or retire', 'VALIDATION_ERROR', jsonMode);
+        }
+        const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
+        const batchId = requireOption(options, 'batchId', command, jsonMode);
+        const metadata = getJsonMetadata(options, command, jsonMode);
+        const payload = await requestJson(
+          'POST',
+          '/workspaces/' + encodeURIComponent(workspaceId) + '/proposals/' + action,
+          undefined,
+          {
+            batchId,
+            sessionId: getString(options, 'sessionId') || '',
+            localeVariantId: getString(options, 'localeVariantId'),
+            note: getString(options, 'note') || '',
+            rationale: getString(options, 'rationale'),
+            pbiIds: getCsvList(options, 'pbiIds', 'pbiId'),
+            metadata
+          }
+        );
+        write({ ok: true, command: 'proposal ' + action, data: payload }, true);
+        return;
+      }
+      default:
+        fail(command, "unknown command '" + command + "'", 'VALIDATION_ERROR', jsonMode);
     }
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
+  } catch (error) {
+    fail(command, error instanceof Error ? error.message : String(error), 'RUNTIME_ERROR', true);
   }
-
-  return null;
+})().catch((error) => {
+  fail('runtime', error instanceof Error ? error.message : String(error), 'RUNTIME_ERROR', true);
+});
+`;
 }
 
 function isBinaryExecutable(binaryPath: string): boolean {
@@ -63,18 +448,50 @@ export class KbCliRuntimeService {
     private readonly workspaceRepository?: WorkspaceRepository
   ) {}
 
+  private ensureShimBinary(): string {
+    fs.mkdirSync(KB_CLI_SHIM_DIR, { recursive: true });
+    const source = buildKbCliShimSource();
+
+    if (process.platform === 'win32') {
+      const scriptPath = path.join(KB_CLI_SHIM_DIR, 'kb.js');
+      const wrapperPath = path.join(KB_CLI_SHIM_DIR, 'kb.cmd');
+      if (!fs.existsSync(scriptPath) || fs.readFileSync(scriptPath, 'utf8') !== source) {
+        fs.writeFileSync(scriptPath, source, 'utf8');
+      }
+      const wrapperSource = `@echo off\r\nnode "%~dp0\\kb.js" %*\r\n`;
+      if (!fs.existsSync(wrapperPath) || fs.readFileSync(wrapperPath, 'utf8') !== wrapperSource) {
+        fs.writeFileSync(wrapperPath, wrapperSource, 'utf8');
+      }
+      return wrapperPath;
+    }
+
+    const binaryPath = path.join(KB_CLI_SHIM_DIR, 'kb');
+    if (!fs.existsSync(binaryPath) || fs.readFileSync(binaryPath, 'utf8') !== source) {
+      fs.writeFileSync(binaryPath, source, 'utf8');
+    }
+    fs.chmodSync(binaryPath, 0o755);
+    return binaryPath;
+  }
+
   getBinaryName(): string {
-    return process.env[KB_CLI_BINARY_ENV]?.trim() || 'kb';
+    return 'kb';
   }
 
   resolveBinaryPath(): string | null {
-    return resolveBinaryOnPath(this.getBinaryName());
+    return this.ensureShimBinary();
   }
 
   getEnvironment(): Record<string, string> {
+    const shimBinaryPath = this.resolveBinaryPath() || this.ensureShimBinary();
     const baseUrl = this.loopbackService.getBaseUrl() ?? '';
     const authToken = this.loopbackService.getAuthToken();
+    const shimDir = path.dirname(shimBinaryPath);
+    const existingPath = process.env.PATH ?? '';
+    const normalizedPath = existingPath.startsWith(`${shimDir}${path.delimiter}`)
+      ? existingPath
+      : `${shimDir}${path.delimiter}${existingPath}`;
     return {
+      PATH: normalizedPath,
       KB_AGENT_API_BASE_URL: baseUrl,
       KB_AGENT_API_TOKEN: authToken,
       KBV_KB_CLI_BASE_URL: baseUrl,
@@ -88,16 +505,27 @@ export class KbCliRuntimeService {
 
   applyProcessEnv(): void {
     const env = this.getEnvironment();
+    delete process.env.KBV_KB_CLI_BINARY;
     for (const [key, value] of Object.entries(env)) {
       process.env[key] = value;
     }
   }
 
   buildPromptSuffix(): string {
+    const binaryPath = this.resolveBinaryPath() || this.getBinaryName();
     return [
       'CLI transport is preconfigured by KB Vault.',
-      'Use plain `kb ... --json` commands first; do not invent localhost URLs or auth tokens.',
-      'If syntax is unclear, call `kb --help` before trying a resource command.'
+      `Use this exact KB Vault CLI binary for every command: \`${binaryPath}\`. Do not rely on any other installed \`kb\` binary.`,
+      'Do not invent localhost URLs or auth tokens.',
+      'The proposal commands you need are available through this binary:',
+      `- \`${binaryPath} proposal create --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata '{"targetTitle":"<article title>","proposedHtml":"<html>...</html>"}' --json\``,
+      `- \`${binaryPath} proposal edit --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --locale-variant-id <locale-variant-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata '{"targetTitle":"<article title>","proposedHtml":"<html>...</html>"}' --json\``,
+      `- \`${binaryPath} proposal edit --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --locale-variant-id <locale-variant-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata-file /tmp/proposal-metadata.json --json\``,
+      `- \`${binaryPath} proposal retire --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --locale-variant-id <locale-variant-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata '{"targetTitle":"<article title>"}' --json\``,
+      'For create proposals, always include `metadata.targetTitle`.',
+      'For create/edit proposals, include the full final article HTML in `metadata.proposedHtml` when you have it.',
+      'If the HTML is too large or awkward for an inline JSON shell argument, write the metadata JSON to a temporary file and use `--metadata-file` instead of narrating escaping strategy.',
+      `If syntax is unclear, call \`${binaryPath} help --json\` or \`${binaryPath} proposal --json\` before trying a resource command.`
     ].join('\n');
   }
 

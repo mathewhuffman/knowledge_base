@@ -1,4 +1,6 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { test, expect } from '@playwright/test';
@@ -6,6 +8,8 @@ import { CliHealthFailure } from '@kb-vault/shared-types';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
 import { KbCliLoopbackService } from '../src/main/services/kb-cli-loopback-service';
 import { KbCliRuntimeService } from '../src/main/services/kb-cli-runtime-service';
+
+const execFileAsync = promisify(execFile);
 
 test.describe('kb cli desktop services', () => {
   let workspaceRoot: string;
@@ -265,76 +269,53 @@ test.describe('kb cli desktop services', () => {
     expect(headerTokenResp.ok).toBe(true);
   });
 
-  test('reports a clear CLI health failure when the kb binary is missing', async () => {
+  test('ignores stale KBV_KB_CLI_BINARY overrides and exposes a single shimmed kb command', async () => {
     const previousBinary = process.env.KBV_KB_CLI_BINARY;
-    process.env.KBV_KB_CLI_BINARY = path.join(workspaceRoot, 'missing-kb-binary');
+    process.env.KBV_KB_CLI_BINARY = path.join(workspaceRoot, 'stale-kb-binary');
 
     try {
       cliRuntimeService.applyProcessEnv();
-      const health = await cliRuntimeService.checkHealth();
-      expect(health.mode).toBe('cli');
-      expect(health.ok).toBe(false);
-      expect(health.baseUrl).toBe(loopbackService.getBaseUrl());
-      expect(health.issues?.some((issue) => issue.includes('binary'))).toBe(true);
-      expect(health.failureCode).toBe(CliHealthFailure.BINARY_NOT_FOUND);
-    } finally {
-      if (previousBinary === undefined) {
-        delete process.env.KBV_KB_CLI_BINARY;
-      } else {
-        process.env.KBV_KB_CLI_BINARY = previousBinary;
-      }
-    }
-  });
+      expect(process.env.KBV_KB_CLI_BINARY).toBeUndefined();
 
-  test('reports BINARY_NOT_EXECUTABLE when binary exists but lacks execute permission', async () => {
-    if (process.platform === 'win32') {
-      test.skip();
-      return;
-    }
+      const binaryPath = cliRuntimeService.resolveBinaryPath();
+      expect(binaryPath).toBeTruthy();
+      expect(path.basename(binaryPath!)).toContain('kb');
 
-    const fakeBinary = path.join(workspaceRoot, 'kb-no-exec');
-    await writeFile(fakeBinary, '#!/bin/sh\necho ok', 'utf8');
-    await chmod(fakeBinary, 0o644); // readable but not executable
+      const env = cliRuntimeService.getEnvironment();
+      const firstPathEntry = env.PATH.split(path.delimiter)[0];
+      expect(firstPathEntry).toBe(path.dirname(binaryPath!));
 
-    const previousBinary = process.env.KBV_KB_CLI_BINARY;
-    process.env.KBV_KB_CLI_BINARY = fakeBinary;
+      const help = await execFileAsync('kb', ['help', '--json'], {
+        env: {
+          ...process.env,
+          ...env
+        }
+      });
+      const helpJson = JSON.parse(help.stdout) as {
+        ok?: boolean;
+        command?: string;
+        data?: { commands?: string[] };
+      };
+      expect(helpJson.ok).toBe(true);
+      expect(helpJson.command).toBe('help');
+      expect(helpJson.data?.commands).toContain('proposal create');
 
-    try {
-      const health = await cliRuntimeService.checkHealth();
-      expect(health.ok).toBe(false);
-      expect(health.failureCode).toBe(CliHealthFailure.BINARY_NOT_EXECUTABLE);
-      expect(health.issues?.some((issue) => issue.includes('executable'))).toBe(true);
-    } finally {
-      if (previousBinary === undefined) {
-        delete process.env.KBV_KB_CLI_BINARY;
-      } else {
-        process.env.KBV_KB_CLI_BINARY = previousBinary;
-      }
-    }
-  });
-
-  test('runs the local health probe against the binary and reports probe failure', async () => {
-    if (process.platform === 'win32') {
-      test.skip();
-      return;
-    }
-
-    const fakeBinary = path.join(workspaceRoot, 'kb-failing-probe');
-    await writeFile(
-      fakeBinary,
-      '#!/usr/bin/env node\nconsole.error(\"cli probe failed\");\nprocess.exit(1);\n',
-      'utf8'
-    );
-    await chmod(fakeBinary, 0o755);
-
-    const previousBinary = process.env.KBV_KB_CLI_BINARY;
-    process.env.KBV_KB_CLI_BINARY = fakeBinary;
-
-    try {
-      const health = await cliRuntimeService.checkHealth();
-      expect(health.ok).toBe(false);
-      expect(health.failureCode).toBe(CliHealthFailure.HEALTH_PROBE_FAILED);
-      expect(health.issues?.some((issue) => issue.includes('cli probe failed'))).toBe(true);
+      const proposalHelp = await execFileAsync('kb', ['proposal', '--json'], {
+        env: {
+          ...process.env,
+          ...env
+        }
+      });
+      const proposalHelpJson = JSON.parse(proposalHelp.stdout) as {
+        ok?: boolean;
+        command?: string;
+        data?: { subcommands?: string[]; options?: string[]; examples?: string[] };
+      };
+      expect(proposalHelpJson.ok).toBe(true);
+      expect(proposalHelpJson.command).toBe('help');
+      expect(proposalHelpJson.data?.subcommands).toContain('create');
+      expect(proposalHelpJson.data?.options).toContain('--metadata');
+      expect(proposalHelpJson.data?.examples?.[0]).toContain('--metadata');
     } finally {
       if (previousBinary === undefined) {
         delete process.env.KBV_KB_CLI_BINARY;
@@ -480,5 +461,118 @@ test.describe('kb cli desktop services', () => {
     const json = await resp.json() as { ok: boolean; error: string };
     expect(json.ok).toBe(false);
     expect(json.error).toContain('No CLI route');
+  });
+
+  test('installs a local kb shim that advertises proposal commands', async () => {
+    cliRuntimeService.applyProcessEnv();
+    const binaryPath = cliRuntimeService.resolveBinaryPath();
+    expect(binaryPath).toBeTruthy();
+
+    const { stdout } = await execFileAsync(binaryPath!, ['help', '--json'], {
+      env: {
+        ...process.env,
+        ...cliRuntimeService.getEnvironment()
+      }
+    });
+
+    const payload = JSON.parse(stdout) as {
+      ok: boolean;
+      command: string;
+      data: { commands: string[] };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.command).toBe('help');
+    expect(payload.data.commands).toContain('proposal create');
+    expect(payload.data.commands).toContain('proposal edit');
+    expect(payload.data.commands).toContain('proposal retire');
+  });
+
+  test('builds CLI prompt guidance that pins the shim binary and proposal commands', () => {
+    cliRuntimeService.applyProcessEnv();
+    const binaryPath = cliRuntimeService.resolveBinaryPath();
+    expect(binaryPath).toBeTruthy();
+
+    const promptSuffix = cliRuntimeService.buildPromptSuffix();
+
+    expect(promptSuffix).toContain(`Use this exact KB Vault CLI binary for every command: \`${binaryPath}\``);
+    expect(promptSuffix).toContain(`${binaryPath} proposal create --workspace-id <workspace-id> --batch-id <batch-id>`);
+    expect(promptSuffix).toContain(`${binaryPath} proposal edit --workspace-id <workspace-id> --batch-id <batch-id>`);
+    expect(promptSuffix).toContain(`${binaryPath} proposal retire --workspace-id <workspace-id> --batch-id <batch-id>`);
+  });
+
+  test('creates proposal review records through the local kb shim', async () => {
+    const created = await repository.createWorkspace({
+      name: 'Proposal CLI Workspace',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us'],
+      path: path.join(workspaceRoot, 'workspace-cli-proposals')
+    });
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Proposal Batch',
+      'proposal-batch.csv',
+      '/tmp/proposal-batch.csv',
+      'csv',
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 0
+      }
+    );
+
+    cliRuntimeService.applyProcessEnv();
+    const binaryPath = cliRuntimeService.resolveBinaryPath();
+    expect(binaryPath).toBeTruthy();
+
+    const { stdout } = await execFileAsync(
+      binaryPath!,
+      [
+        'proposal',
+        'create',
+        '--workspace-id',
+        created.id,
+        '--batch-id',
+        batch.id,
+        '--session-id',
+        'session-proposal-cli',
+        '--note',
+        'Create a dedicated food list duplicate article',
+        '--rationale',
+        'Food duplication is covered only conceptually today.',
+        '--json'
+      ],
+      {
+        env: {
+          ...process.env,
+          ...cliRuntimeService.getEnvironment()
+        }
+      }
+    );
+
+    const payload = JSON.parse(stdout) as {
+      ok: boolean;
+      command: string;
+      data: { ok: boolean; id: string; batchId: string; action: string; reviewStatus: string };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.command).toBe('proposal create');
+    expect(payload.data.ok).toBe(true);
+    expect(payload.data.batchId).toBe(batch.id);
+    expect(payload.data.action).toBe('create');
+    expect(payload.data.reviewStatus).toBe('pending_review');
+
+    const proposals = await repository.listProposalReviewQueue(created.id, batch.id);
+    expect(proposals.queue).toHaveLength(1);
+    expect(proposals.queue[0]?.action).toBe('create');
+    expect(proposals.queue[0]?.reviewStatus).toBe('pending_review');
+
+    const proposalDetail = await repository.getProposalReviewDetail(created.id, payload.data.id);
+    expect(proposalDetail.proposal.action).toBe('create');
+    expect(proposalDetail.proposal.reviewStatus).toBe('pending_review');
+    expect(proposalDetail.proposal.rationaleSummary).toContain('Food duplication');
   });
 });

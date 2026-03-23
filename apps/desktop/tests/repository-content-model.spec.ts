@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { test, expect } from '@playwright/test';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
+import { PBIImportFormat, PBIBatchScopeMode, ProposalReviewDecision, ProposalReviewStatus } from '@kb-vault/shared-types';
 
 test.describe('workspace repository content model', () => {
   let workspaceRoot: string;
@@ -133,6 +134,129 @@ test.describe('workspace repository content model', () => {
         kbAccessMode: 'broken' as 'mcp'
       })
     ).rejects.toThrow('kbAccessMode must be mcp or cli');
+  });
+
+  test('builds proposal review queue, detail payload, and persists decisions', async () => {
+    const created = await repository.createWorkspace({
+      name: `ProposalReview-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 42',
+      'sprint-42.csv',
+      'imports/sprint-42.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.insertPBIRecords(created.id, batch.id, [
+      {
+        batchId: batch.id,
+        sourceRowNumber: 1,
+        externalId: 'PBI-42',
+        title: 'Add team dashboard assignment docs',
+        description: 'Document the new team dashboard assignment flow'
+      }
+    ]);
+    const insertedPbis = await repository.getPBIRecords(created.id, batch.id);
+    const pbiId = insertedPbis[0]?.id;
+    expect(pbiId).toBeTruthy();
+
+    const proposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      targetTitle: 'Create & Edit Chat Channels',
+      targetLocale: 'en-us',
+      confidenceScore: 0.92,
+      rationaleSummary: 'Update the assignment steps to match the new dashboard flow.',
+      aiNotes: 'The title stays the same but steps 3-5 change.',
+      suggestedPlacement: {
+        sectionId: 'sec-dashboard',
+        notes: 'Keep this in the admin workflows section.'
+      },
+      sourceHtml: '<h1>Create & Edit Chat Channels</h1>\n<p>Old flow.</p>',
+      proposedHtml: '<h1>Create & Edit Chat Channels</h1>\n<p>New team dashboard flow.</p>',
+      relatedPbiIds: [pbiId as string]
+    });
+
+    expect(proposal.reviewStatus).toBe(ProposalReviewStatus.PENDING_REVIEW);
+
+    const queue = await repository.listProposalReviewQueue(created.id, batch.id);
+    expect(queue.summary.total).toBe(1);
+    expect(queue.summary.pendingReview).toBe(1);
+    expect(queue.groups[0].articleLabel).toBe('Create & Edit Chat Channels');
+    expect(queue.queue[0].relatedPbiCount).toBe(1);
+
+    const detail = await repository.getProposalReviewDetail(created.id, proposal.id);
+    expect(detail.relatedPbis).toHaveLength(1);
+    expect(detail.diff.changeRegions.length).toBeGreaterThan(0);
+    expect(detail.navigation.total).toBe(1);
+
+    const decision = await repository.decideProposalReview({
+      workspaceId: created.id,
+      proposalId: proposal.id,
+      decision: ProposalReviewDecision.ACCEPT,
+      note: 'Looks good.'
+    });
+
+    expect(decision.reviewStatus).toBe(ProposalReviewStatus.ACCEPTED);
+    expect(decision.batchStatus).toBe('review_complete');
+    expect(decision.summary.accepted).toBe(1);
+  });
+
+  test('rejects empty create proposals and infers KB-prefixed article titles', async () => {
+    const created = await repository.createWorkspace({
+      name: `ProposalGuardrails-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 43',
+      'sprint-43.csv',
+      'imports/sprint-43.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await expect(
+      repository.createAgentProposal({
+        workspaceId: created.id,
+        batchId: batch.id,
+        action: 'create'
+      })
+    ).rejects.toThrow('Proposal must include notes, rationale, metadata, linked PBIs, or HTML content');
+
+    const createdProposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'create',
+      note: 'KB create: article Duplicate Food Lists and Food Items (Portal)',
+      rationale: 'No duplicate article exists today.'
+    });
+
+    expect(createdProposal.targetTitle).toBe('Duplicate Food Lists and Food Items');
   });
 
   test('manages article family CRUD and validation', async () => {

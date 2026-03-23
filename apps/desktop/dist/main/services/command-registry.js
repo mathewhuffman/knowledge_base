@@ -1380,6 +1380,105 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
         }
     });
+    bus.register('proposal.ingest', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.batchId || !input.action) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.ingest requires workspaceId, batchId, and action');
+            }
+            const proposal = await workspaceRepository.createAgentProposal({
+                workspaceId: input.workspaceId,
+                batchId: input.batchId,
+                action: input.action,
+                _sessionId: input.sessionId,
+                familyId: input.familyId,
+                localeVariantId: input.localeVariantId,
+                sourceRevisionId: input.sourceRevisionId,
+                targetTitle: input.targetTitle,
+                targetLocale: input.targetLocale,
+                confidenceScore: input.confidenceScore,
+                note: input.aiNotes,
+                rationale: input.rationaleSummary,
+                rationaleSummary: input.rationaleSummary,
+                aiNotes: input.aiNotes,
+                suggestedPlacement: input.suggestedPlacement,
+                sourceHtml: input.sourceHtml,
+                proposedHtml: input.proposedHtml,
+                relatedPbiIds: input.relatedPbiIds,
+                metadata: input.metadata
+            });
+            return { ok: true, data: proposal };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'PBI batch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('proposal.review.list', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.batchId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.list requires workspaceId and batchId');
+            }
+            return { ok: true, data: await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'PBI batch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('proposal.review.batchList', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.batchList requires workspaceId');
+            }
+            return { ok: true, data: await workspaceRepository.listProposalReviewBatches(input.workspaceId) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('proposal.review.get', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.proposalId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.get requires workspaceId and proposalId');
+            }
+            return { ok: true, data: await workspaceRepository.getProposalReviewDetail(input.workspaceId, input.proposalId) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Proposal not found' || error.message === 'PBI batch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('proposal.review.decide', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.proposalId || !input.decision) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.decide requires workspaceId, proposalId, and decision');
+            }
+            if (!Object.values(shared_types_1.ProposalReviewDecision).includes(input.decision)) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.decide decision must be accept|deny|defer|apply_to_branch|archive');
+            }
+            return { ok: true, data: await workspaceRepository.decideProposalReview(input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Proposal not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
     jobs.registerRunner('workspace.bootstrap', async (payload, emit) => {
         emit({
             id: payload.jobId ?? 'bootstrap',

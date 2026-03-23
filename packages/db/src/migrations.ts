@@ -341,6 +341,49 @@ export const migrations: Migration[] = [
     sql: `
       ALTER TABLE ai_runs ADD COLUMN raw_output_json TEXT;
     `
+  },
+  {
+    version: 8,
+    name: '0008_batch7_proposal_review_model',
+    description: 'Extend proposals for structured review state, rich metadata, and persisted diff artifacts.',
+    sql: `
+      ALTER TABLE proposals ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending_review';
+      ALTER TABLE proposals ADD COLUMN queue_order INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE proposals ADD COLUMN family_id TEXT;
+      ALTER TABLE proposals ADD COLUMN source_revision_id TEXT;
+      ALTER TABLE proposals ADD COLUMN target_title TEXT;
+      ALTER TABLE proposals ADD COLUMN target_locale TEXT;
+      ALTER TABLE proposals ADD COLUMN confidence_score REAL;
+      ALTER TABLE proposals ADD COLUMN rationale_summary TEXT;
+      ALTER TABLE proposals ADD COLUMN ai_notes TEXT;
+      ALTER TABLE proposals ADD COLUMN suggested_placement_json TEXT;
+      ALTER TABLE proposals ADD COLUMN source_html_path TEXT;
+      ALTER TABLE proposals ADD COLUMN proposed_html_path TEXT;
+      ALTER TABLE proposals ADD COLUMN metadata_json TEXT;
+      ALTER TABLE proposals ADD COLUMN decision_payload_json TEXT;
+      ALTER TABLE proposals ADD COLUMN decided_at TEXT;
+      ALTER TABLE proposals ADD COLUMN agent_session_id TEXT;
+
+      UPDATE proposals
+      SET review_status = CASE
+        WHEN status = 'accept' THEN 'accepted'
+        WHEN status = 'deny' THEN 'denied'
+        WHEN status = 'apply_to_branch' THEN 'applied_to_branch'
+        WHEN status = 'create_branch' THEN 'accepted'
+        WHEN status = 'defer' THEN 'deferred'
+        ELSE 'pending_review'
+      END
+      WHERE review_status IS NULL OR review_status = '';
+
+      UPDATE proposals
+      SET queue_order = (
+        SELECT COUNT(*)
+        FROM proposals p2
+        WHERE p2.batch_id = proposals.batch_id
+          AND p2.generated_at <= proposals.generated_at
+      )
+      WHERE queue_order = 0;
+    `
   }
 ];
 

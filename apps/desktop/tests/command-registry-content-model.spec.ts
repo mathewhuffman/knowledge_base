@@ -132,6 +132,83 @@ test.describe('command registry content model transitions', () => {
     expect(secondData.workspaces[0].workspaceDbVersion).toBeGreaterThan(0);
   });
 
+  test('supports batch 7 proposal review commands end to end', async () => {
+    const workspace = await createWorkspace();
+
+    const importResp = await bus.execute({
+      method: 'pbiBatch.import',
+      payload: {
+        workspaceId: workspace.id,
+        sourceFileName: 'batch-7.csv',
+        sourceContent: 'Id,Title,Description\n101,Dashboard Assignment,Document the new dashboard assignment flow'
+      }
+    });
+    expect(importResp.ok).toBe(true);
+    const imported = importResp.data as { batch: { id: string } };
+
+    const rowsResp = await bus.execute({
+      method: 'pbiBatch.rows.list',
+      payload: {
+        workspaceId: workspace.id,
+        batchId: imported.batch.id
+      }
+    });
+    expect(rowsResp.ok).toBe(true);
+    const rows = (rowsResp.data as { rows: Array<{ id: string }> }).rows;
+    expect(rows.length).toBeGreaterThan(0);
+
+    const ingestResp = await bus.execute({
+      method: 'proposal.ingest',
+      payload: {
+        workspaceId: workspace.id,
+        batchId: imported.batch.id,
+        action: 'edit',
+        targetTitle: 'Create & Edit Chat Channels',
+        targetLocale: 'en-us',
+        confidenceScore: 0.88,
+        rationaleSummary: 'Reflect the new dashboard assignment path.',
+        aiNotes: 'Steps 2-4 need updates.',
+        sourceHtml: '<p>Old assignment flow.</p>',
+        proposedHtml: '<p>New assignment flow.</p>',
+        relatedPbiIds: [rows[0].id]
+      }
+    });
+    expect(ingestResp.ok).toBe(true);
+    const proposal = ingestResp.data as { id: string };
+
+    const listResp = await bus.execute({
+      method: 'proposal.review.list',
+      payload: {
+        workspaceId: workspace.id,
+        batchId: imported.batch.id
+      }
+    });
+    expect(listResp.ok).toBe(true);
+    expect((listResp.data as { summary: { pendingReview: number } }).summary.pendingReview).toBe(1);
+
+    const detailResp = await bus.execute({
+      method: 'proposal.review.get',
+      payload: {
+        workspaceId: workspace.id,
+        proposalId: proposal.id
+      }
+    });
+    expect(detailResp.ok).toBe(true);
+    expect((detailResp.data as { diff: { changeRegions: unknown[] } }).diff.changeRegions.length).toBeGreaterThan(0);
+
+    const decideResp = await bus.execute({
+      method: 'proposal.review.decide',
+      payload: {
+        workspaceId: workspace.id,
+        proposalId: proposal.id,
+        decision: 'deny',
+        note: 'Not needed.'
+      }
+    });
+    expect(decideResp.ok).toBe(true);
+    expect((decideResp.data as { reviewStatus: string }).reviewStatus).toBe('denied');
+  });
+
   test('handles articleFamily command lifecycle', async () => {
     const workspace = await createWorkspace();
 

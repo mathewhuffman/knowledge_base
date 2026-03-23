@@ -2,9 +2,11 @@
   "name": "@kb-vault/diff-engine",
   "version": "0.1.0",
   "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "lint": "tsc -p tsconfig.json --noEmit",
+    "build": "pnpm -C ../../apps/desktop exec tsc -p ../../packages/diff-engine/tsconfig.json",
+    "lint": "pnpm -C ../../apps/desktop exec tsc -p ../../packages/diff-engine/tsconfig.json --noEmit",
     "test": "echo '\"diff-engine\" tests are not implemented in batch 1'"
   }
 }

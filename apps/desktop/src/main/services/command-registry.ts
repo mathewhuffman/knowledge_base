@@ -57,7 +57,13 @@ import {
   type MCPListSectionsInput,
   type MCPRecordAgentNotesInput,
   type MCPFindRelatedArticlesInput,
-  type AgentStreamingPayload
+  type AgentStreamingPayload,
+  type ProposalIngestRequest,
+  type ProposalReviewDecisionRequest,
+  type ProposalReviewBatchListRequest,
+  ProposalReviewDecision,
+  type ProposalReviewGetRequest,
+  type ProposalReviewListRequest
 } from '@kb-vault/shared-types';
 import { ZendeskClient } from '@kb-vault/zendesk-client';
 import { CursorAcpRuntime, type AgentRuntimeToolContext } from '@kb-vault/agent-runtime';
@@ -1495,6 +1501,105 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       return { ok: true, data: preflight };
     } catch (error) {
       if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('proposal.ingest', async (payload) => {
+    try {
+      const input = payload as ProposalIngestRequest;
+      if (!input?.workspaceId || !input.batchId || !input.action) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.ingest requires workspaceId, batchId, and action');
+      }
+      const proposal = await workspaceRepository.createAgentProposal({
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        action: input.action,
+        _sessionId: input.sessionId,
+        familyId: input.familyId,
+        localeVariantId: input.localeVariantId,
+        sourceRevisionId: input.sourceRevisionId,
+        targetTitle: input.targetTitle,
+        targetLocale: input.targetLocale,
+        confidenceScore: input.confidenceScore,
+        note: input.aiNotes,
+        rationale: input.rationaleSummary,
+        rationaleSummary: input.rationaleSummary,
+        aiNotes: input.aiNotes,
+        suggestedPlacement: input.suggestedPlacement,
+        sourceHtml: input.sourceHtml,
+        proposedHtml: input.proposedHtml,
+        relatedPbiIds: input.relatedPbiIds,
+        metadata: input.metadata
+      });
+      return { ok: true, data: proposal };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('proposal.review.list', async (payload) => {
+    try {
+      const input = payload as ProposalReviewListRequest;
+      if (!input?.workspaceId || !input.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.review.list requires workspaceId and batchId');
+      }
+      return { ok: true, data: await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId) };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('proposal.review.batchList', async (payload) => {
+    try {
+      const input = payload as ProposalReviewBatchListRequest;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.review.batchList requires workspaceId');
+      }
+      return { ok: true, data: await workspaceRepository.listProposalReviewBatches(input.workspaceId) };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('proposal.review.get', async (payload) => {
+    try {
+      const input = payload as ProposalReviewGetRequest;
+      if (!input?.workspaceId || !input.proposalId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.review.get requires workspaceId and proposalId');
+      }
+      return { ok: true, data: await workspaceRepository.getProposalReviewDetail(input.workspaceId, input.proposalId) };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'Proposal not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('proposal.review.decide', async (payload) => {
+    try {
+      const input = payload as ProposalReviewDecisionRequest;
+      if (!input?.workspaceId || !input.proposalId || !input.decision) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.review.decide requires workspaceId, proposalId, and decision');
+      }
+      if (!Object.values(ProposalReviewDecision).includes(input.decision)) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.review.decide decision must be accept|deny|defer|apply_to_branch|archive');
+      }
+      return { ok: true, data: await workspaceRepository.decideProposalReview(input) };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'Proposal not found') {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
       }
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));

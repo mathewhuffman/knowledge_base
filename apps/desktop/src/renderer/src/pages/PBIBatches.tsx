@@ -45,6 +45,7 @@ const STATUS_LABEL: Record<string, string> = {
   imported: 'Imported',
   scoped: 'Scoped',
   submitted: 'Submitted',
+  analyzing: 'Analyzing',
   analyzed: 'Analyzed',
   review_in_progress: 'In Review',
   review_complete: 'Complete',
@@ -59,6 +60,7 @@ function batchStatusVariant(status: string): 'neutral' | 'primary' | 'success' |
     case 'imported': return 'neutral';
     case 'scoped': return 'primary';
     case 'submitted': return 'primary';
+    case 'analyzing': return 'warning';
     case 'analyzed': return 'primary';
     case 'review_in_progress': return 'warning';
     case 'review_complete': return 'success';
@@ -328,6 +330,7 @@ export const PBI = () => {
   const batchListQuery = useIpc<{ workspaceId: string; batches: PBIBatchRecord[] }>('pbiBatch.list');
   const sessionListQuery = useIpc<{ workspaceId: string; sessions: AgentSessionRecord[] }>('agent.session.list');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const jobStateByIdRef = useRef<Record<string, string>>({});
 
   const [wizard, setWizard] = useState<WizardState>(WIZARD_INITIAL);
   const [batchToDelete, setBatchToDelete] = useState<PBIBatchRecord | null>(null);
@@ -335,20 +338,86 @@ export const PBI = () => {
   const [deleteBatchError, setDeleteBatchError] = useState<string | null>(null);
   const [analysisBatch, setAnalysisBatch] = useState<PBIBatchRecord | null>(null);
   const [analysisAutoRun, setAnalysisAutoRun] = useState(false);
+  const [activeAnalysisBatchIds, setActiveAnalysisBatchIds] = useState<string[]>([]);
+  const [cachedBatches, setCachedBatches] = useState<PBIBatchRecord[]>([]);
+  const [cachedSessions, setCachedSessions] = useState<AgentSessionRecord[]>([]);
   const batches = useMemo(() => {
     const data = batchListQuery.data;
-    if (!data) return [];
-    return Array.isArray(data.batches) ? data.batches : [];
+    if (data && Array.isArray(data.batches)) {
+      return data.batches;
+    }
+    return cachedBatches;
+  }, [batchListQuery.data, cachedBatches]);
+
+  useEffect(() => {
+    if (batchListQuery.data?.batches && Array.isArray(batchListQuery.data.batches)) {
+      setCachedBatches(batchListQuery.data.batches);
+    }
   }, [batchListQuery.data]);
+
+  useEffect(() => {
+    if (sessionListQuery.data?.sessions && Array.isArray(sessionListQuery.data.sessions)) {
+      setCachedSessions(sessionListQuery.data.sessions);
+    }
+  }, [sessionListQuery.data]);
 
   // Fetch batch list on mount
   useEffect(() => {
     if (activeWorkspace) {
+      jobStateByIdRef.current = {};
       batchListQuery.execute({ workspaceId: activeWorkspace.id });
       sessionListQuery.execute({ workspaceId: activeWorkspace.id, includeClosed: true });
+    } else {
+      setCachedBatches([]);
+      setCachedSessions([]);
+      setActiveAnalysisBatchIds([]);
     }
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (!activeWorkspace) {
+      setActiveAnalysisBatchIds([]);
+      return;
+    }
+
+    const unsubscribe = window.kbv.emitJobEvents((event) => {
+      if (event.command !== 'agent.analysis.run') return;
+      const previousState = jobStateByIdRef.current[event.id];
+      jobStateByIdRef.current[event.id] = event.state;
+      const metadata = (event as { metadata?: { batchId?: unknown } }).metadata;
+      const batchId = typeof metadata?.batchId === 'string' ? metadata.batchId : null;
+
+      if (batchId) {
+        setActiveAnalysisBatchIds((current) => {
+          const next = new Set(current);
+          if (event.state === 'RUNNING' || event.state === 'QUEUED') {
+            next.add(batchId);
+          }
+          if (event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED') {
+            next.delete(batchId);
+          }
+          return Array.from(next);
+        });
+      }
+
+      const stateChanged = previousState !== event.state;
+      const shouldRefresh =
+        (event.state === 'QUEUED' || event.state === 'RUNNING' || event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED')
+        && stateChanged;
+
+      if (shouldRefresh) {
+        void batchListQuery.execute({ workspaceId: activeWorkspace.id });
+        void sessionListQuery.execute({ workspaceId: activeWorkspace.id, includeClosed: true });
+      }
+    });
+
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+ 
   const openWizard = useCallback(() => {
     setAnalysisBatch(null);
     setAnalysisAutoRun(false);
@@ -364,7 +433,7 @@ export const PBI = () => {
   }, [activeWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
  
   const batchHasHistory = useMemo(() => {
-    const sessions = sessionListQuery.data?.sessions ?? [];
+    const sessions = sessionListQuery.data?.sessions ?? cachedSessions;
     const analyzedBatchIds = new Set<string>();
     for (const session of sessions) {
       if (session.type === 'batch_analysis' && session.batchId) {
@@ -372,7 +441,29 @@ export const PBI = () => {
       }
     }
     return analyzedBatchIds;
-  }, [sessionListQuery.data?.sessions]);
+  }, [sessionListQuery.data?.sessions, cachedSessions]);
+
+  const runningAnalysisBatchIds = useMemo(() => {
+    const sessions = sessionListQuery.data?.sessions ?? cachedSessions;
+    const activeBatchIds = new Set(activeAnalysisBatchIds);
+    for (const session of sessions) {
+      if (
+        session.type === 'batch_analysis'
+        && session.batchId
+        && (session.status === 'running' || session.status === 'starting')
+      ) {
+        activeBatchIds.add(session.batchId);
+      }
+    }
+    return activeBatchIds;
+  }, [activeAnalysisBatchIds, sessionListQuery.data?.sessions, cachedSessions]);
+
+  const getDisplayBatchStatus = useCallback((batch: PBIBatchRecord) => {
+    if (runningAnalysisBatchIds.has(batch.id)) {
+      return 'analyzing';
+    }
+    return batch.status;
+  }, [runningAnalysisBatchIds]);
 
   const openAnalysis = useCallback((batch: PBIBatchRecord, shouldAutoRun = false) => {
     setAnalysisBatch(batch);
@@ -384,16 +475,22 @@ export const PBI = () => {
     if (hasAnalysisHistory(batch)) {
       return true;
     }
+    if (runningAnalysisBatchIds.has(batch.id)) {
+      return true;
+    }
     return batch.status === PBIBatchStatus.ANALYZED
       || batch.status === PBIBatchStatus.REVIEW_IN_PROGRESS
       || batch.status === PBIBatchStatus.REVIEW_COMPLETE;
-  }, [hasAnalysisHistory]);
+  }, [hasAnalysisHistory, runningAnalysisBatchIds]);
   const canRunAnalysis = useCallback((batch: PBIBatchRecord) => {
+    if (runningAnalysisBatchIds.has(batch.id)) {
+      return false;
+    }
     if (batch.status === PBIBatchStatus.IMPORTED || batch.status === PBIBatchStatus.ARCHIVED) {
       return false;
     }
     return !hasAnyAnalysisOutcome(batch);
-  }, [hasAnyAnalysisOutcome]);
+  }, [hasAnyAnalysisOutcome, runningAnalysisBatchIds]);
 
   const openAnalysisFromRow = useCallback((batch: PBIBatchRecord) => {
     if (!hasAnyAnalysisOutcome(batch)) {
@@ -862,7 +959,9 @@ export const PBI = () => {
                 </tr>
               </thead>
               <tbody>
-                {batches.map((b) => (
+                {batches.map((b) => {
+                  const displayStatus = getDisplayBatchStatus(b);
+                  return (
                   <tr
                     key={b.id}
                     className="pbi-batch-table-row"
@@ -880,8 +979,8 @@ export const PBI = () => {
                     <td>{b.candidateRowCount}</td>
                     <td>{b.scopedRowCount}</td>
                     <td>
-                      <Badge variant={batchStatusVariant(b.status)}>
-                        {STATUS_LABEL[b.status] ?? b.status}
+                      <Badge variant={batchStatusVariant(displayStatus)}>
+                        {STATUS_LABEL[displayStatus] ?? displayStatus}
                       </Badge>
                     </td>
                     <td className="pbi-batch-table-actions-cell">
@@ -913,7 +1012,8 @@ export const PBI = () => {
                       </button>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

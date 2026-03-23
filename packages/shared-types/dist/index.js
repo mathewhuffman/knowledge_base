@@ -20,3 +20,4 @@ __exportStar(require("./ipc"), exports);
 __exportStar(require("./batch2"), exports);
 __exportStar(require("./batch3"), exports);
 __exportStar(require("./batch6"), exports);
+__exportStar(require("./batch7"), exports);
