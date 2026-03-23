@@ -4,7 +4,17 @@ import path from 'node:path';
 import os from 'node:os';
 import { test, expect } from '@playwright/test';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
-import { PBIImportFormat, PBIBatchScopeMode, ProposalReviewDecision, ProposalReviewStatus } from '@kb-vault/shared-types';
+import {
+  ArticleAiPresetAction,
+  DraftBranchStatus,
+  PBIImportFormat,
+  PBIBatchScopeMode,
+  ProposalReviewDecision,
+  ProposalReviewStatus,
+  RevisionState,
+  RevisionStatus,
+  TemplatePackType
+} from '@kb-vault/shared-types';
 
 test.describe('workspace repository content model', () => {
   let workspaceRoot: string;
@@ -214,6 +224,138 @@ test.describe('workspace repository content model', () => {
     expect(decision.reviewStatus).toBe(ProposalReviewStatus.ACCEPTED);
     expect(decision.batchStatus).toBe('review_complete');
     expect(decision.summary.accepted).toBe(1);
+    expect(decision.branchId).toBeTruthy();
+    expect(decision.revisionId).toBeTruthy();
+
+    const revisions = await repository.listRevisions(created.id);
+    const draftRevision = revisions.find((revision) => revision.id === decision.revisionId);
+    expect(draftRevision?.branchId).toBe(decision.branchId);
+    expect(draftRevision?.revisionType).toBe(RevisionState.DRAFT_BRANCH);
+  });
+
+  test('applies proposals to an existing draft branch, archives no-impact proposals, and retires locale variants', async () => {
+    const created = await repository.createWorkspace({
+      name: `ProposalDecisionHooks-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'kb-food-lists',
+      title: 'Manage Food Lists'
+    });
+    const variant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'en-us',
+      status: RevisionState.LIVE
+    });
+    const liveRevision = await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      revisionType: RevisionState.LIVE,
+      filePath: 'articles/manage-food-lists/live.html',
+      revisionNumber: 1,
+      status: RevisionStatus.OPEN
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 44',
+      'sprint-44.csv',
+      'imports/sprint-44.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const editProposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      familyId: family.id,
+      localeVariantId: variant.id,
+      sourceRevisionId: liveRevision.id,
+      targetTitle: 'Manage Food Lists',
+      targetLocale: 'en-us',
+      proposedHtml: '<h1>Manage Food Lists</h1><p>Updated branch content.</p>'
+    });
+
+    const accepted = await repository.decideProposalReview({
+      workspaceId: created.id,
+      proposalId: editProposal.id,
+      decision: ProposalReviewDecision.ACCEPT
+    });
+
+    expect(accepted.branchId).toBeTruthy();
+
+    const secondProposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      familyId: family.id,
+      localeVariantId: variant.id,
+      sourceRevisionId: liveRevision.id,
+      targetTitle: 'Manage Food Lists',
+      targetLocale: 'en-us',
+      proposedHtml: '<h1>Manage Food Lists</h1><p>Applied into the same draft branch.</p>'
+    });
+
+    const applied = await repository.decideProposalReview({
+      workspaceId: created.id,
+      proposalId: secondProposal.id,
+      decision: ProposalReviewDecision.APPLY_TO_BRANCH,
+      branchId: accepted.branchId
+    });
+
+    expect(applied.reviewStatus).toBe(ProposalReviewStatus.APPLIED_TO_BRANCH);
+    expect(applied.branchId).toBe(accepted.branchId);
+    expect(applied.revisionId).toBeTruthy();
+
+    const noImpact = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'no_impact',
+      targetTitle: 'Manage Food Lists',
+      aiNotes: 'No KB action is required for this batch.'
+    });
+    const archived = await repository.decideProposalReview({
+      workspaceId: created.id,
+      proposalId: noImpact.id,
+      decision: ProposalReviewDecision.ACCEPT
+    });
+    expect(archived.reviewStatus).toBe(ProposalReviewStatus.ARCHIVED);
+
+    const retireProposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'retire',
+      familyId: family.id,
+      localeVariantId: variant.id,
+      targetTitle: 'Manage Food Lists',
+      rationaleSummary: 'This article is obsolete after the new workflow launch.'
+    });
+    const retired = await repository.decideProposalReview({
+      workspaceId: created.id,
+      proposalId: retireProposal.id,
+      decision: ProposalReviewDecision.ACCEPT
+    });
+
+    expect(retired.reviewStatus).toBe(ProposalReviewStatus.ACCEPTED);
+    expect(retired.localeVariantId).toBe(variant.id);
+    expect(retired.retiredAtUtc).toBeTruthy();
+
+    const refreshedVariant = await repository.getLocaleVariantByFamilyAndLocale(created.id, family.id, 'en-us');
+    expect(refreshedVariant?.status).toBe(RevisionState.RETIRED);
+    expect(refreshedVariant?.retiredAtUtc).toBeTruthy();
   });
 
   test('rejects empty create proposals and infers KB-prefixed article titles', async () => {
@@ -257,6 +399,195 @@ test.describe('workspace repository content model', () => {
     });
 
     expect(createdProposal.targetTitle).toBe('Duplicate Food Lists and Food Items');
+  });
+
+  test('supports batch 8 draft branch editing, validation, and undo redo history', async () => {
+    const created = await repository.createWorkspace({
+      name: `DraftBatch8-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'kb-draft-editing',
+      title: 'Draft Editing'
+    });
+    const variant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'en-us',
+      status: RevisionState.LIVE
+    });
+    await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      revisionType: RevisionState.LIVE,
+      filePath: 'articles/draft-editing/live.html',
+      revisionNumber: 1,
+      status: RevisionStatus.OPEN
+    });
+
+    const createdBranch = await repository.createDraftBranch({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      name: 'Manual editor branch',
+      sourceHtml: '<h1>Draft Editing</h1><p>Starting point.</p>'
+    });
+
+    expect(createdBranch.branch.status).toBe(DraftBranchStatus.ACTIVE);
+    expect(createdBranch.editor.history.length).toBeGreaterThan(0);
+
+    const saved = await repository.saveDraftBranch({
+      workspaceId: created.id,
+      branchId: createdBranch.branch.id,
+      html: '<h1>Draft Editing</h1><script>alert(1)</script><p>Manual save.</p>',
+      commitMessage: 'Manual update'
+    });
+
+    expect(saved.branch.headRevisionNumber).toBeGreaterThan(createdBranch.branch.headRevisionNumber);
+    expect(saved.editor.validationWarnings.some((warning) => warning.code === 'unsupported_tag')).toBe(true);
+
+    const ready = await repository.setDraftBranchStatus({
+      workspaceId: created.id,
+      branchId: createdBranch.branch.id,
+      status: DraftBranchStatus.READY_TO_PUBLISH
+    });
+    expect(ready.branch.status).toBe(DraftBranchStatus.READY_TO_PUBLISH);
+
+    const undone = await repository.undoDraftBranch({
+      workspaceId: created.id,
+      branchId: createdBranch.branch.id
+    });
+    expect(undone.branch.headRevisionId).toBe(createdBranch.branch.headRevisionId);
+
+    const redone = await repository.redoDraftBranch({
+      workspaceId: created.id,
+      branchId: createdBranch.branch.id
+    });
+    expect(redone.branch.headRevisionId).toBe(saved.branch.headRevisionId);
+  });
+
+  test('supports batch 9 article ai persistence and template CRUD', async () => {
+    const created = await repository.createWorkspace({
+      name: `ArticleAi-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'batch9-ai',
+      title: 'Batch 9 AI'
+    });
+    const variant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'en-us',
+      status: RevisionState.LIVE
+    });
+    await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      revisionType: RevisionState.LIVE,
+      filePath: 'articles/batch9/live.html',
+      revisionNumber: 1,
+      status: RevisionStatus.OPEN
+    });
+
+    const branch = await repository.createDraftBranch({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      sourceHtml: '<h1>Batch 9 AI</h1><p>Original draft.</p>'
+    });
+
+    const initialSession = await repository.getOrCreateArticleAiSession({
+      workspaceId: created.id,
+      branchId: branch.branch.id
+    });
+    expect(initialSession.messages).toHaveLength(0);
+    expect(initialSession.presets.length).toBeGreaterThan(0);
+
+    const templateList = await repository.listTemplatePackSummaries({ workspaceId: created.id, includeInactive: true });
+    expect(templateList.templates.length).toBeGreaterThan(0);
+
+    const submitted = await repository.submitArticleAiMessage(
+      {
+        workspaceId: created.id,
+        branchId: branch.branch.id,
+        message: 'Shorten the article and make it sharper.',
+        presetAction: ArticleAiPresetAction.SHORTEN
+      },
+      {
+        runtimeSessionId: 'session-local',
+        updatedHtml: '<h1>Batch 9 AI</h1><p>Sharper draft.</p>',
+        summary: 'Tightened the opening and simplified wording.',
+        rationale: 'Removed repetition.'
+      }
+    );
+    expect(submitted.messages).toHaveLength(2);
+    expect(submitted.pendingEdit?.proposedHtml).toContain('Sharper draft');
+
+    const rejected = await repository.rejectArticleAiEdit({
+      workspaceId: created.id,
+      sessionId: submitted.session.id
+    });
+    expect(rejected.pendingEdit).toBeUndefined();
+
+    await repository.submitArticleAiMessage(
+      {
+        workspaceId: created.id,
+        branchId: branch.branch.id,
+        message: 'Convert this into a troubleshooting flow.',
+        presetAction: ArticleAiPresetAction.CONVERT_TO_TROUBLESHOOTING
+      },
+      {
+        runtimeSessionId: 'session-local',
+        updatedHtml: '<h1>Batch 9 AI</h1><h2>Symptoms</h2><p>Something is wrong.</p>',
+        summary: 'Converted the draft into troubleshooting sections.'
+      }
+    );
+
+    const accepted = await repository.acceptArticleAiEdit({
+      workspaceId: created.id,
+      sessionId: submitted.session.id
+    });
+    expect(accepted.acceptedBranchId).toBe(branch.branch.id);
+    expect(accepted.acceptedRevisionId).toBeTruthy();
+
+    const editor = await repository.getDraftBranchEditor(created.id, branch.branch.id);
+    expect(editor.editor.html).toContain('Symptoms');
+    expect(editor.editor.history.some((entry) => entry.summary?.includes('Converted'))).toBe(true);
+
+    const reset = await repository.resetArticleAiSession({
+      workspaceId: created.id,
+      sessionId: submitted.session.id
+    });
+    expect(reset.messages).toHaveLength(0);
+
+    const savedTemplate = await repository.upsertTemplatePack({
+      workspaceId: created.id,
+      name: 'Spanish Troubleshooting',
+      language: 'es-es',
+      templateType: TemplatePackType.TROUBLESHOOTING,
+      promptTemplate: 'Estructura el articulo como sintomas, causas y resolucion.',
+      toneRules: 'Usa espanol claro y orientado a tareas.',
+      description: 'Plantilla para articulos de diagnostico.',
+      examples: '<h1>Resolver un error</h1>'
+    });
+    expect(savedTemplate.templateType).toBe(TemplatePackType.TROUBLESHOOTING);
+
+    const analyzed = await repository.analyzeTemplatePack({
+      workspaceId: created.id,
+      templatePackId: savedTemplate.id
+    });
+    expect(analyzed?.analysis?.score).toBeGreaterThan(0);
+
+    await repository.deleteTemplatePack({
+      workspaceId: created.id,
+      templatePackId: savedTemplate.id
+    });
+    expect(await repository.getTemplatePackDetail({ workspaceId: created.id, templatePackId: savedTemplate.id })).toBeNull();
   });
 
   test('manages article family CRUD and validation', async () => {

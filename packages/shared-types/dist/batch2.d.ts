@@ -459,6 +459,10 @@ export interface ExplorerNode {
     familyId: EntityId;
     title: string;
     familyStatus: RevisionState;
+    sectionId?: string;
+    sectionName?: string;
+    categoryId?: string;
+    categoryName?: string;
     locales: {
         locale: string;
         localeVariantId: EntityId;

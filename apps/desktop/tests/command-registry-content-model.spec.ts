@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -7,6 +7,36 @@ import { CommandBus } from '../src/main/services/command-bus';
 import { JobRegistry } from '../src/main/services/job-runner';
 import { registerCoreCommands } from '../src/main/services/command-registry';
 import { AppErrorCode } from '@kb-vault/shared-types';
+
+async function createFakeAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-article-ai-agent');
+  const source = `#!/usr/bin/env node
+const readline = require('node:readline');
+const sessionId = 'fake-acp-session';
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify({ updatedHtml: '<h1>Draft Commands</h1><p>AI refined draft.</p>', summary: 'AI tightened the article.' }) } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
 
 async function createTestHarness() {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch2-commands-'));
@@ -37,8 +67,10 @@ test.describe('command registry content model transitions', () => {
   let bus: CommandBus;
   let cleanup: () => Promise<void>;
   let createWorkspace: () => Promise<{ id: string }>;
+  let previousCursorBinary: string | undefined;
 
   test.beforeEach(async () => {
+    previousCursorBinary = process.env.KBV_CURSOR_BINARY;
     const harness = await createTestHarness();
     bus = harness.bus;
     createWorkspace = harness.createWorkspace;
@@ -46,6 +78,11 @@ test.describe('command registry content model transitions', () => {
   });
 
   test.afterEach(async () => {
+    if (previousCursorBinary === undefined) {
+      delete process.env.KBV_CURSOR_BINARY;
+    } else {
+      process.env.KBV_CURSOR_BINARY = previousCursorBinary;
+    }
     await cleanup();
   });
 
@@ -201,12 +238,200 @@ test.describe('command registry content model transitions', () => {
       payload: {
         workspaceId: workspace.id,
         proposalId: proposal.id,
-        decision: 'deny',
-        note: 'Not needed.'
+        decision: 'accept',
+        note: 'Ship it into a new draft.'
       }
     });
     expect(decideResp.ok).toBe(true);
-    expect((decideResp.data as { reviewStatus: string }).reviewStatus).toBe('denied');
+    expect((decideResp.data as { reviewStatus: string }).reviewStatus).toBe('accepted');
+    expect((decideResp.data as { branchId?: string }).branchId).toBeTruthy();
+    expect((decideResp.data as { revisionId?: string }).revisionId).toBeTruthy();
+  });
+
+  test('supports batch 8 draft branch commands end to end', async () => {
+    const workspace = await createWorkspace();
+
+    const familyResp = await bus.execute({
+      method: 'articleFamily.create',
+      payload: {
+        workspaceId: workspace.id,
+        externalKey: 'kb-draft-commands',
+        title: 'Draft Commands'
+      }
+    });
+    expect(familyResp.ok).toBe(true);
+    const family = familyResp.data as { id: string };
+
+    const localeResp = await bus.execute({
+      method: 'localeVariant.create',
+      payload: {
+        workspaceId: workspace.id,
+        familyId: family.id,
+        locale: 'en-us',
+        status: 'live'
+      }
+    });
+    expect(localeResp.ok).toBe(true);
+    const localeVariant = localeResp.data as { id: string };
+
+    const branchCreate = await bus.execute({
+      method: 'draft.branch.create',
+      payload: {
+        workspaceId: workspace.id,
+        localeVariantId: localeVariant.id,
+        sourceHtml: '<h1>Draft Commands</h1><p>Initial.</p>'
+      }
+    });
+    expect(branchCreate.ok).toBe(true);
+    const created = branchCreate.data as { branch: { id: string; headRevisionId: string } };
+
+    const listResp = await bus.execute({
+      method: 'draft.branch.list',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(listResp.ok).toBe(true);
+    expect((listResp.data as { branches: unknown[] }).branches.length).toBe(1);
+
+    const saveResp = await bus.execute({
+      method: 'draft.branch.save',
+      payload: {
+        workspaceId: workspace.id,
+        branchId: created.branch.id,
+        expectedHeadRevisionId: created.branch.headRevisionId,
+        html: '<h1>Draft Commands</h1><script>alert(1)</script><p>Saved.</p>'
+      }
+    });
+    expect(saveResp.ok).toBe(true);
+    expect((saveResp.data as { editor: { validationWarnings: Array<{ code: string }> } }).editor.validationWarnings.some((warning) => warning.code === 'unsupported_tag')).toBe(true);
+
+    const readyResp = await bus.execute({
+      method: 'draft.branch.status.set',
+      payload: {
+        workspaceId: workspace.id,
+        branchId: created.branch.id,
+        status: 'ready_to_publish'
+      }
+    });
+    expect(readyResp.ok).toBe(true);
+    expect((readyResp.data as { branch: { status: string } }).branch.status).toBe('ready_to_publish');
+  });
+
+  test('supports batch 9 article ai and template pack commands end to end', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch9-commands-'));
+    process.env.KBV_CURSOR_BINARY = await createFakeAcpBinary(isolatedRoot);
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+
+      const familyResp = await harness.bus.execute({
+        method: 'articleFamily.create',
+        payload: {
+          workspaceId: workspace.id,
+          externalKey: 'kb-batch9-commands',
+          title: 'Batch 9 Commands'
+        }
+      });
+      expect(familyResp.ok).toBe(true);
+      const family = familyResp.data as { id: string };
+
+      const localeResp = await harness.bus.execute({
+        method: 'localeVariant.create',
+        payload: {
+          workspaceId: workspace.id,
+          familyId: family.id,
+          locale: 'en-us',
+          status: 'live'
+        }
+      });
+      expect(localeResp.ok).toBe(true);
+      const localeVariant = localeResp.data as { id: string };
+
+      const branchResp = await harness.bus.execute({
+        method: 'draft.branch.create',
+        payload: {
+          workspaceId: workspace.id,
+          localeVariantId: localeVariant.id,
+          sourceHtml: '<h1>Draft Commands</h1><p>Initial draft.</p>'
+        }
+      });
+      expect(branchResp.ok).toBe(true);
+      const branch = branchResp.data as { branch: { id: string } };
+
+      const aiGet = await harness.bus.execute({
+        method: 'article.ai.get',
+        payload: {
+          workspaceId: workspace.id,
+          branchId: branch.branch.id
+        }
+      });
+      expect(aiGet.ok).toBe(true);
+
+      const aiSubmit = await harness.bus.execute({
+        method: 'article.ai.submit',
+        payload: {
+          workspaceId: workspace.id,
+          branchId: branch.branch.id,
+          message: 'Shorten and tighten this article.'
+        }
+      });
+      expect(aiSubmit.ok).toBe(true);
+      expect((aiSubmit.data as { pendingEdit?: { proposedHtml: string } }).pendingEdit?.proposedHtml).toContain('AI refined draft');
+
+      const aiAccept = await harness.bus.execute({
+        method: 'article.ai.accept',
+        payload: {
+          workspaceId: workspace.id,
+          sessionId: (aiSubmit.data as { session: { id: string } }).session.id
+        }
+      });
+      expect(aiAccept.ok).toBe(true);
+      expect((aiAccept.data as { acceptedRevisionId?: string }).acceptedRevisionId).toBeTruthy();
+
+      const templates = await harness.bus.execute({
+        method: 'template.pack.list',
+        payload: { workspaceId: workspace.id, includeInactive: true }
+      });
+      expect(templates.ok).toBe(true);
+      expect((templates.data as { templates: unknown[] }).templates.length).toBeGreaterThan(0);
+
+      const savedTemplate = await harness.bus.execute({
+        method: 'template.pack.save',
+        payload: {
+          workspaceId: workspace.id,
+          name: 'Batch 9 Custom Template',
+          language: 'en-us',
+          templateType: 'faq',
+          promptTemplate: 'Answer questions directly.',
+          toneRules: 'Be concise and helpful.',
+          description: 'FAQ pack'
+        }
+      });
+      expect(savedTemplate.ok).toBe(true);
+      const templateId = (savedTemplate.data as { id: string }).id;
+
+      const analyzed = await harness.bus.execute({
+        method: 'template.pack.analyze',
+        payload: {
+          workspaceId: workspace.id,
+          templatePackId: templateId
+        }
+      });
+      expect(analyzed.ok).toBe(true);
+      expect((analyzed.data as { analysis?: { score: number } }).analysis?.score).toBeGreaterThan(0);
+
+      const deleted = await harness.bus.execute({
+        method: 'template.pack.delete',
+        payload: {
+          workspaceId: workspace.id,
+          templatePackId: templateId
+        }
+      });
+      expect(deleted.ok).toBe(true);
+    } finally {
+      await harness.cleanup();
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
   });
 
   test('handles articleFamily command lifecycle', async () => {

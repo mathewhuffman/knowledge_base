@@ -455,6 +455,95 @@ export const migrations: Migration[] = [
       CREATE UNIQUE INDEX IF NOT EXISTS idx_article_relation_overrides_unique
         ON article_relation_overrides(workspace_id, left_family_id, right_family_id, override_type, relation_type);
     `
+  },
+  {
+    version: 10,
+    name: '0010_batch8_draft_editor_state',
+    description: 'Persist draft branch head state, autosave metadata, and revision commit history for batch-8 editing flows.',
+    sql: `
+      ALTER TABLE draft_branches ADD COLUMN head_revision_id TEXT;
+      ALTER TABLE draft_branches ADD COLUMN autosave_enabled INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE draft_branches ADD COLUMN last_autosaved_at TEXT;
+      ALTER TABLE draft_branches ADD COLUMN last_manual_saved_at TEXT;
+      ALTER TABLE draft_branches ADD COLUMN change_summary TEXT;
+      ALTER TABLE draft_branches ADD COLUMN editor_state_json TEXT;
+
+      CREATE TABLE IF NOT EXISTS draft_revision_commits (
+        revision_id TEXT PRIMARY KEY,
+        branch_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        commit_kind TEXT NOT NULL,
+        commit_message TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      UPDATE draft_branches
+      SET head_revision_id = (
+        SELECT r.id
+        FROM revisions r
+        WHERE r.branch_id = draft_branches.id
+        ORDER BY r.revision_number DESC
+        LIMIT 1
+      )
+      WHERE head_revision_id IS NULL OR head_revision_id = '';
+
+      INSERT OR IGNORE INTO draft_revision_commits (
+        revision_id, branch_id, workspace_id, commit_kind, commit_message, created_at
+      )
+      SELECT r.id,
+             r.branch_id,
+             r.workspace_id,
+             'system',
+             'Backfilled draft revision history',
+             r.created_at
+      FROM revisions r
+      WHERE r.branch_id IS NOT NULL;
+    `
+  },
+  {
+    version: 11,
+    name: '0011_batch9_article_ai_and_templates',
+    description: 'Persist article AI chat sessions/messages and richer template pack metadata for batch-9 flows.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS article_ai_sessions (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        locale_variant_id TEXT NOT NULL,
+        branch_id TEXT,
+        target_type TEXT NOT NULL DEFAULT 'live_article',
+        current_revision_id TEXT NOT NULL,
+        current_html TEXT NOT NULL,
+        pending_html TEXT,
+        pending_summary TEXT,
+        pending_rationale TEXT,
+        pending_metadata_json TEXT,
+        template_pack_id TEXT,
+        runtime_session_id TEXT,
+        status TEXT NOT NULL DEFAULT 'idle',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS article_ai_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        message_kind TEXT NOT NULL DEFAULT 'chat',
+        preset_action TEXT,
+        content TEXT NOT NULL,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      ALTER TABLE template_packs ADD COLUMN template_type TEXT;
+      ALTER TABLE template_packs ADD COLUMN description TEXT;
+      ALTER TABLE template_packs ADD COLUMN analysis_json TEXT;
+
+      UPDATE template_packs
+      SET template_type = COALESCE(template_type, 'standard_how_to')
+      WHERE template_type IS NULL OR template_type = '';
+    `
   }
 ];
 

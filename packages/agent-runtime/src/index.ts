@@ -293,6 +293,9 @@ function buildMcpTaskPrompt(
       '- Use KB Vault tools and structured article/template data only.',
       '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
       '- The preloaded prompt context is for orientation; use KB Vault MCP tools directly when you need to confirm or inspect source records.',
+      '- Return only valid JSON in your final answer.',
+      '- The JSON must include `updatedHtml` (string), `summary` (string), and may include `rationale` (string).',
+      '- Do not wrap the JSON in markdown fences.',
       '',
       mcpGuidance,
       '',
@@ -402,6 +405,9 @@ function buildCliTaskPrompt(
       '- Use kb commands and structured article/template data only.',
       '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
       '- The preloaded prompt context is for orientation; use CLI output directly when you need to confirm or inspect source records.',
+      '- Return only valid JSON in your final answer.',
+      '- The JSON must include `updatedHtml` (string), `summary` (string), and may include `rationale` (string).',
+      '- Do not wrap the JSON in markdown fences.',
       '',
       cliGuidance,
       '',
@@ -956,7 +962,7 @@ export class CursorAcpRuntime {
     });
 
     try {
-      await this.transit(
+      const resultPayload = await this.transit(
         session,
         {
           task: 'analyze_batch',
@@ -980,6 +986,7 @@ export class CursorAcpRuntime {
         status: isCancelled() ? 'canceled' : 'ok',
         transcriptPath,
         rawOutput,
+        resultPayload,
         toolCalls,
         startedAtUtc: startedAt,
         endedAtUtc: endedAt,
@@ -999,6 +1006,7 @@ export class CursorAcpRuntime {
         status: 'error',
         transcriptPath,
         rawOutput,
+        resultPayload: undefined,
         toolCalls,
         startedAtUtc: startedAt,
         endedAtUtc: endedAt,
@@ -1034,7 +1042,7 @@ export class CursorAcpRuntime {
     });
 
     try {
-      await this.transit(
+      const resultPayload = await this.transit(
         session,
         {
           task: 'edit_article',
@@ -1057,6 +1065,7 @@ export class CursorAcpRuntime {
         status: isCancelled() ? 'canceled' : 'ok',
         transcriptPath,
         rawOutput,
+        resultPayload,
         toolCalls,
         startedAtUtc: startedAt,
         endedAtUtc: endedAt,
@@ -1076,6 +1085,7 @@ export class CursorAcpRuntime {
         status: 'error',
         transcriptPath,
         rawOutput,
+        resultPayload: undefined,
         toolCalls,
         startedAtUtc: startedAt,
         endedAtUtc: endedAt,
@@ -1189,7 +1199,7 @@ export class CursorAcpRuntime {
     toolCalls: AgentRunResult['toolCalls'],
     isCancelled: () => boolean,
     timeoutMs: number
-  ): Promise<void> {
+  ): Promise<unknown> {
     const mode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
     const provider = this.getProvider(mode);
     const requestEnvelope = {
@@ -1278,6 +1288,7 @@ export class CursorAcpRuntime {
         `${JSON.stringify({ atUtc: new Date().toISOString(), direction: 'to_agent', event: requestEnvelopeString, payload: requestEnvelopeString })}\n`,
         'utf8'
       );
+      return response;
     } finally {
       this.activeStreamEmitters.delete(session.id);
     }

@@ -40,4 +40,9 @@ Paths stored in DB are workspace-relative.
   - no proposals => keep `analyzed`
   - at least one `pending_review` => `review_in_progress`
   - no remaining `pending_review` => `review_complete`
+- Review decisions can now mutate workspace state inline:
+  - `accept` on `create` / `edit` creates a new draft branch and draft revision
+  - `apply_to_branch` appends a draft revision to an existing branch
+  - `accept` on `retire` marks the target retired and obsoletes related draft branches
+  - `accept` on `no_impact` archives the proposal
 - Legacy proposal `status` is still written for compatibility, but `review_status` is now the canonical review-state field.

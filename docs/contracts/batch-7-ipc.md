@@ -74,6 +74,19 @@ Request:
 Response:
 
 - `ProposalReviewDecisionResponse`
+  - always includes:
+    - `workspaceId`
+    - `batchId`
+    - `proposalId`
+    - `reviewStatus`
+    - `batchStatus`
+    - `summary`
+  - may also include decision side-effect fields:
+    - `branchId`
+    - `revisionId`
+    - `familyId`
+    - `localeVariantId`
+    - `retiredAtUtc`
 
 ## Error behavior
 

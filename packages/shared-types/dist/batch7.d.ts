@@ -182,6 +182,11 @@ export interface ProposalReviewDecisionResponse {
     proposalId: EntityId;
     reviewStatus: ProposalReviewStatus;
     batchStatus: PBIBatchStatus | 'proposed';
+    branchId?: EntityId;
+    revisionId?: EntityId;
+    familyId?: EntityId;
+    localeVariantId?: EntityId;
+    retiredAtUtc?: string;
     summary: ProposalReviewSummaryCounts;
 }
 export interface ProposalIngestRequest {

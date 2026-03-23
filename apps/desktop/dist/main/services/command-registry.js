@@ -123,6 +123,101 @@ const readTranscriptLines = async (transcriptPath, limit) => {
         return [];
     }
 };
+const ARTICLE_AI_PRESET_PROMPTS = {
+    [shared_types_1.ArticleAiPresetAction.REWRITE_TONE]: 'Rewrite the article for clearer tone and readability while preserving factual meaning.',
+    [shared_types_1.ArticleAiPresetAction.SHORTEN]: 'Shorten the article by removing repetition and tightening wording without losing key steps.',
+    [shared_types_1.ArticleAiPresetAction.EXPAND]: 'Expand the article with missing context, examples, and step detail where it will help users succeed.',
+    [shared_types_1.ArticleAiPresetAction.RESTRUCTURE]: 'Restructure the article into a clearer section flow and improve heading hierarchy.',
+    [shared_types_1.ArticleAiPresetAction.CONVERT_TO_TROUBLESHOOTING]: 'Convert the article into a troubleshooting format with symptoms, causes, and resolutions.',
+    [shared_types_1.ArticleAiPresetAction.ALIGN_TO_TEMPLATE]: 'Align the article to the selected template pack while keeping accurate product content.',
+    [shared_types_1.ArticleAiPresetAction.UPDATE_LOCALE]: 'Adapt the article for the requested target locale while keeping terminology and structure consistent.',
+    [shared_types_1.ArticleAiPresetAction.INSERT_IMAGE_PLACEHOLDERS]: 'Insert helpful image placeholders where screenshots would improve comprehension.',
+    [shared_types_1.ArticleAiPresetAction.FREEFORM]: 'Apply the user request directly.'
+};
+function extractJsonObject(text) {
+    const trimmed = text.trim();
+    if (!trimmed) {
+        return null;
+    }
+    const directCandidates = [
+        trimmed,
+        trimmed.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '')
+    ];
+    for (const candidate of directCandidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return parsed;
+            }
+        }
+        catch {
+            // try next candidate
+        }
+    }
+    const start = trimmed.indexOf('{');
+    const end = trimmed.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+        try {
+            const parsed = JSON.parse(trimmed.slice(start, end + 1));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return parsed;
+            }
+        }
+        catch {
+            return null;
+        }
+    }
+    return null;
+}
+function parseArticleAiResult(resultPayload) {
+    const candidates = [];
+    if (typeof resultPayload === 'string') {
+        candidates.push(resultPayload);
+    }
+    else if (resultPayload && typeof resultPayload === 'object') {
+        candidates.push(JSON.stringify(resultPayload));
+        const payload = resultPayload;
+        if (typeof payload.text === 'string') {
+            candidates.push(payload.text);
+        }
+        if (Array.isArray(payload.content)) {
+            for (const part of payload.content) {
+                if (part && typeof part === 'object' && typeof part.text === 'string') {
+                    candidates.push(part.text);
+                }
+            }
+        }
+    }
+    for (const candidate of candidates) {
+        const parsed = extractJsonObject(candidate);
+        const updatedHtml = typeof parsed?.updatedHtml === 'string' ? parsed.updatedHtml.trim() : '';
+        const summary = typeof parsed?.summary === 'string' ? parsed.summary.trim() : '';
+        if (updatedHtml) {
+            return {
+                updatedHtml,
+                summary: summary || 'AI suggested an article update.',
+                rationale: typeof parsed?.rationale === 'string' ? parsed.rationale.trim() : undefined
+            };
+        }
+    }
+    return null;
+}
+function buildArticleAiPrompt(params) {
+    const transcript = params.session.messages
+        .slice(-8)
+        .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+        .join('\n');
+    const presetInstruction = ARTICLE_AI_PRESET_PROMPTS[params.request.presetAction ?? shared_types_1.ArticleAiPresetAction.FREEFORM];
+    return [
+        presetInstruction,
+        params.request.targetLocale ? `Target locale: ${params.request.targetLocale}` : '',
+        params.templatePrompt ? `Template pack guidance:\n${params.templatePrompt}` : '',
+        transcript ? `Recent article chat:\n${transcript}` : '',
+        'Current article HTML follows. Produce an improved version as `updatedHtml`.',
+        `Current article HTML:\n${params.currentHtml}`,
+        `User request: ${params.request.message.trim()}`
+    ].filter(Boolean).join('\n\n');
+}
 function registerCoreCommands(bus, jobs, workspaceRoot) {
     const workspaceRepository = new workspace_repository_1.WorkspaceRepository(workspaceRoot);
     const zendeskSyncService = new zendesk_sync_service_1.ZendeskSyncService(workspaceRepository);
@@ -133,6 +228,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
     const validPBIScopeModes = new Set([shared_types_1.PBIBatchScopeMode.ALL, shared_types_1.PBIBatchScopeMode.SELECTED_ONLY]);
     const validPBIBatchStatuses = new Set(Object.values(shared_types_1.PBIBatchStatus));
     const validPBIValidationStatuses = new Set(Object.values(shared_types_1.PBIValidationStatus));
+    const validDraftBranchStatuses = new Set(Object.values(shared_types_1.DraftBranchStatus));
     const runtimeToolContext = {
         searchKb: async (input) => {
             return workspaceRepository.searchArticles(input.workspaceId, {
@@ -1562,6 +1658,322 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
         }
         catch (error) {
             if (error.message === 'Workspace not found' || error.message === 'Proposal not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('article.ai.get', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || (!input.branchId && !input.localeVariantId)) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'article.ai.get requires workspaceId and branchId or localeVariantId');
+            }
+            return { ok: true, data: await workspaceRepository.getOrCreateArticleAiSession(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('article.ai.submit', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || (!input.branchId && !input.localeVariantId) || !input.message?.trim()) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'article.ai.submit requires workspaceId, branchId or localeVariantId, and message');
+            }
+            const session = await workspaceRepository.getOrCreateArticleAiSession({
+                workspaceId: input.workspaceId,
+                localeVariantId: input.localeVariantId,
+                branchId: input.branchId
+            });
+            const currentHtml = input.branchId
+                ? (await workspaceRepository.getDraftBranchEditor(input.workspaceId, input.branchId)).editor.html
+                : (await workspaceRepository.getArticleDetail(input.workspaceId, {
+                    workspaceId: input.workspaceId,
+                    localeVariantId: input.localeVariantId,
+                    includeLineage: false,
+                    includePublishLog: false
+                })).sourceHtml;
+            const selectedTemplate = input.templatePackId
+                ? await workspaceRepository.getTemplatePackDetail({ workspaceId: input.workspaceId, templatePackId: input.templatePackId })
+                : undefined;
+            const kbAccessMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
+            const run = await agentRuntime.runArticleEdit({
+                workspaceId: input.workspaceId,
+                localeVariantId: session.session.localeVariantId,
+                sessionId: session.session.runtimeSessionId,
+                kbAccessMode,
+                locale: input.targetLocale ?? session.session.locale,
+                prompt: buildArticleAiPrompt({
+                    session,
+                    request: input,
+                    currentHtml,
+                    templatePrompt: selectedTemplate
+                        ? `${selectedTemplate.promptTemplate}\nTone rules:\n${selectedTemplate.toneRules}\nExamples:\n${selectedTemplate.examples ?? ''}`
+                        : undefined
+                })
+            }, () => undefined, () => false);
+            const parsed = parseArticleAiResult(run.resultPayload);
+            if (!parsed) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, 'Unable to parse AI article edit result');
+            }
+            return {
+                ok: true,
+                data: await workspaceRepository.submitArticleAiMessage(input, {
+                    runtimeSessionId: run.sessionId,
+                    templatePackId: input.templatePackId,
+                    updatedHtml: parsed.updatedHtml,
+                    summary: parsed.summary,
+                    rationale: parsed.rationale,
+                    rawResult: run.resultPayload
+                })
+            };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('article.ai.reset', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.sessionId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'article.ai.reset requires workspaceId and sessionId');
+            }
+            return { ok: true, data: await workspaceRepository.resetArticleAiSession(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('article.ai.accept', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.sessionId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'article.ai.accept requires workspaceId and sessionId');
+            }
+            return { ok: true, data: await workspaceRepository.acceptArticleAiEdit(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('article.ai.reject', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.sessionId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'article.ai.reject requires workspaceId and sessionId');
+            }
+            return { ok: true, data: await workspaceRepository.rejectArticleAiEdit(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('template.pack.list', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'template.pack.list requires workspaceId');
+            }
+            return { ok: true, data: await workspaceRepository.listTemplatePackSummaries(input) };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('template.pack.get', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.templatePackId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'template.pack.get requires workspaceId and templatePackId');
+            }
+            const detail = await workspaceRepository.getTemplatePackDetail(input);
+            if (!detail) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, 'Template pack not found');
+            }
+            return { ok: true, data: detail };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('template.pack.save', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.name || !input.language || !input.templateType || !input.promptTemplate || !input.toneRules) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'template.pack.save requires workspaceId, name, language, templateType, promptTemplate, and toneRules');
+            }
+            return { ok: true, data: await workspaceRepository.upsertTemplatePack(input) };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('template.pack.delete', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.templatePackId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'template.pack.delete requires workspaceId and templatePackId');
+            }
+            return { ok: true, data: await workspaceRepository.deleteTemplatePack(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('template.pack.analyze', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.templatePackId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'template.pack.analyze requires workspaceId and templatePackId');
+            }
+            const detail = await workspaceRepository.analyzeTemplatePack(input);
+            if (!detail) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, 'Template pack not found');
+            }
+            return { ok: true, data: detail };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.list', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.list requires workspaceId');
+            }
+            return { ok: true, data: await workspaceRepository.listDraftBranches(input.workspaceId, input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.get', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.branchId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.get requires workspaceId and branchId');
+            }
+            return { ok: true, data: await workspaceRepository.getDraftBranchEditor(input.workspaceId, input.branchId) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Draft branch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.create', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.localeVariantId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.create requires workspaceId and localeVariantId');
+            }
+            return { ok: true, data: await workspaceRepository.createDraftBranch(input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Locale variant not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.save', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.branchId || typeof input.html !== 'string') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.save requires workspaceId, branchId, and html');
+            }
+            return { ok: true, data: await workspaceRepository.saveDraftBranch(input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' ||
+                error.message === 'Draft branch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.status.set', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.branchId || !input.status) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.status.set requires workspaceId, branchId, and status');
+            }
+            if (!validDraftBranchStatuses.has(input.status)) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.status.set status is invalid');
+            }
+            return { ok: true, data: await workspaceRepository.setDraftBranchStatus(input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Draft branch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.discard', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.branchId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.discard requires workspaceId and branchId');
+            }
+            return { ok: true, data: await workspaceRepository.discardDraftBranch(input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Draft branch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.undo', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.branchId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.undo requires workspaceId and branchId');
+            }
+            return { ok: true, data: await workspaceRepository.undoDraftBranch(input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Draft branch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('draft.branch.redo', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.branchId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'draft.branch.redo requires workspaceId and branchId');
+            }
+            return { ok: true, data: await workspaceRepository.redoDraftBranch(input) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Draft branch not found') {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
             }
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));

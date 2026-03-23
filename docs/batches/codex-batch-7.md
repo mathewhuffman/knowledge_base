@@ -10,7 +10,10 @@
   - store proposal HTML artifacts under `proposals/<proposalId>/`,
   - return grouped batch review queues,
   - return full proposal review detail payloads,
-  - persist review decisions and keep batch review status in sync.
+  - persist review decisions and keep batch review status in sync,
+  - execute accept/apply hooks that create draft branches + revisions for create/edit proposals,
+  - archive accepted no-impact proposals,
+  - mark targeted article families / locale variants retired for accepted retire proposals.
 - Added IPC commands for:
   - `proposal.ingest`
   - `proposal.review.list`
@@ -69,6 +72,7 @@
 
 - None.
 - Batch review status is updated synchronously when proposals are created or reviewed.
+- Proposal acceptance hooks run inline with the review decision and persist branch / revision side effects immediately.
 
 ## Sample Payloads
 
@@ -82,6 +86,7 @@
   - Use for the main review surface, evidence panel, diff tabs, and stepper/carousel state.
 - `proposal.review.decide`
   - Use for accept, deny, defer, apply-to-branch, and archive actions.
+  - Response now includes optional `branchId`, `revisionId`, `familyId`, `localeVariantId`, and `retiredAtUtc` when a decision mutates article state.
 - `proposal.ingest`
   - Mostly backend/testing oriented, but useful for fixtures or manual backend validation.
 
@@ -107,14 +112,13 @@
 
 - The diff engine is intentionally lightweight for Batch 7. It is good enough for queue/review scaffolding, but not yet a polished semantic HTML diff.
 - Proposal ingestion is only as rich as the metadata passed by the agent/tool call. The system supports richer fields now, but current prompts/tools may need follow-up tuning to populate every field consistently.
+- Placement override support updates the target family metadata for newly created draft targets, but richer UI-driven placement reassignment still belongs in later draft-management work.
 - Full app `typecheck` still fails because of unrelated pre-existing renderer issues outside the Batch 7 backend slice.
 
 ## Verification
 
 - Main-process compile check passed:
-  - `pnpm -C apps/desktop exec tsc --pretty false --noEmit --moduleResolution Node --module CommonJS --target ES2022 --strict --esModuleInterop --resolveJsonModule --skipLibCheck src/main/services/command-registry.ts src/main/services/workspace-repository.ts src/main/services/pbi-batch-import-service.ts`
-- Focused tests passed:
-  - `pnpm -C apps/desktop exec playwright test tests/repository-content-model.spec.ts -g "builds proposal review queue, detail payload, and persists decisions"`
-  - `pnpm -C apps/desktop exec playwright test tests/command-registry-content-model.spec.ts -g "supports batch 7 proposal review commands end to end"`
-- Environment repair performed to enable tests:
-  - `npm rebuild better-sqlite3 --update-binary`
+  - `apps/desktop/node_modules/.bin/tsc -p apps/desktop/tsconfig.main.json --noEmit`
+- Shared types build passed:
+  - `apps/desktop/node_modules/.bin/tsc -p packages/shared-types/tsconfig.json`
+- Focused Playwright verification is currently blocked in this environment because `better-sqlite3` is compiled for a different Node ABI than the active runtime (`NODE_MODULE_VERSION 123` vs `137`).

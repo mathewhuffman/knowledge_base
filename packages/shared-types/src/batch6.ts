@@ -164,6 +164,7 @@ export interface AgentRunResult {
   status: 'ok' | 'error' | 'timeout' | 'canceled';
   transcriptPath: string;
   rawOutput: string[];
+  resultPayload?: unknown;
   toolCalls: AgentToolCallAudit[];
   startedAtUtc: string;
   endedAtUtc: string;

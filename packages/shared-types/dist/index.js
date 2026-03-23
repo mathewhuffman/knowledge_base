@@ -21,3 +21,5 @@ __exportStar(require("./batch2"), exports);
 __exportStar(require("./batch3"), exports);
 __exportStar(require("./batch6"), exports);
 __exportStar(require("./batch7"), exports);
+__exportStar(require("./batch8"), exports);
+__exportStar(require("./batch9"), exports);

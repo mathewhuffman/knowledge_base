@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { inspect } from 'node:util';
@@ -18,6 +18,7 @@ import {
   WorkspaceState,
   type RepositoryStructurePayload,
   RevisionState,
+  RevisionStatus,
   PBIValidationStatus,
   PBIImportFormat,
   type SearchPayload,
@@ -72,7 +73,51 @@ import {
   type ProposalReviewListResponse,
   type ProposalReviewQueueItem,
   type ProposalReviewRecord,
-  type ProposalReviewSummaryCounts
+  type ProposalReviewSummaryCounts,
+  DraftBranchStatus,
+  DraftCommitSource,
+  DraftValidationCode,
+  DraftValidationSeverity,
+  type DraftAutosaveStatePayload,
+  type DraftBranchCreateRequest,
+  type DraftBranchDiscardRequest,
+  type DraftBranchGetResponse,
+  type DraftBranchHistoryEntry,
+  type DraftBranchHistoryStepRequest,
+  type DraftBranchListRequest,
+  type DraftBranchListResponse,
+  type DraftBranchSaveRequest,
+  type DraftBranchSaveResponse,
+  type DraftBranchStatusUpdateRequest,
+  type DraftBranchSummary,
+  type DraftBranchSummaryCounts,
+  type DraftComparePayload,
+  type DraftEditorPayload,
+  type DraftValidationSummary,
+  type DraftValidationWarning,
+  ArticleAiMessageKind,
+  ArticleAiMessageRole,
+  ArticleAiPresetAction,
+  ArticleAiSessionStatus,
+  TemplatePackType,
+  type ArticleAiChatMessage,
+  type ArticleAiDecisionRequest,
+  type ArticleAiDecisionResponse,
+  type ArticleAiPendingEdit,
+  type ArticleAiResetRequest,
+  type ArticleAiSessionGetRequest,
+  type ArticleAiSessionRecord,
+  type ArticleAiSessionResponse,
+  type ArticleAiSubmitRequest,
+  type ArticleAiSubmitResponse,
+  type TemplatePackAnalysis,
+  type TemplatePackDeleteRequest,
+  type TemplatePackDetail,
+  type TemplatePackGetRequest,
+  type TemplatePackListRequest,
+  type TemplatePackListResponse,
+  type TemplatePackSummary,
+  type TemplatePackUpsertRequest
 } from '@kb-vault/shared-types';
 import { diffHtml } from '@kb-vault/diff-engine';
 import {
@@ -166,6 +211,74 @@ interface ProposalDbRow {
   decisionPayloadJson: string | null;
   decidedAtUtc: string | null;
   sessionId: string | null;
+}
+
+interface ProposalDecisionMutationResult {
+  reviewStatus?: ProposalReviewStatus;
+  legacyStatus?: ProposalDecision;
+  branchId?: string;
+  revisionId?: string;
+  familyId?: string;
+  localeVariantId?: string;
+  retiredAtUtc?: string;
+}
+
+interface DraftBranchDbRow {
+  id: string;
+  workspaceId: string;
+  localeVariantId: string;
+  name: string;
+  baseRevisionId: string;
+  state: string;
+  headRevisionId: string | null;
+  autosaveEnabled: number | null;
+  lastAutosavedAtUtc: string | null;
+  lastManualSavedAtUtc: string | null;
+  changeSummary: string | null;
+  editorStateJson: string | null;
+  createdAtUtc: string;
+  updatedAtUtc: string;
+  retiredAtUtc: string | null;
+}
+
+interface DraftRevisionCommitRow {
+  revisionId: string;
+  branchId: string;
+  workspaceId: string;
+  commitKind: string;
+  commitMessage: string | null;
+  createdAtUtc: string;
+}
+
+interface ArticleAiSessionDbRow {
+  id: string;
+  workspaceId: string;
+  localeVariantId: string;
+  branchId: string | null;
+  targetType: 'live_article' | 'draft_branch';
+  currentRevisionId: string;
+  currentHtml: string;
+  pendingHtml: string | null;
+  pendingSummary: string | null;
+  pendingRationale: string | null;
+  pendingMetadataJson: string | null;
+  templatePackId: string | null;
+  runtimeSessionId: string | null;
+  status: string;
+  createdAtUtc: string;
+  updatedAtUtc: string;
+}
+
+interface ArticleAiMessageDbRow {
+  id: string;
+  sessionId: string;
+  workspaceId: string;
+  role: string;
+  messageKind: string;
+  presetAction: string | null;
+  content: string;
+  metadataJson: string | null;
+  createdAtUtc: string;
 }
 
 interface ArticleRelationDbRow {
@@ -904,10 +1017,12 @@ export class WorkspaceRepository {
     const workspace = await this.getWorkspace(workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
+      await this.ensureDefaultTemplatePacks(workspaceId, workspaceDb);
       return workspaceDb.all<TemplatePackRecord>(
         `SELECT id, workspace_id as workspaceId, name, language, prompt_template as promptTemplate,
                 tone_rules as toneRules, examples, active, updated_at as updatedAtUtc
          FROM template_packs
+         WHERE workspace_id = @workspaceId
          ORDER BY updated_at DESC`,
         { workspaceId }
       );
@@ -920,6 +1035,7 @@ export class WorkspaceRepository {
     const workspace = await this.getWorkspace(workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
+      await this.ensureDefaultTemplatePacks(workspaceId, workspaceDb);
       const row = workspaceDb.get<TemplatePackRecord>(
         `SELECT id, workspace_id as workspaceId, name, language, prompt_template as promptTemplate,
                 tone_rules as toneRules, examples, active, updated_at as updatedAtUtc
@@ -937,6 +1053,7 @@ export class WorkspaceRepository {
     const workspace = await this.getWorkspace(workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
+      await this.ensureDefaultTemplatePacks(workspaceId, workspaceDb);
       const row = workspaceDb.get<TemplatePackRecord>(
         `SELECT id, workspace_id as workspaceId, name, language, prompt_template as promptTemplate,
                 tone_rules as toneRules, examples, active, updated_at as updatedAtUtc
@@ -948,6 +1065,539 @@ export class WorkspaceRepository {
       return row ?? null;
     } finally {
       workspaceDb.close();
+    }
+  }
+
+  async listTemplatePackSummaries(input: TemplatePackListRequest): Promise<TemplatePackListResponse> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      await this.ensureDefaultTemplatePacks(input.workspaceId, workspaceDb);
+      const rows = workspaceDb.all<Array<TemplatePackRecord & { templateType: string | null; description: string | null; analysisJson: string | null }>[number]>(
+        `SELECT id,
+                workspace_id as workspaceId,
+                name,
+                language,
+                prompt_template as promptTemplate,
+                tone_rules as toneRules,
+                examples,
+                active,
+                updated_at as updatedAtUtc,
+                template_type as templateType,
+                description,
+                analysis_json as analysisJson
+         FROM template_packs
+         WHERE workspace_id = @workspaceId
+           AND (@includeInactive = 1 OR active = 1)
+         ORDER BY active DESC, updated_at DESC, name ASC`,
+        {
+          workspaceId: input.workspaceId,
+          includeInactive: input.includeInactive ? 1 : 0
+        }
+      );
+
+      return {
+        workspaceId: input.workspaceId,
+        templates: rows.map((row) => this.mapTemplatePackSummary(row))
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getTemplatePackDetail(input: TemplatePackGetRequest): Promise<TemplatePackDetail | null> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      await this.ensureDefaultTemplatePacks(input.workspaceId, workspaceDb);
+      const row = workspaceDb.get<TemplatePackRecord & { templateType: string | null; description: string | null; analysisJson: string | null }>(
+        `SELECT id,
+                workspace_id as workspaceId,
+                name,
+                language,
+                prompt_template as promptTemplate,
+                tone_rules as toneRules,
+                examples,
+                active,
+                updated_at as updatedAtUtc,
+                template_type as templateType,
+                description,
+                analysis_json as analysisJson
+         FROM template_packs
+         WHERE workspace_id = @workspaceId AND id = @templatePackId`,
+        { workspaceId: input.workspaceId, templatePackId: input.templatePackId }
+      );
+
+      return row ? this.mapTemplatePackSummary(row) : null;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async upsertTemplatePack(input: TemplatePackUpsertRequest): Promise<TemplatePackDetail> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      await this.ensureDefaultTemplatePacks(input.workspaceId, workspaceDb);
+      const id = input.templatePackId ?? randomUUID();
+      const now = new Date().toISOString();
+      workspaceDb.run(
+        `INSERT INTO template_packs (
+          id, workspace_id, name, language, prompt_template, tone_rules, examples, active, updated_at, template_type, description, analysis_json
+        ) VALUES (
+          @id, @workspaceId, @name, @language, @promptTemplate, @toneRules, @examples, @active, @updatedAt, @templateType, @description, NULL
+        )
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          language = excluded.language,
+          prompt_template = excluded.prompt_template,
+          tone_rules = excluded.tone_rules,
+          examples = excluded.examples,
+          active = excluded.active,
+          updated_at = excluded.updated_at,
+          template_type = excluded.template_type,
+          description = excluded.description,
+          analysis_json = NULL`,
+        {
+          id,
+          workspaceId: input.workspaceId,
+          name: input.name.trim(),
+          language: input.language.trim().toLowerCase(),
+          promptTemplate: input.promptTemplate.trim(),
+          toneRules: input.toneRules.trim(),
+          examples: input.examples?.trim() || null,
+          active: input.active === false ? 0 : 1,
+          updatedAt: now,
+          templateType: input.templateType,
+          description: input.description?.trim() || null
+        }
+      );
+      const detail = await this.getTemplatePackDetail({ workspaceId: input.workspaceId, templatePackId: id });
+      if (!detail) {
+        throw new Error('Template pack not found after save');
+      }
+      return detail;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async deleteTemplatePack(input: TemplatePackDeleteRequest): Promise<{ workspaceId: string; templatePackId: string }> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const existing = workspaceDb.get<{ id: string }>(
+        `SELECT id FROM template_packs WHERE workspace_id = @workspaceId AND id = @templatePackId`,
+        { workspaceId: input.workspaceId, templatePackId: input.templatePackId }
+      );
+      if (!existing) {
+        throw new Error('Template pack not found');
+      }
+      workspaceDb.run(
+        `DELETE FROM template_packs WHERE workspace_id = @workspaceId AND id = @templatePackId`,
+        { workspaceId: input.workspaceId, templatePackId: input.templatePackId }
+      );
+      return input;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async analyzeTemplatePack(input: TemplatePackGetRequest): Promise<TemplatePackDetail | null> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const detail = await this.getTemplatePackDetail(input);
+      if (!detail) {
+        return null;
+      }
+      const analysis = buildTemplatePackAnalysis(detail);
+      workspaceDb.run(
+        `UPDATE template_packs
+         SET analysis_json = @analysisJson, updated_at = @updatedAt
+         WHERE workspace_id = @workspaceId AND id = @templatePackId`,
+        {
+          workspaceId: input.workspaceId,
+          templatePackId: input.templatePackId,
+          analysisJson: JSON.stringify(analysis),
+          updatedAt: new Date().toISOString()
+        }
+      );
+      return this.getTemplatePackDetail(input);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getOrCreateArticleAiSession(input: ArticleAiSessionGetRequest): Promise<ArticleAiSessionResponse> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      await this.ensureDefaultTemplatePacks(input.workspaceId, workspaceDb);
+      const target = await this.resolveArticleAiTarget(workspace.path, workspaceDb, input);
+      const existing = workspaceDb.get<ArticleAiSessionDbRow>(
+        `SELECT id,
+                workspace_id as workspaceId,
+                locale_variant_id as localeVariantId,
+                branch_id as branchId,
+                target_type as targetType,
+                current_revision_id as currentRevisionId,
+                current_html as currentHtml,
+                pending_html as pendingHtml,
+                pending_summary as pendingSummary,
+                pending_rationale as pendingRationale,
+                pending_metadata_json as pendingMetadataJson,
+                template_pack_id as templatePackId,
+                runtime_session_id as runtimeSessionId,
+                status,
+                created_at as createdAtUtc,
+                updated_at as updatedAtUtc
+         FROM article_ai_sessions
+         WHERE workspace_id = @workspaceId
+           AND locale_variant_id = @localeVariantId
+           AND COALESCE(branch_id, '') = COALESCE(@branchId, '')
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        {
+          workspaceId: input.workspaceId,
+          localeVariantId: target.localeVariantId,
+          branchId: target.branchId ?? null
+        }
+      );
+
+      const sessionRow = existing ?? await this.createArticleAiSessionRow(workspaceDb, target);
+      return this.buildArticleAiSessionResponse(workspaceDb, target, sessionRow);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async submitArticleAiMessage(
+    input: ArticleAiSubmitRequest,
+    aiResult: {
+      runtimeSessionId?: string;
+      templatePackId?: string;
+      updatedHtml: string;
+      summary: string;
+      rationale?: string;
+      rawResult?: unknown;
+    }
+  ): Promise<ArticleAiSubmitResponse> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const response = await this.getOrCreateArticleAiSession({
+        workspaceId: input.workspaceId,
+        localeVariantId: input.localeVariantId,
+        branchId: input.branchId
+      });
+      const now = new Date().toISOString();
+      const sessionId = response.session.id;
+
+      await this.insertArticleAiMessage(workspaceDb, {
+        id: randomUUID(),
+        sessionId,
+        workspaceId: input.workspaceId,
+        role: ArticleAiMessageRole.USER,
+        messageKind: ArticleAiMessageKind.CHAT,
+        presetAction: input.presetAction ?? ArticleAiPresetAction.FREEFORM,
+        content: input.message.trim(),
+        metadataJson: JSON.stringify({
+          targetLocale: input.targetLocale,
+          templatePackId: input.templatePackId
+        }),
+        createdAtUtc: now
+      });
+
+      await this.insertArticleAiMessage(workspaceDb, {
+        id: randomUUID(),
+        sessionId,
+        workspaceId: input.workspaceId,
+        role: ArticleAiMessageRole.ASSISTANT,
+        messageKind: ArticleAiMessageKind.EDIT_RESULT,
+        presetAction: input.presetAction ?? ArticleAiPresetAction.FREEFORM,
+        content: aiResult.summary,
+        metadataJson: JSON.stringify({
+          rationale: aiResult.rationale,
+          runtimeSessionId: aiResult.runtimeSessionId,
+          rawResult: aiResult.rawResult
+        }),
+        createdAtUtc: now
+      });
+
+      workspaceDb.run(
+        `UPDATE article_ai_sessions
+         SET pending_html = @pendingHtml,
+             pending_summary = @pendingSummary,
+             pending_rationale = @pendingRationale,
+             pending_metadata_json = @pendingMetadataJson,
+             template_pack_id = COALESCE(@templatePackId, template_pack_id),
+             runtime_session_id = COALESCE(@runtimeSessionId, runtime_session_id),
+             status = @status,
+             updated_at = @updatedAt
+         WHERE id = @id`,
+        {
+          id: sessionId,
+          pendingHtml: aiResult.updatedHtml,
+          pendingSummary: aiResult.summary,
+          pendingRationale: aiResult.rationale ?? null,
+          pendingMetadataJson: JSON.stringify({
+            targetLocale: input.targetLocale,
+            presetAction: input.presetAction ?? ArticleAiPresetAction.FREEFORM
+          }),
+          templatePackId: aiResult.templatePackId ?? input.templatePackId ?? null,
+          runtimeSessionId: aiResult.runtimeSessionId ?? null,
+          status: ArticleAiSessionStatus.HAS_PENDING_EDIT,
+          updatedAt: now
+        }
+      );
+
+      const refreshed = await this.getOrCreateArticleAiSession({
+        workspaceId: input.workspaceId,
+        localeVariantId: input.localeVariantId,
+        branchId: input.branchId
+      });
+      return {
+        ...refreshed,
+        acceptedRuntimeSessionId: aiResult.runtimeSessionId
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async resetArticleAiSession(input: ArticleAiResetRequest): Promise<ArticleAiSessionResponse> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const session = workspaceDb.get<ArticleAiSessionDbRow>(
+        `SELECT id,
+                workspace_id as workspaceId,
+                locale_variant_id as localeVariantId,
+                branch_id as branchId,
+                target_type as targetType,
+                current_revision_id as currentRevisionId,
+                current_html as currentHtml,
+                pending_html as pendingHtml,
+                pending_summary as pendingSummary,
+                pending_rationale as pendingRationale,
+                pending_metadata_json as pendingMetadataJson,
+                template_pack_id as templatePackId,
+                runtime_session_id as runtimeSessionId,
+                status,
+                created_at as createdAtUtc,
+                updated_at as updatedAtUtc
+         FROM article_ai_sessions
+         WHERE workspace_id = @workspaceId AND id = @sessionId`,
+        { workspaceId: input.workspaceId, sessionId: input.sessionId }
+      );
+      if (!session) {
+        throw new Error('Article AI session not found');
+      }
+
+      workspaceDb.run(`DELETE FROM article_ai_messages WHERE workspace_id = @workspaceId AND session_id = @sessionId`, {
+        workspaceId: input.workspaceId,
+        sessionId: input.sessionId
+      });
+      workspaceDb.run(
+        `UPDATE article_ai_sessions
+         SET pending_html = NULL,
+             pending_summary = NULL,
+             pending_rationale = NULL,
+             pending_metadata_json = NULL,
+             runtime_session_id = NULL,
+             status = @status,
+             updated_at = @updatedAt
+         WHERE workspace_id = @workspaceId AND id = @sessionId`,
+        {
+          workspaceId: input.workspaceId,
+          sessionId: input.sessionId,
+          status: ArticleAiSessionStatus.IDLE,
+          updatedAt: new Date().toISOString()
+        }
+      );
+
+      return this.getOrCreateArticleAiSession({
+        workspaceId: input.workspaceId,
+        localeVariantId: session.localeVariantId,
+        branchId: session.branchId ?? undefined
+      });
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async rejectArticleAiEdit(input: ArticleAiDecisionRequest): Promise<ArticleAiDecisionResponse> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const session = this.requireArticleAiSession(workspaceDb, input.workspaceId, input.sessionId);
+      const now = new Date().toISOString();
+      await this.insertArticleAiMessage(workspaceDb, {
+        id: randomUUID(),
+        sessionId: session.id,
+        workspaceId: input.workspaceId,
+        role: ArticleAiMessageRole.SYSTEM,
+        messageKind: ArticleAiMessageKind.DECISION,
+        presetAction: null,
+        content: 'Rejected pending AI edit.',
+        metadataJson: null,
+        createdAtUtc: now
+      });
+      workspaceDb.run(
+        `UPDATE article_ai_sessions
+         SET pending_html = NULL,
+             pending_summary = NULL,
+             pending_rationale = NULL,
+             pending_metadata_json = NULL,
+             status = @status,
+             updated_at = @updatedAt
+         WHERE id = @id`,
+        {
+          id: session.id,
+          status: ArticleAiSessionStatus.IDLE,
+          updatedAt: now
+        }
+      );
+
+      return this.getOrCreateArticleAiSession({
+        workspaceId: input.workspaceId,
+        localeVariantId: session.localeVariantId,
+        branchId: session.branchId ?? undefined
+      });
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async acceptArticleAiEdit(input: ArticleAiDecisionRequest): Promise<ArticleAiDecisionResponse> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    let acceptedBranchId: string | undefined;
+    let acceptedRevisionId: string | undefined;
+    try {
+      const session = this.requireArticleAiSession(workspaceDb, input.workspaceId, input.sessionId);
+      if (!session.pendingHtml) {
+        throw new Error('No pending AI edit to accept');
+      }
+      const metadata = safeParseJson<{ targetLocale?: string }>(session.pendingMetadataJson);
+      if (session.branchId) {
+        const saved = await this.saveDraftBranch({
+          workspaceId: input.workspaceId,
+          branchId: session.branchId,
+          html: session.pendingHtml,
+          commitMessage: session.pendingSummary ?? 'Accepted AI edit',
+          expectedHeadRevisionId: session.currentRevisionId,
+          editorState: {
+            source: 'article_ai'
+          }
+        });
+        acceptedBranchId = saved.branch.id;
+        acceptedRevisionId = saved.branch.headRevisionId;
+      } else {
+        const family = workspaceDb.get<{ title: string }>(
+          `SELECT af.title
+           FROM article_families af
+           JOIN locale_variants lv ON lv.family_id = af.id
+           WHERE lv.id = @localeVariantId
+           LIMIT 1`,
+          { localeVariantId: session.localeVariantId }
+        );
+        const created = await this.createDraftBranch({
+          workspaceId: input.workspaceId,
+          localeVariantId: session.localeVariantId,
+          name: `${family?.title ?? 'Article'} AI Draft`
+        });
+        const saved = await this.saveDraftBranch({
+          workspaceId: input.workspaceId,
+          branchId: created.branch.id,
+          html: session.pendingHtml,
+          commitMessage: session.pendingSummary ?? `Accepted AI edit${metadata?.targetLocale ? ` (${metadata.targetLocale})` : ''}`,
+          expectedHeadRevisionId: created.branch.headRevisionId,
+          editorState: {
+            source: 'article_ai'
+          }
+        });
+        acceptedBranchId = saved.branch.id;
+        acceptedRevisionId = saved.branch.headRevisionId;
+      }
+    } finally {
+      workspaceDb.close();
+    }
+
+    const workspaceDb2 = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const session = this.requireArticleAiSession(workspaceDb2, input.workspaceId, input.sessionId);
+      const acceptedHtml = acceptedBranchId
+        ? await this.getDraftBranchHtml(workspace.path, workspaceDb2, input.workspaceId, acceptedBranchId)
+        : session.currentHtml;
+      const acceptedRevision = acceptedRevisionId
+        ? workspaceDb2.get<RevisionRecord>(
+            `SELECT id,
+                    locale_variant_id as localeVariantId,
+                    revision_type as revisionType,
+                    branch_id as branchId,
+                    workspace_id as workspaceId,
+                    file_path as filePath,
+                    content_hash as contentHash,
+                    source_revision_id as sourceRevisionId,
+                    revision_number as revisionNumber,
+                    status,
+                    created_at as createdAtUtc,
+                    updated_at as updatedAtUtc
+             FROM revisions WHERE id = @id`,
+            { id: acceptedRevisionId }
+          )
+        : null;
+      const now = new Date().toISOString();
+      await this.insertArticleAiMessage(workspaceDb2, {
+        id: randomUUID(),
+        sessionId: session.id,
+        workspaceId: input.workspaceId,
+        role: ArticleAiMessageRole.SYSTEM,
+        messageKind: ArticleAiMessageKind.DECISION,
+        presetAction: null,
+        content: acceptedBranchId ? 'Accepted AI edit into draft branch.' : 'Accepted AI edit.',
+        metadataJson: JSON.stringify({
+          branchId: acceptedBranchId,
+          revisionId: acceptedRevisionId
+        }),
+        createdAtUtc: now
+      });
+      workspaceDb2.run(
+        `UPDATE article_ai_sessions
+         SET branch_id = COALESCE(@branchId, branch_id),
+             target_type = CASE WHEN @branchId IS NOT NULL THEN 'draft_branch' ELSE target_type END,
+             current_revision_id = COALESCE(@currentRevisionId, current_revision_id),
+             current_html = @currentHtml,
+             pending_html = NULL,
+             pending_summary = NULL,
+             pending_rationale = NULL,
+             pending_metadata_json = NULL,
+             status = @status,
+             updated_at = @updatedAt
+         WHERE id = @id`,
+        {
+          id: session.id,
+          branchId: acceptedBranchId ?? null,
+          currentRevisionId: acceptedRevision?.id ?? null,
+          currentHtml: acceptedHtml,
+          status: ArticleAiSessionStatus.IDLE,
+          updatedAt: now
+        }
+      );
+      const refreshed = await this.getOrCreateArticleAiSession({
+        workspaceId: input.workspaceId,
+        localeVariantId: session.localeVariantId,
+        branchId: acceptedBranchId ?? session.branchId ?? undefined
+      });
+      return {
+        ...refreshed,
+        acceptedBranchId,
+        acceptedRevisionId
+      };
+    } finally {
+      workspaceDb2.close();
     }
   }
 
@@ -1533,6 +2183,10 @@ export class WorkspaceRepository {
             : ((family as { retired_at?: string | null }).retired_at
               ? RevisionState.RETIRED
               : RevisionState.LIVE),
+          sectionId: family.sectionId ?? undefined,
+          sectionName: family.sectionId ?? undefined,
+          categoryId: family.categoryId ?? undefined,
+          categoryName: family.categoryId ?? undefined,
           locales
         };
       });
@@ -3311,8 +3965,10 @@ export class WorkspaceRepository {
         throw new Error('Proposal not found');
       }
 
-      const mappedStatus = mapReviewDecisionToStatus(input.decision);
-      const legacyStatus = mapReviewDecisionToLegacyStatus(input.decision);
+      const proposal = this.hydrateProposalDisplayFields(this.mapProposalRow(existing), workspaceDb);
+      const mutation = await this.applyProposalDecisionMutation(workspace.path, workspaceDb, proposal, input);
+      const mappedStatus = mutation.reviewStatus ?? mapReviewDecisionToStatus(input.decision);
+      const legacyStatus = mutation.legacyStatus ?? mapReviewDecisionToLegacyStatus(input.decision);
       const decidedAt = new Date().toISOString();
       const nextPlacement = input.placementOverride
         ? JSON.stringify(input.placementOverride)
@@ -3331,11 +3987,15 @@ export class WorkspaceRepository {
         {
           reviewStatus: mappedStatus,
           status: legacyStatus,
-          branchId: input.branchId ?? null,
+          branchId: mutation.branchId ?? input.branchId ?? null,
           suggestedPlacementJson: nextPlacement ?? null,
           decisionPayloadJson: JSON.stringify({
             decision: input.decision,
-            branchId: input.branchId,
+            branchId: mutation.branchId ?? input.branchId,
+            revisionId: mutation.revisionId,
+            familyId: mutation.familyId,
+            localeVariantId: mutation.localeVariantId,
+            retiredAtUtc: mutation.retiredAtUtc,
             note: input.note,
             placementOverride: input.placementOverride
           }),
@@ -3384,6 +4044,11 @@ export class WorkspaceRepository {
         proposalId: input.proposalId,
         reviewStatus: mappedStatus,
         batchStatus,
+        branchId: mutation.branchId ?? input.branchId ?? undefined,
+        revisionId: mutation.revisionId,
+        familyId: mutation.familyId,
+        localeVariantId: mutation.localeVariantId,
+        retiredAtUtc: mutation.retiredAtUtc,
         summary: summarizeProposalStatuses(queueRows.map((row) => this.mapProposalRow(row)))
       };
     } finally {
@@ -4254,6 +4919,353 @@ export class WorkspaceRepository {
     }
   }
 
+  async listDraftBranches(
+    workspaceId: string,
+    payload: DraftBranchListRequest
+  ): Promise<DraftBranchListResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const clauses = ['workspace_id = @workspaceId'];
+      const params: Record<string, unknown> = { workspaceId };
+      if (payload.localeVariantId) {
+        clauses.push('locale_variant_id = @localeVariantId');
+        params.localeVariantId = payload.localeVariantId;
+      }
+      if (!payload.includeDiscarded) {
+        clauses.push(`state != '${DraftBranchStatus.DISCARDED}'`);
+      }
+
+      const branchRows = workspaceDb.all<DraftBranchDbRow>(`
+        SELECT id,
+               workspace_id as workspaceId,
+               locale_variant_id as localeVariantId,
+               name,
+               base_revision_id as baseRevisionId,
+               state,
+               head_revision_id as headRevisionId,
+               autosave_enabled as autosaveEnabled,
+               last_autosaved_at as lastAutosavedAtUtc,
+               last_manual_saved_at as lastManualSavedAtUtc,
+               change_summary as changeSummary,
+               editor_state_json as editorStateJson,
+               created_at as createdAtUtc,
+               updated_at as updatedAtUtc,
+               retired_at as retiredAtUtc
+        FROM draft_branches
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY updated_at DESC, created_at DESC
+      `, params);
+
+      const branches = await Promise.all(
+        branchRows.map((branch) => this.buildDraftBranchSummary(workspace.path, workspaceDb, branch))
+      );
+
+      return {
+        workspaceId,
+        summary: summarizeDraftBranchStatuses(branches),
+        branches
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getDraftBranchEditor(workspaceId: string, branchId: string): Promise<DraftBranchGetResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const branch = this.getDraftBranchRow(workspaceDb, workspaceId, branchId);
+      const summary = await this.buildDraftBranchSummary(workspace.path, workspaceDb, branch);
+      const editor = await this.buildDraftEditorPayload(workspace.path, workspaceDb, branch, summary);
+      return {
+        workspaceId,
+        branch: summary,
+        editor
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async createDraftBranch(payload: DraftBranchCreateRequest): Promise<DraftBranchGetResponse> {
+    const workspace = await this.getWorkspace(payload.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const variant = workspaceDb.get<{ familyId: string; locale: string }>(
+        `SELECT family_id as familyId, locale
+         FROM locale_variants
+         WHERE id = @localeVariantId
+         LIMIT 1`,
+        { localeVariantId: payload.localeVariantId }
+      );
+      if (!variant) {
+        throw new Error('Locale variant not found');
+      }
+
+      const baseRevision = payload.baseRevisionId
+        ? workspaceDb.get<RevisionRecord>(
+            `SELECT id, locale_variant_id as localeVariantId, revision_type as revisionType, branch_id as branchId,
+                    workspace_id as workspaceId, file_path as filePath, content_hash as contentHash, source_revision_id as sourceRevisionId,
+                    revision_number as revisionNumber, status, created_at as createdAtUtc, updated_at as updatedAtUtc
+             FROM revisions
+             WHERE id = @revisionId AND workspace_id = @workspaceId
+             LIMIT 1`,
+            { revisionId: payload.baseRevisionId, workspaceId: payload.workspaceId }
+          )
+        : await this.getLatestRevisionForVariant(workspaceDb, payload.localeVariantId, RevisionState.LIVE);
+
+      const headSourceHtml = payload.sourceHtml
+        ?? (baseRevision ? await this.readRevisionSource(resolveRevisionPath(workspace.path, baseRevision.filePath)) : '');
+      const branchId = randomUUID();
+      const revisionId = randomUUID();
+      const revisionNumber = (await this.getLatestRevisionForVariant(workspaceDb, payload.localeVariantId))?.revisionNumber ?? 0;
+      const nextRevisionNumber = revisionNumber + 1;
+      const now = new Date().toISOString();
+      const branchName = payload.name?.trim() || `${variant.locale.toUpperCase()} Draft ${nextRevisionNumber}`;
+      const filePath = await this.writeProposalDraftRevision(
+        workspace.path,
+        payload.localeVariantId,
+        branchId,
+        revisionId,
+        nextRevisionNumber,
+        headSourceHtml
+      );
+      const liveHtml = baseRevision ? await this.readRevisionSource(resolveRevisionPath(workspace.path, baseRevision.filePath)) : '';
+      const changeSummary = summarizeDraftChanges(diffHtml(liveHtml, headSourceHtml));
+
+      workspaceDb.run(
+        `INSERT INTO draft_branches (
+          id, workspace_id, locale_variant_id, name, base_revision_id, state, created_at, updated_at, retired_at,
+          head_revision_id, autosave_enabled, last_autosaved_at, last_manual_saved_at, change_summary, editor_state_json
+        ) VALUES (
+          @id, @workspaceId, @localeVariantId, @name, @baseRevisionId, @state, @createdAt, @updatedAt, NULL,
+          @headRevisionId, 1, NULL, @lastManualSavedAt, @changeSummary, @editorStateJson
+        )`,
+        {
+          id: branchId,
+          workspaceId: payload.workspaceId,
+          localeVariantId: payload.localeVariantId,
+          name: branchName,
+          baseRevisionId: baseRevision?.id ?? revisionId,
+          state: DraftBranchStatus.ACTIVE,
+          createdAt: now,
+          updatedAt: now,
+          headRevisionId: revisionId,
+          lastManualSavedAt: now,
+          changeSummary,
+          editorStateJson: payload.editorState ? JSON.stringify(payload.editorState) : null
+        }
+      );
+
+      workspaceDb.run(
+        `INSERT INTO revisions (
+          id, locale_variant_id, revision_type, branch_id, workspace_id, file_path, content_hash, source_revision_id, revision_number, status, created_at, updated_at
+        ) VALUES (
+          @id, @localeVariantId, @revisionType, @branchId, @workspaceId, @filePath, @contentHash, @sourceRevisionId, @revisionNumber, @status, @createdAt, @updatedAt
+        )`,
+        {
+          id: revisionId,
+          localeVariantId: payload.localeVariantId,
+          revisionType: RevisionState.DRAFT_BRANCH,
+          branchId,
+          workspaceId: payload.workspaceId,
+          filePath,
+          contentHash: createContentHash(headSourceHtml),
+          sourceRevisionId: baseRevision?.id ?? null,
+          revisionNumber: nextRevisionNumber,
+          status: RevisionStatus.OPEN,
+          createdAt: now,
+          updatedAt: now
+        }
+      );
+      this.recordDraftRevisionCommit(workspaceDb, {
+        revisionId,
+        branchId,
+        workspaceId: payload.workspaceId,
+        source: DraftCommitSource.MANUAL,
+        message: 'Created draft branch'
+      });
+      if (baseRevision) {
+        this.recordArticleLineage(workspaceDb, payload.localeVariantId, baseRevision.id, revisionId, 'manual', now);
+      }
+
+      return this.getDraftBranchEditor(payload.workspaceId, branchId);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async saveDraftBranch(payload: DraftBranchSaveRequest): Promise<DraftBranchSaveResponse> {
+    const workspace = await this.getWorkspace(payload.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const branch = this.getDraftBranchRow(workspaceDb, payload.workspaceId, payload.branchId);
+      const currentHead = await this.getDraftBranchHeadRevision(workspaceDb, branch);
+      if (payload.expectedHeadRevisionId && currentHead && payload.expectedHeadRevisionId !== currentHead.id) {
+        throw new Error('Draft branch changed since the editor loaded');
+      }
+      if (normalizeDraftBranchStatus(branch.state) === DraftBranchStatus.OBSOLETE) {
+        throw new Error('Cannot save an obsolete draft branch');
+      }
+      if (normalizeDraftBranchStatus(branch.state) === DraftBranchStatus.DISCARDED) {
+        throw new Error('Cannot save a discarded draft branch');
+      }
+
+      const nextRevisionNumber = ((await this.getLatestRevisionForVariant(workspaceDb, branch.localeVariantId))?.revisionNumber ?? 0) + 1;
+      const revisionId = randomUUID();
+      const now = new Date().toISOString();
+      const html = payload.html ?? '';
+      const filePath = await this.writeProposalDraftRevision(
+        workspace.path,
+        branch.localeVariantId,
+        branch.id,
+        revisionId,
+        nextRevisionNumber,
+        html
+      );
+      const liveRevision = await this.getLatestRevisionForVariant(workspaceDb, branch.localeVariantId, RevisionState.LIVE);
+      const liveHtml = liveRevision ? await this.readRevisionSource(resolveRevisionPath(workspace.path, liveRevision.filePath)) : '';
+      const diff = diffHtml(liveHtml, html);
+      const changeSummary = summarizeDraftChanges(diff);
+      const status = normalizeDraftBranchStatus(branch.state, Boolean(liveRevision && branch.baseRevisionId !== liveRevision.id));
+
+      workspaceDb.run(
+        `INSERT INTO revisions (
+          id, locale_variant_id, revision_type, branch_id, workspace_id, file_path, content_hash, source_revision_id, revision_number, status, created_at, updated_at
+        ) VALUES (
+          @id, @localeVariantId, @revisionType, @branchId, @workspaceId, @filePath, @contentHash, @sourceRevisionId, @revisionNumber, @status, @createdAt, @updatedAt
+        )`,
+        {
+          id: revisionId,
+          localeVariantId: branch.localeVariantId,
+          revisionType: RevisionState.DRAFT_BRANCH,
+          branchId: branch.id,
+          workspaceId: payload.workspaceId,
+          filePath,
+          contentHash: createContentHash(html),
+          sourceRevisionId: currentHead?.id ?? branch.baseRevisionId,
+          revisionNumber: nextRevisionNumber,
+          status: RevisionStatus.OPEN,
+          createdAt: now,
+          updatedAt: now
+        }
+      );
+      this.recordDraftRevisionCommit(workspaceDb, {
+        revisionId,
+        branchId: branch.id,
+        workspaceId: payload.workspaceId,
+        source: payload.autosave ? DraftCommitSource.AUTOSAVE : DraftCommitSource.MANUAL,
+        message: payload.commitMessage
+      });
+      if (currentHead) {
+        this.recordArticleLineage(
+          workspaceDb,
+          branch.localeVariantId,
+          currentHead.id,
+          revisionId,
+          payload.autosave ? 'system' : 'manual',
+          now
+        );
+      }
+
+      workspaceDb.run(
+        `UPDATE draft_branches
+         SET head_revision_id = @headRevisionId,
+             state = @state,
+             updated_at = @updatedAt,
+             last_autosaved_at = CASE WHEN @isAutosave = 1 THEN @updatedAt ELSE last_autosaved_at END,
+             last_manual_saved_at = CASE WHEN @isAutosave = 0 THEN @updatedAt ELSE last_manual_saved_at END,
+             change_summary = @changeSummary,
+             editor_state_json = COALESCE(@editorStateJson, editor_state_json)
+         WHERE id = @branchId AND workspace_id = @workspaceId`,
+        {
+          branchId: branch.id,
+          workspaceId: payload.workspaceId,
+          headRevisionId: revisionId,
+          state: status,
+          updatedAt: now,
+          isAutosave: payload.autosave ? 1 : 0,
+          changeSummary,
+          editorStateJson: payload.editorState ? JSON.stringify(payload.editorState) : null
+        }
+      );
+
+      const summary = await this.buildDraftBranchSummary(workspace.path, workspaceDb, {
+        ...branch,
+        headRevisionId: revisionId,
+        state: status,
+        updatedAtUtc: now,
+        lastAutosavedAtUtc: payload.autosave ? now : branch.lastAutosavedAtUtc,
+        lastManualSavedAtUtc: payload.autosave ? branch.lastManualSavedAtUtc : now,
+        changeSummary
+      });
+      const editor = await this.buildDraftEditorPayload(workspace.path, workspaceDb, {
+        ...branch,
+        headRevisionId: revisionId,
+        state: status,
+        updatedAtUtc: now,
+        lastAutosavedAtUtc: payload.autosave ? now : branch.lastAutosavedAtUtc,
+        lastManualSavedAtUtc: payload.autosave ? branch.lastManualSavedAtUtc : now,
+        changeSummary,
+        editorStateJson: payload.editorState ? JSON.stringify(payload.editorState) : branch.editorStateJson
+      }, summary);
+
+      return {
+        workspaceId: payload.workspaceId,
+        branch: summary,
+        editor
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async setDraftBranchStatus(payload: DraftBranchStatusUpdateRequest): Promise<DraftBranchGetResponse> {
+    const workspace = await this.getWorkspace(payload.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const branch = this.getDraftBranchRow(workspaceDb, payload.workspaceId, payload.branchId);
+      const nextStatus = payload.status;
+      workspaceDb.run(
+        `UPDATE draft_branches
+         SET state = @state,
+             updated_at = @updatedAt
+         WHERE id = @branchId AND workspace_id = @workspaceId`,
+        {
+          branchId: payload.branchId,
+          workspaceId: payload.workspaceId,
+          state: nextStatus,
+          updatedAt: new Date().toISOString()
+        }
+      );
+      return this.getDraftBranchEditor(payload.workspaceId, branch.id);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async discardDraftBranch(payload: DraftBranchDiscardRequest): Promise<DraftBranchGetResponse> {
+    return this.setDraftBranchStatus({
+      workspaceId: payload.workspaceId,
+      branchId: payload.branchId,
+      status: DraftBranchStatus.DISCARDED
+    });
+  }
+
+  async undoDraftBranch(payload: DraftBranchHistoryStepRequest): Promise<DraftBranchGetResponse> {
+    return this.stepDraftBranchHistory(payload.workspaceId, payload.branchId, -1);
+  }
+
+  async redoDraftBranch(payload: DraftBranchHistoryStepRequest): Promise<DraftBranchGetResponse> {
+    return this.stepDraftBranchHistory(payload.workspaceId, payload.branchId, 1);
+  }
+
   async getMigrationHealth(workspaceId?: string): Promise<WorkspaceMigrationHealthReport> {
     const catalog = await this.openCatalogWithRecovery();
     try {
@@ -4764,6 +5776,478 @@ export class WorkspaceRepository {
     return { sourceHtmlPath, proposedHtmlPath };
   }
 
+  private async applyProposalDecisionMutation(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord,
+    input: ProposalReviewDecisionRequest
+  ): Promise<ProposalDecisionMutationResult> {
+    if (input.decision === ProposalReviewDecision.ARCHIVE) {
+      return {
+        reviewStatus: ProposalReviewStatus.ARCHIVED,
+        legacyStatus: ProposalDecision.DEFER
+      };
+    }
+
+    if (input.decision === ProposalReviewDecision.DENY) {
+      return {
+        reviewStatus: ProposalReviewStatus.DENIED,
+        legacyStatus: ProposalDecision.DENY
+      };
+    }
+
+    if (input.decision === ProposalReviewDecision.DEFER) {
+      return {
+        reviewStatus: ProposalReviewStatus.DEFERRED,
+        legacyStatus: ProposalDecision.DEFER
+      };
+    }
+
+    if (proposal.action === ProposalAction.NO_IMPACT && input.decision === ProposalReviewDecision.ACCEPT) {
+      return {
+        reviewStatus: ProposalReviewStatus.ARCHIVED,
+        legacyStatus: ProposalDecision.DEFER
+      };
+    }
+
+    if (proposal.action === ProposalAction.RETIRE && input.decision === ProposalReviewDecision.ACCEPT) {
+      return this.markProposalTargetRetired(workspaceDb, proposal);
+    }
+
+    if (proposal.action === ProposalAction.CREATE || proposal.action === ProposalAction.EDIT) {
+      if (input.decision === ProposalReviewDecision.APPLY_TO_BRANCH) {
+        return this.applyProposalToExistingBranch(workspacePath, workspaceDb, proposal, input.branchId);
+      }
+      if (input.decision === ProposalReviewDecision.ACCEPT) {
+        return this.applyProposalToNewBranch(workspacePath, workspaceDb, proposal, input.placementOverride);
+      }
+    }
+
+    return {};
+  }
+
+  private async applyProposalToNewBranch(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord,
+    placementOverride?: ProposalPlacementSuggestion
+  ): Promise<ProposalDecisionMutationResult> {
+    const now = new Date().toISOString();
+    const ensuredIdentity = await this.ensureProposalTargetIdentity(workspacePath, workspaceDb, proposal, placementOverride);
+    const latestRevision = ensuredIdentity.localeVariantId
+      ? await this.getLatestRevisionForVariant(workspaceDb, ensuredIdentity.localeVariantId)
+      : null;
+    const nextRevisionNumber = latestRevision ? latestRevision.revisionNumber + 1 : 1;
+    const branchId = randomUUID();
+    const revisionId = randomUUID();
+    const branchName = this.buildProposalBranchName(proposal, nextRevisionNumber);
+    const html = await this.getProposalFinalHtml(workspacePath, workspaceDb, proposal);
+    const filePath = await this.writeProposalDraftRevision(
+      workspacePath,
+      ensuredIdentity.localeVariantId,
+      branchId,
+      revisionId,
+      nextRevisionNumber,
+      html
+    );
+
+    workspaceDb.run(
+      `INSERT INTO draft_branches (
+        id, workspace_id, locale_variant_id, name, base_revision_id, state, created_at, updated_at, retired_at,
+        head_revision_id, autosave_enabled, last_autosaved_at, last_manual_saved_at, change_summary, editor_state_json
+      ) VALUES (
+        @id, @workspaceId, @localeVariantId, @name, @baseRevisionId, @state, @createdAt, @updatedAt, NULL,
+        @headRevisionId, 1, NULL, @lastManualSavedAt, @changeSummary, NULL
+      )`,
+      {
+        id: branchId,
+        workspaceId: proposal.workspaceId,
+        localeVariantId: ensuredIdentity.localeVariantId,
+        name: branchName,
+        baseRevisionId: latestRevision?.id ?? revisionId,
+        state: DraftBranchStatus.ACTIVE,
+        createdAt: now,
+        updatedAt: now,
+        headRevisionId: revisionId,
+        lastManualSavedAt: now,
+        changeSummary: summarizeDraftChanges(diffHtml(latestRevision ? await this.readRevisionSource(resolveRevisionPath(workspacePath, latestRevision.filePath)) : '', html))
+      }
+    );
+
+    workspaceDb.run(
+      `INSERT INTO revisions (
+        id, locale_variant_id, revision_type, branch_id, workspace_id, file_path, content_hash, source_revision_id, revision_number, status, created_at, updated_at
+      ) VALUES (
+        @id, @localeVariantId, @revisionType, @branchId, @workspaceId, @filePath, @contentHash, @sourceRevisionId, @revisionNumber, @status, @createdAt, @updatedAt
+      )`,
+      {
+        id: revisionId,
+        localeVariantId: ensuredIdentity.localeVariantId,
+        revisionType: RevisionState.DRAFT_BRANCH,
+        branchId,
+        workspaceId: proposal.workspaceId,
+        filePath,
+        contentHash: createContentHash(html),
+        sourceRevisionId: latestRevision?.id ?? proposal.sourceRevisionId ?? null,
+        revisionNumber: nextRevisionNumber,
+        status: RevisionStatus.OPEN,
+        createdAt: now,
+        updatedAt: now
+      }
+    );
+    this.recordDraftRevisionCommit(workspaceDb, {
+      revisionId,
+      branchId,
+      workspaceId: proposal.workspaceId,
+      source: DraftCommitSource.PROPOSAL,
+      message: 'Created from accepted proposal'
+    });
+    if (latestRevision) {
+      this.recordArticleLineage(workspaceDb, ensuredIdentity.localeVariantId, latestRevision.id, revisionId, 'system', now);
+    }
+
+    return {
+      reviewStatus: ProposalReviewStatus.ACCEPTED,
+      legacyStatus: ProposalDecision.ACCEPT,
+      branchId,
+      revisionId,
+      familyId: ensuredIdentity.familyId,
+      localeVariantId: ensuredIdentity.localeVariantId
+    };
+  }
+
+  private async applyProposalToExistingBranch(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord,
+    branchId?: string
+  ): Promise<ProposalDecisionMutationResult> {
+    const normalizedBranchId = branchId?.trim();
+    if (!normalizedBranchId) {
+      throw new Error('branchId is required when applying a proposal to an existing branch');
+    }
+
+    const branch = workspaceDb.get<{
+      id: string;
+      localeVariantId: string;
+      baseRevisionId: string;
+      state: string;
+    }>(
+      `SELECT id, locale_variant_id as localeVariantId, base_revision_id as baseRevisionId, state
+       FROM draft_branches
+       WHERE id = @branchId AND workspace_id = @workspaceId
+       LIMIT 1`,
+      { branchId: normalizedBranchId, workspaceId: proposal.workspaceId }
+    );
+    if (!branch) {
+      throw new Error('Draft branch not found');
+    }
+    if (branch.state === RevisionState.OBSOLETE) {
+      throw new Error('Cannot apply a proposal to an obsolete draft branch');
+    }
+
+    const variant = workspaceDb.get<{ familyId: string }>(
+      `SELECT family_id as familyId
+       FROM locale_variants
+       WHERE id = @localeVariantId
+       LIMIT 1`,
+      { localeVariantId: branch.localeVariantId }
+    );
+    if (!variant) {
+      throw new Error('Locale variant not found');
+    }
+
+    const latestRevision = await this.getLatestRevisionForVariant(workspaceDb, branch.localeVariantId);
+    const nextRevisionNumber = latestRevision ? latestRevision.revisionNumber + 1 : 1;
+    const revisionId = randomUUID();
+    const html = await this.getProposalFinalHtml(workspacePath, workspaceDb, proposal);
+    const filePath = await this.writeProposalDraftRevision(
+      workspacePath,
+      branch.localeVariantId,
+      normalizedBranchId,
+      revisionId,
+      nextRevisionNumber,
+      html
+    );
+    const now = new Date().toISOString();
+
+    workspaceDb.run(
+      `INSERT INTO revisions (
+        id, locale_variant_id, revision_type, branch_id, workspace_id, file_path, content_hash, source_revision_id, revision_number, status, created_at, updated_at
+      ) VALUES (
+        @id, @localeVariantId, @revisionType, @branchId, @workspaceId, @filePath, @contentHash, @sourceRevisionId, @revisionNumber, @status, @createdAt, @updatedAt
+      )`,
+      {
+        id: revisionId,
+        localeVariantId: branch.localeVariantId,
+        revisionType: RevisionState.DRAFT_BRANCH,
+        branchId: normalizedBranchId,
+        workspaceId: proposal.workspaceId,
+        filePath,
+        contentHash: createContentHash(html),
+        sourceRevisionId: latestRevision?.id ?? branch.baseRevisionId,
+        revisionNumber: nextRevisionNumber,
+        status: RevisionStatus.OPEN,
+        createdAt: now,
+        updatedAt: now
+      }
+    );
+
+    workspaceDb.run(
+      `UPDATE draft_branches
+       SET head_revision_id = @headRevisionId,
+           state = @state,
+           last_manual_saved_at = @updatedAt,
+           change_summary = @changeSummary,
+           updated_at = @updatedAt
+       WHERE id = @branchId AND workspace_id = @workspaceId`,
+      {
+        branchId: normalizedBranchId,
+        workspaceId: proposal.workspaceId,
+        headRevisionId: revisionId,
+        state: DraftBranchStatus.ACTIVE,
+        updatedAt: now,
+        changeSummary: summarizeDraftChanges(diffHtml(latestRevision ? await this.readRevisionSource(resolveRevisionPath(workspacePath, latestRevision.filePath)) : '', html))
+      }
+    );
+    this.recordDraftRevisionCommit(workspaceDb, {
+      revisionId,
+      branchId: normalizedBranchId,
+      workspaceId: proposal.workspaceId,
+      source: DraftCommitSource.PROPOSAL,
+      message: 'Applied proposal into existing draft branch'
+    });
+    if (latestRevision) {
+      this.recordArticleLineage(workspaceDb, branch.localeVariantId, latestRevision.id, revisionId, 'system', now);
+    }
+
+    return {
+      reviewStatus: ProposalReviewStatus.APPLIED_TO_BRANCH,
+      legacyStatus: ProposalDecision.APPLY_TO_BRANCH,
+      branchId: normalizedBranchId,
+      revisionId,
+      familyId: variant.familyId,
+      localeVariantId: branch.localeVariantId
+    };
+  }
+
+  private markProposalTargetRetired(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord
+  ): ProposalDecisionMutationResult {
+    const retiredAtUtc = new Date().toISOString();
+
+    if (proposal.localeVariantId) {
+      workspaceDb.run(
+        `UPDATE locale_variants
+         SET status = @status,
+             retired_at = @retiredAtUtc
+         WHERE id = @variantId`,
+        {
+          variantId: proposal.localeVariantId,
+          status: RevisionState.RETIRED,
+          retiredAtUtc
+        }
+      );
+      workspaceDb.run(
+        `UPDATE draft_branches
+         SET state = @state,
+             updated_at = @updatedAt
+         WHERE workspace_id = @workspaceId AND locale_variant_id = @localeVariantId AND state != @state`,
+        {
+          workspaceId: proposal.workspaceId,
+          localeVariantId: proposal.localeVariantId,
+          state: RevisionState.OBSOLETE,
+          updatedAt: retiredAtUtc
+        }
+      );
+
+      const family = workspaceDb.get<{ familyId: string }>(
+        `SELECT family_id as familyId
+         FROM locale_variants
+         WHERE id = @variantId
+         LIMIT 1`,
+        { variantId: proposal.localeVariantId }
+      );
+
+      return {
+        reviewStatus: ProposalReviewStatus.ACCEPTED,
+        legacyStatus: ProposalDecision.ACCEPT,
+        familyId: proposal.familyId ?? family?.familyId,
+        localeVariantId: proposal.localeVariantId,
+        retiredAtUtc
+      };
+    }
+
+    if (!proposal.familyId) {
+      throw new Error('Retire proposals must target a locale variant or article family');
+    }
+
+    workspaceDb.run(
+      `UPDATE article_families
+       SET retired_at = @retiredAtUtc
+       WHERE id = @familyId AND workspace_id = @workspaceId`,
+      {
+        familyId: proposal.familyId,
+        workspaceId: proposal.workspaceId,
+        retiredAtUtc
+      }
+    );
+    workspaceDb.run(
+      `UPDATE locale_variants
+       SET status = @status,
+           retired_at = @retiredAtUtc
+       WHERE family_id = @familyId`,
+      {
+        familyId: proposal.familyId,
+        status: RevisionState.RETIRED,
+        retiredAtUtc
+      }
+    );
+    workspaceDb.run(
+      `UPDATE draft_branches
+       SET state = @state,
+           updated_at = @updatedAt
+       WHERE workspace_id = @workspaceId
+         AND locale_variant_id IN (
+           SELECT id
+           FROM locale_variants
+           WHERE family_id = @familyId
+         )
+         AND state != @state`,
+      {
+        familyId: proposal.familyId,
+        workspaceId: proposal.workspaceId,
+        state: RevisionState.OBSOLETE,
+        updatedAt: retiredAtUtc
+      }
+    );
+
+    return {
+      reviewStatus: ProposalReviewStatus.ACCEPTED,
+      legacyStatus: ProposalDecision.ACCEPT,
+      familyId: proposal.familyId,
+      retiredAtUtc
+    };
+  }
+
+  private async ensureProposalTargetIdentity(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord,
+    placementOverride?: ProposalPlacementSuggestion
+  ): Promise<{ familyId: string; localeVariantId: string }> {
+    if (proposal.localeVariantId) {
+      const variant = workspaceDb.get<{ familyId: string }>(
+        `SELECT family_id as familyId
+         FROM locale_variants
+         WHERE id = @variantId
+         LIMIT 1`,
+        { variantId: proposal.localeVariantId }
+      );
+      if (!variant) {
+        throw new Error('Locale variant not found');
+      }
+      return {
+        familyId: proposal.familyId ?? variant.familyId,
+        localeVariantId: proposal.localeVariantId
+      };
+    }
+
+    let familyId = proposal.familyId;
+    const locale = proposal.targetLocale?.trim() || 'en-us';
+    const placement = placementOverride ?? proposal.suggestedPlacement;
+
+    if (!familyId) {
+      const familyTitle = proposal.targetTitle?.trim() || deriveProposalArticleDescriptor(proposal).articleLabel;
+      const family = await this.createArticleFamily({
+        workspaceId: proposal.workspaceId,
+        externalKey: `proposal-${proposal.id}`,
+        title: familyTitle,
+        categoryId: placement?.categoryId,
+        sectionId: placement?.sectionId
+      });
+      familyId = family.id;
+    } else if (placement?.categoryId || placement?.sectionId) {
+      await this.updateArticleFamily({
+        workspaceId: proposal.workspaceId,
+        familyId,
+        categoryId: placement.categoryId ?? undefined,
+        sectionId: placement.sectionId ?? undefined
+      });
+    }
+
+    let localeVariant = await this.getLocaleVariantByFamilyAndLocale(proposal.workspaceId, familyId, locale);
+    if (!localeVariant) {
+      localeVariant = await this.createLocaleVariant({
+        workspaceId: proposal.workspaceId,
+        familyId,
+        locale,
+        status: RevisionState.DRAFT_BRANCH
+      });
+    }
+
+    return {
+      familyId,
+      localeVariantId: localeVariant.id
+    };
+  }
+
+  private async getLatestRevisionForVariant(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    localeVariantId: string,
+    revisionType?: RevisionState
+  ): Promise<RevisionRecord | null> {
+    const row = workspaceDb.get<RevisionRecord>(
+      `SELECT id, locale_variant_id as localeVariantId, revision_type as revisionType, branch_id as branchId,
+              workspace_id as workspaceId, file_path as filePath, content_hash as contentHash, source_revision_id as sourceRevisionId,
+              revision_number as revisionNumber, status, created_at as createdAtUtc, updated_at as updatedAtUtc
+       FROM revisions
+       WHERE locale_variant_id = @localeVariantId
+         ${revisionType ? 'AND revision_type = @revisionType' : ''}
+       ORDER BY revision_number DESC
+       LIMIT 1`,
+      { localeVariantId, revisionType }
+    );
+    return row ?? null;
+  }
+
+  private async getProposalFinalHtml(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    proposal: ProposalReviewRecord
+  ): Promise<string> {
+    const relatedPbis = [] as PBIRecord[];
+    const hydrated = await this.ensureProposalReviewArtifacts(
+      workspacePath,
+      workspaceDb,
+      proposal,
+      relatedPbis
+    );
+    return hydrated.afterHtml || hydrated.beforeHtml;
+  }
+
+  private buildProposalBranchName(proposal: ProposalReviewRecord, revisionNumber: number): string {
+    const base = proposal.targetTitle?.trim() || deriveProposalArticleDescriptor(proposal).articleLabel;
+    return `${base} Draft ${revisionNumber}`;
+  }
+
+  private async writeProposalDraftRevision(
+    workspacePath: string,
+    localeVariantId: string,
+    branchId: string,
+    revisionId: string,
+    revisionNumber: number,
+    html: string
+  ): Promise<string> {
+    const branchDir = path.join(workspacePath, 'drafts', localeVariantId, branchId);
+    await fs.mkdir(branchDir, { recursive: true });
+    const fileName = `${String(revisionNumber).padStart(4, '0')}-${revisionId}.html`;
+    const absolutePath = path.join(branchDir, fileName);
+    await fs.writeFile(absolutePath, html || '', 'utf8');
+    return path.relative(workspacePath, absolutePath);
+  }
+
   private async ensureProposalReviewArtifacts(
     workspacePath: string,
     workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
@@ -5068,6 +6552,670 @@ export class WorkspaceRepository {
     };
   }
 
+  private getDraftBranchRow(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    branchId: string
+  ): DraftBranchDbRow {
+    const branch = workspaceDb.get<DraftBranchDbRow>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              locale_variant_id as localeVariantId,
+              name,
+              base_revision_id as baseRevisionId,
+              state,
+              head_revision_id as headRevisionId,
+              autosave_enabled as autosaveEnabled,
+              last_autosaved_at as lastAutosavedAtUtc,
+              last_manual_saved_at as lastManualSavedAtUtc,
+              change_summary as changeSummary,
+              editor_state_json as editorStateJson,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc,
+              retired_at as retiredAtUtc
+       FROM draft_branches
+       WHERE id = @branchId AND workspace_id = @workspaceId
+       LIMIT 1`,
+      { branchId, workspaceId }
+    );
+    if (!branch) {
+      throw new Error('Draft branch not found');
+    }
+    return branch;
+  }
+
+  private async buildDraftBranchSummary(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    branch: DraftBranchDbRow
+  ): Promise<DraftBranchSummary> {
+    const variant = workspaceDb.get<{ familyId: string; locale: string; familyTitle: string }>(
+      `SELECT lv.family_id as familyId, lv.locale, af.title as familyTitle
+       FROM locale_variants lv
+       JOIN article_families af ON af.id = lv.family_id
+       WHERE lv.id = @localeVariantId
+       LIMIT 1`,
+      { localeVariantId: branch.localeVariantId }
+    );
+    if (!variant) {
+      throw new Error('Locale variant not found');
+    }
+
+    const liveRevision = await this.getLatestRevisionForVariant(workspaceDb, branch.localeVariantId, RevisionState.LIVE);
+    const headRevision = await this.getDraftBranchHeadRevision(workspaceDb, branch);
+    if (!headRevision) {
+      throw new Error('Draft branch has no revision history');
+    }
+    const headHtml = await this.readRevisionSource(resolveRevisionPath(workspacePath, headRevision.filePath));
+    const validationWarnings = await this.validateDraftBranchHtml(workspacePath, workspaceDb, branch, headHtml);
+
+    return {
+      id: branch.id,
+      workspaceId: branch.workspaceId,
+      familyId: variant.familyId,
+      familyTitle: variant.familyTitle,
+      localeVariantId: branch.localeVariantId,
+      locale: variant.locale,
+      name: branch.name,
+      status: normalizeDraftBranchStatus(branch.state, Boolean(liveRevision && branch.baseRevisionId !== liveRevision.id)),
+      legacyState: branch.state,
+      baseRevisionId: branch.baseRevisionId,
+      baseRevisionNumber: await this.getRevisionNumberById(workspaceDb, branch.baseRevisionId),
+      headRevisionId: headRevision.id,
+      headRevisionNumber: headRevision.revisionNumber,
+      liveRevisionId: liveRevision?.id,
+      liveRevisionNumber: liveRevision?.revisionNumber,
+      createdAtUtc: branch.createdAtUtc,
+      updatedAtUtc: branch.updatedAtUtc,
+      lastAutosavedAtUtc: branch.lastAutosavedAtUtc ?? undefined,
+      lastManualSaveAtUtc: branch.lastManualSavedAtUtc ?? undefined,
+      changeSummary: branch.changeSummary ?? summarizeDraftChanges(diffHtml(liveRevision ? await this.readRevisionSource(resolveRevisionPath(workspacePath, liveRevision.filePath)) : '', headHtml)),
+      validationSummary: summarizeDraftValidationWarnings(validationWarnings)
+    };
+  }
+
+  private async buildDraftEditorPayload(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    branch: DraftBranchDbRow,
+    summary: DraftBranchSummary
+  ): Promise<DraftEditorPayload> {
+    const headRevision = await this.getDraftBranchHeadRevision(workspaceDb, branch);
+    if (!headRevision) {
+      throw new Error('Draft branch has no revision history');
+    }
+    const liveRevision = summary.liveRevisionId
+      ? await this.getRevisionById(workspaceDb, summary.liveRevisionId)
+      : null;
+    const html = await this.readRevisionSource(resolveRevisionPath(workspacePath, headRevision.filePath));
+    const liveHtml = liveRevision ? await this.readRevisionSource(resolveRevisionPath(workspacePath, liveRevision.filePath)) : '';
+    const compareDiff = diffHtml(liveHtml, html);
+    const validationWarnings = await this.validateDraftBranchHtml(workspacePath, workspaceDb, branch, html);
+    const history = this.listDraftBranchHistory(workspaceDb, branch.id, headRevision.id);
+
+    return {
+      html,
+      previewHtml: html,
+      compare: {
+        liveHtml,
+        draftHtml: html,
+        diff: mapDiffToProposalPayload(compareDiff)
+      },
+      validationWarnings,
+      autosave: {
+        enabled: branch.autosaveEnabled !== 0,
+        status: 'saved',
+        lastAutosavedAtUtc: branch.lastAutosavedAtUtc ?? undefined,
+        lastManualSaveAtUtc: branch.lastManualSavedAtUtc ?? undefined,
+        pendingChanges: false
+      },
+      history,
+      capabilities: {
+        preferredEditor: 'monaco',
+        previewSync: true,
+        compareAgainstLive: true,
+        undoRedo: true
+      },
+      editorState: safeParseJson<Record<string, unknown>>(branch.editorStateJson) ?? undefined
+    };
+  }
+
+  private mapTemplatePackSummary(
+    row: TemplatePackRecord & { templateType?: string | null; description?: string | null; analysisJson?: string | null }
+  ): TemplatePackDetail {
+    const analysis = safeParseJson<TemplatePackAnalysis>(row.analysisJson);
+    return {
+      id: row.id,
+      workspaceId: row.workspaceId,
+      name: row.name,
+      language: row.language,
+      promptTemplate: row.promptTemplate,
+      toneRules: row.toneRules,
+      examples: row.examples,
+      active: row.active,
+      updatedAtUtc: row.updatedAtUtc,
+      templateType: normalizeTemplatePackType(row.templateType),
+      description: row.description ?? undefined,
+      analysisSummary: analysis?.summary,
+      analysis: analysis ?? undefined
+    };
+  }
+
+  private async ensureDefaultTemplatePacks(
+    workspaceId: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>
+  ): Promise<void> {
+    const count = workspaceDb.get<{ total: number }>(
+      `SELECT COUNT(*) as total FROM template_packs WHERE workspace_id = @workspaceId`,
+      { workspaceId }
+    )?.total ?? 0;
+    if (count > 0) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    for (const template of buildDefaultTemplatePacks(workspaceId)) {
+      workspaceDb.run(
+        `INSERT INTO template_packs (
+          id, workspace_id, name, language, prompt_template, tone_rules, examples, active, updated_at, template_type, description, analysis_json
+        ) VALUES (
+          @id, @workspaceId, @name, @language, @promptTemplate, @toneRules, @examples, @active, @updatedAt, @templateType, @description, NULL
+        )`,
+        {
+          ...template,
+          active: template.active ? 1 : 0,
+          updatedAt: now
+        }
+      );
+    }
+  }
+
+  private async resolveArticleAiTarget(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    input: ArticleAiSessionGetRequest
+  ): Promise<{
+    workspaceId: string;
+    localeVariantId: string;
+    branchId?: string;
+    targetType: 'live_article' | 'draft_branch';
+    familyId: string;
+    familyTitle: string;
+    locale: string;
+    revisionId: string;
+    revisionNumber: number;
+    currentHtml: string;
+  }> {
+    if (!input.branchId && !input.localeVariantId) {
+      throw new Error('Article AI session requires branchId or localeVariantId');
+    }
+
+    if (input.branchId) {
+      const branch = this.getDraftBranchRow(workspaceDb, input.workspaceId, input.branchId);
+      const summary = await this.buildDraftBranchSummary(workspacePath, workspaceDb, branch);
+      const headRevision = await this.getDraftBranchHeadRevision(workspaceDb, branch);
+      if (!headRevision) {
+        throw new Error('Draft branch has no revision history');
+      }
+      return {
+        workspaceId: input.workspaceId,
+        localeVariantId: branch.localeVariantId,
+        branchId: branch.id,
+        targetType: 'draft_branch',
+        familyId: summary.familyId,
+        familyTitle: summary.familyTitle,
+        locale: summary.locale,
+        revisionId: headRevision.id,
+        revisionNumber: headRevision.revisionNumber,
+        currentHtml: await this.readRevisionSource(resolveRevisionPath(workspacePath, headRevision.filePath))
+      };
+    }
+
+    const variant = await this.getLocaleVariant(input.workspaceId, input.localeVariantId!);
+    const family = workspaceDb.get<ArticleFamilyRecord>(
+      `SELECT id, workspace_id as workspaceId, external_key as externalKey, title, section_id as sectionId, category_id as categoryId, retired_at as retiredAtUtc
+       FROM article_families
+       WHERE id = @familyId`,
+      { familyId: variant.familyId }
+    );
+    const revision = await this.getLatestRevision(input.workspaceId, input.localeVariantId!, RevisionState.LIVE)
+      ?? await this.getLatestRevision(input.workspaceId, input.localeVariantId!);
+    if (!family || !revision) {
+      throw new Error('Article not found');
+    }
+    return {
+      workspaceId: input.workspaceId,
+      localeVariantId: variant.id,
+      targetType: 'live_article',
+      familyId: family.id,
+      familyTitle: family.title,
+      locale: variant.locale,
+      revisionId: revision.id,
+      revisionNumber: revision.revisionNumber,
+      currentHtml: await this.readRevisionSource(resolveRevisionPath(workspacePath, revision.filePath))
+    };
+  }
+
+  private async createArticleAiSessionRow(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    target: Awaited<ReturnType<WorkspaceRepository['resolveArticleAiTarget']>>
+  ): Promise<ArticleAiSessionDbRow> {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    workspaceDb.run(
+      `INSERT INTO article_ai_sessions (
+        id, workspace_id, locale_variant_id, branch_id, target_type, current_revision_id, current_html,
+        pending_html, pending_summary, pending_rationale, pending_metadata_json, template_pack_id, runtime_session_id, status, created_at, updated_at
+      ) VALUES (
+        @id, @workspaceId, @localeVariantId, @branchId, @targetType, @currentRevisionId, @currentHtml,
+        NULL, NULL, NULL, NULL, NULL, NULL, @status, @createdAt, @updatedAt
+      )`,
+      {
+        id,
+        workspaceId: target.workspaceId,
+        localeVariantId: target.localeVariantId,
+        branchId: target.branchId ?? null,
+        targetType: target.targetType,
+        currentRevisionId: target.revisionId,
+        currentHtml: target.currentHtml,
+        status: ArticleAiSessionStatus.IDLE,
+        createdAt: now,
+        updatedAt: now
+      }
+    );
+    return this.requireArticleAiSession(workspaceDb, target.workspaceId, id);
+  }
+
+  private requireArticleAiSession(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    sessionId: string
+  ): ArticleAiSessionDbRow {
+    const session = workspaceDb.get<ArticleAiSessionDbRow>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              locale_variant_id as localeVariantId,
+              branch_id as branchId,
+              target_type as targetType,
+              current_revision_id as currentRevisionId,
+              current_html as currentHtml,
+              pending_html as pendingHtml,
+              pending_summary as pendingSummary,
+              pending_rationale as pendingRationale,
+              pending_metadata_json as pendingMetadataJson,
+              template_pack_id as templatePackId,
+              runtime_session_id as runtimeSessionId,
+              status,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+       FROM article_ai_sessions
+       WHERE workspace_id = @workspaceId AND id = @sessionId`,
+      { workspaceId, sessionId }
+    );
+    if (!session) {
+      throw new Error('Article AI session not found');
+    }
+    return session;
+  }
+
+  private async insertArticleAiMessage(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    row: ArticleAiMessageDbRow
+  ): Promise<void> {
+    workspaceDb.run(
+      `INSERT INTO article_ai_messages (
+        id, session_id, workspace_id, role, message_kind, preset_action, content, metadata_json, created_at
+      ) VALUES (
+        @id, @sessionId, @workspaceId, @role, @messageKind, @presetAction, @content, @metadataJson, @createdAtUtc
+      )`,
+      {
+        ...row,
+        presetAction: row.presetAction ?? null,
+        metadataJson: row.metadataJson ?? null
+      }
+    );
+  }
+
+  private async buildArticleAiSessionResponse(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    target: Awaited<ReturnType<WorkspaceRepository['resolveArticleAiTarget']>>,
+    sessionRow: ArticleAiSessionDbRow
+  ): Promise<ArticleAiSessionResponse> {
+    const messages = workspaceDb.all<ArticleAiMessageDbRow>(
+      `SELECT id,
+              session_id as sessionId,
+              workspace_id as workspaceId,
+              role,
+              message_kind as messageKind,
+              preset_action as presetAction,
+              content,
+              metadata_json as metadataJson,
+              created_at as createdAtUtc
+       FROM article_ai_messages
+       WHERE workspace_id = @workspaceId AND session_id = @sessionId
+       ORDER BY created_at ASC`,
+      {
+        workspaceId: target.workspaceId,
+        sessionId: sessionRow.id
+      }
+    ).map((row) => ({
+      id: row.id,
+      sessionId: row.sessionId,
+      role: row.role as ArticleAiMessageRole,
+      kind: row.messageKind as ArticleAiMessageKind,
+      content: row.content,
+      presetAction: row.presetAction ? row.presetAction as ArticleAiPresetAction : undefined,
+      metadata: safeParseJson<Record<string, unknown>>(row.metadataJson) ?? undefined,
+      createdAtUtc: row.createdAtUtc
+    })) as ArticleAiChatMessage[];
+
+    const pendingEdit = sessionRow.pendingHtml
+      ? {
+          basedOnRevisionId: sessionRow.currentRevisionId,
+          currentHtml: sessionRow.currentHtml,
+          proposedHtml: sessionRow.pendingHtml,
+          previewHtml: sessionRow.pendingHtml,
+          summary: sessionRow.pendingSummary ?? 'AI suggested update',
+          rationale: sessionRow.pendingRationale ?? undefined,
+          diff: mapDiffToProposalPayload(diffHtml(sessionRow.currentHtml, sessionRow.pendingHtml)),
+          updatedAtUtc: sessionRow.updatedAtUtc
+        } satisfies ArticleAiPendingEdit
+      : undefined;
+
+    return {
+      workspaceId: target.workspaceId,
+      session: {
+        id: sessionRow.id,
+        workspaceId: target.workspaceId,
+        localeVariantId: target.localeVariantId,
+        branchId: sessionRow.branchId ?? undefined,
+        targetType: sessionRow.targetType,
+        familyId: target.familyId,
+        familyTitle: target.familyTitle,
+        locale: target.locale,
+        currentRevisionId: sessionRow.currentRevisionId,
+        currentRevisionNumber: target.revisionNumber,
+        templatePackId: sessionRow.templatePackId ?? undefined,
+        runtimeSessionId: sessionRow.runtimeSessionId ?? undefined,
+        status: normalizeArticleAiSessionStatus(sessionRow.status),
+        createdAtUtc: sessionRow.createdAtUtc,
+        updatedAtUtc: sessionRow.updatedAtUtc
+      },
+      messages,
+      pendingEdit,
+      presets: [...ARTICLE_AI_PRESETS],
+      templatePacks: (await this.listTemplatePackSummaries({ workspaceId: target.workspaceId, includeInactive: false })).templates
+    };
+  }
+
+  private async getDraftBranchHtml(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    branchId: string
+  ): Promise<string> {
+    const branch = this.getDraftBranchRow(workspaceDb, workspaceId, branchId);
+    const headRevision = await this.getDraftBranchHeadRevision(workspaceDb, branch);
+    if (!headRevision) {
+      throw new Error('Draft branch has no revision history');
+    }
+    return this.readRevisionSource(resolveRevisionPath(workspacePath, headRevision.filePath));
+  }
+
+  private async validateDraftBranchHtml(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    branch: DraftBranchDbRow,
+    html: string
+  ): Promise<DraftValidationWarning[]> {
+    const warnings: DraftValidationWarning[] = [];
+    const variant = workspaceDb.get<{ locale: string; familyId: string }>(
+      `SELECT locale, family_id as familyId
+       FROM locale_variants
+       WHERE id = @localeVariantId
+       LIMIT 1`,
+      { localeVariantId: branch.localeVariantId }
+    );
+    const family = variant
+      ? workspaceDb.get<{ sectionId: string | null; categoryId: string | null }>(
+          `SELECT section_id as sectionId, category_id as categoryId
+           FROM article_families
+           WHERE id = @familyId
+           LIMIT 1`,
+          { familyId: variant.familyId }
+        )
+      : null;
+    const enabledLocales = (await this.getWorkspaceSettings(branch.workspaceId)).enabledLocales;
+
+    const unsupportedTags = ['script', 'iframe', 'style', 'object', 'embed'];
+    for (const tag of unsupportedTags) {
+      if (new RegExp(`<${tag}\\b`, 'i').test(html)) {
+        warnings.push({
+          code: DraftValidationCode.UNSUPPORTED_TAG,
+          severity: DraftValidationSeverity.ERROR,
+          message: `Unsupported <${tag}> tag detected in draft HTML.`,
+          detail: tag
+        });
+      }
+    }
+
+    const placeholderMatches = [
+      ...html.matchAll(/\{\{\s*([A-Za-z0-9._-]+)\s*\}\}/g),
+      ...html.matchAll(/<image_placeholder\b[^>]*description="([^"]*)"[^>]*\/?>/gi)
+    ];
+    for (const match of placeholderMatches) {
+      warnings.push({
+        code: DraftValidationCode.UNRESOLVED_PLACEHOLDER,
+        severity: DraftValidationSeverity.WARNING,
+        message: 'Draft contains unresolved placeholder content.',
+        detail: match[1] || match[0]
+      });
+    }
+
+    const htmlIntegrityWarning = detectHtmlIntegrityWarning(html);
+    if (htmlIntegrityWarning) {
+      warnings.push(htmlIntegrityWarning);
+    }
+
+    if (!summaryPlacementExists(family) && !summaryHasLiveRevision(workspaceDb, branch.localeVariantId)) {
+      warnings.push({
+        code: DraftValidationCode.MISSING_PLACEMENT,
+        severity: DraftValidationSeverity.WARNING,
+        message: 'New draft target is missing category or section placement metadata.'
+      });
+    }
+
+    if (variant?.locale && !enabledLocales.includes(variant.locale)) {
+      warnings.push({
+        code: DraftValidationCode.LOCALE_ISSUE,
+        severity: DraftValidationSeverity.WARNING,
+        message: `Locale ${variant.locale} is not currently enabled for this workspace.`,
+        detail: variant.locale
+      });
+    }
+
+    return warnings;
+  }
+
+  private async getDraftBranchHeadRevision(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    branch: DraftBranchDbRow
+  ): Promise<RevisionRecord | null> {
+    if (branch.headRevisionId) {
+      const head = await this.getRevisionById(workspaceDb, branch.headRevisionId);
+      if (head) {
+        return head;
+      }
+    }
+    return workspaceDb.get<RevisionRecord>(
+      `SELECT id, locale_variant_id as localeVariantId, revision_type as revisionType, branch_id as branchId,
+              workspace_id as workspaceId, file_path as filePath, content_hash as contentHash, source_revision_id as sourceRevisionId,
+              revision_number as revisionNumber, status, created_at as createdAtUtc, updated_at as updatedAtUtc
+       FROM revisions
+       WHERE branch_id = @branchId
+       ORDER BY revision_number DESC
+       LIMIT 1`,
+      { branchId: branch.id }
+    ) ?? null;
+  }
+
+  private async getRevisionById(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    revisionId: string
+  ): Promise<RevisionRecord | null> {
+    return workspaceDb.get<RevisionRecord>(
+      `SELECT id, locale_variant_id as localeVariantId, revision_type as revisionType, branch_id as branchId,
+              workspace_id as workspaceId, file_path as filePath, content_hash as contentHash, source_revision_id as sourceRevisionId,
+              revision_number as revisionNumber, status, created_at as createdAtUtc, updated_at as updatedAtUtc
+       FROM revisions
+       WHERE id = @revisionId
+       LIMIT 1`,
+      { revisionId }
+    ) ?? null;
+  }
+
+  private async getRevisionNumberById(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    revisionId: string
+  ): Promise<number | undefined> {
+    const row = workspaceDb.get<{ revisionNumber: number }>(
+      `SELECT revision_number as revisionNumber
+       FROM revisions
+       WHERE id = @revisionId
+       LIMIT 1`,
+      { revisionId }
+    );
+    return row?.revisionNumber;
+  }
+
+  private listDraftBranchHistory(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    branchId: string,
+    headRevisionId: string
+  ): DraftBranchHistoryEntry[] {
+    const revisions = workspaceDb.all<RevisionRecord>(
+      `SELECT id, locale_variant_id as localeVariantId, revision_type as revisionType, branch_id as branchId,
+              workspace_id as workspaceId, file_path as filePath, content_hash as contentHash, source_revision_id as sourceRevisionId,
+              revision_number as revisionNumber, status, created_at as createdAtUtc, updated_at as updatedAtUtc
+       FROM revisions
+       WHERE branch_id = @branchId
+       ORDER BY revision_number DESC`,
+      { branchId }
+    );
+    const commits = workspaceDb.all<DraftRevisionCommitRow>(
+      `SELECT revision_id as revisionId,
+              branch_id as branchId,
+              workspace_id as workspaceId,
+              commit_kind as commitKind,
+              commit_message as commitMessage,
+              created_at as createdAtUtc
+       FROM draft_revision_commits
+       WHERE branch_id = @branchId
+       ORDER BY created_at DESC`,
+      { branchId }
+    );
+    const commitByRevision = new Map(commits.map((commit) => [commit.revisionId, commit]));
+    return revisions.map((revision) => {
+      const commit = commitByRevision.get(revision.id);
+      return {
+        revisionId: revision.id,
+        revisionNumber: revision.revisionNumber,
+        sourceRevisionId: revision.sourceRevisionId,
+        source: normalizeDraftCommitSource(commit?.commitKind),
+        summary: commit?.commitMessage ?? undefined,
+        createdAtUtc: revision.createdAtUtc,
+        updatedAtUtc: revision.updatedAtUtc,
+        isCurrent: revision.id === headRevisionId
+      };
+    });
+  }
+
+  private recordDraftRevisionCommit(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    payload: { revisionId: string; branchId: string; workspaceId: string; source: DraftCommitSource; message?: string }
+  ): void {
+    workspaceDb.run(
+      `INSERT OR REPLACE INTO draft_revision_commits (
+        revision_id, branch_id, workspace_id, commit_kind, commit_message, created_at
+      ) VALUES (
+        @revisionId, @branchId, @workspaceId, @commitKind, @commitMessage, @createdAt
+      )`,
+      {
+        revisionId: payload.revisionId,
+        branchId: payload.branchId,
+        workspaceId: payload.workspaceId,
+        commitKind: payload.source,
+        commitMessage: payload.message ?? null,
+        createdAt: new Date().toISOString()
+      }
+    );
+  }
+
+  private recordArticleLineage(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    localeVariantId: string,
+    predecessorRevisionId: string,
+    successorRevisionId: string,
+    createdBy: 'system' | 'manual',
+    createdAtUtc: string
+  ): void {
+    workspaceDb.run(
+      `INSERT INTO article_lineage (
+        id, locale_variant_id, predecessor_revision_id, successor_revision_id, created_by, created_at
+      ) VALUES (
+        @id, @localeVariantId, @predecessorRevisionId, @successorRevisionId, @createdBy, @createdAt
+      )`,
+      {
+        id: randomUUID(),
+        localeVariantId,
+        predecessorRevisionId,
+        successorRevisionId,
+        createdBy,
+        createdAt: createdAtUtc
+      }
+    );
+  }
+
+  private async stepDraftBranchHistory(
+    workspaceId: string,
+    branchId: string,
+    offset: -1 | 1
+  ): Promise<DraftBranchGetResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const branch = this.getDraftBranchRow(workspaceDb, workspaceId, branchId);
+      const revisions = workspaceDb.all<{ id: string }>(
+        `SELECT id
+         FROM revisions
+         WHERE branch_id = @branchId
+         ORDER BY revision_number ASC`,
+        { branchId }
+      );
+      const currentHeadId = (await this.getDraftBranchHeadRevision(workspaceDb, branch))?.id;
+      const currentIndex = revisions.findIndex((revision) => revision.id === currentHeadId);
+      const nextIndex = currentIndex + offset;
+      if (currentIndex < 0 || nextIndex < 0 || nextIndex >= revisions.length) {
+        return this.getDraftBranchEditor(workspaceId, branchId);
+      }
+      workspaceDb.run(
+        `UPDATE draft_branches
+         SET head_revision_id = @headRevisionId,
+             updated_at = @updatedAt
+         WHERE id = @branchId AND workspace_id = @workspaceId`,
+        {
+          branchId,
+          workspaceId,
+          headRevisionId: revisions[nextIndex].id,
+          updatedAt: new Date().toISOString()
+        }
+      );
+      return this.getDraftBranchEditor(workspaceId, branchId);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   private async syncBatchReviewStatus(
     workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
     workspaceId: string,
@@ -5104,6 +7252,402 @@ function normalizeSearchScope(scope: SearchContext['scope'] | undefined): Search
     return scope;
   }
   return 'all';
+}
+
+function normalizeDraftBranchStatus(value: string | null | undefined, hasConflict = false): DraftBranchStatus {
+  switch (value) {
+    case DraftBranchStatus.READY_TO_PUBLISH:
+    case DraftBranchStatus.PUBLISHED:
+    case DraftBranchStatus.OBSOLETE:
+    case DraftBranchStatus.DISCARDED:
+      return value;
+    case DraftBranchStatus.CONFLICTED:
+      return DraftBranchStatus.CONFLICTED;
+    case DraftBranchStatus.ACTIVE:
+    case RevisionState.DRAFT_BRANCH:
+    default:
+      return hasConflict ? DraftBranchStatus.CONFLICTED : DraftBranchStatus.ACTIVE;
+  }
+}
+
+function normalizeDraftCommitSource(value: string | null | undefined): DraftCommitSource {
+  switch (value) {
+    case DraftCommitSource.PROPOSAL:
+    case DraftCommitSource.MANUAL:
+    case DraftCommitSource.AUTOSAVE:
+      return value;
+    case DraftCommitSource.SYSTEM:
+    default:
+      return DraftCommitSource.SYSTEM;
+  }
+}
+
+function normalizeArticleAiSessionStatus(value: string | null | undefined): ArticleAiSessionStatus {
+  switch (value) {
+    case ArticleAiSessionStatus.RUNNING:
+    case ArticleAiSessionStatus.HAS_PENDING_EDIT:
+      return value;
+    case ArticleAiSessionStatus.IDLE:
+    default:
+      return ArticleAiSessionStatus.IDLE;
+  }
+}
+
+function normalizeTemplatePackType(value: string | null | undefined): TemplatePackType {
+  switch (value) {
+    case TemplatePackType.FAQ:
+    case TemplatePackType.TROUBLESHOOTING:
+    case TemplatePackType.POLICY_NOTICE:
+    case TemplatePackType.FEATURE_OVERVIEW:
+      return value;
+    case TemplatePackType.STANDARD_HOW_TO:
+    default:
+      return TemplatePackType.STANDARD_HOW_TO;
+  }
+}
+
+function summarizeDraftBranchStatuses(branches: DraftBranchSummary[]): DraftBranchSummaryCounts {
+  const summary: DraftBranchSummaryCounts = {
+    total: branches.length,
+    active: 0,
+    readyToPublish: 0,
+    conflicted: 0,
+    obsolete: 0,
+    discarded: 0
+  };
+  for (const branch of branches) {
+    switch (branch.status) {
+      case DraftBranchStatus.READY_TO_PUBLISH:
+        summary.readyToPublish += 1;
+        break;
+      case DraftBranchStatus.CONFLICTED:
+        summary.conflicted += 1;
+        break;
+      case DraftBranchStatus.OBSOLETE:
+        summary.obsolete += 1;
+        break;
+      case DraftBranchStatus.DISCARDED:
+        summary.discarded += 1;
+        break;
+      case DraftBranchStatus.ACTIVE:
+      case DraftBranchStatus.PUBLISHED:
+      default:
+        summary.active += 1;
+        break;
+    }
+  }
+  return summary;
+}
+
+function summarizeDraftValidationWarnings(warnings: DraftValidationWarning[]): DraftValidationSummary {
+  const summary: DraftValidationSummary = {
+    total: warnings.length,
+    errors: 0,
+    warnings: 0,
+    infos: 0
+  };
+  for (const warning of warnings) {
+    if (warning.severity === DraftValidationSeverity.ERROR) {
+      summary.errors += 1;
+    } else if (warning.severity === DraftValidationSeverity.WARNING) {
+      summary.warnings += 1;
+    } else {
+      summary.infos += 1;
+    }
+  }
+  return summary;
+}
+
+const ARTICLE_AI_PRESETS = [
+  {
+    action: ArticleAiPresetAction.REWRITE_TONE,
+    label: 'Rewrite for tone',
+    description: 'Adjust voice and clarity without changing core meaning.'
+  },
+  {
+    action: ArticleAiPresetAction.SHORTEN,
+    label: 'Shorten',
+    description: 'Reduce length and tighten repetition.'
+  },
+  {
+    action: ArticleAiPresetAction.EXPAND,
+    label: 'Expand',
+    description: 'Add missing context, steps, or examples.'
+  },
+  {
+    action: ArticleAiPresetAction.RESTRUCTURE,
+    label: 'Restructure',
+    description: 'Reorganize sections for better flow.'
+  },
+  {
+    action: ArticleAiPresetAction.CONVERT_TO_TROUBLESHOOTING,
+    label: 'Troubleshooting',
+    description: 'Convert the content into a diagnosis-and-resolution format.'
+  },
+  {
+    action: ArticleAiPresetAction.ALIGN_TO_TEMPLATE,
+    label: 'Align to template',
+    description: 'Reshape the article to match a selected template pack.'
+  },
+  {
+    action: ArticleAiPresetAction.UPDATE_LOCALE,
+    label: 'Update locale',
+    description: 'Adapt language and locale expectations, including Spanish flows.'
+  },
+  {
+    action: ArticleAiPresetAction.INSERT_IMAGE_PLACEHOLDERS,
+    label: 'Insert placeholders',
+    description: 'Add image placeholder markers where screenshots would help.'
+  }
+] as const;
+
+function buildDefaultTemplatePacks(workspaceId: string): Array<{
+  id: string;
+  workspaceId: string;
+  name: string;
+  language: string;
+  promptTemplate: string;
+  toneRules: string;
+  examples?: string;
+  active: boolean;
+  templateType: TemplatePackType;
+  description?: string;
+}> {
+  return [
+    {
+      id: randomUUID(),
+      workspaceId,
+      name: 'Standard How-To',
+      language: 'en-us',
+      templateType: TemplatePackType.STANDARD_HOW_TO,
+      promptTemplate: 'Write a task-focused help article with a short introduction, prerequisites when needed, numbered steps, and a clear outcome.',
+      toneRules: 'Use concise, direct instructions. Prefer active voice, plain language, and short paragraphs.',
+      examples: '<h1>Update notification settings</h1><p>Use this article to change notification preferences.</p><ol><li>Open Settings.</li><li>Select Notifications.</li><li>Choose your preferences.</li></ol>',
+      active: true,
+      description: 'Default step-by-step article structure.'
+    },
+    {
+      id: randomUUID(),
+      workspaceId,
+      name: 'FAQ',
+      language: 'en-us',
+      templateType: TemplatePackType.FAQ,
+      promptTemplate: 'Organize the article as common user questions with concise answers and only the context needed to resolve each question.',
+      toneRules: 'Keep answers skimmable. Start with the direct answer, then add supporting detail.',
+      active: true,
+      description: 'Question-and-answer format for recurring support issues.'
+    },
+    {
+      id: randomUUID(),
+      workspaceId,
+      name: 'Troubleshooting',
+      language: 'en-us',
+      templateType: TemplatePackType.TROUBLESHOOTING,
+      promptTemplate: 'Structure the article around symptoms, likely causes, and resolution steps. Call out prerequisites before risky actions.',
+      toneRules: 'Lead with symptom recognition, then progress from least risky to most invasive fixes.',
+      active: true,
+      description: 'Diagnostic format for problem solving.'
+    },
+    {
+      id: randomUUID(),
+      workspaceId,
+      name: 'Policy / Notice',
+      language: 'en-us',
+      templateType: TemplatePackType.POLICY_NOTICE,
+      promptTemplate: 'Write a factual policy or notice article with clear effective scope, impacted users, and any action required.',
+      toneRules: 'Be precise and neutral. Avoid unnecessary marketing language.',
+      active: true,
+      description: 'For policy changes, deprecations, and operational notices.'
+    },
+    {
+      id: randomUUID(),
+      workspaceId,
+      name: 'Feature Overview',
+      language: 'en-us',
+      templateType: TemplatePackType.FEATURE_OVERVIEW,
+      promptTemplate: 'Introduce the feature, who it is for, what it helps accomplish, and the primary workflows it unlocks.',
+      toneRules: 'Use benefit-first framing without losing implementation accuracy.',
+      active: true,
+      description: 'High-level overview for new or changed features.'
+    }
+  ];
+}
+
+function buildTemplatePackAnalysis(template: TemplatePackDetail): TemplatePackAnalysis {
+  const suggestions: TemplatePackAnalysis['suggestions'] = [];
+  const strengths: string[] = [];
+  const gaps: string[] = [];
+  let score = 50;
+
+  if (template.promptTemplate.trim().length >= 80) {
+    strengths.push('Prompt template has enough structure to guide article generation.');
+    score += 15;
+  } else {
+    gaps.push('Prompt template is brief and may not constrain structure strongly enough.');
+    suggestions.push({
+      title: 'Expand structural guidance',
+      detail: 'Add required sections, ordering rules, and explicit output expectations.',
+      priority: 'high'
+    });
+  }
+
+  if (template.toneRules.trim().length >= 40) {
+    strengths.push('Tone rules give the model concrete style guidance.');
+    score += 15;
+  } else {
+    gaps.push('Tone guidance is sparse.');
+    suggestions.push({
+      title: 'Add tone rules',
+      detail: 'Specify voice, reading level, and wording constraints for consistency.',
+      priority: 'medium'
+    });
+  }
+
+  if (template.examples?.trim()) {
+    strengths.push('Examples are present to anchor formatting decisions.');
+    score += 10;
+  } else {
+    gaps.push('No examples are attached.');
+    suggestions.push({
+      title: 'Provide a worked example',
+      detail: 'Add one representative article excerpt so edits can better match expected output.',
+      priority: 'medium'
+    });
+  }
+
+  if (!/es|spanish/i.test(template.language) && template.language !== 'en-us') {
+    suggestions.push({
+      title: 'Review locale targeting',
+      detail: 'Confirm the template includes locale-specific phrasing and formatting requirements.',
+      priority: 'low'
+    });
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  return {
+    score,
+    summary: score >= 75
+      ? 'Strong template pack with clear generation guidance.'
+      : score >= 60
+        ? 'Usable template pack with a few guidance gaps.'
+        : 'Template pack needs more structure before it will steer edits reliably.',
+    strengths,
+    gaps,
+    suggestions,
+    analyzedAtUtc: new Date().toISOString()
+  };
+}
+
+function mapDiffToProposalPayload(diff: ReturnType<typeof diffHtml>): DraftComparePayload['diff'] {
+  return {
+    beforeHtml: diff.beforeHtml,
+    afterHtml: diff.afterHtml,
+    sourceDiff: {
+      lines: diff.sourceLines.map((line) => ({
+        kind: line.kind,
+        lineNumberBefore: line.beforeLineNumber,
+        lineNumberAfter: line.afterLineNumber,
+        content: line.content
+      }))
+    },
+    renderedDiff: {
+      blocks: diff.renderedBlocks.map((block) => ({
+        kind: block.kind,
+        beforeText: block.beforeText,
+        afterText: block.afterText
+      }))
+    },
+    changeRegions: diff.changeRegions.map((region) => ({
+      id: region.id,
+      kind: region.kind,
+      label: region.label,
+      beforeText: region.beforeText,
+      afterText: region.afterText,
+      beforeLineStart: region.beforeLineStart,
+      beforeLineEnd: region.beforeLineEnd,
+      afterLineStart: region.afterLineStart,
+      afterLineEnd: region.afterLineEnd
+    })),
+    gutter: diff.gutter.map((item) => ({
+      lineNumber: item.lineNumber,
+      kind: item.kind,
+      regionId: item.regionId,
+      side: item.side
+    }))
+  };
+}
+
+function summarizeDraftChanges(diff: ReturnType<typeof diffHtml>): string {
+  const added = diff.changeRegions.filter((region) => region.kind === 'added').length;
+  const removed = diff.changeRegions.filter((region) => region.kind === 'removed').length;
+  const changed = diff.changeRegions.filter((region) => region.kind === 'changed').length;
+  const parts = [
+    changed > 0 ? `${changed} changed` : null,
+    added > 0 ? `${added} added` : null,
+    removed > 0 ? `${removed} removed` : null
+  ].filter(Boolean);
+  return parts.length > 0 ? `Live diff: ${parts.join(', ')} region${parts.length > 1 ? 's' : ''}` : 'No live diff detected.';
+}
+
+function detectHtmlIntegrityWarning(html: string): DraftValidationWarning | null {
+  const voidTags = new Set(['br', 'hr', 'img', 'meta', 'input', 'link', 'source']);
+  const stack: string[] = [];
+  const tagPattern = /<\/?([A-Za-z0-9:-]+)(?:\s[^>]*?)?>/g;
+  let match = tagPattern.exec(html);
+  while (match) {
+    const raw = match[0];
+    const tag = match[1].toLowerCase();
+    if (voidTags.has(tag) || raw.endsWith('/>')) {
+      match = tagPattern.exec(html);
+      continue;
+    }
+    if (raw.startsWith('</')) {
+      const open = stack.pop();
+      if (open !== tag) {
+        return {
+          code: DraftValidationCode.INVALID_HTML,
+          severity: DraftValidationSeverity.ERROR,
+          message: `HTML structure looks invalid near closing </${tag}>.`,
+          detail: tag
+        };
+      }
+    } else {
+      stack.push(tag);
+    }
+    match = tagPattern.exec(html);
+  }
+  if (stack.length > 0) {
+    return {
+      code: DraftValidationCode.INVALID_HTML,
+      severity: DraftValidationSeverity.ERROR,
+      message: `HTML structure looks invalid; unclosed <${stack[stack.length - 1]}> tag detected.`,
+      detail: stack[stack.length - 1]
+    };
+  }
+  return null;
+}
+
+function summaryPlacementExists(value: { sectionId: string | null; categoryId: string | null } | null | undefined): boolean {
+  return Boolean(value?.sectionId || value?.categoryId);
+}
+
+function summaryHasLiveRevision(
+  workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+  localeVariantId: string
+): boolean {
+  const row = workspaceDb.get<{ total: number }>(
+    `SELECT COUNT(*) as total
+     FROM revisions
+     WHERE locale_variant_id = @localeVariantId
+       AND revision_type = @revisionType`,
+    { localeVariantId, revisionType: RevisionState.LIVE }
+  );
+  return (row?.total ?? 0) > 0;
+}
+
+function createContentHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 function normalizeReviewStatus(value: string | null | undefined): ProposalReviewStatus {

@@ -577,6 +577,11 @@ The editor should support:
 ## 8.11 Article-level AI editing
 From any article or draft branch, the user can ask the AI to:
 
+- open an article-scoped chat window
+- type a freeform request to the LLM in natural language
+- receive an AI response grounded in the current article or branch context
+- have the AI perform the requested improvement within that chat flow
+
 - rewrite for tone
 - refactor structure
 - shorten or expand
@@ -586,7 +591,15 @@ From any article or draft branch, the user can ask the AI to:
 - update Spanish or English locale variants
 - insert image placeholders
 
-All article-level AI edits must still come back as proposals or patches that the user can accept or reject.
+This should feel like an in-context editing chat, not a hidden backend action. The user should be able to describe the requested change in their own words, review the AI response, and then accept or reject the resulting patch or proposal.
+
+Article chat history should persist for each article or draft until the user chooses to reset it. The UI should provide a clear `Reset Chat` action that deletes that article’s chat history and starts a fresh conversation.
+
+When the user asks the AI to make article changes, the AI response should update the article view immediately so the user can inspect the returned edit in context.
+
+Article-level AI editing should not go through the batch Proposal Review flow. Instead, these article-scoped AI edits should be accepted or rejected directly inside the article editing experience.
+
+When an article-scoped AI edit is accepted, that accepted change must be persisted into the article’s revision/history model so it appears in the History tab like other meaningful local edits.
 
 ## 8.12 Templates and prompt packs
 The workspace must provide editable template and prompt management.

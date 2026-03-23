@@ -5,3 +5,5 @@ export * from './batch2';
 export * from './batch3';
 export * from './batch6';
 export * from './batch7';
+export * from './batch8';
+export * from './batch9';

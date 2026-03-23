@@ -1,10 +1,13 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   ArticleRelationDirection,
   ArticleRelationType,
   RevisionState,
+  ArticleAiPresetAction,
   type ArticleDetailResponse,
   type ArticleRelationRecord,
+  type ArticleAiSessionResponse,
+  type TemplatePackSummary,
   type ExplorerNode,
   type SearchResult,
   type SearchResponse,
@@ -19,6 +22,7 @@ import { StatusChip } from '../components/StatusChip';
 import { Drawer } from '../components/Drawer';
 import {
   IconFolder,
+  IconFolderOpen,
   IconFileText,
   IconSearch,
   IconRefreshCw,
@@ -29,19 +33,24 @@ import {
   IconLink,
   IconImage,
   IconChevronRight,
+  IconChevronDown,
+  IconZap,
+  IconSend,
+  IconCheckCircle,
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 
 type Filter = 'all' | 'live' | 'drafts' | 'retired' | 'conflicted';
 
-type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbis' | 'relations';
+type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbis' | 'relations' | 'ai';
 
 type PreviewStyleResponse = { css: string; sourcePath: string };
 
 const DETAIL_TAB_CONFIG: { id: DetailTab; label: string; icon: typeof IconEye }[] = [
   { id: 'preview', label: 'Preview', icon: IconEye },
   { id: 'source', label: 'Source', icon: IconCode },
+  { id: 'ai', label: 'AI Chat', icon: IconZap },
   { id: 'history', label: 'History', icon: IconClock },
   { id: 'lineage', label: 'Lineage', icon: IconLink },
   { id: 'publish', label: 'Publish', icon: IconRefreshCw },
@@ -522,6 +531,268 @@ function RelationsPanel({
   );
 }
 
+/* ---------- Article AI Chat Tab ---------- */
+
+function presetLabel(action: ArticleAiPresetAction): string {
+  switch (action) {
+    case ArticleAiPresetAction.REWRITE_TONE: return 'Tone';
+    case ArticleAiPresetAction.SHORTEN: return 'Shorten';
+    case ArticleAiPresetAction.EXPAND: return 'Expand';
+    case ArticleAiPresetAction.RESTRUCTURE: return 'Restructure';
+    case ArticleAiPresetAction.CONVERT_TO_TROUBLESHOOTING: return 'Troubleshoot';
+    case ArticleAiPresetAction.ALIGN_TO_TEMPLATE: return 'Template';
+    case ArticleAiPresetAction.UPDATE_LOCALE: return 'Locale';
+    case ArticleAiPresetAction.INSERT_IMAGE_PLACEHOLDERS: return 'Images';
+    default: return 'Custom';
+  }
+}
+
+function presetPrompt(action: ArticleAiPresetAction): string {
+  switch (action) {
+    case ArticleAiPresetAction.REWRITE_TONE: return 'Rewrite this article for a clearer, more confident support tone.';
+    case ArticleAiPresetAction.SHORTEN: return 'Shorten this article while preserving every required step.';
+    case ArticleAiPresetAction.EXPAND: return 'Expand this article with missing context and examples.';
+    case ArticleAiPresetAction.RESTRUCTURE: return 'Restructure this article into a clearer heading and section flow.';
+    case ArticleAiPresetAction.CONVERT_TO_TROUBLESHOOTING: return 'Convert this article into a troubleshooting article with symptoms, causes, and fixes.';
+    case ArticleAiPresetAction.ALIGN_TO_TEMPLATE: return 'Align this article to the selected template pack.';
+    case ArticleAiPresetAction.UPDATE_LOCALE: return 'Update this article for the target locale and keep terminology consistent.';
+    case ArticleAiPresetAction.INSERT_IMAGE_PLACEHOLDERS: return 'Insert image placeholders where screenshots would help.';
+    default: return '';
+  }
+}
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function ArticleAiTab({
+  workspaceId,
+  localeVariantId,
+}: {
+  workspaceId: string;
+  localeVariantId: string;
+}) {
+  const sessionQuery = useIpc<ArticleAiSessionResponse>('article.ai.get');
+  const submitMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.submit');
+  const resetMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.reset');
+  const acceptMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.accept');
+  const rejectMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.reject');
+
+  const [prompt, setPrompt] = useState('');
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [selectedPreset, setSelectedPreset] = useState<ArticleAiPresetAction>(ArticleAiPresetAction.FREEFORM);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    void sessionQuery.execute({ workspaceId, localeVariantId });
+  }, [workspaceId, localeVariantId]);
+
+  useEffect(() => {
+    if (transcriptRef.current) {
+      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+    }
+  }, [sessionQuery.data?.messages.length]);
+
+  const session = sessionQuery.data;
+  const busy = sessionQuery.loading || submitMutation.loading || resetMutation.loading || acceptMutation.loading || rejectMutation.loading;
+  const hasPending = !!session?.pendingEdit;
+  const isRunning = session?.session.status === 'running';
+  const templates: TemplatePackSummary[] = session?.templatePacks ?? [];
+
+  const refreshSession = async () => {
+    await sessionQuery.execute({ workspaceId, localeVariantId });
+  };
+
+  const handlePreset = (action: ArticleAiPresetAction) => {
+    setSelectedPreset(action);
+    setPrompt(presetPrompt(action));
+  };
+
+  const handleSubmit = async () => {
+    if (!prompt.trim() || !session) return;
+    const result = await submitMutation.mutate({
+      workspaceId,
+      localeVariantId,
+      message: prompt,
+      templatePackId: selectedTemplateId || undefined,
+      presetAction: selectedPreset,
+    });
+    if (result) {
+      setPrompt('');
+      setSelectedPreset(ArticleAiPresetAction.FREEFORM);
+      await refreshSession();
+    }
+  };
+
+  const handleReset = async () => {
+    if (!session) return;
+    await resetMutation.mutate({ workspaceId, sessionId: session.session.id });
+    await refreshSession();
+  };
+
+  const handleAccept = async () => {
+    if (!session) return;
+    await acceptMutation.mutate({ workspaceId, sessionId: session.session.id });
+    await refreshSession();
+  };
+
+  const handleReject = async () => {
+    if (!session) return;
+    await rejectMutation.mutate({ workspaceId, sessionId: session.session.id });
+    await refreshSession();
+  };
+
+  if (sessionQuery.loading && !session) {
+    return <LoadingState message="Starting AI session..." />;
+  }
+
+  if (sessionQuery.error && !session) {
+    return <ErrorState title="Unable to start AI session" description={sessionQuery.error} />;
+  }
+
+  if (!session) {
+    return <EmptyState title="AI chat unavailable" description="Could not initialize an AI session for this article." />;
+  }
+
+  return (
+    <div className="article-ai-panel" style={{ padding: 'var(--space-3) 0' }}>
+      {/* Header with reset */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-3)' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-1)', fontWeight: 600, fontSize: 'var(--text-sm)' }}>
+          <IconZap size={14} /> Article AI Chat
+        </span>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={() => void handleReset()} disabled={busy} title="Clear chat history and start fresh">
+          Reset
+        </button>
+      </div>
+
+      {/* Pending edit card */}
+      {hasPending && (
+        <div className="article-ai-pending">
+          <div className="article-ai-pending-header">
+            <IconZap size={12} style={{ color: 'var(--color-primary)' }} />
+            <span className="article-ai-pending-label">Pending AI edit</span>
+          </div>
+          <div className="article-ai-pending-summary">{session.pendingEdit!.summary}</div>
+          {session.pendingEdit!.rationale && (
+            <div className="article-ai-pending-diff-hint">{session.pendingEdit!.rationale}</div>
+          )}
+          <div className="article-ai-pending-actions">
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => void handleAccept()} disabled={busy}>
+              <IconCheckCircle size={12} /> Accept into draft
+            </button>
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => void handleReject()} disabled={busy}>
+              Reject
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Running indicator */}
+      {isRunning && (
+        <div className="article-ai-running">
+          <span className="article-ai-running-dot" />
+          AI is processing your request...
+        </div>
+      )}
+
+      {/* Chat transcript */}
+      <div className="article-ai-transcript" ref={transcriptRef}>
+        {session.messages.length === 0 ? (
+          <div className="article-ai-empty-hint">
+            Use a quick action or type a request below to start editing this article with AI. Chat history persists until you reset it.
+          </div>
+        ) : (
+          session.messages.map((message) => (
+            <div key={message.id} className={`article-ai-msg ${message.role}`}>
+              <div className="article-ai-msg-header">
+                <span className={`article-ai-msg-role ${message.role}`}>
+                  {message.role === 'assistant' ? 'AI' : message.role}
+                </span>
+                <span className="article-ai-msg-time">{relativeTime(message.createdAtUtc)}</span>
+              </div>
+              {message.presetAction && message.presetAction !== ArticleAiPresetAction.FREEFORM && (
+                <div style={{ marginBottom: 4 }}>
+                  <Badge variant="primary">{presetLabel(message.presetAction)}</Badge>
+                </div>
+              )}
+              <div>{message.content}</div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Preset chips */}
+      <div className="article-ai-presets">
+        {session.presets.map((preset) => (
+          <button
+            key={preset.action}
+            type="button"
+            className="article-ai-preset-chip"
+            onClick={() => handlePreset(preset.action)}
+            disabled={busy || hasPending}
+            title={preset.description}
+          >
+            {presetLabel(preset.action)}
+          </button>
+        ))}
+      </div>
+
+      {/* Template selector */}
+      <div className="article-ai-template-row">
+        <select
+          className="input article-ai-template-select"
+          value={selectedTemplateId}
+          onChange={(e) => setSelectedTemplateId(e.target.value)}
+          disabled={busy}
+        >
+          <option value="">No template (use article context)</option>
+          {templates.map((template) => (
+            <option key={template.id} value={template.id}>
+              {template.name} ({template.language})
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* Compose */}
+      <div className="article-ai-compose">
+        <div className="article-ai-compose-row">
+          <textarea
+            className="article-ai-textarea"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Describe the change you want..."
+            disabled={busy || hasPending}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && prompt.trim()) {
+                e.preventDefault();
+                void handleSubmit();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="article-ai-send-btn"
+            onClick={() => void handleSubmit()}
+            disabled={busy || !prompt.trim() || hasPending}
+            title="Submit (Cmd+Enter)"
+          >
+            <IconSend size={14} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PlaceholderBlocks({ placeholders }: { placeholders: ArticleDetailResponse['placeholders'] }) {
   if (placeholders.length === 0) return null;
   return (
@@ -540,6 +811,302 @@ function PlaceholderBlocks({ placeholders }: { placeholders: ArticleDetailRespon
   );
 }
 
+/* ---------- Folder Tree ---------- */
+
+interface FolderTreeItem {
+  type: 'folder';
+  id: string;
+  name: string;
+  depth: number;
+  children: (FolderTreeItem | ArticleTreeItem)[];
+  articleCount: number;
+}
+
+interface ArticleTreeItem {
+  type: 'article';
+  node: ExplorerNode;
+  depth: number;
+}
+
+function buildFolderTree(nodes: ExplorerNode[]): (FolderTreeItem | ArticleTreeItem)[] {
+  const categoryMap = new Map<string, { name: string; sections: Map<string, { name: string; articles: ExplorerNode[] }> }>();
+  const uncategorized: ExplorerNode[] = [];
+
+  for (const node of nodes) {
+    const catId = node.categoryId;
+    const secId = node.sectionId;
+
+    if (!catId && !secId) {
+      uncategorized.push(node);
+      continue;
+    }
+
+    if (catId && secId) {
+      if (!categoryMap.has(catId)) {
+        categoryMap.set(catId, { name: node.categoryName || catId, sections: new Map() });
+      }
+      const cat = categoryMap.get(catId)!;
+      if (!cat.sections.has(secId)) {
+        cat.sections.set(secId, { name: node.sectionName || secId, articles: [] });
+      }
+      cat.sections.get(secId)!.articles.push(node);
+    } else if (secId) {
+      // Section without category - treat section as top-level folder
+      const syntheticCatId = `__section_${secId}`;
+      if (!categoryMap.has(syntheticCatId)) {
+        categoryMap.set(syntheticCatId, { name: node.sectionName || secId, sections: new Map() });
+      }
+      const cat = categoryMap.get(syntheticCatId)!;
+      const directKey = '__direct__';
+      if (!cat.sections.has(directKey)) {
+        cat.sections.set(directKey, { name: '', articles: [] });
+      }
+      cat.sections.get(directKey)!.articles.push(node);
+    } else if (catId) {
+      // Category without section - articles directly under category
+      if (!categoryMap.has(catId)) {
+        categoryMap.set(catId, { name: node.categoryName || catId, sections: new Map() });
+      }
+      const cat = categoryMap.get(catId)!;
+      const directKey = '__direct__';
+      if (!cat.sections.has(directKey)) {
+        cat.sections.set(directKey, { name: '', articles: [] });
+      }
+      cat.sections.get(directKey)!.articles.push(node);
+    }
+  }
+
+  const result: (FolderTreeItem | ArticleTreeItem)[] = [];
+
+  // Sort categories alphabetically
+  const sortedCategories = [...categoryMap.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name));
+
+  for (const [catId, cat] of sortedCategories) {
+    const categoryFolder: FolderTreeItem = {
+      type: 'folder',
+      id: catId,
+      name: cat.name,
+      depth: 0,
+      children: [],
+      articleCount: 0,
+    };
+
+    const sortedSections = [...cat.sections.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name));
+
+    for (const [secId, sec] of sortedSections) {
+      const sortedArticles = [...sec.articles].sort((a, b) => a.title.localeCompare(b.title));
+
+      if (secId === '__direct__') {
+        // Articles directly under category
+        for (const article of sortedArticles) {
+          categoryFolder.children.push({ type: 'article', node: article, depth: 1 });
+          categoryFolder.articleCount++;
+        }
+      } else {
+        const sectionFolder: FolderTreeItem = {
+          type: 'folder',
+          id: secId,
+          name: sec.name,
+          depth: 1,
+          children: sortedArticles.map((article) => ({
+            type: 'article' as const,
+            node: article,
+            depth: 2,
+          })),
+          articleCount: sortedArticles.length,
+        };
+        categoryFolder.children.push(sectionFolder);
+        categoryFolder.articleCount += sortedArticles.length;
+      }
+    }
+
+    result.push(categoryFolder);
+  }
+
+  // Add uncategorized articles
+  if (uncategorized.length > 0) {
+    const sortedUncategorized = [...uncategorized].sort((a, b) => a.title.localeCompare(b.title));
+
+    // If there are categories, group uncategorized under a folder
+    if (categoryMap.size > 0) {
+      result.push({
+        type: 'folder',
+        id: '__uncategorized__',
+        name: 'Uncategorized',
+        depth: 0,
+        children: sortedUncategorized.map((article) => ({
+          type: 'article' as const,
+          node: article,
+          depth: 1,
+        })),
+        articleCount: sortedUncategorized.length,
+      });
+    } else {
+      // No folder structure at all - just return flat articles
+      for (const article of sortedUncategorized) {
+        result.push({ type: 'article', node: article, depth: 0 });
+      }
+    }
+  }
+
+  return result;
+}
+
+function FolderRow({
+  folder,
+  expanded,
+  onToggle,
+}: {
+  folder: FolderTreeItem;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const ChevronIcon = expanded ? IconChevronDown : IconChevronRight;
+  const FolderIcon = expanded ? IconFolderOpen : IconFolder;
+
+  return (
+    <div
+      className={`explorer-folder-row${expanded ? ' expanded' : ''}`}
+      style={{ paddingLeft: `calc(${folder.depth * 20}px + var(--space-2))` }}
+      onClick={onToggle}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onToggle();
+        }
+      }}
+    >
+      <ChevronIcon size={12} className="explorer-folder-chevron" />
+      <FolderIcon size={15} className="explorer-folder-icon" />
+      <span className="explorer-folder-name">{folder.name}</span>
+      <span className="explorer-folder-count">{folder.articleCount}</span>
+    </div>
+  );
+}
+
+function ArticleRow({
+  item,
+  isSelected,
+  onOpen,
+  onHistoryClick,
+}: {
+  item: ArticleTreeItem;
+  isSelected: boolean;
+  onOpen: () => void;
+  onHistoryClick: (e: React.MouseEvent) => void;
+}) {
+  const node = item.node;
+  const totalDrafts = node.locales.reduce((sum, l) => sum + l.revision.draftCount, 0);
+  const hasConflicts = node.locales.some((l) => l.hasConflicts);
+
+  return (
+    <div
+      className={`explorer-article-row${isSelected ? ' selected' : ''}`}
+      style={{ paddingLeft: `calc(${item.depth * 20}px + var(--space-2))` }}
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+    >
+      <IconFileText size={14} className="explorer-article-icon" />
+      <span className="explorer-article-title">{node.title}</span>
+
+      <div className="explorer-article-meta">
+        <StatusChip status={revisionStateToBadge(node.familyStatus)} />
+
+        {totalDrafts > 0 && (
+          <Badge variant="primary">{totalDrafts} draft{totalDrafts !== 1 ? 's' : ''}</Badge>
+        )}
+
+        {hasConflicts && <Badge variant="danger">Conflict</Badge>}
+
+        {node.locales.map((l) => (
+          <Badge key={l.locale} variant="neutral">{l.locale}</Badge>
+        ))}
+
+        {node.locales[0]?.revision?.updatedAtUtc && (() => {
+          const info = formatSyncAge(node.locales[0].revision.updatedAtUtc);
+          return (
+            <span className={`sync-freshness-badge sync-freshness-badge--${info.freshness}`}>
+              {info.label}
+            </span>
+          );
+        })()}
+
+        <button
+          type="button"
+          className="explorer-article-history-btn"
+          onClick={onHistoryClick}
+          aria-label={`View history for ${node.title}`}
+        >
+          <IconClock size={11} />
+          History
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function FolderTreeView({
+  items,
+  expandedFolders,
+  onToggleFolder,
+  detailPanel,
+  openArticleDetail,
+}: {
+  items: (FolderTreeItem | ArticleTreeItem)[];
+  expandedFolders: Set<string>;
+  onToggleFolder: (id: string) => void;
+  detailPanel: { open: boolean; familyId: string };
+  openArticleDetail: (node: ExplorerNode, tab: DetailTab) => void;
+}) {
+  const rows: React.ReactNode[] = [];
+
+  function renderItems(items: (FolderTreeItem | ArticleTreeItem)[]) {
+    for (const item of items) {
+      if (item.type === 'folder') {
+        const isExpanded = expandedFolders.has(item.id);
+        rows.push(
+          <FolderRow
+            key={`folder-${item.id}`}
+            folder={item}
+            expanded={isExpanded}
+            onToggle={() => onToggleFolder(item.id)}
+          />
+        );
+        if (isExpanded) {
+          renderItems(item.children);
+        }
+      } else {
+        rows.push(
+          <ArticleRow
+            key={`article-${item.node.familyId}`}
+            item={item}
+            isSelected={detailPanel.open && detailPanel.familyId === item.node.familyId}
+            onOpen={() => openArticleDetail(item.node, 'preview')}
+            onHistoryClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              openArticleDetail(item.node, 'history');
+            }}
+          />
+        );
+      }
+    }
+  }
+
+  renderItems(items);
+
+  return <div className="explorer-article-list">{rows}</div>;
+}
+
 /* ---------- Main Component ---------- */
 
 export const ArticleExplorer = () => {
@@ -553,6 +1120,7 @@ export const ArticleExplorer = () => {
   const [activeFilter, setActiveFilter] = useState<Filter>('all');
   const [searchText, setSearchText] = useState('');
   const [selectedLocale, setSelectedLocale] = useState<string | null>(null);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [detailPanel, setDetailPanel] = useState<DetailPanelState>({
     familyId: '',
     open: false,
@@ -662,6 +1230,50 @@ export const ArticleExplorer = () => {
     openableTree.forEach((node) => node.locales.forEach((l) => localeSet.add(l.locale)));
     return Array.from(localeSet).sort();
   }, [tree]);
+
+  const folderTree = useMemo(() => buildFolderTree(filteredTree), [filteredTree]);
+
+  // Auto-expand all top-level folders on first load
+  useEffect(() => {
+    if (expandedFolders.size === 0 && folderTree.length > 0) {
+      const topLevelFolderIds = folderTree
+        .filter((item): item is FolderTreeItem => item.type === 'folder')
+        .map((f) => f.id);
+      if (topLevelFolderIds.length > 0) {
+        setExpandedFolders(new Set(topLevelFolderIds));
+      }
+    }
+  }, [folderTree]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggleFolder = useCallback((folderId: string) => {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(folderId)) {
+        next.delete(folderId);
+      } else {
+        next.add(folderId);
+      }
+      return next;
+    });
+  }, []);
+
+  const expandAllFolders = useCallback(() => {
+    const allIds: string[] = [];
+    function collectIds(items: (FolderTreeItem | ArticleTreeItem)[]) {
+      for (const item of items) {
+        if (item.type === 'folder') {
+          allIds.push(item.id);
+          collectIds(item.children);
+        }
+      }
+    }
+    collectIds(folderTree);
+    setExpandedFolders(new Set(allIds));
+  }, [folderTree]);
+
+  const collapseAllFolders = useCallback(() => {
+    setExpandedFolders(new Set());
+  }, []);
 
   const openArticleDetail = useCallback(async (
     node: ExplorerNode,
@@ -993,6 +1605,13 @@ export const ArticleExplorer = () => {
             onOpenRelation={openRelatedFamily}
           />
         )}
+
+        {detailPanel.activeTab === 'ai' && activeWorkspace && (
+          <ArticleAiTab
+            workspaceId={activeWorkspace.id}
+            localeVariantId={detailPanel.localeVariantId}
+          />
+        )}
       </>
     );
   };
@@ -1173,69 +1792,26 @@ export const ArticleExplorer = () => {
                 description="Try changing the filter or locale selection."
               />
             ) : (
-              /* Article tree */
-              <div className="explorer-article-list">
-                {filteredTree.map((node) => {
-                  const totalDrafts = node.locales.reduce((sum, l) => sum + l.revision.draftCount, 0);
-                  const hasConflicts = node.locales.some((l) => l.hasConflicts);
-
-                  return (
-                    <div
-                      key={node.familyId}
-                      className={`explorer-article-row${detailPanel.open && detailPanel.familyId === node.familyId ? ' selected' : ''}`}
-                      onClick={() => openArticleDetail(node, 'preview')}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault();
-                          void openArticleDetail(node, 'preview');
-                        }
-                      }}
-                    >
-                      <IconFileText size={14} className="explorer-article-icon" />
-                      <span className="explorer-article-title">{node.title}</span>
-
-                      <div className="explorer-article-meta">
-                        <StatusChip status={revisionStateToBadge(node.familyStatus)} />
-
-                        {totalDrafts > 0 && (
-                          <Badge variant="primary">{totalDrafts} draft{totalDrafts !== 1 ? 's' : ''}</Badge>
-                        )}
-
-                        {hasConflicts && <Badge variant="danger">Conflict</Badge>}
-
-                        {node.locales.map((l) => (
-                          <Badge key={l.locale} variant="neutral">{l.locale}</Badge>
-                        ))}
-
-                        {node.locales[0]?.revision?.updatedAtUtc && (() => {
-                          const info = formatSyncAge(node.locales[0].revision.updatedAtUtc);
-                          return (
-                            <span className={`sync-freshness-badge sync-freshness-badge--${info.freshness}`}>
-                              {info.label}
-                            </span>
-                          );
-                        })()}
-
-                        <button
-                          type="button"
-                          className="explorer-article-history-btn"
-                          onClick={(event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            openArticleDetail(node, 'history');
-                          }}
-                          aria-label={`View history for ${node.title}`}
-                        >
-                          <IconClock size={11} />
-                          History
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              /* Folder tree view */
+              <>
+                {folderTree.some((item) => item.type === 'folder') && (
+                  <div className="explorer-tree-toolbar">
+                    <button className="btn btn-ghost btn-xs" onClick={expandAllFolders}>
+                      Expand all
+                    </button>
+                    <button className="btn btn-ghost btn-xs" onClick={collapseAllFolders}>
+                      Collapse all
+                    </button>
+                  </div>
+                )}
+                <FolderTreeView
+                  items={folderTree}
+                  expandedFolders={expandedFolders}
+                  onToggleFolder={toggleFolder}
+                  detailPanel={detailPanel}
+                  openArticleDetail={openArticleDetail}
+                />
+              </>
             )}
           </div>
         </div>
