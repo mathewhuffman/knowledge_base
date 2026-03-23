@@ -32,6 +32,10 @@ import {
   type ZendeskSectionsListRequest,
   type ZendeskSearchArticlesRequest,
   type ArticleDetailRequest,
+  type ArticleRelationDeleteRequest,
+  type ArticleRelationRefreshRequest,
+  type ArticleRelationsListRequest,
+  type ArticleRelationUpsertRequest,
   type WorkspaceDefaultRequest,
   type ZendeskSyncRunRequest,
   type AgentAnalysisRunRequest,
@@ -206,7 +210,7 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
     searchKb: async (input: MCPFindRelatedArticlesInput & { workspaceId: string }) => {
       return workspaceRepository.searchArticles(input.workspaceId, {
         workspaceId: input.workspaceId,
-        query: input.query,
+        query: input.query ?? '',
         scope: 'all',
         includeArchived: true
       });
@@ -230,14 +234,47 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       return workspaceRepository.getLocaleVariant(input.workspaceId, input.familyId);
     },
     findRelatedArticles: async (input: MCPFindRelatedArticlesInput) => {
-      const result = await workspaceRepository.searchArticles(input.workspaceId, {
+      if (input.articleId || input.familyId || input.batchId) {
+        return workspaceRepository.listArticleRelations(input.workspaceId, {
+          workspaceId: input.workspaceId,
+          localeVariantId: input.articleId,
+          familyId: input.familyId,
+          batchId: input.batchId,
+          limit: input.max,
+          minScore: input.minScore,
+          includeEvidence: input.includeEvidence
+        });
+      }
+      if (input.query?.trim()) {
+        const search = await workspaceRepository.searchArticles(input.workspaceId, {
+          workspaceId: input.workspaceId,
+          query: input.query,
+          scope: 'all',
+          includeArchived: true
+        });
+        const top = search.results[0];
+        if (!top) {
+          return {
+            workspaceId: input.workspaceId,
+            seedFamilyIds: [],
+            total: 0,
+            relations: []
+          };
+        }
+        return workspaceRepository.listArticleRelations(input.workspaceId, {
+          workspaceId: input.workspaceId,
+          familyId: top.familyId,
+          limit: input.max,
+          minScore: input.minScore,
+          includeEvidence: input.includeEvidence
+        });
+      }
+      return {
         workspaceId: input.workspaceId,
-        query: input.query,
-        scope: 'all',
-        includeArchived: true,
-        changedWithinHours: input.max ?? undefined
-      });
-      return result;
+        seedFamilyIds: [],
+        total: 0,
+        relations: []
+      };
     },
     listCategories: async (input: MCPListCategoriesInput) => {
       const client = await buildZendeskClient(input.workspaceId);
@@ -837,6 +874,61 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       ) {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
       }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.list', async (payload) => {
+    try {
+      const input = payload as ArticleRelationsListRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.list requires workspaceId');
+      }
+      if (!input.familyId && !input.localeVariantId && !input.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.list requires familyId, localeVariantId, or batchId');
+      }
+      const response = await workspaceRepository.listArticleRelations(input.workspaceId, input);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.upsert', async (payload) => {
+    try {
+      const input = payload as ArticleRelationUpsertRequest | undefined;
+      if (!input?.workspaceId || !input.sourceFamilyId || !input.targetFamilyId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.upsert requires workspaceId, sourceFamilyId, and targetFamilyId');
+      }
+      const response = await workspaceRepository.upsertManualArticleRelation(input);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.delete', async (payload) => {
+    try {
+      const input = payload as ArticleRelationDeleteRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.delete requires workspaceId');
+      }
+      const response = await workspaceRepository.deleteArticleRelation(input);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.status', async (payload) => {
+    try {
+      const workspaceId = (payload as { workspaceId?: string } | undefined)?.workspaceId;
+      if (!workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.status requires workspaceId');
+      }
+      const response = await workspaceRepository.getArticleRelationsStatus(workspaceId);
+      return { ok: true, data: response };
+    } catch (error) {
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
     }
   });
@@ -1821,6 +1913,67 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       progress: 100,
       message: result.message ?? 'article edit command complete'
     });
+  });
+
+  jobs.registerRunner('article.relations.refresh', async (payload: JobRunContext, emit, isCancelled) => {
+    const input = payload.input as unknown as ArticleRelationRefreshRequest;
+    if (!input?.workspaceId) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'article.relations.refresh requires workspaceId'
+      });
+      return;
+    }
+    if (isCancelled()) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.CANCELED,
+        progress: 100,
+        message: 'relation refresh canceled'
+      });
+      return;
+    }
+
+    emit({
+      id: payload.jobId,
+      command: payload.command,
+      state: JobState.RUNNING,
+      progress: 20,
+      message: 'Building article relation graph'
+    });
+
+    try {
+      const result = await workspaceRepository.refreshArticleRelations(input.workspaceId, {
+        limitPerArticle: input.limitPerArticle,
+        source: 'manual_refresh',
+        triggeredBy: 'user'
+      });
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.SUCCEEDED,
+        progress: 100,
+        message: JSON.stringify(result.summary ?? {}),
+        metadata: {
+          runId: result.id,
+          totalArticles: result.summary?.totalArticles ?? 0,
+          candidatePairs: result.summary?.candidatePairs ?? 0,
+          inferredRelations: result.summary?.inferredRelations ?? 0
+        }
+      });
+    } catch (error) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
   });
 
   bus.register('zendesk.credentials.get', async (payload) => {

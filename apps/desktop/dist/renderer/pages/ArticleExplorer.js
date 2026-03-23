@@ -1,6 +1,6 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { RevisionState } from '@kb-vault/shared-types';
+import { ArticleRelationDirection, ArticleRelationType, RevisionState } from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
 import { LoadingState } from '../components/LoadingState';
@@ -10,7 +10,7 @@ import { StatusChip } from '../components/StatusChip';
 import { Drawer } from '../components/Drawer';
 import { IconFolder, IconFileText, IconSearch, IconRefreshCw, IconClock, IconGlobe, IconEye, IconCode, IconLink, IconImage, IconChevronRight, } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
-import { useIpc } from '../hooks/useIpc';
+import { useIpc, useIpcMutation } from '../hooks/useIpc';
 const DETAIL_TAB_CONFIG = [
     { id: 'preview', label: 'Preview', icon: IconEye },
     { id: 'source', label: 'Source', icon: IconCode },
@@ -18,6 +18,7 @@ const DETAIL_TAB_CONFIG = [
     { id: 'lineage', label: 'Lineage', icon: IconLink },
     { id: 'publish', label: 'Publish', icon: IconRefreshCw },
     { id: 'pbis', label: 'PBIs', icon: IconFileText },
+    { id: 'relations', label: 'Relations', icon: IconLink },
 ];
 function formatSyncAge(utcStr) {
     const diff = Date.now() - new Date(utcStr).getTime();
@@ -189,6 +190,73 @@ function PBIPanel({ pbis }) {
         return _jsx(EmptyState, { title: "No related PBIs", description: "No linked PBIs were found for this article." });
     }
     return (_jsx("div", { className: "pbi-list", children: pbis.map((pbi, index) => (_jsxs("div", { className: "pbi-card", children: [_jsxs("div", { className: "pbi-card-header", children: [_jsx("span", { className: "pbi-card-id", children: pbi.externalId }), pbi.priority && _jsx(Badge, { variant: "neutral", children: pbi.priority })] }), _jsx("div", { className: "pbi-card-title", children: pbi.title }), pbi.description && (_jsx("div", { className: "pbi-card-desc", children: pbi.description }))] }, pbi.id ?? index))) }));
+}
+function relationTypeLabel(type) {
+    switch (type) {
+        case ArticleRelationType.SAME_WORKFLOW: return 'Same Workflow';
+        case ArticleRelationType.PREREQUISITE: return 'Prerequisite';
+        case ArticleRelationType.FOLLOW_UP: return 'Follow Up';
+        case ArticleRelationType.PARENT_TOPIC: return 'Parent Topic';
+        case ArticleRelationType.CHILD_TOPIC: return 'Child Topic';
+        case ArticleRelationType.SHARED_SURFACE: return 'Shared Surface';
+        case ArticleRelationType.REPLACES: return 'Replaces';
+        case ArticleRelationType.SEE_ALSO:
+        default:
+            return 'See Also';
+    }
+}
+function relationVariant(relation) {
+    return relation.origin === 'manual' ? 'primary' : 'neutral';
+}
+function RelationsPanel({ workspaceId, familyId, relations, onChanged, onOpenRelation }) {
+    const searchQuery = useIpc('workspace.search');
+    const createRelation = useIpcMutation('article.relations.upsert');
+    const deleteRelation = useIpcMutation('article.relations.delete');
+    const [searchText, setSearchText] = useState('');
+    const [selectedFamilyId, setSelectedFamilyId] = useState('');
+    const [relationType, setRelationType] = useState(ArticleRelationType.SEE_ALSO);
+    useEffect(() => {
+        if (searchText.trim().length < 2)
+            return;
+        const timeout = setTimeout(() => {
+            searchQuery.execute({
+                workspaceId,
+                query: searchText.trim(),
+                scope: 'all',
+                includeArchived: true
+            });
+        }, 250);
+        return () => clearTimeout(timeout);
+    }, [searchText, workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+    const searchResults = (searchQuery.data?.results ?? []).filter((result) => result.familyId !== familyId);
+    const uniqueTargets = searchResults.filter((result, index, array) => array.findIndex((candidate) => candidate.familyId === result.familyId) === index);
+    const addRelation = async () => {
+        if (!selectedFamilyId)
+            return;
+        await createRelation.mutate({
+            workspaceId,
+            sourceFamilyId: familyId,
+            targetFamilyId: selectedFamilyId,
+            relationType,
+            direction: ArticleRelationDirection.BIDIRECTIONAL
+        });
+        setSearchText('');
+        setSelectedFamilyId('');
+        await onChanged();
+    };
+    const removeRelation = async (relation) => {
+        await deleteRelation.mutate({
+            workspaceId,
+            relationId: relation.id,
+            sourceFamilyId: relation.sourceFamily.id,
+            targetFamilyId: relation.targetFamily.id
+        });
+        await onChanged();
+    };
+    return (_jsxs("div", { style: { display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }, children: [_jsxs("div", { className: "card", children: [_jsx("div", { className: "card-header", children: _jsx("span", { className: "card-header-title", children: "Add Manual Relation" }) }), _jsxs("div", { className: "card-body", style: { display: 'grid', gap: 'var(--space-3)' }, children: [_jsx("input", { className: "input input-sm", placeholder: "Search article title...", value: searchText, onChange: (event) => setSearchText(event.target.value) }), _jsxs("select", { className: "input input-sm", value: selectedFamilyId, onChange: (event) => setSelectedFamilyId(event.target.value), children: [_jsx("option", { value: "", children: "Select article" }), uniqueTargets.map((result) => (_jsx("option", { value: result.familyId, children: result.title }, result.familyId)))] }), _jsx("select", { className: "input input-sm", value: relationType, onChange: (event) => setRelationType(event.target.value), children: Object.values(ArticleRelationType).map((type) => (_jsx("option", { value: type, children: relationTypeLabel(type) }, type))) }), _jsx("button", { className: "btn btn-primary btn-sm", onClick: () => void addRelation(), disabled: !selectedFamilyId || createRelation.loading, children: "Add Relation" }), (createRelation.error || deleteRelation.error) && (_jsx("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-danger)' }, children: createRelation.error ?? deleteRelation.error }))] })] }), relations.length === 0 ? (_jsx(EmptyState, { title: "No relations yet", description: "Run a relation refresh or add a manual relation for this article family." })) : (_jsx("div", { className: "publish-list", children: relations.map((relation) => {
+                    const counterpart = relation.sourceFamily.id === familyId ? relation.targetFamily : relation.sourceFamily;
+                    return (_jsxs("div", { className: "publish-card", children: [_jsxs("div", { className: "publish-card-header", children: [_jsx("button", { className: "btn btn-ghost btn-sm", style: { padding: 0, fontWeight: 'var(--weight-semibold)' }, onClick: () => void onOpenRelation(counterpart.id), title: `Open ${counterpart.title}`, children: counterpart.title }), _jsxs("div", { style: { display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }, children: [_jsx(Badge, { variant: relationVariant(relation), children: relation.origin }), _jsx(Badge, { variant: "neutral", children: relationTypeLabel(relation.relationType) }), _jsx("button", { className: "btn btn-ghost btn-xs", onClick: () => void removeRelation(relation), children: "Remove" })] })] }), _jsxs("div", { className: "publish-card-meta", children: ["Score ", Math.round(relation.strengthScore * 100), "%"] }), relation.evidence.length > 0 && (_jsx("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginTop: 'var(--space-2)', lineHeight: 1.5 }, children: relation.evidence.slice(0, 2).map((evidence) => evidence.snippet).filter(Boolean).join(' • ') }))] }, relation.id));
+                }) }))] }));
 }
 function PlaceholderBlocks({ placeholders }) {
     if (placeholders.length === 0)
@@ -367,7 +435,7 @@ export const ArticleExplorer = () => {
             error: null,
             familyId: node.familyId,
             familyTitle: node.title,
-            localeVariantId: targetLocaleVariantId,
+            localeVariantId: localeInfo.localeVariantId,
             localeVariants: node.locales,
             activeTab: preferredTab,
             detail: null,
@@ -393,7 +461,8 @@ export const ArticleExplorer = () => {
                     : Promise.resolve({ ok: false, error: { code: 'NOT_AVAILABLE', message: 'No locale variant selected for history.' } })
             ]);
             const detail = detailRes.ok && detailRes.data ? detailRes.data : null;
-            const revisions = historyRes.ok && historyRes.data?.revisions ? historyRes.data.revisions : [];
+            const historyData = historyRes.ok && 'data' in historyRes ? historyRes.data : undefined;
+            const revisions = historyData?.revisions ?? [];
             setDetailPanel({
                 open: true,
                 loading: false,
@@ -451,6 +520,24 @@ export const ArticleExplorer = () => {
         };
         await openArticleDetail(fallbackNode, 'preview', result.localeVariantId, result.revisionId);
     }, [activeWorkspace, tree, openArticleDetail]);
+    const reloadCurrentDetail = useCallback(async () => {
+        if (!detailPanel.detail)
+            return;
+        const node = tree.find((item) => item.familyId === detailPanel.familyId) ?? {
+            familyId: detailPanel.familyId,
+            title: detailPanel.familyTitle,
+            familyStatus: RevisionState.LIVE,
+            locales: detailPanel.localeVariants
+        };
+        await openArticleDetail(node, 'relations', detailPanel.localeVariantId, detailPanel.detail.revision.id);
+    }, [detailPanel, tree, openArticleDetail]);
+    const openRelatedFamily = useCallback(async (relatedFamilyId) => {
+        const node = tree.find((item) => item.familyId === relatedFamilyId);
+        if (!node) {
+            return;
+        }
+        await openArticleDetail(node, 'relations');
+    }, [tree, openArticleDetail]);
     const filters = [
         { id: 'all', label: 'All Articles', count: filterCounts.all },
         { id: 'live', label: 'Live', count: filterCounts.live },
@@ -491,7 +578,7 @@ export const ArticleExplorer = () => {
                                     locales: detailPanel.localeVariants
                                 };
                                 await openArticleDetail(fallbackNode, detailPanel.activeTab, nextLocaleVariantId);
-                            }, children: detailPanel.localeVariants.map((locale) => (_jsxs("option", { value: locale.localeVariantId, children: [locale.locale, locale.revision.draftCount > 0 ? ` (${locale.revision.draftCount} drafts)` : ''] }, locale.localeVariantId))) })] })), _jsx("div", { className: "detail-tab-bar", role: "tablist", children: DETAIL_TAB_CONFIG.map((tab) => (_jsx("button", { role: "tab", "aria-selected": detailPanel.activeTab === tab.id, className: `detail-tab${detailPanel.activeTab === tab.id ? ' active' : ''}`, onClick: () => setDetailPanel((current) => ({ ...current, activeTab: tab.id })), children: tab.label }, tab.id))) }), detailPanel.activeTab === 'preview' && ((detailPanel.detail.sourceHtml || detailPanel.detail.previewHtml) ? (_jsxs(_Fragment, { children: [_jsx("div", { className: "detail-preview-frame-card", children: _jsx("iframe", { className: "detail-preview-frame", title: `Article preview ${detailPanel.familyTitle}`, srcDoc: buildArticlePreviewDocument(detailPanel.detail.previewHtml || detailPanel.detail.sourceHtml || '', detailPanel.familyTitle, previewStyleQuery.data?.css ?? '') }, `${detailPanel.familyId}-${detailPanel.localeVariantId}-${detailPanel.activeTab}`) }), _jsx(PlaceholderBlocks, { placeholders: detailPanel.detail.placeholders })] })) : (_jsx(EmptyState, { title: "No preview", description: "No preview HTML available for this article." }))), detailPanel.activeTab === 'source' && (detailPanel.detail.sourceHtml ? (_jsx("pre", { className: "detail-source-view", children: detailPanel.detail.sourceHtml })) : (_jsx(EmptyState, { title: "No source", description: "No source HTML available." }))), detailPanel.activeTab === 'history' && (_jsx(HistoryTimeline, { revisions: detailPanel.revisions })), detailPanel.activeTab === 'lineage' && (_jsx(LineagePanel, { entries: detailPanel.detail.lineage })), detailPanel.activeTab === 'publish' && (_jsx(PublishLogPanel, { records: detailPanel.detail.publishLog })), detailPanel.activeTab === 'pbis' && (_jsx(PBIPanel, { pbis: detailPanel.detail.relatedPbis }))] }));
+                            }, children: detailPanel.localeVariants.map((locale) => (_jsxs("option", { value: locale.localeVariantId, children: [locale.locale, locale.revision.draftCount > 0 ? ` (${locale.revision.draftCount} drafts)` : ''] }, locale.localeVariantId))) })] })), _jsx("div", { className: "detail-tab-bar", role: "tablist", children: DETAIL_TAB_CONFIG.map((tab) => (_jsx("button", { role: "tab", "aria-selected": detailPanel.activeTab === tab.id, className: `detail-tab${detailPanel.activeTab === tab.id ? ' active' : ''}`, onClick: () => setDetailPanel((current) => ({ ...current, activeTab: tab.id })), children: tab.label }, tab.id))) }), detailPanel.activeTab === 'preview' && ((detailPanel.detail.sourceHtml || detailPanel.detail.previewHtml) ? (_jsxs(_Fragment, { children: [_jsx("div", { className: "detail-preview-frame-card", children: _jsx("iframe", { className: "detail-preview-frame", title: `Article preview ${detailPanel.familyTitle}`, srcDoc: buildArticlePreviewDocument(detailPanel.detail.previewHtml || detailPanel.detail.sourceHtml || '', detailPanel.familyTitle, previewStyleQuery.data?.css ?? '') }, `${detailPanel.familyId}-${detailPanel.localeVariantId}-${detailPanel.activeTab}`) }), _jsx(PlaceholderBlocks, { placeholders: detailPanel.detail.placeholders })] })) : (_jsx(EmptyState, { title: "No preview", description: "No preview HTML available for this article." }))), detailPanel.activeTab === 'source' && (detailPanel.detail.sourceHtml ? (_jsx("pre", { className: "detail-source-view", children: detailPanel.detail.sourceHtml })) : (_jsx(EmptyState, { title: "No source", description: "No source HTML available." }))), detailPanel.activeTab === 'history' && (_jsx(HistoryTimeline, { revisions: detailPanel.revisions })), detailPanel.activeTab === 'lineage' && (_jsx(LineagePanel, { entries: detailPanel.detail.lineage })), detailPanel.activeTab === 'publish' && (_jsx(PublishLogPanel, { records: detailPanel.detail.publishLog })), detailPanel.activeTab === 'pbis' && (_jsx(PBIPanel, { pbis: detailPanel.detail.relatedPbis })), detailPanel.activeTab === 'relations' && activeWorkspace && (_jsx(RelationsPanel, { workspaceId: activeWorkspace.id, familyId: detailPanel.detail.familyId, relations: detailPanel.detail.relations, onChanged: reloadCurrentDetail, onOpenRelation: openRelatedFamily }))] }));
     };
     /* ---------- No workspace state ---------- */
     if (!activeWorkspace) {

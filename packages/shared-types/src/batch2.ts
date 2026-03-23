@@ -71,6 +71,44 @@ export enum PublishStatus {
   CANCELED = 'canceled'
 }
 
+export enum ArticleRelationType {
+  SAME_WORKFLOW = 'same_workflow',
+  PREREQUISITE = 'prerequisite',
+  FOLLOW_UP = 'follow_up',
+  PARENT_TOPIC = 'parent_topic',
+  CHILD_TOPIC = 'child_topic',
+  SHARED_SURFACE = 'shared_surface',
+  REPLACES = 'replaces',
+  SEE_ALSO = 'see_also'
+}
+
+export enum ArticleRelationDirection {
+  BIDIRECTIONAL = 'bidirectional',
+  LEFT_TO_RIGHT = 'left_to_right',
+  RIGHT_TO_LEFT = 'right_to_left'
+}
+
+export enum ArticleRelationOrigin {
+  INFERRED = 'inferred',
+  MANUAL = 'manual'
+}
+
+export enum ArticleRelationStatus {
+  ACTIVE = 'active',
+  SUPPRESSED = 'suppressed'
+}
+
+export enum ArticleRelationEvidenceType {
+  TITLE_TOKEN = 'title_token',
+  SECTION_MATCH = 'section_match',
+  CATEGORY_MATCH = 'category_match',
+  CONTENT_TOKEN = 'content_token',
+  EXTERNAL_KEY = 'external_key',
+  PBI_LINK = 'pbi_link',
+  MANUAL_NOTE = 'manual_note',
+  HEURISTIC = 'heuristic'
+}
+
 export interface WorkspaceRecord {
   id: EntityId;
   name: string;
@@ -563,6 +601,112 @@ export interface ArticlePublishRecord {
   publishedAtUtc: string;
 }
 
+export interface ArticleRelationEvidence {
+  id: EntityId;
+  relationId: EntityId;
+  evidenceType: ArticleRelationEvidenceType;
+  sourceRef?: string;
+  snippet?: string;
+  weight: number;
+  metadata?: unknown;
+}
+
+export interface ArticleRelationRecord {
+  id: EntityId;
+  workspaceId: EntityId;
+  relationType: ArticleRelationType;
+  direction: ArticleRelationDirection;
+  strengthScore: number;
+  status: ArticleRelationStatus;
+  origin: ArticleRelationOrigin;
+  runId?: EntityId;
+  createdAtUtc: string;
+  updatedAtUtc: string;
+  sourceFamily: {
+    id: EntityId;
+    title: string;
+    externalKey?: string;
+  };
+  targetFamily: {
+    id: EntityId;
+    title: string;
+    externalKey?: string;
+  };
+  evidence: ArticleRelationEvidence[];
+}
+
+export interface ArticleRelationSummary {
+  totalActive: number;
+  inferred: number;
+  manual: number;
+  lastRefreshedAtUtc?: string;
+  latestRunState?: 'running' | 'complete' | 'failed' | 'canceled';
+}
+
+export interface ArticleRelationsListRequest {
+  workspaceId: EntityId;
+  familyId?: EntityId;
+  localeVariantId?: EntityId;
+  batchId?: EntityId;
+  minScore?: number;
+  limit?: number;
+  includeEvidence?: boolean;
+}
+
+export interface ArticleRelationsListResponse {
+  workspaceId: EntityId;
+  seedFamilyIds: EntityId[];
+  total: number;
+  relations: ArticleRelationRecord[];
+}
+
+export interface ArticleRelationUpsertRequest {
+  workspaceId: EntityId;
+  sourceFamilyId: EntityId;
+  targetFamilyId: EntityId;
+  relationType: ArticleRelationType;
+  direction?: ArticleRelationDirection;
+  note?: string;
+}
+
+export interface ArticleRelationDeleteRequest {
+  workspaceId: EntityId;
+  relationId?: EntityId;
+  sourceFamilyId?: EntityId;
+  targetFamilyId?: EntityId;
+}
+
+export interface ArticleRelationRefreshRequest {
+  workspaceId: EntityId;
+  limitPerArticle?: number;
+}
+
+export interface ArticleRelationRefreshSummary {
+  totalArticles: number;
+  candidatePairs: number;
+  inferredRelations: number;
+  manualRelations: number;
+  suppressedRelations: number;
+}
+
+export interface ArticleRelationRefreshRun {
+  id: EntityId;
+  workspaceId: EntityId;
+  status: 'running' | 'complete' | 'failed' | 'canceled';
+  source: 'manual_refresh' | 'post_sync' | 'post_import';
+  triggeredBy?: string;
+  startedAtUtc: string;
+  endedAtUtc?: string;
+  agentSessionId?: string;
+  summary?: ArticleRelationRefreshSummary;
+}
+
+export interface ArticleRelationRefreshStatusResponse {
+  workspaceId: EntityId;
+  latestRun: ArticleRelationRefreshRun | null;
+  summary: ArticleRelationSummary;
+}
+
 export interface ArticleDetailRequest {
   workspaceId: EntityId;
   revisionId?: EntityId;
@@ -597,6 +741,8 @@ export interface ArticleDetailResponse {
   placeholders: PlaceholderToken[];
   lineage: LineageRecord[];
   relatedPbis: PBIRecord[];
+  relations: ArticleRelationRecord[];
+  relationSummary: ArticleRelationSummary;
   publishLog: ArticlePublishRecord[];
   filePath: string;
 }

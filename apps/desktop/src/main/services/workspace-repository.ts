@@ -26,6 +26,21 @@ import {
   type RevisionHistoryResponse,
   type ArticleDetailRequest,
   type ArticleDetailResponse,
+  type ArticleRelationDeleteRequest,
+  ArticleRelationDirection,
+  type ArticleRelationEvidence,
+  ArticleRelationEvidenceType,
+  type ArticleRelationRecord,
+  type ArticleRelationRefreshRun,
+  type ArticleRelationRefreshStatusResponse,
+  type ArticleRelationRefreshSummary,
+  type ArticleRelationSummary,
+  type ArticleRelationsListRequest,
+  type ArticleRelationsListResponse,
+  ArticleRelationOrigin,
+  ArticleRelationStatus,
+  ArticleRelationType,
+  type ArticleRelationUpsertRequest,
   type KbAccessMode,
   type AgentToolCallAudit,
   type PersistedAgentAnalysisRun,
@@ -86,6 +101,9 @@ const WORKSPACE_SCOPED_DB_TABLES = [
   'zendesk_credentials',
   'zendesk_sync_checkpoints',
   'zendesk_sync_runs',
+  'article_relation_runs',
+  'article_relations',
+  'article_relation_overrides'
 ] as const;
 const PBIBATCH_STATUS_SEQUENCE: Array<PBIBatchStatus> = [
   PBIBatchStatus.IMPORTED,
@@ -148,6 +166,25 @@ interface ProposalDbRow {
   decisionPayloadJson: string | null;
   decidedAtUtc: string | null;
   sessionId: string | null;
+}
+
+interface ArticleRelationDbRow {
+  id: string;
+  workspaceId: string;
+  leftFamilyId: string;
+  rightFamilyId: string;
+  relationType: ArticleRelationType;
+  direction: ArticleRelationDirection;
+  strengthScore: number;
+  status: ArticleRelationStatus;
+  origin: ArticleRelationOrigin;
+  runId: string | null;
+  createdAtUtc: string;
+  updatedAtUtc: string;
+  leftTitle: string;
+  leftExternalKey: string | null;
+  rightTitle: string;
+  rightExternalKey: string | null;
 }
 
 export interface WorkspaceMigrationHealth {
@@ -1667,6 +1704,573 @@ export class WorkspaceRepository {
     }
   }
 
+  async getArticleRelationsStatus(workspaceId: string): Promise<ArticleRelationRefreshStatusResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+
+    try {
+      const latestRun = workspaceDb.get<{
+        id: string;
+        workspace_id: string;
+        status: string;
+        source: string;
+        triggered_by: string | null;
+        agent_session_id: string | null;
+        started_at: string;
+        ended_at: string | null;
+        summary_json: string | null;
+      }>(
+        `SELECT id, workspace_id, status, source, triggered_by, agent_session_id, started_at, ended_at, summary_json
+         FROM article_relation_runs
+         WHERE workspace_id = @workspaceId
+         ORDER BY started_at DESC
+         LIMIT 1`,
+        { workspaceId }
+      );
+
+      const counts = workspaceDb.get<{
+        totalActive: number;
+        inferred: number;
+        manual: number;
+      }>(
+        `SELECT
+           COUNT(*) as totalActive,
+           SUM(CASE WHEN origin = 'inferred' THEN 1 ELSE 0 END) as inferred,
+           SUM(CASE WHEN origin = 'manual' THEN 1 ELSE 0 END) as manual
+         FROM article_relations
+         WHERE workspace_id = @workspaceId
+           AND status = @status`,
+        {
+          workspaceId,
+          status: ArticleRelationStatus.ACTIVE
+        }
+      );
+
+      const summary: ArticleRelationSummary = {
+        totalActive: counts?.totalActive ?? 0,
+        inferred: counts?.inferred ?? 0,
+        manual: counts?.manual ?? 0,
+        lastRefreshedAtUtc: latestRun?.ended_at ?? latestRun?.started_at,
+        latestRunState: normalizeRelationRunStatus(latestRun?.status)
+      };
+
+      return {
+        workspaceId,
+        latestRun: latestRun
+          ? {
+              id: latestRun.id,
+              workspaceId: latestRun.workspace_id,
+              status: normalizeRelationRunStatus(latestRun.status) ?? 'failed',
+              source: normalizeRelationRunSource(latestRun.source),
+              triggeredBy: latestRun.triggered_by ?? undefined,
+              startedAtUtc: latestRun.started_at,
+              endedAtUtc: latestRun.ended_at ?? undefined,
+              agentSessionId: latestRun.agent_session_id ?? undefined,
+              summary: safeParseJson<ArticleRelationRefreshSummary>(latestRun.summary_json) ?? undefined
+            }
+          : null,
+        summary
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async listArticleRelations(workspaceId: string, payload: ArticleRelationsListRequest): Promise<ArticleRelationsListResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+
+    try {
+      const seedFamilyIds = await this.resolveRelationSeedFamilyIds(workspaceId, workspaceDb, payload);
+      if (seedFamilyIds.length === 0) {
+        return {
+          workspaceId,
+          seedFamilyIds: [],
+          total: 0,
+          relations: []
+        };
+      }
+
+      const minScore = typeof payload.minScore === 'number' ? payload.minScore : 0;
+      const limit = clampRelationLimit(payload.limit ?? 24);
+      const includeEvidence = payload.includeEvidence !== false;
+      const params: Record<string, string | number> = {
+        workspaceId,
+        activeStatus: ArticleRelationStatus.ACTIVE,
+        minScore
+      };
+      const placeholders = seedFamilyIds.map((familyId, index) => {
+        const key = `seed${index}`;
+        params[key] = familyId;
+        return `@${key}`;
+      }).join(', ');
+
+      const rows = workspaceDb.all<ArticleRelationDbRow>(
+        `SELECT
+           r.id,
+           r.workspace_id as workspaceId,
+           r.left_family_id as leftFamilyId,
+           r.right_family_id as rightFamilyId,
+           r.relation_type as relationType,
+           r.direction as direction,
+           r.strength_score as strengthScore,
+           r.status as status,
+           r.origin as origin,
+           r.run_id as runId,
+           r.created_at as createdAtUtc,
+           r.updated_at as updatedAtUtc,
+           left_f.title as leftTitle,
+           left_f.external_key as leftExternalKey,
+           right_f.title as rightTitle,
+           right_f.external_key as rightExternalKey
+         FROM article_relations r
+         JOIN article_families left_f ON left_f.id = r.left_family_id
+         JOIN article_families right_f ON right_f.id = r.right_family_id
+         WHERE r.workspace_id = @workspaceId
+           AND r.status = @activeStatus
+           AND r.strength_score >= @minScore
+           AND (r.left_family_id IN (${placeholders}) OR r.right_family_id IN (${placeholders}))
+         ORDER BY r.strength_score DESC, r.updated_at DESC
+         LIMIT ${limit}`
+        ,
+        params
+      );
+
+      const relations = rows.map((row) => this.mapArticleRelationRow(row, workspaceDb, includeEvidence));
+      return {
+        workspaceId,
+        seedFamilyIds,
+        total: relations.length,
+        relations
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async upsertManualArticleRelation(payload: ArticleRelationUpsertRequest): Promise<ArticleRelationRecord> {
+    const workspace = await this.getWorkspace(payload.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+
+    try {
+      const now = new Date().toISOString();
+      const pair = normalizeFamilyPair(payload.sourceFamilyId, payload.targetFamilyId);
+      const direction = payload.direction ?? ArticleRelationDirection.BIDIRECTIONAL;
+      const existing = workspaceDb.get<{ id: string }>(
+        `SELECT id
+         FROM article_relations
+         WHERE workspace_id = @workspaceId
+           AND left_family_id = @leftFamilyId
+           AND right_family_id = @rightFamilyId
+           AND relation_type = @relationType
+           AND origin = @origin`,
+        {
+          workspaceId: payload.workspaceId,
+          leftFamilyId: pair.leftFamilyId,
+          rightFamilyId: pair.rightFamilyId,
+          relationType: payload.relationType,
+          origin: ArticleRelationOrigin.MANUAL
+        }
+      );
+      const relationId = existing?.id ?? randomUUID();
+
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      try {
+        workspaceDb.run(
+          `INSERT INTO article_relations (
+             id, workspace_id, left_family_id, right_family_id, relation_type, direction, strength_score, status, origin, run_id, created_at, updated_at
+           ) VALUES (
+             @id, @workspaceId, @leftFamilyId, @rightFamilyId, @relationType, @direction, @strengthScore, @status, @origin, NULL, @createdAt, @updatedAt
+           )
+           ON CONFLICT(id) DO UPDATE SET
+             relation_type = excluded.relation_type,
+             direction = excluded.direction,
+             strength_score = excluded.strength_score,
+             status = excluded.status,
+             updated_at = excluded.updated_at`,
+          {
+            id: relationId,
+            workspaceId: payload.workspaceId,
+            leftFamilyId: pair.leftFamilyId,
+            rightFamilyId: pair.rightFamilyId,
+            relationType: payload.relationType,
+            direction,
+            strengthScore: 1,
+            status: ArticleRelationStatus.ACTIVE,
+            origin: ArticleRelationOrigin.MANUAL,
+            createdAt: now,
+            updatedAt: now
+          }
+        );
+
+        workspaceDb.run(
+          `DELETE FROM article_relation_overrides
+           WHERE workspace_id = @workspaceId
+             AND left_family_id = @leftFamilyId
+             AND right_family_id = @rightFamilyId
+             AND override_type = 'force_remove'`,
+          {
+            workspaceId: payload.workspaceId,
+            leftFamilyId: pair.leftFamilyId,
+            rightFamilyId: pair.rightFamilyId
+          }
+        );
+
+        if (payload.note?.trim()) {
+          workspaceDb.run(
+            `DELETE FROM article_relation_evidence
+             WHERE relation_id = @relationId
+               AND evidence_type = @evidenceType`,
+            {
+              relationId,
+              evidenceType: ArticleRelationEvidenceType.MANUAL_NOTE
+            }
+          );
+
+          workspaceDb.run(
+            `INSERT INTO article_relation_evidence (
+               id, relation_id, evidence_type, source_ref, snippet, weight, metadata_json
+             ) VALUES (
+               @id, @relationId, @evidenceType, NULL, @snippet, @weight, NULL
+             )`,
+            {
+              id: randomUUID(),
+              relationId,
+              evidenceType: ArticleRelationEvidenceType.MANUAL_NOTE,
+              snippet: payload.note.trim(),
+              weight: 1
+            }
+          );
+        }
+
+        workspaceDb.exec('COMMIT');
+      } catch (error) {
+        workspaceDb.exec('ROLLBACK');
+        throw error;
+      }
+
+      const row = workspaceDb.get<ArticleRelationDbRow>(
+        `SELECT
+           r.id,
+           r.workspace_id as workspaceId,
+           r.left_family_id as leftFamilyId,
+           r.right_family_id as rightFamilyId,
+           r.relation_type as relationType,
+           r.direction as direction,
+           r.strength_score as strengthScore,
+           r.status as status,
+           r.origin as origin,
+           r.run_id as runId,
+           r.created_at as createdAtUtc,
+           r.updated_at as updatedAtUtc,
+           left_f.title as leftTitle,
+           left_f.external_key as leftExternalKey,
+           right_f.title as rightTitle,
+           right_f.external_key as rightExternalKey
+         FROM article_relations r
+         JOIN article_families left_f ON left_f.id = r.left_family_id
+         JOIN article_families right_f ON right_f.id = r.right_family_id
+         WHERE r.id = @id`,
+        { id: relationId }
+      );
+
+      if (!row) {
+        throw new Error('Article relation not found');
+      }
+
+      return this.mapArticleRelationRow(row, workspaceDb, true);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async deleteArticleRelation(payload: ArticleRelationDeleteRequest): Promise<{ workspaceId: string; relationId?: string }> {
+    const workspace = await this.getWorkspace(payload.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+
+    try {
+      let pair: { leftFamilyId: string; rightFamilyId: string } | null = null;
+      let relationId = payload.relationId;
+      let relationOrigin: ArticleRelationOrigin | null = null;
+
+      if (payload.relationId) {
+        const relation = workspaceDb.get<{
+          id: string;
+          leftFamilyId: string;
+          rightFamilyId: string;
+          origin: ArticleRelationOrigin;
+        }>(
+          `SELECT id, left_family_id as leftFamilyId, right_family_id as rightFamilyId, origin
+           FROM article_relations
+           WHERE id = @id AND workspace_id = @workspaceId`,
+          {
+            id: payload.relationId,
+            workspaceId: payload.workspaceId
+          }
+        );
+        if (relation) {
+          pair = {
+            leftFamilyId: relation.leftFamilyId,
+            rightFamilyId: relation.rightFamilyId
+          };
+          relationOrigin = relation.origin;
+        }
+      } else if (payload.sourceFamilyId && payload.targetFamilyId) {
+        pair = normalizeFamilyPair(payload.sourceFamilyId, payload.targetFamilyId);
+      }
+
+      if (!pair) {
+        throw new Error('Article relation not found');
+      }
+
+      const now = new Date().toISOString();
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      try {
+        if (relationId && relationOrigin === ArticleRelationOrigin.MANUAL) {
+          workspaceDb.run(`DELETE FROM article_relation_evidence WHERE relation_id = @relationId`, { relationId });
+          workspaceDb.run(`DELETE FROM article_relations WHERE id = @relationId`, { relationId });
+        } else if (relationId) {
+          workspaceDb.run(
+            `UPDATE article_relations
+             SET status = @status, updated_at = @updatedAt
+             WHERE id = @relationId`,
+            {
+              relationId,
+              status: ArticleRelationStatus.SUPPRESSED,
+              updatedAt: now
+            }
+          );
+        }
+
+        workspaceDb.run(
+          `INSERT INTO article_relation_overrides (
+             id, workspace_id, left_family_id, right_family_id, override_type, relation_type, note, created_by, created_at, updated_at
+           ) VALUES (
+             @id, @workspaceId, @leftFamilyId, @rightFamilyId, 'force_remove', '', NULL, 'user', @createdAt, @updatedAt
+           )
+           ON CONFLICT(workspace_id, left_family_id, right_family_id, override_type, relation_type) DO UPDATE SET
+             updated_at = excluded.updated_at`,
+          {
+            id: randomUUID(),
+            workspaceId: payload.workspaceId,
+            leftFamilyId: pair.leftFamilyId,
+            rightFamilyId: pair.rightFamilyId,
+            createdAt: now,
+            updatedAt: now
+          }
+        );
+        workspaceDb.exec('COMMIT');
+      } catch (error) {
+        workspaceDb.exec('ROLLBACK');
+        throw error;
+      }
+
+      return {
+        workspaceId: payload.workspaceId,
+        relationId
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async refreshArticleRelations(workspaceId: string, options?: { limitPerArticle?: number; source?: ArticleRelationRefreshRun['source']; triggeredBy?: string }): Promise<ArticleRelationRefreshRun> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+
+    const runId = randomUUID();
+    const startedAtUtc = new Date().toISOString();
+    const source = options?.source ?? 'manual_refresh';
+    const triggeredBy = options?.triggeredBy ?? 'user';
+
+    try {
+      workspaceDb.run(
+        `INSERT INTO article_relation_runs (
+           id, workspace_id, status, source, triggered_by, started_at
+         ) VALUES (
+           @id, @workspaceId, @status, @source, @triggeredBy, @startedAt
+         )`,
+        {
+          id: runId,
+          workspaceId,
+          status: 'running',
+          source,
+          triggeredBy,
+          startedAt: startedAtUtc
+        }
+      );
+
+      const corpus = await this.buildArticleRelationCorpus(workspace.path, workspaceDb);
+      const inferred = buildInferredRelationCandidates(corpus, clampRelationLimit(options?.limitPerArticle ?? 12));
+      const summary: ArticleRelationRefreshSummary = {
+        totalArticles: corpus.length,
+        candidatePairs: inferred.candidatePairs,
+        inferredRelations: inferred.relations.length,
+        manualRelations: 0,
+        suppressedRelations: 0
+      };
+
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      try {
+        const previousInferredIds = workspaceDb.all<{ id: string }>(
+          `SELECT id FROM article_relations WHERE workspace_id = @workspaceId AND origin = @origin`,
+          {
+            workspaceId,
+            origin: ArticleRelationOrigin.INFERRED
+          }
+        );
+        if (previousInferredIds.length > 0) {
+          const params: Record<string, string> = {};
+          const placeholders = previousInferredIds.map((row, index) => {
+            const key = `id${index}`;
+            params[key] = row.id;
+            return `@${key}`;
+          }).join(', ');
+          workspaceDb.run(`DELETE FROM article_relation_evidence WHERE relation_id IN (${placeholders})`, params);
+          workspaceDb.run(`DELETE FROM article_relations WHERE id IN (${placeholders})`, params);
+        }
+
+        const insertRelation = workspaceDb.prepare(
+          `INSERT INTO article_relations (
+             id, workspace_id, left_family_id, right_family_id, relation_type, direction, strength_score, status, origin, run_id, created_at, updated_at
+           ) VALUES (
+             @id, @workspaceId, @leftFamilyId, @rightFamilyId, @relationType, @direction, @strengthScore, @status, @origin, @runId, @createdAt, @updatedAt
+           )`
+        );
+        const insertEvidence = workspaceDb.prepare(
+          `INSERT INTO article_relation_evidence (
+             id, relation_id, evidence_type, source_ref, snippet, weight, metadata_json
+           ) VALUES (
+             @id, @relationId, @evidenceType, @sourceRef, @snippet, @weight, @metadataJson
+           )`
+        );
+
+        for (const relation of inferred.relations) {
+          insertRelation.run({
+            id: relation.id,
+            workspaceId,
+            leftFamilyId: relation.leftFamilyId,
+            rightFamilyId: relation.rightFamilyId,
+            relationType: relation.relationType,
+            direction: relation.direction,
+            strengthScore: relation.strengthScore,
+            status: ArticleRelationStatus.ACTIVE,
+            origin: ArticleRelationOrigin.INFERRED,
+            runId,
+            createdAt: startedAtUtc,
+            updatedAt: startedAtUtc
+          });
+          for (const evidence of relation.evidence) {
+            insertEvidence.run({
+              id: randomUUID(),
+              relationId: relation.id,
+              evidenceType: evidence.evidenceType,
+              sourceRef: evidence.sourceRef ?? null,
+              snippet: evidence.snippet ?? null,
+              weight: evidence.weight,
+              metadataJson: evidence.metadata ? JSON.stringify(evidence.metadata) : null
+            });
+          }
+        }
+
+        const manualCounts = workspaceDb.get<{ total: number }>(
+          `SELECT COUNT(*) as total
+           FROM article_relations
+           WHERE workspace_id = @workspaceId
+             AND origin = @origin
+             AND status = @status`,
+          {
+            workspaceId,
+            origin: ArticleRelationOrigin.MANUAL,
+            status: ArticleRelationStatus.ACTIVE
+          }
+        );
+        summary.manualRelations = manualCounts?.total ?? 0;
+
+        const suppressions = workspaceDb.all<{ leftFamilyId: string; rightFamilyId: string }>(
+          `SELECT left_family_id as leftFamilyId, right_family_id as rightFamilyId
+           FROM article_relation_overrides
+           WHERE workspace_id = @workspaceId
+             AND override_type = 'force_remove'`,
+          { workspaceId }
+        );
+        summary.suppressedRelations = suppressions.length;
+        for (const suppression of suppressions) {
+          workspaceDb.run(
+            `UPDATE article_relations
+             SET status = @status, updated_at = @updatedAt
+             WHERE workspace_id = @workspaceId
+               AND left_family_id = @leftFamilyId
+               AND right_family_id = @rightFamilyId`,
+            {
+              workspaceId,
+              leftFamilyId: suppression.leftFamilyId,
+              rightFamilyId: suppression.rightFamilyId,
+              status: ArticleRelationStatus.SUPPRESSED,
+              updatedAt: startedAtUtc
+            }
+          );
+        }
+
+        workspaceDb.run(
+          `UPDATE article_relation_runs
+           SET status = 'complete',
+               ended_at = @endedAt,
+               summary_json = @summaryJson
+           WHERE id = @id`,
+          {
+            id: runId,
+            endedAt: new Date().toISOString(),
+            summaryJson: JSON.stringify(summary)
+          }
+        );
+        workspaceDb.exec('COMMIT');
+      } catch (error) {
+        workspaceDb.exec('ROLLBACK');
+        throw error;
+      }
+
+      return {
+        id: runId,
+        workspaceId,
+        status: 'complete',
+        source,
+        triggeredBy,
+        startedAtUtc,
+        endedAtUtc: new Date().toISOString(),
+        summary
+      };
+    } catch (error) {
+      workspaceDb.run(
+        `UPDATE article_relation_runs
+         SET status = 'failed',
+             ended_at = @endedAt,
+             summary_json = @summaryJson
+         WHERE id = @id`,
+        {
+          id: runId,
+          endedAt: new Date().toISOString(),
+          summaryJson: JSON.stringify({
+            totalArticles: 0,
+            candidatePairs: 0,
+            inferredRelations: 0,
+            manualRelations: 0,
+            suppressedRelations: 0,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        }
+      );
+      throw error;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async createPBIBatch(
     workspaceId: string,
     batchName: string,
@@ -3161,6 +3765,14 @@ export class WorkspaceRepository {
             { revisionId: revision.id }
           );
 
+      const relationSummaryStatus = await this.getArticleRelationsStatus(workspaceId);
+      const relationResults = await this.listArticleRelations(workspaceId, {
+        workspaceId,
+        familyId: family.id,
+        limit: 16,
+        includeEvidence: true
+      });
+
       return {
         workspaceId,
         familyId: family.id,
@@ -3184,6 +3796,8 @@ export class WorkspaceRepository {
         placeholders,
         lineage,
         relatedPbis,
+        relations: relationResults.relations,
+        relationSummary: relationSummaryStatus.summary,
         publishLog: publishLog.map((record) => ({
           id: record.id,
           revisionId: record.revision_id,
@@ -3804,6 +4418,197 @@ export class WorkspaceRepository {
         { defaultId: fallback.id }
       );
     }
+  }
+
+  private mapArticleRelationRow(
+    row: ArticleRelationDbRow,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    includeEvidence: boolean
+  ): ArticleRelationRecord {
+    const evidence = includeEvidence
+      ? workspaceDb.all<{
+          id: string;
+          relation_id: string;
+          evidence_type: ArticleRelationEvidenceType;
+          source_ref: string | null;
+          snippet: string | null;
+          weight: number;
+          metadata_json: string | null;
+        }>(
+          `SELECT id, relation_id, evidence_type, source_ref, snippet, weight, metadata_json
+           FROM article_relation_evidence
+           WHERE relation_id = @relationId
+           ORDER BY weight DESC, id ASC`,
+          { relationId: row.id }
+        ).map((evidenceRow): ArticleRelationEvidence => ({
+          id: evidenceRow.id,
+          relationId: evidenceRow.relation_id,
+          evidenceType: evidenceRow.evidence_type,
+          sourceRef: evidenceRow.source_ref ?? undefined,
+          snippet: evidenceRow.snippet ?? undefined,
+          weight: evidenceRow.weight,
+          metadata: safeParseJson(evidenceRow.metadata_json)
+        }))
+      : [];
+
+    return {
+      id: row.id,
+      workspaceId: row.workspaceId,
+      relationType: row.relationType,
+      direction: row.direction,
+      strengthScore: row.strengthScore,
+      status: row.status,
+      origin: row.origin,
+      runId: row.runId ?? undefined,
+      createdAtUtc: row.createdAtUtc,
+      updatedAtUtc: row.updatedAtUtc,
+      sourceFamily: {
+        id: row.leftFamilyId,
+        title: row.leftTitle,
+        externalKey: row.leftExternalKey ?? undefined
+      },
+      targetFamily: {
+        id: row.rightFamilyId,
+        title: row.rightTitle,
+        externalKey: row.rightExternalKey ?? undefined
+      },
+      evidence
+    };
+  }
+
+  private async resolveRelationSeedFamilyIds(
+    workspaceId: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    payload: ArticleRelationsListRequest
+  ): Promise<string[]> {
+    if (payload.familyId) {
+      return [payload.familyId];
+    }
+
+    if (payload.localeVariantId) {
+      const variant = workspaceDb.get<{ familyId: string }>(
+        `SELECT family_id as familyId FROM locale_variants WHERE id = @id`,
+        { id: payload.localeVariantId }
+      );
+      return variant ? [variant.familyId] : [];
+    }
+
+    if (!payload.batchId) {
+      return [];
+    }
+
+    const proposalFamilies = workspaceDb.all<{ familyId: string }>(
+      `SELECT DISTINCT COALESCE(p.family_id, lv.family_id) as familyId
+       FROM proposals p
+       LEFT JOIN locale_variants lv ON lv.id = p.locale_variant_id
+       WHERE p.batch_id = @batchId
+         AND COALESCE(p.family_id, lv.family_id) IS NOT NULL`,
+      { batchId: payload.batchId }
+    );
+    if (proposalFamilies.length > 0) {
+      return proposalFamilies.map((row) => row.familyId);
+    }
+
+    const pbiRows = workspaceDb.all<{ title: string }>(
+      `SELECT title
+       FROM pbi_records
+       WHERE batch_id = @batchId
+         AND validation_status = @candidateStatus
+       ORDER BY source_row_number ASC
+       LIMIT 8`,
+      {
+        batchId: payload.batchId,
+        candidateStatus: PBIValidationStatus.CANDIDATE
+      }
+    );
+    const seedFamilyIds = new Set<string>();
+    for (const row of pbiRows) {
+      const results = await this.searchArticles(workspaceId, {
+        workspaceId,
+        query: row.title,
+        scope: 'all',
+        includeArchived: true
+      });
+      const top = results.results[0];
+      if (top?.familyId) {
+        seedFamilyIds.add(top.familyId);
+      }
+    }
+    return Array.from(seedFamilyIds);
+  }
+
+  private async buildArticleRelationCorpus(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>
+  ): Promise<ArticleRelationCorpusItem[]> {
+    const families = workspaceDb.all<{
+      id: string;
+      title: string;
+      externalKey: string;
+      sectionId: string | null;
+      categoryId: string | null;
+    }>(
+      `SELECT id, title, external_key as externalKey, section_id as sectionId, category_id as categoryId
+       FROM article_families
+       WHERE retired_at IS NULL
+       ORDER BY title COLLATE NOCASE`
+    );
+    const variants = workspaceDb.all<{
+      id: string;
+      familyId: string;
+      locale: string;
+      status: RevisionState;
+    }>(
+      `SELECT id, family_id as familyId, locale, status
+       FROM locale_variants
+       WHERE status != @retiredStatus`,
+      { retiredStatus: RevisionState.RETIRED }
+    );
+    const revisions = workspaceDb.all<{
+      id: string;
+      locale_variant_id: string;
+      revision_number: number;
+      revision_type: RevisionState;
+      file_path: string;
+      updated_at: string;
+    }>(
+      `SELECT id, locale_variant_id, revision_number, revision_type, file_path, updated_at
+       FROM revisions`
+    );
+    const latestByVariant = getLatestRevisions(revisions.map((revision) => ({
+      id: revision.id,
+      localeVariantId: revision.locale_variant_id,
+      revisionNumber: revision.revision_number,
+      revisionType: revision.revision_type,
+      filePath: revision.file_path,
+      updatedAtUtc: revision.updated_at
+    })));
+    const variantsByFamily = new Map<string, Array<{ id: string; locale: string }>>();
+    for (const variant of variants) {
+      const bucket = variantsByFamily.get(variant.familyId) ?? [];
+      bucket.push({ id: variant.id, locale: variant.locale });
+      variantsByFamily.set(variant.familyId, bucket);
+    }
+
+    const corpus: ArticleRelationCorpusItem[] = [];
+    for (const family of families) {
+      const familyVariants = variantsByFamily.get(family.id) ?? [];
+      const chosenVariant = familyVariants.find((variant) => variant.locale.toLowerCase().startsWith('en'))
+        ?? familyVariants[0];
+      let bodyText = '';
+      if (chosenVariant) {
+        const revision = latestByVariant.get(chosenVariant.id);
+        if (revision?.filePath) {
+          const absolutePath = resolveRevisionPath(workspacePath, revision.filePath);
+          if (await this.fileExists(absolutePath)) {
+            bodyText = await this.readRevisionSource(absolutePath);
+          }
+        }
+      }
+      corpus.push(buildCorpusItemFromFamily(family, bodyText));
+    }
+
+    return corpus;
   }
 
   private openWorkspaceDbWithRecovery(dbPath: string) {
@@ -4655,6 +5460,243 @@ function getLatestRevisions(revisions: LatestRevisionForMap[]): Map<string, Revi
     }
   });
   return latest;
+}
+
+interface ArticleRelationCorpusItem {
+  familyId: string;
+  title: string;
+  externalKey: string;
+  sectionId?: string;
+  categoryId?: string;
+  titleTokens: string[];
+  contentTokens: string[];
+}
+
+interface InferredRelationCandidate {
+  id: string;
+  leftFamilyId: string;
+  rightFamilyId: string;
+  relationType: ArticleRelationType;
+  direction: ArticleRelationDirection;
+  strengthScore: number;
+  evidence: Array<{
+    evidenceType: ArticleRelationEvidenceType;
+    sourceRef?: string;
+    snippet?: string;
+    weight: number;
+    metadata?: unknown;
+  }>;
+}
+
+function buildCorpusItemFromFamily(
+  family: { id: string; title: string; externalKey: string; sectionId: string | null; categoryId: string | null },
+  bodyHtml: string
+): ArticleRelationCorpusItem {
+  const titleTokens = tokenizeRelationText(`${family.title} ${family.externalKey}`).slice(0, 18);
+  const contentTokens = tokenizeRelationText(stripHtml(bodyHtml)).slice(0, 36);
+  return {
+    familyId: family.id,
+    title: family.title,
+    externalKey: family.externalKey,
+    sectionId: family.sectionId ?? undefined,
+    categoryId: family.categoryId ?? undefined,
+    titleTokens,
+    contentTokens
+  };
+}
+
+function buildInferredRelationCandidates(
+  corpus: ArticleRelationCorpusItem[],
+  limitPerArticle: number
+): { candidatePairs: number; relations: InferredRelationCandidate[] } {
+  const byId = new Map(corpus.map((item) => [item.familyId, item]));
+  const tokenIndex = new Map<string, string[]>();
+
+  for (const item of corpus) {
+    const uniqueTokens = new Set([...item.titleTokens, ...item.contentTokens.slice(0, 16)]);
+    for (const token of uniqueTokens) {
+      const bucket = tokenIndex.get(token) ?? [];
+      bucket.push(item.familyId);
+      tokenIndex.set(token, bucket);
+    }
+  }
+
+  const scoresByPair = new Map<string, {
+    score: number;
+    titleOverlap: string[];
+    contentOverlap: string[];
+    sectionMatch: boolean;
+    categoryMatch: boolean;
+  }>();
+
+  for (const item of corpus) {
+    const candidateScores = new Map<string, { score: number; titleOverlap: string[]; contentOverlap: string[] }>();
+    for (const token of item.titleTokens) {
+      const matches = tokenIndex.get(token) ?? [];
+      if (matches.length < 2 || matches.length > 40) {
+        continue;
+      }
+      for (const candidateId of matches) {
+        if (candidateId === item.familyId) {
+          continue;
+        }
+        const current = candidateScores.get(candidateId) ?? { score: 0, titleOverlap: [], contentOverlap: [] };
+        current.score += 1.35;
+        if (!current.titleOverlap.includes(token)) {
+          current.titleOverlap.push(token);
+        }
+        candidateScores.set(candidateId, current);
+      }
+    }
+    for (const token of item.contentTokens) {
+      const matches = tokenIndex.get(token) ?? [];
+      if (matches.length < 2 || matches.length > 24) {
+        continue;
+      }
+      for (const candidateId of matches) {
+        if (candidateId === item.familyId) {
+          continue;
+        }
+        const current = candidateScores.get(candidateId) ?? { score: 0, titleOverlap: [], contentOverlap: [] };
+        current.score += 0.35;
+        if (current.contentOverlap.length < 6 && !current.contentOverlap.includes(token)) {
+          current.contentOverlap.push(token);
+        }
+        candidateScores.set(candidateId, current);
+      }
+    }
+
+    const ranked = Array.from(candidateScores.entries())
+      .map(([candidateId, value]) => ({ candidateId, ...value }))
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limitPerArticle);
+
+    for (const candidate of ranked) {
+      const other = byId.get(candidate.candidateId);
+      if (!other) {
+        continue;
+      }
+      const pair = normalizeFamilyPair(item.familyId, other.familyId);
+      const key = `${pair.leftFamilyId}:${pair.rightFamilyId}`;
+      const existing = scoresByPair.get(key) ?? {
+        score: 0,
+        titleOverlap: [],
+        contentOverlap: [],
+        sectionMatch: false,
+        categoryMatch: false
+      };
+      existing.score = Math.max(existing.score, candidate.score);
+      existing.titleOverlap = Array.from(new Set([...existing.titleOverlap, ...candidate.titleOverlap])).slice(0, 6);
+      existing.contentOverlap = Array.from(new Set([...existing.contentOverlap, ...candidate.contentOverlap])).slice(0, 6);
+      existing.sectionMatch = existing.sectionMatch || Boolean(item.sectionId && other.sectionId && item.sectionId === other.sectionId);
+      existing.categoryMatch = existing.categoryMatch || Boolean(item.categoryId && other.categoryId && item.categoryId === other.categoryId);
+      if (existing.sectionMatch) {
+        existing.score += 0.75;
+      }
+      if (existing.categoryMatch) {
+        existing.score += 0.3;
+      }
+      scoresByPair.set(key, existing);
+    }
+  }
+
+  const relations: InferredRelationCandidate[] = [];
+  for (const [key, value] of scoresByPair.entries()) {
+    if (value.score < 1.5) {
+      continue;
+    }
+    const [leftFamilyId, rightFamilyId] = key.split(':');
+    const evidence: InferredRelationCandidate['evidence'] = [];
+    if (value.titleOverlap.length > 0) {
+      evidence.push({
+        evidenceType: ArticleRelationEvidenceType.TITLE_TOKEN,
+        snippet: `Shared title tokens: ${value.titleOverlap.join(', ')}`,
+        weight: Math.min(1, value.titleOverlap.length / 4)
+      });
+    }
+    if (value.contentOverlap.length > 0) {
+      evidence.push({
+        evidenceType: ArticleRelationEvidenceType.CONTENT_TOKEN,
+        snippet: `Shared content terms: ${value.contentOverlap.join(', ')}`,
+        weight: Math.min(0.9, value.contentOverlap.length / 8)
+      });
+    }
+    if (value.sectionMatch) {
+      evidence.push({
+        evidenceType: ArticleRelationEvidenceType.SECTION_MATCH,
+        snippet: 'Articles are in the same section',
+        weight: 0.85
+      });
+    }
+    if (value.categoryMatch) {
+      evidence.push({
+        evidenceType: ArticleRelationEvidenceType.CATEGORY_MATCH,
+        snippet: 'Articles are in the same category',
+        weight: 0.45
+      });
+    }
+
+    relations.push({
+      id: randomUUID(),
+      leftFamilyId,
+      rightFamilyId,
+      relationType: value.sectionMatch ? ArticleRelationType.SAME_WORKFLOW : ArticleRelationType.SHARED_SURFACE,
+      direction: ArticleRelationDirection.BIDIRECTIONAL,
+      strengthScore: Number(Math.min(1, value.score / 4.5).toFixed(3)),
+      evidence
+    });
+  }
+
+  relations.sort((left, right) => right.strengthScore - left.strengthScore);
+  return {
+    candidatePairs: scoresByPair.size,
+    relations
+  };
+}
+
+function tokenizeRelationText(input: string): string[] {
+  const normalized = input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  if (!normalized) {
+    return [];
+  }
+  const stopWords = new Set([
+    'the', 'and', 'for', 'with', 'your', 'from', 'that', 'this', 'into', 'using', 'use',
+    'how', 'what', 'when', 'where', 'why', 'are', 'can', 'not', 'all', 'you', 'our', 'but',
+    'about', 'set', 'get', 'new', 'edit', 'article', 'articles', 'help', 'center'
+  ]);
+  return normalized
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && !stopWords.has(token));
+}
+
+function normalizeFamilyPair(sourceFamilyId: string, targetFamilyId: string): { leftFamilyId: string; rightFamilyId: string } {
+  return sourceFamilyId.localeCompare(targetFamilyId) <= 0
+    ? { leftFamilyId: sourceFamilyId, rightFamilyId: targetFamilyId }
+    : { leftFamilyId: targetFamilyId, rightFamilyId: sourceFamilyId };
+}
+
+function normalizeRelationRunStatus(value?: string | null): ArticleRelationRefreshRun['status'] | undefined {
+  if (value === 'running' || value === 'complete' || value === 'failed' || value === 'canceled') {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeRelationRunSource(value?: string | null): ArticleRelationRefreshRun['source'] {
+  if (value === 'post_sync' || value === 'post_import') {
+    return value;
+  }
+  return 'manual_refresh';
+}
+
+function clampRelationLimit(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 24;
+  }
+  return Math.max(1, Math.min(100, Math.floor(value)));
 }
 
 function mapWorkspaceRow(row: CatalogWorkspaceRow): WorkspaceRecord {

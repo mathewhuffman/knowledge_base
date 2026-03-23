@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
-import { PBIValidationStatus, ProposalAction, type SearchPayload } from '@kb-vault/shared-types';
+import { ProposalAction, type SearchPayload } from '@kb-vault/shared-types';
 import { WorkspaceRepository } from './workspace-repository';
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
@@ -293,67 +293,33 @@ export class KbCliLoopbackService {
       if (request.method === 'POST' && segments[2] === 'articles' && segments[3] === 'related') {
         const body = await readJsonBody(request);
         const articleId = typeof body.articleId === 'string' ? body.articleId : undefined;
+        const familyId = typeof body.familyId === 'string' ? body.familyId : undefined;
         const batchId = typeof body.batchId === 'string' ? body.batchId : undefined;
         const limit = clampLimit(body.limit) ?? 10;
+        const minScore = typeof body.minScore === 'number' ? body.minScore : undefined;
+        const includeEvidence = body.includeEvidence !== false;
 
-        if (!articleId && !batchId) {
+        if (!articleId && !familyId && !batchId) {
           sendJson(response, 400, {
             ok: false,
-            error: 'Either articleId or batchId is required.'
+            error: 'Either articleId, familyId, or batchId is required.'
           });
           return;
         }
-
-        let query = '';
-
-        if (articleId) {
-          try {
-            const article = await this.workspaceRepository.getLocaleVariant(workspaceId, articleId);
-            const family = await this.workspaceRepository.getArticleFamily(workspaceId, article.familyId);
-            const title = family.title?.trim();
-            const externalKey = (family.externalKey ?? '').trim();
-            query = title || externalKey;
-          } catch {
-            query = '';
-          }
-        }
-
-        if (!query && batchId) {
-          let pbiRecords = await this.workspaceRepository.getPBIRecords(workspaceId, batchId, [PBIValidationStatus.CANDIDATE]);
-
-          if (!pbiRecords.length) {
-            pbiRecords = await this.workspaceRepository.getPBIRecords(workspaceId, batchId);
-          }
-
-          if (pbiRecords.length > 0) {
-            query = pbiRecords
-              .slice(0, 3)
-              .map((record) => record.title)
-              .filter((title): title is string => Boolean(title?.trim()))
-              .join(' ');
-          }
-        }
-
-        if (!query) {
-          sendJson(response, 200, { ok: true, total: 0, results: [] });
-          return;
-        }
-
-        const result = await this.workspaceRepository.searchArticles(workspaceId, {
+        const result = await this.workspaceRepository.listArticleRelations(workspaceId, {
           workspaceId,
-          query,
-          scope: 'all',
-          includeArchived: true
+          localeVariantId: articleId,
+          familyId,
+          batchId,
+          limit,
+          minScore,
+          includeEvidence
         });
-        const limitedResults = typeof limit === 'number'
-          ? result.results.slice(0, limit)
-          : result.results;
 
         sendJson(response, 200, {
           ok: true,
-          workspaceId,
-          total: limitedResults.length,
-          results: limitedResults
+          ...result,
+          results: result.relations
         });
         return;
       }

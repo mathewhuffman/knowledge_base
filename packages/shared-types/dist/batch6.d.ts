@@ -200,9 +200,14 @@ export interface MCPGetLocaleVariantInput extends MCPToolInput {
     familyId: string;
 }
 export interface MCPFindRelatedArticlesInput extends MCPToolInput {
-    query: string;
+    query?: string;
+    articleId?: string;
+    familyId?: string;
+    batchId?: string;
     locale?: string;
     max?: number;
+    minScore?: number;
+    includeEvidence?: boolean;
 }
 export interface MCPListCategoriesInput extends MCPToolInput {
     locale: string;

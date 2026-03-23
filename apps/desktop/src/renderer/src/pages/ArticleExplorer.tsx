@@ -1,5 +1,15 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { RevisionState, type ArticleDetailResponse, type ExplorerNode, type SearchResult, type SearchResponse, type ZendeskSyncRunRecord } from '@kb-vault/shared-types';
+import {
+  ArticleRelationDirection,
+  ArticleRelationType,
+  RevisionState,
+  type ArticleDetailResponse,
+  type ArticleRelationRecord,
+  type ExplorerNode,
+  type SearchResult,
+  type SearchResponse,
+  type ZendeskSyncRunRecord
+} from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
 import { LoadingState } from '../components/LoadingState';
@@ -21,11 +31,11 @@ import {
   IconChevronRight,
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
-import { useIpc } from '../hooks/useIpc';
+import { useIpc, useIpcMutation } from '../hooks/useIpc';
 
 type Filter = 'all' | 'live' | 'drafts' | 'retired' | 'conflicted';
 
-type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbis';
+type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbis' | 'relations';
 
 type PreviewStyleResponse = { css: string; sourcePath: string };
 
@@ -36,6 +46,7 @@ const DETAIL_TAB_CONFIG: { id: DetailTab; label: string; icon: typeof IconEye }[
   { id: 'lineage', label: 'Lineage', icon: IconLink },
   { id: 'publish', label: 'Publish', icon: IconRefreshCw },
   { id: 'pbis', label: 'PBIs', icon: IconFileText },
+  { id: 'relations', label: 'Relations', icon: IconLink },
 ];
 
 type DetailLocaleVariant = {
@@ -343,6 +354,174 @@ function PBIPanel({ pbis }: { pbis: ArticleDetailResponse['relatedPbis'] }) {
   );
 }
 
+function relationTypeLabel(type: ArticleRelationType): string {
+  switch (type) {
+    case ArticleRelationType.SAME_WORKFLOW: return 'Same Workflow';
+    case ArticleRelationType.PREREQUISITE: return 'Prerequisite';
+    case ArticleRelationType.FOLLOW_UP: return 'Follow Up';
+    case ArticleRelationType.PARENT_TOPIC: return 'Parent Topic';
+    case ArticleRelationType.CHILD_TOPIC: return 'Child Topic';
+    case ArticleRelationType.SHARED_SURFACE: return 'Shared Surface';
+    case ArticleRelationType.REPLACES: return 'Replaces';
+    case ArticleRelationType.SEE_ALSO:
+    default:
+      return 'See Also';
+  }
+}
+
+function relationVariant(relation: ArticleRelationRecord): 'primary' | 'neutral' {
+  return relation.origin === 'manual' ? 'primary' : 'neutral';
+}
+
+function RelationsPanel({
+  workspaceId,
+  familyId,
+  relations,
+  onChanged,
+  onOpenRelation
+}: {
+  workspaceId: string;
+  familyId: string;
+  relations: ArticleDetailResponse['relations'];
+  onChanged: () => Promise<void>;
+  onOpenRelation: (familyId: string) => Promise<void>;
+}) {
+  const searchQuery = useIpc<SearchResponse>('workspace.search');
+  const createRelation = useIpcMutation<ArticleRelationRecord>('article.relations.upsert');
+  const deleteRelation = useIpcMutation<{ workspaceId: string; relationId?: string }>('article.relations.delete');
+  const [searchText, setSearchText] = useState('');
+  const [selectedFamilyId, setSelectedFamilyId] = useState('');
+  const [relationType, setRelationType] = useState<ArticleRelationType>(ArticleRelationType.SEE_ALSO);
+
+  useEffect(() => {
+    if (searchText.trim().length < 2) return;
+    const timeout = setTimeout(() => {
+      searchQuery.execute({
+        workspaceId,
+        query: searchText.trim(),
+        scope: 'all',
+        includeArchived: true
+      });
+    }, 250);
+    return () => clearTimeout(timeout);
+  }, [searchText, workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const searchResults = (searchQuery.data?.results ?? []).filter((result) => result.familyId !== familyId);
+  const uniqueTargets = searchResults.filter((result, index, array) =>
+    array.findIndex((candidate) => candidate.familyId === result.familyId) === index
+  );
+
+  const addRelation = async () => {
+    if (!selectedFamilyId) return;
+    await createRelation.mutate({
+      workspaceId,
+      sourceFamilyId: familyId,
+      targetFamilyId: selectedFamilyId,
+      relationType,
+      direction: ArticleRelationDirection.BIDIRECTIONAL
+    });
+    setSearchText('');
+    setSelectedFamilyId('');
+    await onChanged();
+  };
+
+  const removeRelation = async (relation: ArticleRelationRecord) => {
+    await deleteRelation.mutate({
+      workspaceId,
+      relationId: relation.id,
+      sourceFamilyId: relation.sourceFamily.id,
+      targetFamilyId: relation.targetFamily.id
+    });
+    await onChanged();
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+      <div className="card">
+        <div className="card-header">
+          <span className="card-header-title">Add Manual Relation</span>
+        </div>
+        <div className="card-body" style={{ display: 'grid', gap: 'var(--space-3)' }}>
+          <input
+            className="input input-sm"
+            placeholder="Search article title..."
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+          />
+          <select
+            className="input input-sm"
+            value={selectedFamilyId}
+            onChange={(event) => setSelectedFamilyId(event.target.value)}
+          >
+            <option value="">Select article</option>
+            {uniqueTargets.map((result) => (
+              <option key={result.familyId} value={result.familyId}>
+                {result.title}
+              </option>
+            ))}
+          </select>
+          <select
+            className="input input-sm"
+            value={relationType}
+            onChange={(event) => setRelationType(event.target.value as ArticleRelationType)}
+          >
+            {Object.values(ArticleRelationType).map((type) => (
+              <option key={type} value={type}>
+                {relationTypeLabel(type)}
+              </option>
+            ))}
+          </select>
+          <button className="btn btn-primary btn-sm" onClick={() => void addRelation()} disabled={!selectedFamilyId || createRelation.loading}>
+            Add Relation
+          </button>
+          {(createRelation.error || deleteRelation.error) && (
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-danger)' }}>
+              {createRelation.error ?? deleteRelation.error}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {relations.length === 0 ? (
+        <EmptyState title="No relations yet" description="Run a relation refresh or add a manual relation for this article family." />
+      ) : (
+        <div className="publish-list">
+          {relations.map((relation) => {
+            const counterpart = relation.sourceFamily.id === familyId ? relation.targetFamily : relation.sourceFamily;
+            return (
+              <div key={relation.id} className="publish-card">
+                <div className="publish-card-header">
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    style={{ padding: 0, fontWeight: 'var(--weight-semibold)' }}
+                    onClick={() => void onOpenRelation(counterpart.id)}
+                    title={`Open ${counterpart.title}`}
+                  >
+                    {counterpart.title}
+                  </button>
+                  <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+                    <Badge variant={relationVariant(relation)}>{relation.origin}</Badge>
+                    <Badge variant="neutral">{relationTypeLabel(relation.relationType)}</Badge>
+                    <button className="btn btn-ghost btn-xs" onClick={() => void removeRelation(relation)}>Remove</button>
+                  </div>
+                </div>
+                <div className="publish-card-meta">
+                  Score {Math.round(relation.strengthScore * 100)}%
+                </div>
+                {relation.evidence.length > 0 && (
+                  <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginTop: 'var(--space-2)', lineHeight: 1.5 }}>
+                    {relation.evidence.slice(0, 2).map((evidence) => evidence.snippet).filter(Boolean).join(' • ')}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PlaceholderBlocks({ placeholders }: { placeholders: ArticleDetailResponse['placeholders'] }) {
   if (placeholders.length === 0) return null;
   return (
@@ -543,7 +722,7 @@ export const ArticleExplorer = () => {
       error: null,
       familyId: node.familyId,
       familyTitle: node.title,
-      localeVariantId: targetLocaleVariantId,
+      localeVariantId: localeInfo.localeVariantId,
       localeVariants: node.locales,
       activeTab: preferredTab,
       detail: null,
@@ -571,7 +750,8 @@ export const ArticleExplorer = () => {
       ]);
 
       const detail = detailRes.ok && detailRes.data ? detailRes.data : null;
-      const revisions = historyRes.ok && historyRes.data?.revisions ? historyRes.data.revisions : [];
+      const historyData = historyRes.ok && 'data' in historyRes ? historyRes.data : undefined;
+      const revisions = historyData?.revisions ?? [];
 
       setDetailPanel({
         open: true,
@@ -632,6 +812,25 @@ export const ArticleExplorer = () => {
 
     await openArticleDetail(fallbackNode, 'preview', result.localeVariantId, result.revisionId);
   }, [activeWorkspace, tree, openArticleDetail]);
+
+  const reloadCurrentDetail = useCallback(async () => {
+    if (!detailPanel.detail) return;
+    const node = tree.find((item) => item.familyId === detailPanel.familyId) ?? {
+      familyId: detailPanel.familyId,
+      title: detailPanel.familyTitle,
+      familyStatus: RevisionState.LIVE,
+      locales: detailPanel.localeVariants
+    };
+    await openArticleDetail(node, 'relations', detailPanel.localeVariantId, detailPanel.detail.revision.id);
+  }, [detailPanel, tree, openArticleDetail]);
+
+  const openRelatedFamily = useCallback(async (relatedFamilyId: string) => {
+    const node = tree.find((item) => item.familyId === relatedFamilyId);
+    if (!node) {
+      return;
+    }
+    await openArticleDetail(node, 'relations');
+  }, [tree, openArticleDetail]);
 
   const filters: { id: Filter; label: string; count: number }[] = [
     { id: 'all', label: 'All Articles', count: filterCounts.all },
@@ -784,6 +983,15 @@ export const ArticleExplorer = () => {
 
         {detailPanel.activeTab === 'pbis' && (
           <PBIPanel pbis={detailPanel.detail.relatedPbis} />
+        )}
+        {detailPanel.activeTab === 'relations' && activeWorkspace && (
+          <RelationsPanel
+            workspaceId={activeWorkspace.id}
+            familyId={detailPanel.detail.familyId}
+            relations={detailPanel.detail.relations}
+            onChanged={reloadCurrentDetail}
+            onOpenRelation={openRelatedFamily}
+          />
         )}
       </>
     );

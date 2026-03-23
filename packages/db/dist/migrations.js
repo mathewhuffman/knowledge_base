@@ -379,6 +379,77 @@ exports.migrations = [
       )
       WHERE queue_order = 0;
     `
+    },
+    {
+        version: 9,
+        name: '0009_article_relations_graph',
+        description: 'Persist article relation graph runs, edges, evidence, and manual overrides.',
+        sql: `
+      CREATE TABLE IF NOT EXISTS article_relation_runs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'manual_refresh',
+        triggered_by TEXT,
+        agent_session_id TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        summary_json TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS article_relations (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        left_family_id TEXT NOT NULL,
+        right_family_id TEXT NOT NULL,
+        relation_type TEXT NOT NULL,
+        direction TEXT NOT NULL DEFAULT 'bidirectional',
+        strength_score REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        origin TEXT NOT NULL DEFAULT 'inferred',
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS article_relation_evidence (
+        id TEXT PRIMARY KEY,
+        relation_id TEXT NOT NULL,
+        evidence_type TEXT NOT NULL,
+        source_ref TEXT,
+        snippet TEXT,
+        weight REAL NOT NULL DEFAULT 0,
+        metadata_json TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS article_relation_overrides (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        left_family_id TEXT NOT NULL,
+        right_family_id TEXT NOT NULL,
+        override_type TEXT NOT NULL,
+        relation_type TEXT NOT NULL DEFAULT '',
+        note TEXT,
+        created_by TEXT NOT NULL DEFAULT 'user',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_article_relations_workspace_left
+        ON article_relations(workspace_id, left_family_id, status, strength_score DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_article_relations_workspace_right
+        ON article_relations(workspace_id, right_family_id, status, strength_score DESC);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_article_relations_unique_edge
+        ON article_relations(workspace_id, left_family_id, right_family_id, relation_type, origin);
+
+      CREATE INDEX IF NOT EXISTS idx_article_relation_evidence_relation
+        ON article_relation_evidence(relation_id);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_article_relation_overrides_unique
+        ON article_relation_overrides(workspace_id, left_family_id, right_family_id, override_type, relation_type);
+    `
     }
 ];
 function getMigrationStatements() {

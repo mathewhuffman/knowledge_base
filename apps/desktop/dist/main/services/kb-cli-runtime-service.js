@@ -338,10 +338,12 @@ async function resolveArticle(workspaceId, options, command, jsonMode) {
         const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
         const batchId = getString(options, 'batchId');
         const articleId = getString(options, 'articleId', 'localeVariantId');
-        if (!batchId && !articleId) {
-          fail(command, '--batch-id or --article-id is required', 'VALIDATION_ERROR', jsonMode);
+        const familyId = getString(options, 'familyId');
+        if (!batchId && !articleId && !familyId) {
+          fail(command, '--batch-id, --family-id, or --article-id is required', 'VALIDATION_ERROR', jsonMode);
         }
         const limit = getString(options, 'limit');
+        const minScore = getString(options, 'minScore');
         const payload = await requestJson(
           'POST',
           '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/related',
@@ -349,7 +351,10 @@ async function resolveArticle(workspaceId, options, command, jsonMode) {
           {
             ...(batchId ? { batchId } : {}),
             ...(articleId ? { articleId } : {}),
-            ...(limit ? { limit: Number(limit) } : {})
+            ...(familyId ? { familyId } : {}),
+            ...(limit ? { limit: Number(limit) } : {}),
+            ...(minScore ? { minScore: Number(minScore) } : {}),
+            includeEvidence: true
           }
         );
         write({ ok: true, command, data: payload }, true);

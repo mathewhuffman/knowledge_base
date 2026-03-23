@@ -1398,7 +1398,7 @@ class CursorAcpRuntime {
                 handler: async (input, context, log) => {
                     const parsed = input;
                     parsed.workspaceId = context.workspaceId;
-                    const result = await toolContext.findRelatedArticles(parsed);
+                    const result = await toolContext.searchKb(parsed);
                     await log({ direction: 'system', event: 'tool_result', payload: 'search_kb returned' });
                     return result;
                 }
@@ -1436,7 +1436,7 @@ class CursorAcpRuntime {
                 requiresScope: true
             },
             find_related_articles: {
-                description: 'Search for related article candidates from KB content.',
+                description: 'Load persisted article relationships for an article or a PBI batch.',
                 handler: async (input, context, log) => {
                     const payload = input;
                     payload.workspaceId = context.workspaceId;
