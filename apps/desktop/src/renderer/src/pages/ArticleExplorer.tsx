@@ -48,6 +48,7 @@ type Filter = 'all' | 'live' | 'drafts' | 'retired' | 'conflicted';
 type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbis' | 'relations';
 
 type PreviewStyleResponse = { css: string; sourcePath: string };
+const EXPANDED_FOLDER_STORAGE_KEY_PREFIX = 'kbv.articleExplorer.expandedFolders';
 
 const DETAIL_TAB_CONFIG: { id: DetailTab; label: string; icon: typeof IconEye }[] = [
   { id: 'preview', label: 'Preview', icon: IconEye },
@@ -829,6 +830,69 @@ interface ArticleTreeItem {
   depth: number;
 }
 
+function collectFolderIds(items: (FolderTreeItem | ArticleTreeItem)[]): string[] {
+  const ids: string[] = [];
+
+  function walk(nodes: (FolderTreeItem | ArticleTreeItem)[]) {
+    for (const node of nodes) {
+      if (node.type !== 'folder') {
+        continue;
+      }
+
+      ids.push(node.id);
+      walk(node.children);
+    }
+  }
+
+  walk(items);
+  return ids;
+}
+
+function getExpandedFolderStorageKey(workspaceId: string): string {
+  return `${EXPANDED_FOLDER_STORAGE_KEY_PREFIX}:${workspaceId}`;
+}
+
+function readExpandedFolderPreference(workspaceId: string): {
+  expandedFolders: Set<string>;
+  hasStoredPreference: boolean;
+} {
+  if (typeof window === 'undefined') {
+    return { expandedFolders: new Set(), hasStoredPreference: false };
+  }
+
+  try {
+    const storedValue = window.localStorage.getItem(getExpandedFolderStorageKey(workspaceId));
+    if (!storedValue) {
+      return { expandedFolders: new Set(), hasStoredPreference: false };
+    }
+
+    const parsed = JSON.parse(storedValue);
+    if (!Array.isArray(parsed)) {
+      return { expandedFolders: new Set(), hasStoredPreference: false };
+    }
+
+    const folderIds = parsed.filter((value): value is string => typeof value === 'string');
+    return { expandedFolders: new Set(folderIds), hasStoredPreference: true };
+  } catch {
+    return { expandedFolders: new Set(), hasStoredPreference: false };
+  }
+}
+
+function writeExpandedFolderPreference(workspaceId: string, expandedFolders: Set<string>) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(
+      getExpandedFolderStorageKey(workspaceId),
+      JSON.stringify(Array.from(expandedFolders).sort())
+    );
+  } catch {
+    // Ignore storage failures so the directory view still works in-memory.
+  }
+}
+
 function buildFolderTree(nodes: ExplorerNode[]): (FolderTreeItem | ArticleTreeItem)[] {
   const categoryMap = new Map<string, { name: string; sections: Map<string, { name: string; articles: ExplorerNode[] }> }>();
   const uncategorized: ExplorerNode[] = [];
@@ -883,9 +947,12 @@ function buildFolderTree(nodes: ExplorerNode[]): (FolderTreeItem | ArticleTreeIt
   const sortedCategories = [...categoryMap.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name));
 
   for (const [catId, cat] of sortedCategories) {
+    const categoryFolderId = catId.startsWith('__section_')
+      ? `section:${catId.replace('__section_', '')}`
+      : `category:${catId}`;
     const categoryFolder: FolderTreeItem = {
       type: 'folder',
-      id: catId,
+      id: categoryFolderId,
       name: cat.name,
       depth: 0,
       children: [],
@@ -906,7 +973,7 @@ function buildFolderTree(nodes: ExplorerNode[]): (FolderTreeItem | ArticleTreeIt
       } else {
         const sectionFolder: FolderTreeItem = {
           type: 'folder',
-          id: secId,
+          id: `${categoryFolderId}/section:${secId}`,
           name: sec.name,
           depth: 1,
           children: sortedArticles.map((article) => ({
@@ -932,7 +999,7 @@ function buildFolderTree(nodes: ExplorerNode[]): (FolderTreeItem | ArticleTreeIt
     if (categoryMap.size > 0) {
       result.push({
         type: 'folder',
-        id: '__uncategorized__',
+        id: 'folder:uncategorized',
         name: 'Uncategorized',
         depth: 0,
         children: sortedUncategorized.map((article) => ({
@@ -1122,6 +1189,8 @@ export const ArticleExplorer = () => {
   const [searchText, setSearchText] = useState('');
   const [selectedLocale, setSelectedLocale] = useState<string | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [folderPreferenceReady, setFolderPreferenceReady] = useState(false);
+  const [hasStoredFolderPreference, setHasStoredFolderPreference] = useState(false);
   const [detailPanel, setDetailPanel] = useState<DetailPanelState>({
     familyId: '',
     open: false,
@@ -1198,8 +1267,11 @@ export const ArticleExplorer = () => {
     return [];
   }, [treeQuery.data]);
 
+  const openableTree = useMemo(() => (
+    tree.filter((node) => node.locales.some((locale) => Boolean(locale.revision?.revisionId)))
+  ), [tree]);
+
   const filterCounts = useMemo(() => {
-    const openableTree = tree.filter((node) => node.locales.some((locale) => Boolean(locale.revision?.revisionId)));
     const counts = { all: 0, live: 0, drafts: 0, retired: 0, conflicted: 0 };
     openableTree.forEach((node) => {
       counts.all++;
@@ -1209,10 +1281,9 @@ export const ArticleExplorer = () => {
       if (node.locales.some((l) => l.revision.draftCount > 0)) counts.drafts++;
     });
     return counts;
-  }, [tree]);
+  }, [openableTree]);
 
   const filteredTree = useMemo(() => {
-    const openableTree = tree.filter((node) => node.locales.some((locale) => Boolean(locale.revision?.revisionId)));
     return openableTree.filter((node) => {
       if (activeFilter === 'live') return node.familyStatus === RevisionState.LIVE;
       if (activeFilter === 'retired') return node.familyStatus === RevisionState.RETIRED;
@@ -1223,28 +1294,69 @@ export const ArticleExplorer = () => {
       if (!selectedLocale) return true;
       return node.locales.some((l) => l.locale === selectedLocale);
     });
-  }, [tree, activeFilter, selectedLocale]);
+  }, [openableTree, activeFilter, selectedLocale]);
 
   const availableLocales = useMemo(() => {
-    const openableTree = tree.filter((node) => node.locales.some((locale) => Boolean(locale.revision?.revisionId)));
     const localeSet = new Set<string>();
     openableTree.forEach((node) => node.locales.forEach((l) => localeSet.add(l.locale)));
     return Array.from(localeSet).sort();
-  }, [tree]);
+  }, [openableTree]);
 
+  const allFolderTree = useMemo(() => buildFolderTree(openableTree), [openableTree]);
   const folderTree = useMemo(() => buildFolderTree(filteredTree), [filteredTree]);
+  const topLevelFolderIds = useMemo(() => (
+    allFolderTree
+      .filter((item): item is FolderTreeItem => item.type === 'folder')
+      .map((item) => item.id)
+  ), [allFolderTree]);
+  const allFolderIds = useMemo(() => new Set(collectFolderIds(allFolderTree)), [allFolderTree]);
+  const visibleFolderCount = useMemo(() => collectFolderIds(folderTree).length, [folderTree]);
 
-  // Auto-expand all top-level folders on first load
   useEffect(() => {
-    if (expandedFolders.size === 0 && folderTree.length > 0) {
-      const topLevelFolderIds = folderTree
-        .filter((item): item is FolderTreeItem => item.type === 'folder')
-        .map((f) => f.id);
-      if (topLevelFolderIds.length > 0) {
-        setExpandedFolders(new Set(topLevelFolderIds));
-      }
+    if (!activeWorkspace) {
+      setExpandedFolders(new Set());
+      setHasStoredFolderPreference(false);
+      setFolderPreferenceReady(false);
+      return;
     }
-  }, [folderTree]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const { expandedFolders: storedFolders, hasStoredPreference } = readExpandedFolderPreference(activeWorkspace.id);
+    setExpandedFolders(storedFolders);
+    setHasStoredFolderPreference(hasStoredPreference);
+    setFolderPreferenceReady(true);
+  }, [activeWorkspace?.id]);
+
+  useEffect(() => {
+    if (!folderPreferenceReady) {
+      return;
+    }
+
+    setExpandedFolders((prev) => {
+      const filtered = Array.from(prev).filter((folderId) => allFolderIds.has(folderId));
+      if (filtered.length === prev.size) {
+        return prev;
+      }
+
+      return new Set(filtered);
+    });
+  }, [allFolderIds, folderPreferenceReady]);
+
+  useEffect(() => {
+    if (!folderPreferenceReady || hasStoredFolderPreference || topLevelFolderIds.length === 0) {
+      return;
+    }
+
+    setExpandedFolders(new Set(topLevelFolderIds));
+    setHasStoredFolderPreference(true);
+  }, [folderPreferenceReady, hasStoredFolderPreference, topLevelFolderIds]);
+
+  useEffect(() => {
+    if (!activeWorkspace || !folderPreferenceReady) {
+      return;
+    }
+
+    writeExpandedFolderPreference(activeWorkspace.id, expandedFolders);
+  }, [activeWorkspace?.id, expandedFolders, folderPreferenceReady]);
 
   const toggleFolder = useCallback((folderId: string) => {
     setExpandedFolders((prev) => {
@@ -1259,22 +1371,21 @@ export const ArticleExplorer = () => {
   }, []);
 
   const expandAllFolders = useCallback(() => {
-    const allIds: string[] = [];
-    function collectIds(items: (FolderTreeItem | ArticleTreeItem)[]) {
-      for (const item of items) {
-        if (item.type === 'folder') {
-          allIds.push(item.id);
-          collectIds(item.children);
-        }
-      }
-    }
-    collectIds(folderTree);
-    setExpandedFolders(new Set(allIds));
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      collectFolderIds(folderTree).forEach((folderId) => next.add(folderId));
+      return next;
+    });
   }, [folderTree]);
 
   const collapseAllFolders = useCallback(() => {
-    setExpandedFolders(new Set());
-  }, []);
+    if (folderTree.length === 0) {
+      return;
+    }
+
+    const visibleFolderIds = new Set(collectFolderIds(folderTree));
+    setExpandedFolders((prev) => new Set(Array.from(prev).filter((folderId) => !visibleFolderIds.has(folderId))));
+  }, [folderTree]);
 
   const openArticleDetail = useCallback(async (
     node: ExplorerNode,
@@ -1823,23 +1934,42 @@ export const ArticleExplorer = () => {
             ) : (
               /* Folder tree view */
               <>
-                {folderTree.some((item) => item.type === 'folder') && (
-                  <div className="explorer-tree-toolbar">
-                    <button className="btn btn-ghost btn-xs" onClick={expandAllFolders}>
-                      Expand all
-                    </button>
-                    <button className="btn btn-ghost btn-xs" onClick={collapseAllFolders}>
-                      Collapse all
-                    </button>
+                <div className="explorer-directory-shell">
+                  <div className="explorer-directory-header">
+                    <div>
+                      <div className="explorer-directory-eyebrow">Directory</div>
+                      <div className="explorer-directory-title">Article library</div>
+                    </div>
+                    <div className="explorer-directory-summary">
+                      <Badge variant="neutral">{filteredTree.length} famil{filteredTree.length === 1 ? 'y' : 'ies'}</Badge>
+                      {visibleFolderCount > 0 && (
+                        <Badge variant="neutral">{visibleFolderCount} folder{visibleFolderCount !== 1 ? 's' : ''}</Badge>
+                      )}
+                    </div>
                   </div>
-                )}
-                <FolderTreeView
-                  items={folderTree}
-                  expandedFolders={expandedFolders}
-                  onToggleFolder={toggleFolder}
-                  detailPanel={detailPanel}
-                  openArticleDetail={openArticleDetail}
-                />
+                  {folderTree.some((item) => item.type === 'folder') && (
+                    <div className="explorer-tree-toolbar">
+                      <div className="explorer-tree-toolbar-copy">
+                        Collapse and expand state is saved per workspace.
+                      </div>
+                      <div className="explorer-tree-toolbar-actions">
+                        <button className="btn btn-ghost btn-xs" onClick={expandAllFolders}>
+                          Expand all
+                        </button>
+                        <button className="btn btn-ghost btn-xs" onClick={collapseAllFolders}>
+                          Collapse all
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  <FolderTreeView
+                    items={folderTree}
+                    expandedFolders={expandedFolders}
+                    onToggleFolder={toggleFolder}
+                    detailPanel={detailPanel}
+                    openArticleDetail={openArticleDetail}
+                  />
+                </div>
               </>
             )}
           </div>

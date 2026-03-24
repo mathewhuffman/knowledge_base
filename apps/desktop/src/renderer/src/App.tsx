@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { AppRoute, type RpcResponse } from '@kb-vault/shared-types';
 import { routeToComponent } from './routes/routeMap';
 import { Sidebar } from './components/Sidebar';
@@ -19,7 +19,10 @@ function AppShell() {
   const [activeRoute, setActiveRoute] = useState<AppRoute>(AppRoute.KB_VAULT_HOME);
   const [boot, setBoot] = useState<RpcResponse | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const { activeWorkspace } = useWorkspace();
+
+  const toggleSidebar = useCallback(() => setSidebarCollapsed((c) => !c), []);
 
   useEffect(() => {
     if (!window.kbv) {
@@ -60,6 +63,8 @@ function AppShell() {
         onNavigate={setActiveRoute}
         workspaceName={activeWorkspace?.name}
         isConnected={boot?.ok === true}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={toggleSidebar}
       />
       {bootError ? <p style={{ padding: '16px', color: 'crimson' }}>{bootError}</p> : null}
       <AiAssistantProvider
