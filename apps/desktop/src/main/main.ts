@@ -135,6 +135,9 @@ function createWindow() {
   });
 
   window.webContents.on('console-message', (_event, level, message, lineNumber, sourceId) => {
+    if (message.includes('Third-party cookie will be blocked')) {
+      return;
+    }
     logger.info('renderer-console', {
       level,
       sourceId,

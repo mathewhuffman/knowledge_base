@@ -9,6 +9,8 @@ import { ConfirmationDialog } from '../components/ConfirmationDialog';
 import { IconPlus, IconLayout, IconZap, IconTrash2, IconCheckCircle } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
+import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
+import { AppRoute, type AiAssistantUiAction } from '@kb-vault/shared-types';
 
 const TEMPLATE_TYPE_OPTIONS = [
   { value: TemplatePackType.STANDARD_HOW_TO, label: 'Standard How-To' },
@@ -77,6 +79,55 @@ export const TemplatesAndPrompts = () => {
       setDraft(emptyForm());
     }
   }, [selected, selectedId]);
+
+  const templateVersionToken = useMemo(
+    () => `${selectedId ?? 'new'}:${selected?.updatedAtUtc ?? 'draft'}:${JSON.stringify(draft)}`,
+    [draft, selected?.updatedAtUtc, selectedId]
+  );
+
+  useRegisterAiAssistantView({
+    enabled: Boolean(activeWorkspace),
+    context: {
+      workspaceId: activeWorkspace?.id ?? '',
+      route: AppRoute.TEMPLATES_AND_PROMPTS,
+      routeLabel: 'Templates & Prompts',
+      subject: {
+        type: 'template_pack',
+        id: selectedId ?? 'new-template',
+        title: draft.name || selected?.name || 'Template Pack',
+        locale: draft.language
+      },
+      workingState: {
+        kind: 'template_pack',
+        versionToken: templateVersionToken,
+        payload: draft
+      },
+      capabilities: {
+        canChat: true,
+        canCreateProposal: false,
+        canPatchProposal: false,
+        canPatchDraft: false,
+        canPatchTemplate: true,
+        canUseUnsavedWorkingState: true
+      },
+      backingData: {
+        selectedTemplateId: selectedId,
+        templatePackId: selectedId,
+        persistedTemplate: selected
+      }
+    },
+    applyUiActions: (actions: AiAssistantUiAction[]) => {
+      actions.forEach((action) => {
+        if (action.type === 'replace_template_form') {
+          setDraft((prev) => ({
+            ...prev,
+            ...action.payload,
+            templateType: (action.payload.templateType as TemplatePackType | undefined) ?? prev.templateType
+          }));
+        }
+      });
+    }
+  });
 
   const refresh = async () => {
     if (!activeWorkspace) return;

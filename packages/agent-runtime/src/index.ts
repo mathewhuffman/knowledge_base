@@ -8,6 +8,7 @@ import { McpToolServer } from '@kb-vault/mcp-server';
 import type {
   AgentArticleEditRunRequest,
   AgentAnalysisRunRequest,
+  AgentAssistantChatRunRequest,
   AgentHealthCheckResponse,
   AgentSessionCreateRequest,
   AgentSessionListRequest,
@@ -308,6 +309,32 @@ function buildMcpTaskPrompt(
     ].filter(Boolean).join('\n');
   }
 
+  if (taskPayload.task === 'assistant_chat') {
+    return [
+      'You are running inside KB Vault as a route-aware assistant for conversational help and proposal drafting.',
+      `Workspace ID: ${session.workspaceId}`,
+      `Locale: ${locale}`,
+      '',
+      'Tool rules:',
+      '- Use KB Vault tools and structured article/template data only when they help answer the user.',
+      '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
+      '- The preloaded prompt context is for orientation; use KB Vault MCP tools directly when you need to confirm or inspect source records.',
+      '- Return only valid JSON in your final answer.',
+      '- Do not include preamble, commentary about your reasoning, or markdown fences.',
+      '- For informational chat, return only `artifactType` and `response`. Omit `summary`, `html`, `formPatch`, and `payload` unless they are needed.',
+      '- Only return `proposal_candidate` when the user explicitly asks you to make or propose changes.',
+      '',
+      mcpGuidance,
+      '',
+      explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
+      '',
+      extraSections,
+      '',
+      'Session context JSON:',
+      JSON.stringify({ session, task: taskPayload })
+    ].filter(Boolean).join('\n');
+  }
+
   return JSON.stringify({ session, task: taskPayload });
 }
 
@@ -408,6 +435,32 @@ function buildCliTaskPrompt(
       '- Return only valid JSON in your final answer.',
       '- The JSON must include `updatedHtml` (string), `summary` (string), and may include `rationale` (string).',
       '- Do not wrap the JSON in markdown fences.',
+      '',
+      cliGuidance,
+      '',
+      explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
+      '',
+      extraSections,
+      '',
+      'Session context JSON:',
+      JSON.stringify({ session, task: taskPayload })
+    ].filter(Boolean).join('\n');
+  }
+
+  if (taskPayload.task === 'assistant_chat') {
+    return [
+      'You are running inside KB Vault as a route-aware assistant for conversational help and proposal drafting.',
+      `Workspace ID: ${session.workspaceId}`,
+      `Locale: ${locale}`,
+      '',
+      'Tool rules:',
+      '- Use kb commands and structured article/template data only when they help answer the user.',
+      '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
+      '- The preloaded prompt context is for orientation; use CLI output directly when you need to confirm or inspect source records.',
+      '- Return only valid JSON in your final answer.',
+      '- Do not include preamble, commentary about your reasoning, or markdown fences.',
+      '- For informational chat, return only `artifactType` and `response`. Omit `summary`, `html`, `formPatch`, and `payload` unless they are needed.',
+      '- Only return `proposal_candidate` when the user explicitly asks you to make or propose changes.',
       '',
       cliGuidance,
       '',
@@ -760,6 +813,7 @@ export class CursorAcpRuntime {
   private readonly cursorSessionIds = new Map<string, { mode: KbAccessMode; acpSessionId: string }>();
   private readonly cursorSessionLookup = new Map<string, { localSessionId: string; mode: KbAccessMode }>();
   private readonly activeStreamEmitters = new Map<string, (payload: Omit<AgentStreamingPayload, 'sessionId' | 'atUtc'>) => void>();
+  private readonly promptMessageChunks = new Map<string, string[]>();
   private readonly debugLogger: RuntimeDebugLogger;
   private readonly configuredMcpServers: AcpMcpServerConfig[];
   private runtimeMcpServers: AcpMcpServerConfig[] = [];
@@ -1103,6 +1157,85 @@ export class CursorAcpRuntime {
     }
   }
 
+  async runAssistantChat(
+    request: AgentAssistantChatRunRequest,
+    emit: (payload: AgentStreamingPayload) => Promise<void> | void,
+    isCancelled: () => boolean
+  ): Promise<AgentRunResult> {
+    const session = await this.resolveSession({ ...request, sessionType: 'assistant_chat' });
+    const startedAt = new Date().toISOString();
+    const runId = randomUUID();
+    const transcriptPath = await this.ensureTranscriptPath(session.id, runId);
+    const toolCalls: AgentRunResult['toolCalls'] = [];
+    const rawOutput: string[] = [];
+    this.log('agent.runtime.assistant_chat_begin', {
+      workspaceId: request.workspaceId,
+      localeVariantId: request.localeVariantId,
+      timeoutMs: request.timeoutMs ?? this.config.requestTimeoutMs
+    });
+
+    try {
+      const resultPayload = await this.transit(
+        session,
+        {
+          task: 'assistant_chat',
+          localeVariantId: request.localeVariantId,
+          prompt: request.prompt,
+          locale: request.locale
+        },
+        (event) => {
+          rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+          emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+        },
+        toolCalls,
+        isCancelled,
+        request.timeoutMs ?? this.config.requestTimeoutMs
+      );
+      const endedAt = new Date().toISOString();
+      return {
+        sessionId: session.id,
+        kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
+        status: isCancelled() ? 'canceled' : 'ok',
+        transcriptPath,
+        rawOutput,
+        resultPayload,
+        toolCalls,
+        startedAtUtc: startedAt,
+        endedAtUtc: endedAt,
+        durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+        message: isCancelled() ? 'Run cancelled' : 'Completed'
+      };
+    } catch (error) {
+      this.log('agent.runtime.assistant_chat_failed', {
+        workspaceId: request.workspaceId,
+        localeVariantId: request.localeVariantId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      const endedAt = new Date().toISOString();
+      return {
+        sessionId: session.id,
+        kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
+        status: 'error',
+        transcriptPath,
+        rawOutput,
+        resultPayload: undefined,
+        toolCalls,
+        startedAtUtc: startedAt,
+        endedAtUtc: endedAt,
+        durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+        message: error instanceof Error ? error.message : String(error)
+      };
+    } finally {
+      session.status = 'idle';
+      session.updatedAtUtc = new Date().toISOString();
+      this.log('agent.runtime.assistant_chat_complete', {
+        workspaceId: request.workspaceId,
+        localeVariantId: request.localeVariantId,
+        sessionId: session.id
+      });
+    }
+  }
+
   async getTranscripts(input: AgentTranscriptRequest): Promise<AgentTranscriptResponse> {
     const session = this.sessions.get(input.sessionId);
     if (!session || session.workspaceId !== input.workspaceId) {
@@ -1159,7 +1292,7 @@ export class CursorAcpRuntime {
     await Promise.all(Array.from(this.transports.values()).map((transport) => transport.stop()));
   }
 
-  private async resolveSession(input: AgentAnalysisRunRequest | AgentArticleEditRunRequest): Promise<AgentSessionRecord> {
+  private async resolveSession(input: AgentAnalysisRunRequest | AgentArticleEditRunRequest | AgentAssistantChatRunRequest): Promise<AgentSessionRecord> {
     const existing = input.sessionId ? this.getSession(input.sessionId) : null;
     let session = existing;
     if (!session) {
@@ -1169,7 +1302,7 @@ export class CursorAcpRuntime {
       const createRequest: AgentSessionCreateRequest = {
         workspaceId: input.workspaceId,
         kbAccessMode: input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
-        type: 'localeVariantId' in input ? 'article_edit' : 'batch_analysis',
+        type: input.sessionType ?? ('localeVariantId' in input ? 'article_edit' : 'batch_analysis'),
         batchId: 'batchId' in input ? input.batchId : undefined,
         locale: input.locale,
         templatePackId: 'templatePackId' in input ? input.templatePackId : undefined,
@@ -1208,6 +1341,7 @@ export class CursorAcpRuntime {
     };
 
     this.activeStreamEmitters.set(session.id, emit);
+    this.promptMessageChunks.set(session.id, []);
     try {
       // Log runtime mode in transcript so CLI-mode runs are identifiable in history
       await this.appendTranscriptLine(
@@ -1276,7 +1410,17 @@ export class CursorAcpRuntime {
           if (response.error) {
             throw new Error(response.error.message);
           }
-          return response.result;
+          const result = response.result && typeof response.result === 'object'
+            ? { ...(response.result as Record<string, unknown>) }
+            : {};
+          const assembledText = this.consumePromptMessageText(session.id);
+          if (assembledText) {
+            result.text = assembledText;
+            if (!Array.isArray(result.content)) {
+              result.content = [{ type: 'text', text: assembledText }];
+            }
+          }
+          return result;
         },
         3,
         isCancelled
@@ -1291,6 +1435,7 @@ export class CursorAcpRuntime {
       return response;
     } finally {
       this.activeStreamEmitters.delete(session.id);
+      this.promptMessageChunks.delete(session.id);
     }
   }
 
@@ -1395,6 +1540,18 @@ export class CursorAcpRuntime {
       return;
     }
     const localSessionId = sessionInfo.localSessionId;
+    const updateRecord = params.update && typeof params.update === 'object'
+      ? params.update as Record<string, unknown>
+      : undefined;
+
+    if (updateRecord?.sessionUpdate === 'agent_message_chunk') {
+      const text = extractAgentMessageChunkText(updateRecord.content);
+      if (text) {
+        const chunks = this.promptMessageChunks.get(localSessionId) ?? [];
+        chunks.push(text);
+        this.promptMessageChunks.set(localSessionId, chunks);
+      }
+    }
 
     const payload = JSON.stringify(message.params);
     if (!isHiddenAgentThoughtUpdate(message.params)) {
@@ -1448,6 +1605,12 @@ export class CursorAcpRuntime {
       data: message.params,
       message: params.update?.sessionUpdate ? `session/update:${params.update.sessionUpdate}` : 'session/update'
     });
+  }
+
+  private consumePromptMessageText(sessionId: string): string {
+    const chunks = this.promptMessageChunks.get(sessionId) ?? [];
+    this.promptMessageChunks.delete(sessionId);
+    return chunks.join('');
   }
 
   private async ensureTranscriptPath(sessionId: string, runId: string): Promise<string> {
@@ -2019,6 +2182,16 @@ export class CursorAcpRuntime {
       sessionId: session.id
     };
   }
+}
+
+function extractAgentMessageChunkText(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const content = value as Record<string, unknown>;
+  return typeof content.text === 'string' && content.text.length > 0
+    ? content.text
+    : undefined;
 }
 
 export class AgentRuntimeService {

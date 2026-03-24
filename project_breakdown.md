@@ -308,11 +308,16 @@ Depending on proposal type:
   - no draft is created
 
 ## 7.7 Edit with AI at article level
-1. User opens any draft branch.
-2. User chats with the LLM inside KB Vault.
-3. The app routes the request through ACP using article-scoped context.
-4. AI returns a proposed edit patch or a full proposed rewrite.
-5. User can accept the proposal into the branch, reject it, or manually edit further.
+1. User opens a live article, draft branch, proposal review screen, or template pack.
+2. User opens the global AI assistant from the bottom-right launcher.
+3. The app registers the current route and subject as assistant context.
+4. User can have a normal back-and-forth conversation in ask mode without creating changes.
+5. If the user asks for content changes:
+   - from a live article, AI creates a proposal candidate that the user can `Create Proposal` or `Dismiss`
+   - from a draft, AI returns a draft patch that updates the working copy
+   - from Proposal Review, AI returns a proposal patch that updates the review working copy
+   - from Templates & Prompts, AI returns a template patch that updates the current form state
+6. User remains the explicit decision-maker for any persisted change.
 
 ## 7.8 Publish selected drafts
 1. User selects one or more draft branches for publish.
@@ -382,7 +387,7 @@ The article detail surface must support:
 - publish history
 - asset placeholders
 - manual edit mode
-- AI chat side panel
+- global AI assistant panel with route-aware context
 
 ## 8.4 PBI import requirements
 The import pipeline must:
@@ -442,7 +447,7 @@ The app must:
 - run a persistent ACP client session without requiring visible user interaction in Cursor
 - create or resume sessions per:
   - PBI batch,
-  - article editing conversation,
+  - assistant conversation,
   - optionally workspace background context
 - maintain local mapping between app objects and ACP sessions
 - support structured request/response handling
@@ -450,12 +455,25 @@ The app must:
 - keep the app usable if Cursor is not available
 
 ### ACP usage model
-Two primary ACP session types:
+Three primary ACP session types:
 
 1. **Batch analysis session**
    - used for bulk PBI -> proposal generation
-2. **Article editing session**
-   - used when the user chats on a specific article branch
+2. **Ask-mode assistant chat session**
+   - used for conversational back-and-forth in the global assistant
+   - uses a dedicated ask-mode system prompt
+   - defaults to `informational_response` for normal conversation
+3. **Edit-capable assistant session**
+   - used when the user asks for concrete changes in an allowed route context
+   - returns typed artifacts such as proposal candidates, proposal patches, draft patches, or template patches
+
+### Assistant result normalization
+Every assistant turn must be normalized before rendering in the transcript.
+
+- If the model returns a JSON object as plain text, the app must parse it and display only the user-facing `response` value for `informational_response`.
+- Internal reasoning, schema commentary, and transport metadata must never be shown in visible chat output.
+- Runtime stop metadata such as `stop reason` must be stripped from user-visible content.
+- Normal conversational turns must not render proposal decision controls.
 
 ## 8.7 MCP tool server
 KB Vault must expose a local MCP server so Cursor can call workspace-aware tools.
@@ -575,9 +593,9 @@ The editor should support:
 - safe handling of inline styles and supported tags
 
 ## 8.11 Article-level AI editing
-From any article or draft branch, the user can ask the AI to:
+From any live article, draft branch, proposal review screen, or template pack, the user can ask the AI to:
 
-- open an article-scoped chat window
+- open the global assistant panel with route-aware context
 - type a freeform request to the LLM in natural language
 - receive an AI response grounded in the current article or branch context
 - have the AI perform the requested improvement within that chat flow
@@ -593,13 +611,36 @@ From any article or draft branch, the user can ask the AI to:
 
 This should feel like an in-context editing chat, not a hidden backend action. The user should be able to describe the requested change in their own words, review the AI response, and then accept or reject the resulting patch or proposal.
 
+The assistant must support two distinct modes inside the same panel:
+
+- **Ask mode**
+  - used for greetings, questions, explanations, summaries, and normal back-and-forth
+  - stores chat messages in a route/entity-scoped assistant transcript
+  - displays only the assistant-visible response text
+  - does not show proposal controls
+- **Change mode**
+  - used when the user clearly asks the AI to make or propose changes
+  - returns a typed artifact based on route capabilities
+  - may show explicit decision controls such as `Create Proposal` or `Dismiss`
+
 Article chat history should persist for each article or draft until the user chooses to reset it. The UI should provide a clear `Reset Chat` action that deletes that article’s chat history and starts a fresh conversation.
 
-When the user asks the AI to make article changes, the AI response should update the article view immediately so the user can inspect the returned edit in context.
+The chat transcript should behave like a normal messaging surface:
 
-Article-level AI editing should not go through the batch Proposal Review flow. Instead, these article-scoped AI edits should be accepted or rejected directly inside the article editing experience.
+- the user’s message appears in the transcript immediately when sent
+- transcript content remains text-selectable so users can copy assistant output
+- optimistic local messages are replaced by the persisted transcript when the turn completes
 
-When an article-scoped AI edit is accepted, that accepted change must be persisted into the article’s revision/history model so it appears in the History tab like other meaningful local edits.
+When the user asks the AI to make article changes, the resulting artifact should be routed by context:
+
+- live article context -> proposal candidate
+- draft context -> draft patch
+- proposal review context -> proposal patch
+- template context -> template patch
+
+Live article requests for changes should not silently mutate the article view. They should create a proposal candidate first, and only after user confirmation should the app create a proposal record.
+
+Draft and proposal working-copy changes may update the visible screen immediately, but they remain user-controlled until the user saves, accepts, or dismisses the resulting work.
 
 ## 8.12 Templates and prompt packs
 The workspace must provide editable template and prompt management.
@@ -1380,7 +1421,15 @@ Users must be able to directly edit:
 - related article links
 
 ## 17.2 AI editing within an article
-The article screen must support a local AI conversation panel.
+The article screen must support access to the global AI assistant while the article viewer is open.
+
+The launcher lives in the bottom-right corner of the app shell and must remain visible above the article viewer.
+
+When the current context is a live article:
+
+- the assistant behaves as article-aware ask mode by default
+- normal chat stays conversational
+- change requests produce proposal candidates rather than silent article mutations
 
 Typical commands:
 - “Rewrite this to match the current tone”
@@ -1391,12 +1440,14 @@ Typical commands:
 - “Create the Spanish variant”
 
 ## 17.3 AI acceptance behavior
-Even in article-level chat, AI changes should land as:
-- a proposed patch,
-- a proposed full replacement,
-- or a proposed structured section insertion.
+Even in article-level chat, AI changes must land as explicit typed artifacts.
 
-User must explicitly accept the change into the branch.
+- Live article change request -> proposal candidate
+- Draft change request -> draft patch
+- Proposal review change request -> proposal patch
+- Template change request -> template patch
+
+User must explicitly accept, dismiss, save, or otherwise confirm the relevant artifact before a durable product action occurs.
 
 ## 17.4 Local edit history
 Every manual and accepted AI change should create a new draft revision record.

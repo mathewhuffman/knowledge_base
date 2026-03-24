@@ -117,7 +117,8 @@ import {
   type TemplatePackListRequest,
   type TemplatePackListResponse,
   type TemplatePackSummary,
-  type TemplatePackUpsertRequest
+  type TemplatePackUpsertRequest,
+  type ProposalPatchPayload
 } from '@kb-vault/shared-types';
 import { diffHtml } from '@kb-vault/diff-engine';
 import {
@@ -3922,6 +3923,106 @@ export class WorkspaceRepository {
           nextProposalId: currentIndex < queueRows.length - 1 ? queueRows[currentIndex + 1]?.id : undefined
         }
       };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async updateProposalReviewWorkingCopy(
+    workspaceId: string,
+    proposalId: string,
+    patch: ProposalPatchPayload
+  ): Promise<ProposalReviewDetailResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<ProposalDbRow>(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.workspace_id = @workspaceId AND p.id = @proposalId
+      `, { workspaceId, proposalId });
+      if (!row) {
+        throw new Error('Proposal not found');
+      }
+
+      const proposal = this.hydrateProposalDisplayFields(this.mapProposalRow(row), workspaceDb);
+      const relatedPbis = workspaceDb.all<PBIRecord>(`
+        SELECT p.id, p.batch_id as batchId, p.source_row_number as sourceRowNumber, p.external_id as externalId, p.title,
+               p.description, p.priority, p.state, p.work_item_type as workItemType, p.title1, p.title2, p.title3,
+               p.raw_description as rawDescription, p.raw_acceptance_criteria as rawAcceptanceCriteria,
+               p.description_text as descriptionText, p.acceptance_criteria_text as acceptanceCriteriaText,
+               p.parent_external_id as parentExternalId, p.parent_record_id as parentRecordId,
+               p.validation_status as validationStatus, p.validation_reason as validationReason
+        FROM pbi_records p
+        JOIN proposal_pbi_links l ON l.pbi_id = p.id
+        WHERE l.proposal_id = @proposalId
+        ORDER BY p.source_row_number ASC
+      `, { proposalId });
+      const hydrated = await this.ensureProposalReviewArtifacts(workspace.path, workspaceDb, proposal, relatedPbis);
+      const now = new Date().toISOString();
+      const existingMetadata = normalizeProposalMetadata(proposal.metadata);
+      const nextMetadata = {
+        ...existingMetadata,
+        assistantWorkingCopyUpdatedAt: now
+      };
+
+      const artifacts = await this.persistProposalArtifacts(workspace.path, proposalId, {
+        sourceHtml: hydrated.beforeHtml,
+        proposedHtml: patch.html,
+        metadata: nextMetadata
+      });
+
+      workspaceDb.run(
+        `UPDATE proposals
+         SET target_title = COALESCE(@targetTitle, target_title),
+             rationale = COALESCE(@rationale, rationale),
+             rationale_summary = COALESCE(@rationaleSummary, rationale_summary),
+             ai_notes = COALESCE(@aiNotes, ai_notes),
+             source_html_path = COALESCE(@sourceHtmlPath, source_html_path),
+             proposed_html_path = COALESCE(@proposedHtmlPath, proposed_html_path),
+             metadata_json = @metadataJson,
+             updated_at = @updatedAt
+         WHERE workspace_id = @workspaceId AND id = @proposalId`,
+        {
+          workspaceId,
+          proposalId,
+          targetTitle: patch.title ?? null,
+          rationale: patch.rationale ?? null,
+          rationaleSummary: patch.rationaleSummary ?? null,
+          aiNotes: patch.aiNotes ?? null,
+          sourceHtmlPath: artifacts.sourceHtmlPath ?? null,
+          proposedHtmlPath: artifacts.proposedHtmlPath ?? null,
+          metadataJson: JSON.stringify(nextMetadata),
+          updatedAt: now
+        }
+      );
+
+      return this.getProposalReviewDetail(workspaceId, proposalId);
     } finally {
       workspaceDb.close();
     }

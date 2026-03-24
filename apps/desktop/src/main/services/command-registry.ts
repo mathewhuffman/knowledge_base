@@ -85,7 +85,12 @@ import {
   type TemplatePackDeleteRequest,
   type TemplatePackGetRequest,
   type TemplatePackListRequest,
-  type TemplatePackUpsertRequest
+  type TemplatePackUpsertRequest,
+  type AiAssistantArtifactDecisionRequest,
+  type AiAssistantContextGetRequest,
+  type AiAssistantMessageSendRequest,
+  type AiAssistantSessionGetRequest,
+  type AiAssistantSessionResetRequest
 } from '@kb-vault/shared-types';
 import { ZendeskClient } from '@kb-vault/zendesk-client';
 import { CursorAcpRuntime, type AgentRuntimeToolContext } from '@kb-vault/agent-runtime';
@@ -98,6 +103,7 @@ import { PBIBatchImportService } from './pbi-batch-import-service';
 import { logger } from './logger';
 import { KbCliLoopbackService } from './kb-cli-loopback-service';
 import { KbCliRuntimeService } from './kb-cli-runtime-service';
+import { AiAssistantService } from './ai-assistant-service';
 
 const ZENDESK_PREVIEW_STYLE_TOKENS: Record<string, string> = {
   base_font_size: '16px',
@@ -532,6 +538,7 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
     const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
     return settings.kbAccessMode || defaultKbAccessMode;
   };
+  const aiAssistantService = new AiAssistantService(workspaceRepository, agentRuntime, resolveWorkspaceKbAccessMode);
   const buildZendeskClient = async (workspaceId: string): Promise<ZendeskClient> => {
     const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
     const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
@@ -1814,6 +1821,96 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
       return { ok: true, data: await workspaceRepository.decideProposalReview(input) };
     } catch (error) {
       if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'Proposal not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.context.get', async (payload) => {
+    try {
+      const input = payload as AiAssistantContextGetRequest;
+      if (!input?.workspaceId || !input.context) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.context.get requires workspaceId and context');
+      }
+      return { ok: true, data: await aiAssistantService.getContext(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.session.get', async (payload) => {
+    try {
+      const input = payload as AiAssistantSessionGetRequest;
+      if (!input?.workspaceId || !input.route) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.get requires workspaceId and route');
+      }
+      return { ok: true, data: await aiAssistantService.getSession(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.message.send', async (payload) => {
+    try {
+      const input = payload as AiAssistantMessageSendRequest;
+      if (!input?.workspaceId || !input.context || !input.message?.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.message.send requires workspaceId, context, and message');
+      }
+      return { ok: true, data: await aiAssistantService.sendMessage(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.session.reset', async (payload) => {
+    try {
+      const input = payload as AiAssistantSessionResetRequest;
+      if (!input?.workspaceId || !input.sessionId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.reset requires workspaceId and sessionId');
+      }
+      return { ok: true, data: await aiAssistantService.resetSession(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.artifact.apply', async (payload) => {
+    try {
+      const input = payload as AiAssistantArtifactDecisionRequest;
+      if (!input?.workspaceId || !input.sessionId || !input.artifactId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.artifact.apply requires workspaceId, sessionId, and artifactId');
+      }
+      return { ok: true, data: await aiAssistantService.applyArtifact(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.artifact.reject', async (payload) => {
+    try {
+      const input = payload as AiAssistantArtifactDecisionRequest;
+      if (!input?.workspaceId || !input.sessionId || !input.artifactId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.artifact.reject requires workspaceId, sessionId, and artifactId');
+      }
+      return { ok: true, data: await aiAssistantService.rejectArtifact(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
       }
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));

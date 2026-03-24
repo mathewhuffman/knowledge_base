@@ -544,6 +544,63 @@ export const migrations: Migration[] = [
       SET template_type = COALESCE(template_type, 'standard_how_to')
       WHERE template_type IS NULL OR template_type = '';
     `
+  },
+  {
+    version: 12,
+    name: '0012_global_ai_assistant',
+    description: 'Add generic route-aware AI assistant sessions, messages, and artifacts.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS ai_sessions (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        scope_type TEXT NOT NULL,
+        route TEXT NOT NULL,
+        entity_type TEXT,
+        entity_id TEXT,
+        status TEXT NOT NULL DEFAULT 'idle',
+        runtime_session_id TEXT,
+        latest_artifact_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        message_kind TEXT NOT NULL DEFAULT 'chat',
+        content TEXT NOT NULL,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_artifacts (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        artifact_type TEXT NOT NULL,
+        entity_type TEXT,
+        entity_id TEXT,
+        base_version_token TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        payload_json TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        applied_at TEXT,
+        rejected_at TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_sessions_scope
+        ON ai_sessions(workspace_id, route, COALESCE(entity_type, ''), COALESCE(entity_id, ''));
+
+      CREATE INDEX IF NOT EXISTS idx_ai_messages_session_created
+        ON ai_messages(session_id, created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_ai_artifacts_session_created
+        ON ai_artifacts(session_id, created_at DESC);
+    `
   }
 ];
 

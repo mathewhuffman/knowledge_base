@@ -7,3 +7,4 @@ export * from './batch6';
 export * from './batch7';
 export * from './batch8';
 export * from './batch9';
+export * from './ai-assistant';

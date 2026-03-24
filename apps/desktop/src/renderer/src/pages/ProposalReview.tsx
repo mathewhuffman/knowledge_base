@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
+  AppRoute,
   ProposalReviewStatus,
   ProposalReviewDecision,
   type ProposalReviewBatchListResponse,
@@ -10,12 +11,13 @@ import {
   type ProposalReviewQueueItem,
   type ProposalReviewSummaryCounts,
   type ProposalSourceLineChange,
-  type ProposalRenderedBlockChange,
   type ProposalChangeRegion,
   type ProposalPlacementSuggestion,
   type PBIRecord,
   ProposalAction,
+  type AiAssistantUiAction,
 } from '@kb-vault/shared-types';
+import * as diffEngine from '@kb-vault/diff-engine';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
 import { LoadingState } from '../components/LoadingState';
@@ -36,6 +38,10 @@ import {
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
+import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
+
+const { diffHtml } = diffEngine;
+const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
 
 type ContentTab = 'preview' | 'diff' | 'source' | 'regions';
 
@@ -330,27 +336,6 @@ function SourceDiffPanel({ lines }: { lines: ProposalSourceLineChange[] }) {
   );
 }
 
-function RenderedDiffPanel({ blocks }: { blocks: ProposalRenderedBlockChange[] }) {
-  if (!blocks || blocks.length === 0) {
-    return (
-      <div style={{ padding: 'var(--space-4)', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 'var(--text-sm)' }}>
-        No rendered diff available
-      </div>
-    );
-  }
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column' }}>
-      {blocks.map((block, i) => (
-        <div key={i} className={`rendered-diff-block rendered-diff-block--${block.kind}`}>
-          {block.kind === 'removed' && block.beforeText}
-          {block.kind === 'added' && block.afterText}
-          {block.kind === 'unchanged' && (block.beforeText || block.afterText)}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function SourcePanel({ html }: { html: string }) {
   return <pre className="source-view">{html || 'No source HTML'}</pre>;
 }
@@ -583,6 +568,12 @@ export const ProposalReview = () => {
   const [activeTab, setActiveTab] = useState<ContentTab>('preview');
   const [decidingAs, setDecidingAs] = useState<ProposalReviewDecision | null>(null);
   const [selectedPBI, setSelectedPBI] = useState<PBIRecord | null>(null);
+  const [proposalWorkingCopy, setProposalWorkingCopy] = useState<{
+    html: string;
+    title?: string;
+    rationale?: string;
+    rationaleSummary?: string;
+  } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const batchSummaries = batchListIpc.data?.batches ?? [];
@@ -592,7 +583,7 @@ export const ProposalReview = () => {
   const groups = listData?.groups ?? [];
   const summary = listData?.summary;
   const proposal = detail?.proposal;
-  const diff = detail?.diff;
+  const persistedDiff = detail?.diff;
   const navigation = detail?.navigation;
   const relatedPbis = detail?.relatedPbis ?? [];
   const selectedQueueItem = queue.find((item) => item.proposalId === selectedProposalId);
@@ -634,6 +625,16 @@ export const ProposalReview = () => {
   }, [activeWorkspace?.id, resetBatchList, resetList, resetDetail, loadBatchSummaries]);
 
   useEffect(() => {
+    if (!activeWorkspace) return;
+    const targetProposalId = window.sessionStorage.getItem(PROPOSAL_REVIEW_TARGET_KEY);
+    if (!targetProposalId) return;
+    window.sessionStorage.removeItem(PROPOSAL_REVIEW_TARGET_KEY);
+    setSelectedProposalId(targetProposalId);
+    setSelectedPBI(null);
+    setActiveTab('preview');
+  }, [activeWorkspace?.id]);
+
+  useEffect(() => {
     if (!activeWorkspace || !selectedBatchId) return;
     void executeList({ workspaceId: activeWorkspace.id, batchId: selectedBatchId });
   }, [activeWorkspace?.id, selectedBatchId, executeList]);
@@ -644,8 +645,18 @@ export const ProposalReview = () => {
   }, [activeWorkspace?.id, selectedProposalId, executeDetail]);
 
   useEffect(() => {
+    if (!detail?.batchId) return;
+    if (selectedBatchId === detail.batchId) return;
+    setSelectedBatchId(detail.batchId);
+  }, [detail?.batchId, selectedBatchId]);
+
+  useEffect(() => {
     setSelectedPBI(null);
   }, [selectedProposalId]);
+
+  useEffect(() => {
+    setProposalWorkingCopy(null);
+  }, [detail?.proposal.id, detail?.diff?.afterHtml]);
 
   useEffect(() => {
     if (queue.length === 0 || selectedProposalId) return;
@@ -738,7 +749,99 @@ export const ProposalReview = () => {
   }, [selectedBatchId, handleDecision, navigateNext, navigatePrevious]);
 
   const isEditProposal = proposal?.action === ProposalAction.EDIT;
+  const workingHtml = proposalWorkingCopy?.html ?? persistedDiff?.afterHtml ?? '';
+  const diff = useMemo(() => {
+    if (!persistedDiff) return persistedDiff;
+    if (!proposalWorkingCopy?.html) return persistedDiff;
+    const next = diffHtml(persistedDiff.beforeHtml ?? '', proposalWorkingCopy.html);
+    return {
+      beforeHtml: next.beforeHtml,
+      afterHtml: next.afterHtml,
+      sourceDiff: {
+        lines: next.sourceLines.map((line) => ({
+          kind: line.kind,
+          lineNumberBefore: line.beforeLineNumber,
+          lineNumberAfter: line.afterLineNumber,
+          content: line.content
+        }))
+      },
+      renderedDiff: {
+        blocks: next.renderedBlocks.map((block) => ({
+          kind: block.kind,
+          beforeText: block.beforeText,
+          afterText: block.afterText
+        }))
+      },
+      changeRegions: next.changeRegions.map((region) => ({
+        id: region.id,
+        kind: region.kind,
+        label: region.label,
+        beforeText: region.beforeText,
+        afterText: region.afterText,
+        beforeLineStart: region.beforeLineStart,
+        beforeLineEnd: region.beforeLineEnd,
+        afterLineStart: region.afterLineStart,
+        afterLineEnd: region.afterLineEnd
+      })),
+      gutter: next.gutter.map((item) => ({
+        lineNumber: item.lineNumber,
+        kind: item.kind,
+        regionId: item.regionId,
+        side: item.side
+      }))
+    };
+  }, [persistedDiff, proposalWorkingCopy?.html]);
   const hasDiff = !!diff?.sourceDiff?.lines?.length;
+
+  useRegisterAiAssistantView({
+    enabled: Boolean(activeWorkspace && proposal && diff),
+    context: {
+      workspaceId: activeWorkspace?.id ?? '',
+      route: AppRoute.PROPOSAL_REVIEW,
+      routeLabel: 'Proposal Review',
+      subject: {
+        type: 'proposal',
+        id: proposal?.id ?? 'proposal',
+        title: proposalWorkingCopy?.title ?? proposal?.targetTitle ?? selectedQueueItem?.articleLabel,
+        locale: proposal?.targetLocale
+      },
+      workingState: {
+        kind: 'proposal_html',
+        versionToken: proposal ? `${proposal.id}:${proposal.updatedAtUtc}` : 'proposal',
+        payload: {
+          html: workingHtml,
+          title: proposalWorkingCopy?.title ?? proposal?.targetTitle,
+          rationaleSummary: proposalWorkingCopy?.rationaleSummary ?? proposal?.rationaleSummary
+        }
+      },
+      capabilities: {
+        canChat: true,
+        canCreateProposal: false,
+        canPatchProposal: true,
+        canPatchDraft: false,
+        canPatchTemplate: false,
+        canUseUnsavedWorkingState: true
+      },
+      backingData: {
+        proposalId: proposal?.id,
+        localeVariantId: proposal?.localeVariantId,
+        sourceRevisionId: proposal?.sourceRevisionId,
+        proposal
+      }
+    },
+    applyUiActions: (actions: AiAssistantUiAction[]) => {
+      actions.forEach((action) => {
+        if (action.type === 'replace_working_html' && action.target === 'proposal') {
+          setProposalWorkingCopy((prev) => ({
+            html: action.html,
+            title: prev?.title ?? proposal?.targetTitle,
+            rationale: prev?.rationale ?? proposal?.aiNotes,
+            rationaleSummary: prev?.rationaleSummary ?? proposal?.rationaleSummary
+          }));
+        }
+      });
+    }
+  });
 
   if (!activeWorkspace) {
     return (
@@ -964,7 +1067,7 @@ export const ProposalReview = () => {
                       {ACTION_LABEL[proposal.action] ?? proposal.action}
                     </Badge>
                     <span className="review-center-title-text">
-                      {proposal.targetTitle || selectedQueueItem?.articleLabel || 'Proposal'}
+                      {proposalWorkingCopy?.title || proposal.targetTitle || selectedQueueItem?.articleLabel || 'Proposal'}
                     </span>
                     {proposal.reviewStatus !== ProposalReviewStatus.PENDING_REVIEW && (
                       <Badge variant={STATUS_VARIANT[proposal.reviewStatus] ?? 'neutral'}>
@@ -1027,16 +1130,10 @@ export const ProposalReview = () => {
 
                 <div className="review-content-body">
                   {activeTab === 'preview' && (
-                    <>
-                      {isEditProposal && diff && (diff.renderedDiff?.blocks?.length ?? 0) > 0 ? (
-                        <RenderedDiffPanel blocks={diff.renderedDiff?.blocks ?? []} />
-                      ) : (
-                        <PreviewPanel html={diff?.afterHtml ?? ''} />
-                      )}
-                    </>
+                    <PreviewPanel html={workingHtml} />
                   )}
                   {activeTab === 'diff' && diff && <SourceDiffPanel lines={diff.sourceDiff?.lines ?? []} />}
-                  {activeTab === 'source' && <SourcePanel html={diff?.afterHtml ?? ''} />}
+                  {activeTab === 'source' && <SourcePanel html={workingHtml} />}
                   {activeTab === 'regions' && diff && <ChangeRegionsPanel regions={diff.changeRegions ?? []} />}
                 </div>
               </>
@@ -1047,7 +1144,10 @@ export const ProposalReview = () => {
             {proposal && (
               <>
                 <ConfidenceCard score={proposal.confidenceScore} />
-                <AISummaryCard rationaleSummary={proposal.rationaleSummary} aiNotes={proposal.aiNotes} />
+                <AISummaryCard
+                  rationaleSummary={proposalWorkingCopy?.rationaleSummary ?? proposal.rationaleSummary}
+                  aiNotes={proposalWorkingCopy?.rationale ?? proposal.aiNotes}
+                />
                 <PBIEvidenceCard pbis={relatedPbis} onSelectPBI={setSelectedPBI} />
                 <PlacementCard placement={proposal.suggestedPlacement} />
 

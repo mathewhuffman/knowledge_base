@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
+  AppRoute,
   ArticleRelationDirection,
   ArticleRelationType,
   RevisionState,
@@ -40,17 +41,17 @@ import {
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
+import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
 
 type Filter = 'all' | 'live' | 'drafts' | 'retired' | 'conflicted';
 
-type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbis' | 'relations' | 'ai';
+type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbis' | 'relations';
 
 type PreviewStyleResponse = { css: string; sourcePath: string };
 
 const DETAIL_TAB_CONFIG: { id: DetailTab; label: string; icon: typeof IconEye }[] = [
   { id: 'preview', label: 'Preview', icon: IconEye },
   { id: 'source', label: 'Source', icon: IconCode },
-  { id: 'ai', label: 'AI Chat', icon: IconZap },
   { id: 'history', label: 'History', icon: IconClock },
   { id: 'lineage', label: 'Lineage', icon: IconLink },
   { id: 'publish', label: 'Publish', icon: IconRefreshCw },
@@ -1461,6 +1462,40 @@ export const ArticleExplorer = () => {
     latestSyncAttempt.endedAtUtc.localeCompare(latestSuccessfulSync.endedAtUtc) > 0
   );
 
+  useRegisterAiAssistantView({
+    enabled: Boolean(activeWorkspace && detailPanel.detail),
+    context: {
+      workspaceId: activeWorkspace?.id ?? '',
+      route: AppRoute.ARTICLE_EXPLORER,
+      routeLabel: 'Article Explorer',
+      subject: {
+        type: 'article',
+        id: detailPanel.localeVariantId || detailPanel.familyId || 'article',
+        title: detailPanel.familyTitle,
+        locale: detailPanel.localeVariants.find((item) => item.localeVariantId === detailPanel.localeVariantId)?.locale
+      },
+      workingState: {
+        kind: 'none',
+        payload: null
+      },
+      capabilities: {
+        canChat: true,
+        canCreateProposal: Boolean(detailPanel.detail),
+        canPatchProposal: false,
+        canPatchDraft: false,
+        canPatchTemplate: false,
+        canUseUnsavedWorkingState: false
+      },
+      backingData: {
+        familyId: detailPanel.detail?.familyId ?? detailPanel.familyId,
+        localeVariantId: detailPanel.localeVariantId,
+        sourceRevisionId: detailPanel.detail?.revision.id,
+        sourceHtml: detailPanel.detail?.sourceHtml,
+        previewHtml: detailPanel.detail?.previewHtml
+      }
+    }
+  });
+
   const renderDetailContent = () => {
     if (detailPanel.loading) {
       return <LoadingState message="Loading article details..." />;
@@ -1606,12 +1641,6 @@ export const ArticleExplorer = () => {
           />
         )}
 
-        {detailPanel.activeTab === 'ai' && activeWorkspace && (
-          <ArticleAiTab
-            workspaceId={activeWorkspace.id}
-            localeVariantId={detailPanel.localeVariantId}
-          />
-        )}
       </>
     );
   };

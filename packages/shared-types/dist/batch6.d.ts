@@ -1,5 +1,5 @@
 import type { KbAccessMode } from './batch2';
-export type AgentSessionType = 'batch_analysis' | 'article_edit';
+export type AgentSessionType = 'batch_analysis' | 'article_edit' | 'assistant_chat';
 export type AgentSessionStatus = 'starting' | 'running' | 'idle' | 'closed' | 'error';
 export declare enum AgentCommand {
     ANALYSIS_RUN = "agent.analysis.run",
@@ -63,6 +63,16 @@ export interface AgentAnalysisRunRequest {
     timeoutMs?: number;
 }
 export interface AgentArticleEditRunRequest {
+    workspaceId: string;
+    localeVariantId: string;
+    kbAccessMode?: KbAccessMode;
+    locale?: string;
+    sessionId?: string;
+    sessionType?: AgentSessionType;
+    prompt?: string;
+    timeoutMs?: number;
+}
+export interface AgentAssistantChatRunRequest {
     workspaceId: string;
     localeVariantId: string;
     kbAccessMode?: KbAccessMode;

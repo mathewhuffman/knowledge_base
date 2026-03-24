@@ -4,6 +4,10 @@ import { routeToComponent } from './routes/routeMap';
 import { Sidebar } from './components/Sidebar';
 import { WorkspaceProvider, useWorkspace } from './context/WorkspaceContext';
 import type { KbvApi } from './types/window';
+import { AiAssistantProvider } from './components/assistant/AssistantContext';
+import { GlobalAssistantHost } from './components/assistant/GlobalAssistantHost';
+
+const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
 
 declare global {
   interface Window {
@@ -42,6 +46,11 @@ function AppShell() {
     }
   }, [activeWorkspace, activeRoute]);
 
+  const openProposalReview = (proposalId: string) => {
+    window.sessionStorage.setItem(PROPOSAL_REVIEW_TARGET_KEY, proposalId);
+    setActiveRoute(AppRoute.PROPOSAL_REVIEW);
+  };
+
   const Active = routeToComponent[activeRoute];
 
   return (
@@ -53,9 +62,16 @@ function AppShell() {
         isConnected={boot?.ok === true}
       />
       {bootError ? <p style={{ padding: '16px', color: 'crimson' }}>{bootError}</p> : null}
-      <main className="main-content">
-        <Active />
-      </main>
+      <AiAssistantProvider
+        activeRoute={activeRoute}
+        workspaceId={activeWorkspace?.id}
+        onOpenProposalReview={openProposalReview}
+      >
+        <main className="main-content">
+          <Active />
+        </main>
+        <GlobalAssistantHost />
+      </AiAssistantProvider>
     </div>
   );
 }

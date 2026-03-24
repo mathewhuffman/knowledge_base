@@ -3,7 +3,9 @@ import {
   DraftBranchStatus,
   DraftValidationSeverity,
   DraftCommitSource,
+  AppRoute,
   ArticleAiPresetAction,
+  type AiAssistantUiAction,
   type DraftBranchGetResponse,
   type DraftBranchListResponse,
   type DraftBranchSummary,
@@ -39,6 +41,7 @@ import {
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
+import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -528,9 +531,6 @@ export const Drafts = () => {
   const [originalHtml, setOriginalHtml] = useState('');
   const [tab, setTab] = useState<EditorTab>('source');
   const [showDiscardDialog, setShowDiscardDialog] = useState(false);
-  const [aiPrompt, setAiPrompt] = useState('');
-  const [selectedTemplateId, setSelectedTemplateId] = useState('');
-  const [selectedPreset, setSelectedPreset] = useState<ArticleAiPresetAction>(ArticleAiPresetAction.FREEFORM);
 
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const hasUnsavedChanges = draftHtml !== originalHtml;
@@ -543,11 +543,6 @@ export const Drafts = () => {
   const redoMutation = useIpcMutation<DraftBranchGetResponse>('draft.branch.redo');
   const statusMutation = useIpcMutation<DraftBranchGetResponse>('draft.branch.status.set');
   const discardMutation = useIpcMutation<DraftBranchGetResponse>('draft.branch.discard');
-  const articleAiQuery = useIpc<ArticleAiSessionResponse>('article.ai.get');
-  const articleAiSubmitMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.submit');
-  const articleAiResetMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.reset');
-  const articleAiAcceptMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.accept');
-  const articleAiRejectMutation = useIpcMutation<ArticleAiSessionResponse>('article.ai.reject');
 
   // ---------------------------------------------------------------------------
   // Data loading
@@ -576,11 +571,6 @@ export const Drafts = () => {
       setOriginalHtml(detailQuery.data.editor.html);
     }
   }, [detailQuery.data]);
-
-  useEffect(() => {
-    if (!activeWorkspace || !selectedBranchId) return;
-    void articleAiQuery.execute({ workspaceId: activeWorkspace.id, branchId: selectedBranchId });
-  }, [activeWorkspace, selectedBranchId]);
 
   // ---------------------------------------------------------------------------
   // Actions
@@ -665,79 +655,6 @@ export const Drafts = () => {
     await applyDetail(result);
   }, [activeWorkspace, selectedBranchId, applyDetail]);
 
-  const refreshArticleAi = useCallback(async (branchId?: string) => {
-    if (!activeWorkspace) return;
-    const targetBranchId = branchId ?? selectedBranchId;
-    if (!targetBranchId) return;
-    await articleAiQuery.execute({ workspaceId: activeWorkspace.id, branchId: targetBranchId });
-  }, [activeWorkspace, selectedBranchId]);
-
-  const handleAiPreset = useCallback((preset: ArticleAiPresetAction) => {
-    setSelectedPreset(preset);
-    const next = preset === ArticleAiPresetAction.REWRITE_TONE
-      ? 'Rewrite this draft for a clearer, more confident support tone.'
-      : preset === ArticleAiPresetAction.SHORTEN
-        ? 'Shorten this draft while preserving every required step.'
-        : preset === ArticleAiPresetAction.EXPAND
-          ? 'Expand this draft with missing context and examples.'
-          : preset === ArticleAiPresetAction.RESTRUCTURE
-            ? 'Restructure this draft into a clearer heading and section flow.'
-            : preset === ArticleAiPresetAction.CONVERT_TO_TROUBLESHOOTING
-              ? 'Convert this draft into a troubleshooting article with symptoms, causes, and fixes.'
-              : preset === ArticleAiPresetAction.ALIGN_TO_TEMPLATE
-                ? 'Align this draft to the selected template pack.'
-                : preset === ArticleAiPresetAction.UPDATE_LOCALE
-                  ? 'Update this draft for the target locale and keep terminology consistent.'
-                  : 'Insert image placeholders where screenshots would help.';
-    setAiPrompt(next);
-  }, []);
-
-  const handleAiSubmit = useCallback(async () => {
-    if (!activeWorkspace || !selectedBranchId || !aiPrompt.trim()) return;
-    const result = await articleAiSubmitMutation.mutate({
-      workspaceId: activeWorkspace.id,
-      branchId: selectedBranchId,
-      message: aiPrompt,
-      templatePackId: selectedTemplateId || undefined,
-      presetAction: selectedPreset
-    });
-    if (result) {
-      setAiPrompt('');
-      setSelectedPreset(ArticleAiPresetAction.FREEFORM);
-      await refreshArticleAi(selectedBranchId);
-    }
-  }, [activeWorkspace, selectedBranchId, aiPrompt, selectedTemplateId, selectedPreset, refreshArticleAi]);
-
-  const handleAiReset = useCallback(async () => {
-    if (!activeWorkspace || !articleAiQuery.data) return;
-    await articleAiResetMutation.mutate({
-      workspaceId: activeWorkspace.id,
-      sessionId: articleAiQuery.data.session.id
-    });
-    await refreshArticleAi();
-  }, [activeWorkspace, articleAiQuery.data, refreshArticleAi]);
-
-  const handleAiAccept = useCallback(async () => {
-    if (!activeWorkspace || !articleAiQuery.data) return;
-    const result = await articleAiAcceptMutation.mutate({
-      workspaceId: activeWorkspace.id,
-      sessionId: articleAiQuery.data.session.id
-    });
-    if (result) {
-      await refresh(selectedBranchId ?? undefined);
-      await refreshArticleAi(result.session.branchId ?? selectedBranchId ?? undefined);
-    }
-  }, [activeWorkspace, articleAiQuery.data, refresh, refreshArticleAi, selectedBranchId]);
-
-  const handleAiReject = useCallback(async () => {
-    if (!activeWorkspace || !articleAiQuery.data) return;
-    await articleAiRejectMutation.mutate({
-      workspaceId: activeWorkspace.id,
-      sessionId: articleAiQuery.data.session.id
-    });
-    await refreshArticleAi();
-  }, [activeWorkspace, articleAiQuery.data, refreshArticleAi]);
-
   // ---------------------------------------------------------------------------
   // Keyboard shortcuts
   // ---------------------------------------------------------------------------
@@ -776,6 +693,54 @@ export const Drafts = () => {
     }, 5000);
     return () => clearTimeout(timer);
   }, [draftHtml, hasUnsavedChanges]);
+
+  const branches = listQuery.data?.branches ?? [];
+  const summary = listQuery.data?.summary ?? { total: 0, active: 0, readyToPublish: 0, conflicted: 0, obsolete: 0, discarded: 0 };
+  const selected = detailQuery.data;
+  const branchStatus = selected?.branch.status;
+  const isEditable = branchStatus === DraftBranchStatus.ACTIVE || branchStatus === DraftBranchStatus.READY_TO_PUBLISH;
+  const isObsoleteOrDiscarded = branchStatus === DraftBranchStatus.OBSOLETE || branchStatus === DraftBranchStatus.DISCARDED;
+
+  useRegisterAiAssistantView({
+    enabled: Boolean(activeWorkspace && selected),
+    context: {
+      workspaceId: activeWorkspace?.id ?? '',
+      route: AppRoute.DRAFTS,
+      routeLabel: 'Drafts',
+      subject: {
+        type: 'draft_branch',
+        id: selected?.branch.id ?? 'draft-branch',
+        title: selected?.branch.name,
+        locale: selected?.branch.locale
+      },
+      workingState: {
+        kind: 'article_html',
+        versionToken: selected?.branch.headRevisionId ?? `draft:${selected?.branch.id ?? 'unknown'}`,
+        payload: { html: draftHtml }
+      },
+      capabilities: {
+        canChat: true,
+        canCreateProposal: false,
+        canPatchProposal: false,
+        canPatchDraft: true,
+        canPatchTemplate: false,
+        canUseUnsavedWorkingState: true
+      },
+      backingData: {
+        branchId: selected?.branch.id,
+        localeVariantId: selected?.branch.localeVariantId,
+        locale: selected?.branch.locale,
+        sourceHtml: originalHtml
+      }
+    },
+    applyUiActions: (actions: AiAssistantUiAction[]) => {
+      actions.forEach((action) => {
+        if (action.type === 'replace_working_html' && action.target === 'draft') {
+          setDraftHtml(action.html);
+        }
+      });
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Render: guards
@@ -821,18 +786,6 @@ export const Drafts = () => {
   // ---------------------------------------------------------------------------
   // Render: main
   // ---------------------------------------------------------------------------
-
-  const branches = listQuery.data?.branches ?? [];
-  const summary = listQuery.data?.summary ?? { total: 0, active: 0, readyToPublish: 0, conflicted: 0, obsolete: 0, discarded: 0 };
-  const selected = detailQuery.data;
-  const branchStatus = selected?.branch.status;
-  const isEditable = branchStatus === DraftBranchStatus.ACTIVE || branchStatus === DraftBranchStatus.READY_TO_PUBLISH;
-  const isObsoleteOrDiscarded = branchStatus === DraftBranchStatus.OBSOLETE || branchStatus === DraftBranchStatus.DISCARDED;
-  const aiBusy = articleAiQuery.loading
-    || articleAiSubmitMutation.loading
-    || articleAiResetMutation.loading
-    || articleAiAcceptMutation.loading
-    || articleAiRejectMutation.loading;
 
   return (
     <>
@@ -1082,20 +1035,6 @@ export const Drafts = () => {
                       <HistoryPanel entries={selected.editor.history} />
                     </div>
 
-                    <ArticleAiPanel
-                      session={articleAiQuery.data}
-                      prompt={aiPrompt}
-                      onPromptChange={setAiPrompt}
-                      selectedTemplateId={selectedTemplateId}
-                      onTemplateChange={setSelectedTemplateId}
-                      onPreset={handleAiPreset}
-                      onSubmit={() => void handleAiSubmit()}
-                      onReset={() => void handleAiReset()}
-                      onAccept={() => void handleAiAccept()}
-                      onReject={() => void handleAiReject()}
-                      loading={aiBusy}
-                      templates={articleAiQuery.data?.templatePacks ?? []}
-                    />
                   </div>
                 )}
               </div>

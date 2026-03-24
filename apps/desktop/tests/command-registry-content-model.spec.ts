@@ -6,11 +6,11 @@ import { test, expect } from '@playwright/test';
 import { CommandBus } from '../src/main/services/command-bus';
 import { JobRegistry } from '../src/main/services/job-runner';
 import { registerCoreCommands } from '../src/main/services/command-registry';
-import { AppErrorCode } from '@kb-vault/shared-types';
+import { AppErrorCode, AppRoute } from '@kb-vault/shared-types';
 
 async function createFakeAcpBinary(root: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-article-ai-agent');
-  const source = `#!/usr/bin/env node
+const source = `#!/usr/bin/env node
 const readline = require('node:readline');
 const sessionId = 'fake-acp-session';
 const rl = readline.createInterface({ input: process.stdin });
@@ -27,7 +27,50 @@ rl.on('line', (line) => {
     return;
   }
   if (message.method === 'session/prompt') {
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify({ updatedHtml: '<h1>Draft Commands</h1><p>AI refined draft.</p>', summary: 'AI tightened the article.' }) } }) + '\\n');
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+    if (promptText.includes('Route: drafts')) {
+      payload = {
+        artifactType: 'draft_patch',
+        response: 'I tightened the draft copy.',
+        summary: 'Refined the draft.',
+        html: '<h1>Draft Commands</h1><p>AI refined draft.</p>'
+      };
+    } else if (promptText.includes('Route: templates_and_prompts')) {
+      payload = {
+        artifactType: 'template_patch',
+        response: 'I strengthened the template guidance.',
+        summary: 'Updated the template fields.',
+        formPatch: {
+          toneRules: 'Be concise, concrete, and action-oriented.',
+          description: 'Template updated by the assistant.'
+        }
+      };
+    } else if (promptText.includes('Route: article_explorer')) {
+      payload = {
+        artifactType: 'proposal_candidate',
+        response: 'I prepared a proposal candidate from the live article.',
+        summary: 'Created a proposal candidate.',
+        title: 'Batch 9 Commands',
+        rationale: 'The article needs a clearer opening.',
+        html: '<h1>Batch 9 Commands</h1><p>Assistant proposal candidate.</p>',
+        payload: {
+          proposedHtml: '<h1>Batch 9 Commands</h1><p>Assistant proposal candidate.</p>'
+        }
+      };
+    } else if (promptText.includes('Route: proposal_review')) {
+      payload = {
+        artifactType: 'proposal_patch',
+        response: 'I refined the proposal working copy.',
+        summary: 'Updated the proposal draft.',
+        title: 'Batch 9 Commands Refined',
+        rationale: 'Made the rationale more specific.',
+        html: '<h1>Batch 9 Commands Refined</h1><p>AI refined proposal.</p>'
+      };
+    } else {
+      payload = { updatedHtml: '<h1>Draft Commands</h1><p>AI refined draft.</p>', summary: 'AI tightened the article.' };
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
     return;
   }
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
@@ -428,6 +471,250 @@ test.describe('command registry content model transitions', () => {
         }
       });
       expect(deleted.ok).toBe(true);
+    } finally {
+      await harness.cleanup();
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('supports the global AI assistant flows across article, draft, proposal, and template contexts', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-global-ai-commands-'));
+    process.env.KBV_CURSOR_BINARY = await createFakeAcpBinary(isolatedRoot);
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+
+      const familyResp = await harness.bus.execute({
+        method: 'articleFamily.create',
+        payload: {
+          workspaceId: workspace.id,
+          externalKey: 'kb-global-ai',
+          title: 'Global AI Commands'
+        }
+      });
+      expect(familyResp.ok).toBe(true);
+      const family = familyResp.data as { id: string };
+
+      const localeResp = await harness.bus.execute({
+        method: 'localeVariant.create',
+        payload: {
+          workspaceId: workspace.id,
+          familyId: family.id,
+          locale: 'en-us',
+          status: 'live'
+        }
+      });
+      expect(localeResp.ok).toBe(true);
+      const localeVariant = localeResp.data as { id: string };
+
+      const branchResp = await harness.bus.execute({
+        method: 'draft.branch.create',
+        payload: {
+          workspaceId: workspace.id,
+          localeVariantId: localeVariant.id,
+          sourceHtml: '<h1>Draft Commands</h1><p>Original global draft.</p>'
+        }
+      });
+      expect(branchResp.ok).toBe(true);
+      const branch = branchResp.data as { branch: { id: string; headRevisionId: string } };
+
+      const draftTurn = await harness.bus.execute({
+        method: 'ai.assistant.message.send',
+        payload: {
+          workspaceId: workspace.id,
+          context: {
+            workspaceId: workspace.id,
+            route: AppRoute.DRAFTS,
+            routeLabel: 'Drafts',
+            subject: {
+              type: 'draft_branch',
+              id: branch.branch.id,
+              title: 'Global Draft',
+              locale: 'en-us'
+            },
+            workingState: {
+              kind: 'article_html',
+              versionToken: branch.branch.headRevisionId,
+              payload: { html: '<h1>Draft Commands</h1><p>Original global draft.</p>' }
+            },
+            capabilities: {
+              canChat: true,
+              canCreateProposal: false,
+              canPatchProposal: false,
+              canPatchDraft: true,
+              canPatchTemplate: false,
+              canUseUnsavedWorkingState: true
+            },
+            backingData: {
+              branchId: branch.branch.id,
+              localeVariantId: localeVariant.id
+            }
+          },
+          message: 'Tighten this draft.'
+        }
+      });
+      expect(draftTurn.ok).toBe(true);
+      expect((draftTurn.data as { artifact?: { artifactType: string } }).artifact?.artifactType).toBe('draft_patch');
+      expect((draftTurn.data as { uiActions: Array<{ type: string; html?: string }> }).uiActions[0]).toMatchObject({
+        type: 'replace_working_html',
+        html: '<h1>Draft Commands</h1><p>AI refined draft.</p>'
+      });
+
+      const templateTurn = await harness.bus.execute({
+        method: 'ai.assistant.message.send',
+        payload: {
+          workspaceId: workspace.id,
+          context: {
+            workspaceId: workspace.id,
+            route: AppRoute.TEMPLATES_AND_PROMPTS,
+            routeLabel: 'Templates & Prompts',
+            subject: {
+              type: 'template_pack',
+              id: 'new-template',
+              title: 'New Template',
+              locale: 'en-us'
+            },
+            workingState: {
+              kind: 'template_pack',
+              versionToken: 'new-template:1',
+              payload: {
+                name: 'New Template',
+                language: 'en-us',
+                templateType: 'faq',
+                promptTemplate: 'Answer clearly.',
+                toneRules: 'Be helpful.'
+              }
+            },
+            capabilities: {
+              canChat: true,
+              canCreateProposal: false,
+              canPatchProposal: false,
+              canPatchDraft: false,
+              canPatchTemplate: true,
+              canUseUnsavedWorkingState: true
+            },
+            backingData: {}
+          },
+          message: 'Improve this template.'
+        }
+      });
+      expect(templateTurn.ok).toBe(true);
+      expect((templateTurn.data as { artifact?: { artifactType: string } }).artifact?.artifactType).toBe('template_patch');
+
+      const articleTurn = await harness.bus.execute({
+        method: 'ai.assistant.message.send',
+        payload: {
+          workspaceId: workspace.id,
+          context: {
+            workspaceId: workspace.id,
+            route: AppRoute.ARTICLE_EXPLORER,
+            routeLabel: 'Article Explorer',
+            subject: {
+              type: 'article',
+              id: localeVariant.id,
+              title: 'Global AI Commands',
+              locale: 'en-us'
+            },
+            workingState: {
+              kind: 'none',
+              payload: null
+            },
+            capabilities: {
+              canChat: true,
+              canCreateProposal: true,
+              canPatchProposal: false,
+              canPatchDraft: false,
+              canPatchTemplate: false,
+              canUseUnsavedWorkingState: false
+            },
+            backingData: {
+              familyId: family.id,
+              localeVariantId: localeVariant.id,
+              sourceRevisionId: 'source-revision-1',
+              sourceHtml: '<h1>Global AI Commands</h1><p>Live article.</p>'
+            }
+          },
+          message: 'Prepare an edit proposal for this live article.'
+        }
+      });
+      expect(articleTurn.ok).toBe(true);
+      const articleData = articleTurn.data as { session: { id: string }; artifact?: { id: string; artifactType: string; status: string } };
+      expect(articleData.artifact?.artifactType).toBe('proposal_candidate');
+      expect(articleData.artifact?.status).toBe('pending');
+
+      const appliedCandidate = await harness.bus.execute({
+        method: 'ai.assistant.artifact.apply',
+        payload: {
+          workspaceId: workspace.id,
+          sessionId: articleData.session.id,
+          artifactId: articleData.artifact?.id
+        }
+      });
+      expect(appliedCandidate.ok).toBe(true);
+      const proposalId = (appliedCandidate.data as { createdProposalId?: string }).createdProposalId;
+      expect(proposalId).toBeTruthy();
+
+      const proposalDetail = await harness.bus.execute({
+        method: 'proposal.review.get',
+        payload: {
+          workspaceId: workspace.id,
+          proposalId
+        }
+      });
+      expect(proposalDetail.ok).toBe(true);
+      const detail = proposalDetail.data as { diff: { afterHtml: string }; proposal: { id: string; updatedAtUtc: string; targetLocale?: string } };
+
+      const proposalTurn = await harness.bus.execute({
+        method: 'ai.assistant.message.send',
+        payload: {
+          workspaceId: workspace.id,
+          context: {
+            workspaceId: workspace.id,
+            route: AppRoute.PROPOSAL_REVIEW,
+            routeLabel: 'Proposal Review',
+            subject: {
+              type: 'proposal',
+              id: proposalId,
+              title: 'Global AI Commands',
+              locale: detail.proposal.targetLocale ?? 'en-us'
+            },
+            workingState: {
+              kind: 'proposal_html',
+              versionToken: `${detail.proposal.id}:${detail.proposal.updatedAtUtc}`,
+              payload: {
+                html: detail.diff.afterHtml
+              }
+            },
+            capabilities: {
+              canChat: true,
+              canCreateProposal: false,
+              canPatchProposal: true,
+              canPatchDraft: false,
+              canPatchTemplate: false,
+              canUseUnsavedWorkingState: true
+            },
+            backingData: {
+              proposalId,
+              localeVariantId: localeVariant.id
+            }
+          },
+          message: 'Refine this proposal.'
+        }
+      });
+      expect(proposalTurn.ok).toBe(true);
+      expect((proposalTurn.data as { artifact?: { artifactType: string; status: string } }).artifact?.artifactType).toBe('proposal_patch');
+      expect((proposalTurn.data as { artifact?: { status: string } }).artifact?.status).toBe('applied');
+
+      const refreshedProposal = await harness.bus.execute({
+        method: 'proposal.review.get',
+        payload: {
+          workspaceId: workspace.id,
+          proposalId
+        }
+      });
+      expect(refreshedProposal.ok).toBe(true);
+      expect((refreshedProposal.data as { diff: { afterHtml: string } }).diff.afterHtml).toContain('AI refined proposal');
     } finally {
       await harness.cleanup();
       await rm(isolatedRoot, { recursive: true, force: true });
