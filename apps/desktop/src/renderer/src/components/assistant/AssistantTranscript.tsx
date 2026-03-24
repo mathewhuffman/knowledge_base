@@ -15,6 +15,25 @@ function formatTime(utc: string): string {
   }
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatAssistantHtml(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) return '';
+  const looksLikeHtml = /<[a-z][\s\S]*>/i.test(trimmed);
+  if (looksLikeHtml) {
+    return trimmed;
+  }
+  return escapeHtml(content).replace(/\n/g, '<br />');
+}
+
 function MessageBubble({ message }: { message: AiMessageRecord }) {
   const isUser = message.role === 'user';
   const isWarning = message.messageKind === 'warning';
@@ -37,7 +56,14 @@ function MessageBubble({ message }: { message: AiMessageRecord }) {
         </div>
       )}
       <div className="ai-msg__body">
-        <div className="ai-msg__content">{message.content}</div>
+        {isUser ? (
+          <div className="ai-msg__content">{message.content}</div>
+        ) : (
+          <div
+            className="ai-msg__content ai-msg__content--rich"
+            dangerouslySetInnerHTML={{ __html: formatAssistantHtml(message.content) }}
+          />
+        )}
         <div className="ai-msg__time">{formatTime(message.createdAtUtc)}</div>
       </div>
     </div>

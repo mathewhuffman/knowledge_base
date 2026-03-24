@@ -20,7 +20,6 @@ import { LoadingState } from '../components/LoadingState';
 import { ErrorState } from '../components/ErrorState';
 import { Badge } from '../components/Badge';
 import { StatusChip } from '../components/StatusChip';
-import { Kbd } from '../components/Kbd';
 import { ConfirmationDialog } from '../components/ConfirmationDialog';
 import {
   IconGitBranch,
@@ -656,33 +655,6 @@ export const Drafts = () => {
   }, [activeWorkspace, selectedBranchId, applyDetail]);
 
   // ---------------------------------------------------------------------------
-  // Keyboard shortcuts
-  // ---------------------------------------------------------------------------
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key === 's') {
-        e.preventDefault();
-        void saveDraft(false);
-      }
-      if (mod && e.key === 'z' && !e.shiftKey) {
-        e.preventDefault();
-        void handleUndo();
-      }
-      if (mod && e.key === 'z' && e.shiftKey) {
-        e.preventDefault();
-        void handleRedo();
-      }
-      if (mod && e.key === '1') { e.preventDefault(); setTab('source'); }
-      if (mod && e.key === '2') { e.preventDefault(); setTab('preview'); }
-      if (mod && e.key === '3') { e.preventDefault(); setTab('compare'); }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [saveDraft, handleUndo, handleRedo]);
-
-  // ---------------------------------------------------------------------------
   // Autosave on idle (debounced)
   // ---------------------------------------------------------------------------
 
@@ -1039,15 +1011,6 @@ export const Drafts = () => {
                 )}
               </div>
 
-              {/* Keyboard shortcut bar */}
-              <div className="draft-kbd-bar">
-                <span className="draft-kbd-hint"><Kbd keys="Cmd+S" /> Save</span>
-                <span className="draft-kbd-hint"><Kbd keys="Cmd+Z" /> Undo</span>
-                <span className="draft-kbd-hint"><Kbd keys="Cmd+Shift+Z" /> Redo</span>
-                <span className="draft-kbd-hint"><Kbd keys="Cmd+1" /> Source</span>
-                <span className="draft-kbd-hint"><Kbd keys="Cmd+2" /> Preview</span>
-                <span className="draft-kbd-hint"><Kbd keys="Cmd+3" /> Compare</span>
-              </div>
             </>
           ) : null}
         </div>

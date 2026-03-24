@@ -37,6 +37,7 @@ type RouteRegistration = {
 type AssistantContextValue = {
   open: boolean;
   setOpen: (open: boolean) => void;
+  hasUnread: boolean;
   historyOpen: boolean;
   setHistoryOpen: (open: boolean) => void;
   routeContext: AiViewContext | null;
@@ -95,6 +96,7 @@ export function AiAssistantProvider({
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  const [lastSeenAssistantMessageId, setLastSeenAssistantMessageId] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [registration, setRegistration] = useState<RouteRegistration | null>(null);
   const [session, setSession] = useState<AiSessionRecord | null>(null);
@@ -149,6 +151,26 @@ export function AiAssistantProvider({
   }, [activeRoute, workspaceId]);
 
   const routeContext = registration?.context ?? fallbackContext;
+
+  const latestAssistantMessageId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === 'assistant') {
+        return messages[index].id;
+      }
+    }
+    return null;
+  }, [messages]);
+
+  const hasUnread = useMemo(() => (
+    latestAssistantMessageId !== null && latestAssistantMessageId !== lastSeenAssistantMessageId
+  ), [lastSeenAssistantMessageId, latestAssistantMessageId]);
+
+  useEffect(() => {
+    if (!open || !latestAssistantMessageId) return;
+    setLastSeenAssistantMessageId((current) => (
+      current === latestAssistantMessageId ? current : latestAssistantMessageId
+    ));
+  }, [latestAssistantMessageId, open]);
 
   useEffect(() => {
     if (!window.kbv?.invoke) {
@@ -275,6 +297,7 @@ export function AiAssistantProvider({
       setSessions([]);
       setMessages([]);
       setArtifact(null);
+      setLastSeenAssistantMessageId(null);
       setSending(false);
       setHistoryOpen(false);
       return;
@@ -288,6 +311,7 @@ export function AiAssistantProvider({
         setSessions([]);
         setMessages([]);
         setArtifact(null);
+        setLastSeenAssistantMessageId(null);
         setSending(false);
       })
       .finally(() => setLoading(false));
@@ -488,6 +512,7 @@ export function AiAssistantProvider({
   const value = useMemo<AssistantContextValue>(() => ({
     open,
     setOpen,
+    hasUnread,
     historyOpen,
     setHistoryOpen,
     routeContext,
@@ -513,6 +538,7 @@ export function AiAssistantProvider({
     error,
     handleArtifactDecision,
     historyOpen,
+    hasUnread,
     loading,
     sending,
     messages,

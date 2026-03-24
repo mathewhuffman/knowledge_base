@@ -1,6 +1,9 @@
+import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { AiViewContext, AiSessionRecord, AiArtifactRecord } from '@kb-vault/shared-types';
 import { AppRoute } from '@kb-vault/shared-types';
-import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconClock, IconPlus } from '../icons';
+import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconClock, IconPlus, IconX } from '../icons';
+
+const DRAG_THRESHOLD_PX = 4;
 
 const ROUTE_ICONS: Partial<Record<AppRoute, React.ReactNode>> = {
   [AppRoute.ARTICLE_EXPLORER]: <IconFileText size={14} />,
@@ -34,6 +37,9 @@ interface AssistantHeaderProps {
   sessionCount: number;
   onCreateSession: () => void;
   onToggleHistory: () => void;
+  onClose: () => void;
+  launcherPosition: { left: number; top: number };
+  onLauncherPositionChange: (position: { left: number; top: number }) => void;
 }
 
 export function AssistantHeader({
@@ -44,24 +50,84 @@ export function AssistantHeader({
   historyOpen,
   sessionCount,
   onCreateSession,
-  onToggleHistory
+  onToggleHistory,
+  onClose,
+  launcherPosition,
+  onLauncherPositionChange
 }: AssistantHeaderProps) {
   const routeIcon = context ? ROUTE_ICONS[context.route] ?? <IconGlobe size={14} /> : <IconGlobe size={14} />;
   const status = statusLabel(session, artifact);
   const caps = context ? capabilityTags(context) : [];
+  const [dragging, setDragging] = useState(false);
+  const dragStateRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startLeft: number;
+    startTop: number;
+    moved: boolean;
+  } | null>(null);
+
+  const handlePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    if ((event.target as HTMLElement).closest('button, a, input, textarea, select')) return;
+    dragStateRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: launcherPosition.left,
+      startTop: launcherPosition.top,
+      moved: false
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }, [launcherPosition.left, launcherPosition.top]);
+
+  const handlePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const dragState = dragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+
+    const deltaX = event.clientX - dragState.startX;
+    const deltaY = event.clientY - dragState.startY;
+
+    if (!dragState.moved && (Math.abs(deltaX) >= DRAG_THRESHOLD_PX || Math.abs(deltaY) >= DRAG_THRESHOLD_PX)) {
+      dragState.moved = true;
+      setDragging(true);
+    }
+
+    if (dragState.moved) {
+      onLauncherPositionChange({
+        left: dragState.startLeft + deltaX,
+        top: dragState.startTop + deltaY
+      });
+    }
+  }, [onLauncherPositionChange]);
+
+  const endDrag = useCallback((pointerId: number) => {
+    const dragState = dragStateRef.current;
+    if (!dragState || dragState.pointerId !== pointerId) return;
+    dragStateRef.current = null;
+    if (dragState.moved) {
+      setDragging(false);
+    }
+  }, []);
+
+  const handlePointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    endDrag(event.pointerId);
+  }, [endDrag]);
+
+  const handlePointerCancel = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    endDrag(event.pointerId);
+  }, [endDrag]);
 
   return (
-    <div className="ai-header">
+    <div
+      className={`ai-header${dragging ? ' ai-header--dragging' : ''}`}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerCancel}
+    >
       <div className="ai-header__top">
-        <div className="ai-header__context">
-          <span className="ai-header__route-badge">
-            {routeIcon}
-            <span>{context?.routeLabel ?? 'No context'}</span>
-          </span>
-          {context?.subject?.locale && (
-            <span className="ai-header__locale-badge">{context.subject.locale.toUpperCase()}</span>
-          )}
-        </div>
         <div className="ai-header__actions">
           <button
             type="button"
@@ -83,6 +149,21 @@ export function AssistantHeader({
             aria-label="Start a new chat"
           >
             <IconPlus size={12} />
+          </button>
+        </div>
+        <div className="ai-header__context">
+          <span className="ai-header__route-badge">
+            {routeIcon}
+            <span>{context?.routeLabel ?? 'No context'}</span>
+          </span>
+          <button
+            type="button"
+            className="ai-header__close"
+            onClick={onClose}
+            title="Close AI assistant"
+            aria-label="Close AI assistant"
+          >
+            <IconX size={12} />
           </button>
         </div>
       </div>

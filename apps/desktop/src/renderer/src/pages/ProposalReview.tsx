@@ -25,7 +25,6 @@ import { LoadingState } from '../components/LoadingState';
 import { ErrorState } from '../components/ErrorState';
 import { ConfirmationDialog } from '../components/ConfirmationDialog';
 import { Badge } from '../components/Badge';
-import { Kbd } from '../components/Kbd';
 import { Modal } from '../components/Modal';
 import {
   IconCheckCircle,
@@ -775,47 +774,6 @@ export const ProposalReview = () => {
     resetList
   ]);
 
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (!selectedBatchId) return;
-      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
-
-      switch (e.key.toLowerCase()) {
-        case 'a':
-          if (!e.metaKey && !e.ctrlKey) void handleDecision(ProposalReviewDecision.ACCEPT);
-          break;
-        case 'd':
-          if (!e.metaKey && !e.ctrlKey) void handleDecision(ProposalReviewDecision.DENY);
-          break;
-        case 'arrowdown':
-        case 'j':
-          e.preventDefault();
-          navigateNext();
-          break;
-        case 'arrowup':
-        case 'k':
-          e.preventDefault();
-          navigatePrevious();
-          break;
-        case '1':
-          setActiveTab('preview');
-          break;
-        case '2':
-          setActiveTab('diff');
-          break;
-        case '3':
-          setActiveTab('source');
-          break;
-        case '4':
-          setActiveTab('regions');
-          break;
-      }
-    };
-
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [selectedBatchId, handleDecision, navigateNext, navigatePrevious]);
-
   const isEditProposal = proposal?.action === ProposalAction.EDIT;
   const workingHtml = proposalWorkingCopy?.html ?? persistedDiff?.afterHtml ?? '';
   const diff = useMemo(() => {
@@ -1274,20 +1232,6 @@ export const ProposalReview = () => {
                         </button>
                       )}
 
-                      <div className="review-keyboard-hints">
-                        <span className="review-keyboard-hint">
-                          <Kbd keys="A" /> accept
-                        </span>
-                        <span className="review-keyboard-hint">
-                          <Kbd keys="D" /> deny
-                        </span>
-                        <span className="review-keyboard-hint">
-                          <Kbd keys="J" /> next
-                        </span>
-                        <span className="review-keyboard-hint">
-                          <Kbd keys="K" /> prev
-                        </span>
-                      </div>
                     </>
                   ) : (
                     <div style={{ textAlign: 'center', padding: 'var(--space-3)' }}>
