@@ -66,6 +66,7 @@ import {
   type ProposalReviewDecisionRequest,
   type ProposalReviewDeleteRequest,
   type ProposalReviewBatchListRequest,
+  type ProposalReviewSaveWorkingCopyRequest,
   ProposalReviewDecision,
   type ProposalReviewGetRequest,
   type ProposalReviewListRequest,
@@ -554,7 +555,12 @@ export function registerCoreCommands(
     const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
     return settings.kbAccessMode || defaultKbAccessMode;
   };
-  const aiAssistantService = new AiAssistantService(workspaceRepository, agentRuntime, resolveWorkspaceKbAccessMode);
+  const aiAssistantService = new AiAssistantService(
+    workspaceRepository,
+    agentRuntime,
+    resolveWorkspaceKbAccessMode,
+    appWorkingStateService
+  );
   const buildZendeskClient = async (workspaceId: string): Promise<ZendeskClient> => {
     const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
     const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
@@ -1850,6 +1856,24 @@ export function registerCoreCommands(
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.review.delete requires workspaceId and proposalId');
       }
       return { ok: true, data: await workspaceRepository.deleteProposalReview(input.workspaceId, input.proposalId) };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'Proposal not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('proposal.review.saveWorkingCopy', async (payload) => {
+    try {
+      const input = payload as ProposalReviewSaveWorkingCopyRequest;
+      if (!input?.workspaceId || !input.proposalId || typeof input.html !== 'string') {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'proposal.review.saveWorkingCopy requires workspaceId, proposalId, and html');
+      }
+      return {
+        ok: true,
+        data: await workspaceRepository.updateProposalReviewWorkingCopy(input.workspaceId, input.proposalId, { html: input.html })
+      };
     } catch (error) {
       if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'Proposal not found') {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);

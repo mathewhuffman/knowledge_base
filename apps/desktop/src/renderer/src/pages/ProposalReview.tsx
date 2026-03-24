@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import {
   AppRoute,
+  buildAppWorkingStateVersionToken,
   type PBIBatchDeleteRequest,
   ProposalReviewStatus,
   ProposalReviewDecision,
@@ -16,7 +17,6 @@ import {
   type ProposalPlacementSuggestion,
   type PBIRecord,
   ProposalAction,
-  type AiAssistantUiAction,
 } from '@kb-vault/shared-types';
 import * as diffEngine from '@kb-vault/diff-engine';
 import { PageHeader } from '../components/PageHeader';
@@ -43,11 +43,77 @@ import {
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
+import { buildPreviewDiffHtml } from '../utils/previewDiff';
+import { buildArticlePreviewDocument } from '../utils/previewDocument';
+import { CodeEditor } from '../components/editor/CodeEditor';
+import { EditorPane } from '../components/editor/EditorPane';
 
 const { diffHtml } = diffEngine;
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
 
-type ContentTab = 'preview' | 'diff' | 'source' | 'regions';
+type ContentTab = 'preview' | 'preview-diff' | 'diff' | 'source' | 'regions';
+type PreviewStyleResponse = { css: string; sourcePath: string };
+
+const PREVIEW_DIFF_FRAME_CSS = `
+  .kbv-preview-diff-added,
+  .kbv-preview-diff-removed {
+    position: relative;
+    border-radius: 0.375rem;
+  }
+
+  .kbv-preview-diff-added {
+    border: 2px solid rgba(22, 163, 74, 0.72);
+    background: rgba(22, 163, 74, 0.1);
+  }
+
+  .kbv-preview-diff-removed {
+    border: 2px solid rgba(220, 38, 38, 0.72);
+    background: rgba(220, 38, 38, 0.1);
+  }
+
+  span.kbv-preview-diff-added,
+  span.kbv-preview-diff-removed {
+    display: inline-block;
+    padding: 0 0.2rem;
+  }
+
+  li.kbv-preview-diff-added,
+  li.kbv-preview-diff-removed,
+  p.kbv-preview-diff-added,
+  p.kbv-preview-diff-removed,
+  div.kbv-preview-diff-added,
+  div.kbv-preview-diff-removed,
+  section.kbv-preview-diff-added,
+  section.kbv-preview-diff-removed,
+  article.kbv-preview-diff-added,
+  article.kbv-preview-diff-removed,
+  blockquote.kbv-preview-diff-added,
+  blockquote.kbv-preview-diff-removed,
+  h1.kbv-preview-diff-added,
+  h1.kbv-preview-diff-removed,
+  h2.kbv-preview-diff-added,
+  h2.kbv-preview-diff-removed,
+  h3.kbv-preview-diff-added,
+  h3.kbv-preview-diff-removed,
+  h4.kbv-preview-diff-added,
+  h4.kbv-preview-diff-removed,
+  h5.kbv-preview-diff-added,
+  h5.kbv-preview-diff-removed,
+  h6.kbv-preview-diff-added,
+  h6.kbv-preview-diff-removed,
+  ul.kbv-preview-diff-added,
+  ul.kbv-preview-diff-removed,
+  ol.kbv-preview-diff-added,
+  ol.kbv-preview-diff-removed,
+  table.kbv-preview-diff-added,
+  table.kbv-preview-diff-removed,
+  pre.kbv-preview-diff-added,
+  pre.kbv-preview-diff-removed {
+    padding: 0.35rem 0.5rem;
+    margin-left: -0.5rem;
+    margin-right: -0.5rem;
+  }
+`;
 
 const ACTION_LABEL: Record<string, string> = {
   create: 'Create',
@@ -300,7 +366,15 @@ function QueueItem({
   );
 }
 
-function PreviewPanel({ html }: { html: string }) {
+function PreviewPanel({
+  html,
+  styleCss,
+  title,
+}: {
+  html: string;
+  styleCss: string;
+  title: string;
+}) {
   if (!html) {
     return (
       <div className="html-preview" style={{ textAlign: 'center', color: 'var(--color-text-muted)' }}>
@@ -308,7 +382,48 @@ function PreviewPanel({ html }: { html: string }) {
       </div>
     );
   }
-  return <div className="html-preview" dangerouslySetInnerHTML={{ __html: html }} />;
+
+  return (
+    <div className="detail-preview-frame-card proposal-review-preview-frame-card">
+      <iframe
+        className="detail-preview-frame proposal-review-preview-frame"
+        title={title}
+        srcDoc={buildArticlePreviewDocument(html, title, styleCss)}
+      />
+    </div>
+  );
+}
+
+function PreviewDiffPanel({
+  beforeHtml,
+  afterHtml,
+  styleCss,
+  title,
+}: {
+  beforeHtml: string;
+  afterHtml: string;
+  styleCss: string;
+  title: string;
+}) {
+  const diffHtml = useMemo(() => buildPreviewDiffHtml(beforeHtml, afterHtml), [beforeHtml, afterHtml]);
+
+  if (!diffHtml) {
+    return (
+      <div className="html-preview" style={{ textAlign: 'center', color: 'var(--color-text-muted)' }}>
+        No content available
+      </div>
+    );
+  }
+
+  return (
+    <div className="detail-preview-frame-card proposal-review-preview-frame-card">
+      <iframe
+        className="detail-preview-frame proposal-review-preview-frame"
+        title={title}
+        srcDoc={buildArticlePreviewDocument(diffHtml, title, styleCss, { extraCss: PREVIEW_DIFF_FRAME_CSS })}
+      />
+    </div>
+  );
 }
 
 function SourceDiffPanel({ lines }: { lines: ProposalSourceLineChange[] }) {
@@ -340,8 +455,45 @@ function SourceDiffPanel({ lines }: { lines: ProposalSourceLineChange[] }) {
   );
 }
 
-function SourcePanel({ html }: { html: string }) {
-  return <pre className="source-view">{html || 'No source HTML'}</pre>;
+function SourcePanel({
+  html,
+  savedHtml,
+  onChange,
+  onSave,
+  onRestore,
+  saving,
+  error,
+}: {
+  html: string;
+  savedHtml: string;
+  onChange: (nextValue: string) => void;
+  onSave: () => void;
+  onRestore: () => void;
+  saving: boolean;
+  error?: string | null;
+}) {
+  const isDirty = html !== savedHtml;
+
+  return (
+    <EditorPane
+      className="source-editor-pane"
+      footerStart={error ? <span className="source-editor-pane__error">{error}</span> : <span />} 
+      footerEnd={
+        isDirty ? (
+          <>
+            <button type="button" className="btn btn-ghost" onClick={onRestore} disabled={saving}>
+              Restore
+            </button>
+            <button type="button" className="btn btn-primary" onClick={onSave} disabled={saving}>
+              {saving ? 'Saving...' : 'Save'}
+            </button>
+          </>
+        ) : null
+      }
+    >
+      <CodeEditor value={html || ''} language="html" onChange={onChange} />
+    </EditorPane>
+  );
 }
 
 function ChangeRegionsPanel({ regions }: { regions: ProposalChangeRegion[] }) {
@@ -583,14 +735,17 @@ function ProposalBatchRow({
 export const ProposalReview = () => {
   const { activeWorkspace } = useWorkspace();
 
+  const previewStyleQuery = useIpc<PreviewStyleResponse>('article.preview.styles.get');
   const batchListIpc = useIpc<ProposalReviewBatchListResponse>('proposal.review.batchList');
   const listIpc = useIpc<ProposalReviewListResponse>('proposal.review.list');
   const detailIpc = useIpc<ProposalReviewDetailResponse>('proposal.review.get');
   const decideMutation = useIpcMutation<ProposalReviewDecisionResponse>('proposal.review.decide');
+  const saveWorkingCopyMutation = useIpcMutation<ProposalReviewDetailResponse>('proposal.review.saveWorkingCopy');
   const { execute: executeBatchList, reset: resetBatchList } = batchListIpc;
   const { execute: executeList, reset: resetList } = listIpc;
   const { execute: executeDetail, reset: resetDetail } = detailIpc;
   const { mutate: mutateDecision } = decideMutation;
+  const { mutate: mutateSaveWorkingCopy, loading: savingWorkingCopy, error: saveWorkingCopyError } = saveWorkingCopyMutation;
 
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null);
@@ -609,6 +764,8 @@ export const ProposalReview = () => {
     rationale?: string;
     rationaleSummary?: string;
   } | null>(null);
+  const [sourceEditorHtml, setSourceEditorHtml] = useState('');
+  const [savedSourceHtml, setSavedSourceHtml] = useState('');
   const containerRef = useRef<HTMLDivElement>(null);
 
   const batchSummaries = batchListIpc.data?.batches ?? [];
@@ -656,8 +813,9 @@ export const ProposalReview = () => {
     resetBatchList();
     resetList();
     resetDetail();
+    void previewStyleQuery.execute({});
     void loadBatchSummaries();
-  }, [activeWorkspace?.id, resetBatchList, resetList, resetDetail, loadBatchSummaries]);
+  }, [activeWorkspace?.id, resetBatchList, resetList, resetDetail, loadBatchSummaries, previewStyleQuery.execute]);
 
   useEffect(() => {
     if (!activeWorkspace) return;
@@ -694,6 +852,12 @@ export const ProposalReview = () => {
   }, [detail?.proposal.id, detail?.diff?.afterHtml]);
 
   useEffect(() => {
+    const nextHtml = proposalWorkingCopy?.html ?? detail?.diff?.afterHtml ?? '';
+    setSourceEditorHtml(nextHtml);
+    setSavedSourceHtml(nextHtml);
+  }, [detail?.proposal.id, detail?.diff?.afterHtml, proposalWorkingCopy?.html]);
+
+  useEffect(() => {
     if (queue.length === 0 || selectedProposalId) return;
     const firstPending = queue.find((item) => item.reviewStatus === ProposalReviewStatus.PENDING_REVIEW);
     setSelectedProposalId(firstPending?.proposalId ?? queue[0].proposalId);
@@ -718,6 +882,31 @@ export const ProposalReview = () => {
       loadBatchSummaries(),
     ]);
   }, [activeWorkspace?.id, selectedBatchId, executeList, loadBatchSummaries]);
+
+  const handleSaveSource = useCallback(async () => {
+    if (!activeWorkspace || !proposal?.id) return;
+    const result = await mutateSaveWorkingCopy({
+      workspaceId: activeWorkspace.id,
+      proposalId: proposal.id,
+      html: sourceEditorHtml,
+    });
+    if (!result) return;
+
+    const nextHtml = result.diff.afterHtml;
+    setProposalWorkingCopy({
+      html: nextHtml,
+      title: result.proposal.targetTitle,
+      rationale: proposalWorkingCopy?.rationale,
+      rationaleSummary: result.proposal.rationaleSummary,
+    });
+    setSavedSourceHtml(nextHtml);
+    setSourceEditorHtml(nextHtml);
+    await executeDetail({ workspaceId: activeWorkspace.id, proposalId: proposal.id });
+  }, [activeWorkspace, proposal?.id, sourceEditorHtml, mutateSaveWorkingCopy, executeDetail]);
+
+  const handleRestoreSource = useCallback(() => {
+    setSourceEditorHtml(savedSourceHtml);
+  }, [savedSourceHtml]);
 
   const handleDecision = useCallback(async (decision: ProposalReviewDecision) => {
     if (!activeWorkspace || !selectedProposalId) return;
@@ -822,6 +1011,8 @@ export const ProposalReview = () => {
     };
   }, [persistedDiff, proposalWorkingCopy?.html]);
   const hasDiff = !!diff?.sourceDiff?.lines?.length;
+  const previewDiffBeforeHtml = persistedDiff?.beforeHtml ?? '';
+  const previewDiffAfterHtml = workingHtml;
 
   useRegisterAiAssistantView({
     enabled: Boolean(activeWorkspace && proposal && diff),
@@ -837,10 +1028,23 @@ export const ProposalReview = () => {
       },
       workingState: {
         kind: 'proposal_html',
-        versionToken: proposal ? `${proposal.id}:${proposal.updatedAtUtc}` : 'proposal',
+        versionToken: proposal ? buildAppWorkingStateVersionToken({
+          route: AppRoute.PROPOSAL_REVIEW,
+          entityType: 'proposal',
+          entityId: proposal.id,
+          currentValues: {
+            html: workingHtml,
+            title: proposalWorkingCopy?.title ?? proposal?.targetTitle ?? '',
+            rationale: proposalWorkingCopy?.rationale ?? '',
+            rationaleSummary: proposalWorkingCopy?.rationaleSummary ?? proposal?.rationaleSummary ?? '',
+            aiNotes: proposal?.aiNotes ?? ''
+          }
+        }) : 'proposal',
         payload: {
           html: workingHtml,
           title: proposalWorkingCopy?.title ?? proposal?.targetTitle,
+          rationale: proposalWorkingCopy?.rationale,
+          aiNotes: proposal?.aiNotes,
           rationaleSummary: proposalWorkingCopy?.rationaleSummary ?? proposal?.rationaleSummary
         }
       },
@@ -853,23 +1057,23 @@ export const ProposalReview = () => {
         canUseUnsavedWorkingState: true
       },
       backingData: {
+        batchId: selectedBatchId,
         proposalId: proposal?.id,
+        articleKey: selectedQueueItem?.articleKey,
         localeVariantId: proposal?.localeVariantId,
         sourceRevisionId: proposal?.sourceRevisionId,
         proposal
       }
     },
-    applyUiActions: (actions: AiAssistantUiAction[]) => {
-      actions.forEach((action) => {
-        if (action.type === 'replace_working_html' && action.target === 'proposal') {
-          setProposalWorkingCopy((prev) => ({
-            html: action.html,
-            title: prev?.title ?? proposal?.targetTitle,
-            rationale: prev?.rationale ?? proposal?.aiNotes,
-            rationaleSummary: prev?.rationaleSummary ?? proposal?.rationaleSummary
-          }));
-        }
-      });
+    applyWorkingStatePatch: (patch) => {
+      setProposalWorkingCopy((prev) => ({
+        html: typeof patch.html === 'string' ? patch.html : (prev?.html ?? workingHtml),
+        title: typeof patch.title === 'string' ? patch.title : (prev?.title ?? proposal?.targetTitle),
+        rationale: typeof patch.rationale === 'string' ? patch.rationale : (prev?.rationale ?? proposal?.aiNotes),
+        rationaleSummary: typeof patch.rationaleSummary === 'string'
+          ? patch.rationaleSummary
+          : (prev?.rationaleSummary ?? proposal?.rationaleSummary)
+      }));
     }
   });
 
@@ -1147,11 +1351,19 @@ export const ProposalReview = () => {
                     Preview
                   </div>
                   {(isEditProposal || hasDiff) && (
+                    <div className={`review-tab ${activeTab === 'preview-diff' ? 'review-tab--active' : ''}`} onClick={() => setActiveTab('preview-diff')}>
+                      <span className="review-tab-icon">
+                        <IconEye size={14} />
+                      </span>
+                      Preview + Diff
+                    </div>
+                  )}
+                  {(isEditProposal || hasDiff) && (
                     <div className={`review-tab ${activeTab === 'diff' ? 'review-tab--active' : ''}`} onClick={() => setActiveTab('diff')}>
                       <span className="review-tab-icon">
                         <IconFileText size={14} />
                       </span>
-                      Diff
+                      Source Diff
                     </div>
                   )}
                   <div className={`review-tab ${activeTab === 'source' ? 'review-tab--active' : ''}`} onClick={() => setActiveTab('source')}>
@@ -1167,12 +1379,38 @@ export const ProposalReview = () => {
                   )}
                 </div>
 
-                <div className="review-content-body">
+                <div
+                  className={`review-content-body ${
+                    activeTab === 'preview' || activeTab === 'preview-diff' ? 'review-content-body--preview' : ''
+                  }`}
+                >
                   {activeTab === 'preview' && (
-                    <PreviewPanel html={workingHtml} />
+                    <PreviewPanel
+                      html={workingHtml}
+                      styleCss={previewStyleQuery.data?.css ?? ''}
+                      title={proposalWorkingCopy?.title ?? proposal?.targetTitle ?? 'Proposal preview'}
+                    />
+                  )}
+                  {activeTab === 'preview-diff' && (
+                    <PreviewDiffPanel
+                      beforeHtml={previewDiffBeforeHtml}
+                      afterHtml={previewDiffAfterHtml}
+                      styleCss={previewStyleQuery.data?.css ?? ''}
+                      title={`${proposalWorkingCopy?.title ?? proposal?.targetTitle ?? 'Proposal preview'} diff preview`}
+                    />
                   )}
                   {activeTab === 'diff' && diff && <SourceDiffPanel lines={diff.sourceDiff?.lines ?? []} />}
-                  {activeTab === 'source' && <SourcePanel html={workingHtml} />}
+                  {activeTab === 'source' && (
+                    <SourcePanel
+                      html={sourceEditorHtml}
+                      savedHtml={savedSourceHtml}
+                      onChange={setSourceEditorHtml}
+                      onSave={() => void handleSaveSource()}
+                      onRestore={handleRestoreSource}
+                      saving={savingWorkingCopy}
+                      error={saveWorkingCopyError}
+                    />
+                  )}
                   {activeTab === 'regions' && diff && <ChangeRegionsPanel regions={diff.changeRegions ?? []} />}
                 </div>
 

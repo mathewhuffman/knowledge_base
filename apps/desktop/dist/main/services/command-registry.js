@@ -436,7 +436,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
         return settings.kbAccessMode || defaultKbAccessMode;
     };
-    const aiAssistantService = new ai_assistant_service_1.AiAssistantService(workspaceRepository, agentRuntime, resolveWorkspaceKbAccessMode);
+    const aiAssistantService = new ai_assistant_service_1.AiAssistantService(workspaceRepository, agentRuntime, resolveWorkspaceKbAccessMode, appWorkingStateService);
     const buildZendeskClient = async (workspaceId) => {
         const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
         const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
@@ -1674,6 +1674,24 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.delete requires workspaceId and proposalId');
             }
             return { ok: true, data: await workspaceRepository.deleteProposalReview(input.workspaceId, input.proposalId) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Proposal not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('proposal.review.saveWorkingCopy', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.proposalId || typeof input.html !== 'string') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.saveWorkingCopy requires workspaceId, proposalId, and html');
+            }
+            return {
+                ok: true,
+                data: await workspaceRepository.updateProposalReviewWorkingCopy(input.workspaceId, input.proposalId, { html: input.html })
+            };
         }
         catch (error) {
             if (error.message === 'Workspace not found' || error.message === 'Proposal not found') {

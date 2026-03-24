@@ -3003,6 +3003,9 @@ class WorkspaceRepository {
         }
     }
     async updateProposalReviewWorkingCopy(workspaceId, proposalId, patch) {
+        if (!patch.html?.trim()) {
+            throw new Error('Proposal working copy updates require resolved HTML content');
+        }
         const workspace = await this.getWorkspace(workspaceId);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {

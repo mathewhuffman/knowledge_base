@@ -87,12 +87,33 @@ export interface ProposalCandidatePayload {
     proposedHtml?: string;
     metadata?: Record<string, unknown>;
 }
+export type ProposalPatchScope = 'current' | 'article' | 'batch';
+export type ProposalLineEditOperation = {
+    type: 'replace_lines';
+    startLine: number;
+    endLine: number;
+    lines: string[];
+    expectedText?: string;
+} | {
+    type: 'insert_after';
+    line: number;
+    lines: string[];
+    expectedText?: string;
+} | {
+    type: 'delete_lines';
+    startLine: number;
+    endLine: number;
+    expectedText?: string;
+};
 export interface ProposalPatchPayload {
+    scope?: ProposalPatchScope;
+    targetArticleKey?: string;
     title?: string;
     rationale?: string;
     rationaleSummary?: string;
     aiNotes?: string;
-    html: string;
+    html?: string;
+    lineEdits?: ProposalLineEditOperation[];
 }
 export interface DraftPatchPayload {
     html: string;

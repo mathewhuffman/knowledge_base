@@ -34,9 +34,10 @@ interface AssistantArtifactCardProps {
   loading: boolean;
   onApply: () => void;
   onReject: () => void;
+  onRerun: () => void;
 }
 
-export function AssistantArtifactCard({ artifact, stale, loading, onApply, onReject }: AssistantArtifactCardProps) {
+export function AssistantArtifactCard({ artifact, stale, loading, onApply, onReject, onRerun }: AssistantArtifactCardProps) {
   const meta = TYPE_META[artifact.artifactType] ?? TYPE_META.informational_response;
   const isPending = artifact.status === 'pending';
   const isProposalCandidate = artifact.artifactType === 'proposal_candidate';
@@ -61,9 +62,23 @@ export function AssistantArtifactCard({ artifact, stale, loading, onApply, onRej
           {meta.icon}
           <span>{meta.label}</span>
         </span>
-        <span className={`ai-artifact__status ai-artifact__status--${artifact.status}`}>
-          {stale ? 'Stale — version changed' : STATUS_LABELS[artifact.status] ?? artifact.status}
-        </span>
+        <div className="ai-artifact__type-row-actions">
+          <span className={`ai-artifact__status ai-artifact__status--${artifact.status}`}>
+            {stale ? 'Stale — version changed' : STATUS_LABELS[artifact.status] ?? artifact.status}
+          </span>
+          {stale && isPending && (
+            <button
+              type="button"
+              className="ai-artifact__dismiss"
+              onClick={onReject}
+              disabled={loading}
+              aria-label="Close clarification alert"
+              title="Close"
+            >
+              <IconXCircle size={14} />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Summary */}
@@ -117,6 +132,7 @@ export function AssistantArtifactCard({ artifact, stale, loading, onApply, onRej
           <button
             type="button"
             className="ai-artifact__btn ai-artifact__btn--rerun"
+            onClick={onRerun}
             disabled={loading}
             title="Re-run with current content"
           >

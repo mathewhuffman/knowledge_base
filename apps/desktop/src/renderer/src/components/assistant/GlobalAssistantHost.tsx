@@ -85,7 +85,8 @@ export function AssistantPanelContent({
     openSession,
     deleteSession,
     applyArtifact,
-    rejectArtifact
+    rejectArtifact,
+    rerunLastMessage
   } = useAiAssistant();
 
   const isStale = useMemo(() => {
@@ -151,6 +152,7 @@ export function AssistantPanelContent({
                 loading={loading}
                 onApply={() => void applyArtifact()}
                 onReject={() => void rejectArtifact()}
+                onRerun={() => void rerunLastMessage()}
               />
             </div>
           )}

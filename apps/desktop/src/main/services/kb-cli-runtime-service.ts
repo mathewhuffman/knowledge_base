@@ -657,10 +657,13 @@ export class KbCliRuntimeService {
       `- \`${binaryPath} app get-form-schema --workspace-id <workspace-id> --route templates_and_prompts --entity-type template_pack --entity-id <entity-id> --json\``,
       `- \`${binaryPath} app patch-form --workspace-id <workspace-id> --route templates_and_prompts --entity-type template_pack --entity-id <entity-id> --version-token <version-token> --patch '{"promptTemplate":"..."}' --json\``,
       `- \`${binaryPath} app patch-form --workspace-id <workspace-id> --route templates_and_prompts --entity-type template_pack --entity-id <entity-id> --patch-file /tmp/template-patch.json --json\``,
+      `- \`${binaryPath} app get-form-schema --workspace-id <workspace-id> --route proposal_review --entity-type proposal --entity-id <proposal-id> --json\``,
+      `- \`${binaryPath} app patch-form --workspace-id <workspace-id> --route proposal_review --entity-type proposal --entity-id <proposal-id> --version-token <version-token> --patch '{"html":"<updated proposal html>"}' --json\``,
       'For create proposals, always include `metadata.targetTitle`.',
       'For create/edit proposals, include the full final article HTML in `metadata.proposedHtml` when you have it.',
       'For every persisted proposal, include `metadata.confidenceScore` as a numeric value from 0 to 1.',
       'For live form edits, load the form schema first when you need field names or the current version token.',
+      'When you are editing the currently open proposal in Proposal Review, use the `kb app` proposal_review commands above instead of `kb proposal create/edit`.',
       'Never claim a form field changed unless `kb app patch-form` succeeded.',
       'If the HTML is too large or awkward for an inline JSON shell argument, write the metadata JSON to a temporary file and use `--metadata-file` instead of narrating escaping strategy.',
       `If syntax is unclear, call \`${binaryPath} help --json\`, \`${binaryPath} proposal --json\`, or \`${binaryPath} app --json\` before trying a resource command.`

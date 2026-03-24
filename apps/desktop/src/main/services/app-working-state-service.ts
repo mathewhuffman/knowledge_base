@@ -35,6 +35,14 @@ const TEMPLATE_PACK_FIELDS: AppWorkingStateFieldSchema[] = [
   { key: 'active', type: 'boolean', label: 'Active' }
 ];
 
+const PROPOSAL_FIELDS: AppWorkingStateFieldSchema[] = [
+  { key: 'html', type: 'string', label: 'HTML', required: true },
+  { key: 'title', type: 'string', label: 'Title' },
+  { key: 'rationale', type: 'string', label: 'Rationale' },
+  { key: 'rationaleSummary', type: 'string', label: 'Rationale Summary' },
+  { key: 'aiNotes', type: 'string', label: 'AI Notes' }
+];
+
 export class AppWorkingStateService {
   private readonly registrations = new Map<string, SupportedRegistration>();
 
@@ -210,6 +218,9 @@ export class AppWorkingStateService {
     if (registration.route === AppRoute.TEMPLATES_AND_PROMPTS && registration.entityType === 'template_pack') {
       return this.validateTemplatePackPatch(registration.currentValues, patch);
     }
+    if (registration.route === AppRoute.PROPOSAL_REVIEW && registration.entityType === 'proposal') {
+      return this.validateStringFieldPatch(registration.currentValues, patch, PROPOSAL_FIELDS);
+    }
     return {
       appliedPatch: {},
       ignoredKeys: [],
@@ -220,6 +231,9 @@ export class AppWorkingStateService {
   private getFieldSchema(route: AppRoute, entityType: AppWorkingStateEntityType): AppWorkingStateFieldSchema[] {
     if (route === AppRoute.TEMPLATES_AND_PROMPTS && entityType === 'template_pack') {
       return TEMPLATE_PACK_FIELDS;
+    }
+    if (route === AppRoute.PROPOSAL_REVIEW && entityType === 'proposal') {
+      return PROPOSAL_FIELDS;
     }
     throw new Error(`Unsupported form schema target: ${route}/${entityType}`);
   }
@@ -269,6 +283,42 @@ export class AppWorkingStateService {
       }
 
       if (currentValues[key] === value) {
+        ignoredKeys.push(key);
+        continue;
+      }
+
+      appliedPatch[key] = value;
+    }
+
+    return {
+      appliedPatch,
+      ignoredKeys,
+      validationErrors
+    };
+  }
+
+  private validateStringFieldPatch(
+    currentValues: Record<string, unknown>,
+    patch: Record<string, unknown>,
+    fields: AppWorkingStateFieldSchema[]
+  ): PatchValidationResult {
+    const appliedPatch: Record<string, unknown> = {};
+    const ignoredKeys: string[] = [];
+    const validationErrors: PatchValidationResult['validationErrors'] = [];
+    const allowedKeys = new Set(fields.map((field) => field.key));
+
+    for (const [key, value] of Object.entries(patch)) {
+      if (!allowedKeys.has(key)) {
+        validationErrors.push({ key, message: `Unknown field: ${key}` });
+        continue;
+      }
+
+      if (typeof value !== 'string') {
+        validationErrors.push({ key, message: `${key} must be a string` });
+        continue;
+      }
+
+      if ((currentValues[key] ?? '') === value) {
         ignoredKeys.push(key);
         continue;
       }

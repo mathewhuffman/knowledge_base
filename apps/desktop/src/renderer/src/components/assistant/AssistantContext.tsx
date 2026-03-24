@@ -55,6 +55,7 @@ type AssistantContextValue = {
   deleteSession: (sessionId: string) => Promise<void>;
   applyArtifact: () => Promise<void>;
   rejectArtifact: () => Promise<void>;
+  rerunLastMessage: () => Promise<void>;
   registerView: (registration: RouteRegistration) => () => void;
 };
 
@@ -502,6 +503,22 @@ export function AiAssistantProvider({
     }
   }, [artifact, loadSessionList, routeContext, runUiActions, session, upsertSession]);
 
+  const rerunLastMessage = useCallback(async () => {
+    if (!routeContext || sending) return;
+    const lastUserMessage = [...messages]
+      .reverse()
+      .find((message) => message.role === 'user' && message.messageKind === 'chat' && !message.id.startsWith(OPTIMISTIC_MESSAGE_PREFIX));
+    if (!lastUserMessage?.content) {
+      return;
+    }
+
+    if (artifact && session && artifact.status === 'pending') {
+      await handleArtifactDecision('ai.assistant.artifact.reject');
+    }
+
+    await sendMessage(lastUserMessage.content);
+  }, [artifact, handleArtifactDecision, messages, routeContext, sendMessage, sending, session]);
+
   const registerView = useCallback((next: RouteRegistration) => {
     setRegistration(next);
     return () => {
@@ -530,6 +547,7 @@ export function AiAssistantProvider({
     deleteSession,
     applyArtifact: () => handleArtifactDecision('ai.assistant.artifact.apply'),
     rejectArtifact: () => handleArtifactDecision('ai.assistant.artifact.reject'),
+    rerunLastMessage,
     registerView
   }), [
     artifact,
@@ -547,6 +565,7 @@ export function AiAssistantProvider({
     registerView,
     resetSession,
     routeContext,
+    rerunLastMessage,
     sendMessage,
     session,
     sessions

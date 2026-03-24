@@ -18,12 +18,14 @@
     "test:smoke": "playwright test --config=playwright.config.ts --grep @smoke"
   },
   "dependencies": {
+    "@kb-vault/agent-runtime": "workspace:*",
     "@kb-vault/db": "workspace:*",
     "@kb-vault/diff-engine": "workspace:*",
-    "@kb-vault/agent-runtime": "workspace:*",
     "@kb-vault/mcp-server": "workspace:*",
-    "@kb-vault/zendesk-client": "workspace:*",
     "@kb-vault/shared-types": "workspace:*",
+    "@kb-vault/zendesk-client": "workspace:*",
+    "@monaco-editor/react": "^4.7.0",
+    "monaco-editor": "^0.55.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

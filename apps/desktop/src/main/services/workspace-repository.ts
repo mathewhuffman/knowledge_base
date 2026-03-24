@@ -3934,6 +3934,9 @@ export class WorkspaceRepository {
     proposalId: string,
     patch: ProposalPatchPayload
   ): Promise<ProposalReviewDetailResponse> {
+    if (!patch.html?.trim()) {
+      throw new Error('Proposal working copy updates require resolved HTML content');
+    }
     const workspace = await this.getWorkspace(workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {

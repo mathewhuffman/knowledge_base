@@ -32,12 +32,15 @@ import {
   type AiViewContext,
   type DraftPatchPayload,
   type ProposalCandidatePayload,
+  type ProposalLineEditOperation,
   type ProposalPatchPayload,
+  type ProposalPatchScope,
   type TemplatePatchPayload
 } from '@kb-vault/shared-types';
 import { applyWorkspaceMigrations, openWorkspaceDatabase } from '@kb-vault/db';
 import { type CursorAcpRuntime } from '@kb-vault/agent-runtime';
 import { WorkspaceRepository } from './workspace-repository';
+import { AppWorkingStateService } from './app-working-state-service';
 
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
 const ASSISTANT_BATCH_NAME = 'AI Assistant Proposals';
@@ -105,7 +108,8 @@ export class AiAssistantService {
   constructor(
     private readonly workspaceRepository: WorkspaceRepository,
     private readonly agentRuntime: CursorAcpRuntime,
-    private readonly resolveWorkspaceKbAccessMode: (workspaceId: string) => Promise<'mcp' | 'cli'>
+    private readonly resolveWorkspaceKbAccessMode: (workspaceId: string) => Promise<'mcp' | 'cli'>,
+    private readonly appWorkingStateService: AppWorkingStateService
   ) {}
 
   async getContext(input: AiAssistantContextGetRequest): Promise<AiViewContext> {
@@ -300,7 +304,13 @@ export class AiAssistantService {
         () => false
       );
 
-      const parsed = this.parseRuntimeResult(runtimeResult.resultPayload, context, input.message);
+      const directWorkingStateMutationApplied = this.didWorkingStateChangeDuringTurn(context);
+      const parsed = this.parseRuntimeResult(
+        runtimeResult.resultPayload,
+        context,
+        input.message,
+        directWorkingStateMutationApplied
+      );
       const artifact = this.insertArtifact(db, {
         sessionId: session.id,
         workspaceId: input.workspaceId,
@@ -463,15 +473,45 @@ export class AiAssistantService {
     if (artifact.artifactType !== 'proposal_patch') {
       return;
     }
-    const proposalId = artifact.entityId ?? context?.subject?.id;
-    if (!proposalId) {
+    const proposalContext = context && context.subject?.type === 'proposal' ? context : undefined;
+    const payload = artifact.payload as ProposalPatchPayload;
+    const targetProposalIds = proposalContext
+      ? await this.resolveProposalPatchTargets(proposalContext, payload)
+      : [artifact.entityId].filter(Boolean) as string[];
+    if (targetProposalIds.length === 0) {
       return;
     }
-    await this.workspaceRepository.updateProposalReviewWorkingCopy(
-      artifact.workspaceId,
-      proposalId,
-      artifact.payload as ProposalPatchPayload
-    );
+    if ((payload.scope === 'article' || payload.scope === 'batch') && payload.html && !(payload.lineEdits?.length)) {
+      throw new Error('Multi-proposal proposal patches must use targeted line edits instead of full HTML replacement.');
+    }
+    for (const proposalId of targetProposalIds) {
+      const detail = await this.workspaceRepository.getProposalReviewDetail(artifact.workspaceId, proposalId);
+      const nextHtml = applyProposalPatchToHtml(detail.diff.afterHtml ?? '', payload);
+      const persistedPatch: ProposalPatchPayload = {
+        ...payload,
+        html: nextHtml
+      };
+      await this.workspaceRepository.updateProposalReviewWorkingCopy(
+        artifact.workspaceId,
+        proposalId,
+        persistedPatch
+      );
+
+      if (proposalContext?.subject?.id === proposalId) {
+        try {
+          this.appWorkingStateService.patchForm({
+            workspaceId: proposalContext.workspaceId,
+            route: AppRoute.PROPOSAL_REVIEW,
+            entityType: 'proposal',
+            entityId: proposalId,
+            versionToken: proposalContext.workingState?.versionToken,
+            patch: buildProposalWorkingStatePatch(persistedPatch)
+          });
+        } catch {
+          // If the route working state is no longer registered, the durable proposal update still succeeded.
+        }
+      }
+    }
   }
 
   private async ensureAssistantBatch(workspaceId: string): Promise<string> {
@@ -530,9 +570,9 @@ export class AiAssistantService {
       '  "rationale": "optional rationale",',
       '  "title": "optional short chat/session title or artifact title",',
       '  "confidenceScore": "optional number from 0 to 1 for proposal candidates",',
-      '  "html": "required for proposal_patch or draft_patch",',
+      '  "html": "full replacement HTML for proposal_patch or draft_patch when returning the whole document",',
       '  "formPatch": { "name"?: "...", "language"?: "...", "templateType"?: "...", "promptTemplate"?: "...", "toneRules"?: "...", "description"?: "...", "examples"?: "...", "active"?: true },',
-      '  "payload": { "targetTitle"?: "...", "targetLocale"?: "...", "sourceHtml"?: "...", "proposedHtml"?: "...", "confidenceScore"?: 0.0, "metadata"?: {} }',
+      '  "payload": { "targetTitle"?: "...", "targetLocale"?: "...", "sourceHtml"?: "...", "proposedHtml"?: "...", "confidenceScore"?: 0.0, "scope"?: "current|article|batch", "targetArticleKey"?: "...", "lineEdits"?: [{ "type": "replace_lines|insert_after|delete_lines", "startLine"?: 1, "endLine"?: 1, "line"?: 1, "lines"?: ["..."], "expectedText"?: "..." }], "metadata"?: {} }',
       '}',
       `Route: ${context.route}`,
       `Route label: ${context.routeLabel}`,
@@ -551,7 +591,13 @@ export class AiAssistantService {
       '- For informational_response, return only the user-facing response text. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
       '- On the first meaningful reply in a new chat, include a short human-readable title in "title" based on the user request.',
       '- For informational_response, omit summary unless it is genuinely needed for internal bookkeeping.',
-      '- If you are editing draft or proposal HTML, put the full replacement HTML in "html".',
+      '- For draft edits, return the full replacement HTML in "html".',
+      '- For proposal review edits, the preferred path is to directly mutate the current proposal working state with `kb app get-form-schema` and `kb app patch-form --route proposal_review --entity-type proposal --entity-id <current proposal id>` using the registered version token.',
+      '- In Proposal Review, do not create or edit a separate proposal record. Edit the currently open proposal directly.',
+      '- Never call `kb proposal create`, `kb proposal edit`, or `kb proposal retire` when the current route is Proposal Review.',
+      '- If you use `kb app patch-form` successfully in Proposal Review, respond with informational_response summarizing the applied change.',
+      '- If you are returning a JSON proposal patch instead of using app commands, prefer targeted "payload.lineEdits" when the change is narrow. Use "html" only when the whole proposal needs rewriting.',
+      '- In Proposal Review JSON patches, use payload.scope="current" for the selected proposal, payload.scope="article" for the article currently being reviewed, and payload.scope="batch" only when the user clearly asks to update every proposal in the open review batch.',
       '- For live form edits such as Templates & Prompts, use the kb CLI commands as the source of truth: call `kb app get-form-schema` first when needed, then call `kb app patch-form`.',
       '- After a successful `kb app patch-form`, respond with informational_response that accurately summarizes the applied change.',
       '- If the kb command does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.',
@@ -568,7 +614,8 @@ export class AiAssistantService {
   private parseRuntimeResult(
     resultPayload: unknown,
     context: AiViewContext,
-    userMessage: string
+    userMessage: string,
+    directWorkingStateMutationApplied = false
   ): Required<Pick<RuntimeResultPayload, 'artifactType' | 'response' | 'summary'>> & RuntimeResultPayload {
     const parsed = extractJsonObject(resultPayload);
     const allowed = new Set(this.allowedArtifactTypes(context));
@@ -583,7 +630,7 @@ export class AiAssistantService {
     const payload = parsed?.payload && typeof parsed.payload === 'object' ? parsed.payload as Record<string, unknown> : undefined;
     const command = extractString(parsed?.command) ?? 'none';
     const confidenceScore = normalizeAssistantConfidenceScore(parsed?.confidenceScore ?? payload?.confidenceScore);
-    const artifactType = this.resolveFinalArtifactType({
+    let artifactType = this.resolveFinalArtifactType({
       command,
       requestedArtifactType,
       context,
@@ -591,18 +638,34 @@ export class AiAssistantService {
       formPatch,
       payload
     });
+    const normalizedPayload = this.normalizeRuntimePayload(payload, context, userMessage);
+
+    const isChangeRequest = looksLikeArticleChangeRequest(userMessage);
+    if (
+      artifactType === 'informational_response'
+      && isChangeRequest
+      && (context.capabilities.canPatchProposal || context.capabilities.canPatchDraft)
+      && !directWorkingStateMutationApplied
+      && looksLikeSuccessfulMutationClaim(response)
+    ) {
+      artifactType = 'clarification_request';
+    }
 
     return {
       command,
       artifactType,
-      response,
-      summary,
+      response: artifactType === 'clarification_request'
+        ? 'I did not apply that edit yet. Please try again, and I will return an explicit patch instead of a chat-only response.'
+        : response,
+      summary: artifactType === 'clarification_request'
+        ? 'Assistant could not confirm a real content mutation.'
+        : summary,
       rationale: extractString(parsed?.rationale) ?? undefined,
       title: extractString(parsed?.title) ?? undefined,
       confidenceScore,
       html,
       formPatch,
-      payload
+      payload: normalizedPayload
     };
   }
 
@@ -612,10 +675,14 @@ export class AiAssistantService {
     }
     if (parsed.artifactType === 'proposal_patch') {
       return {
+        scope: normalizeProposalPatchScope(parsed.payload?.scope),
+        targetArticleKey: extractString(parsed.payload?.targetArticleKey),
         title: parsed.title,
         rationale: parsed.rationale,
         rationaleSummary: parsed.summary,
-        html: parsed.html ?? ''
+        aiNotes: parsed.payload?.aiNotes ? extractString(parsed.payload.aiNotes) : undefined,
+        html: parsed.html,
+        lineEdits: normalizeProposalLineEdits(parsed.payload?.lineEdits)
       } satisfies ProposalPatchPayload;
     }
     if (parsed.artifactType === 'template_patch') {
@@ -660,8 +727,7 @@ export class AiAssistantService {
       return [{ type: 'replace_working_html', target: 'draft', html: payload.html }];
     }
     if (artifact.artifactType === 'proposal_patch') {
-      const payload = artifact.payload as ProposalPatchPayload;
-      return [{ type: 'replace_working_html', target: 'proposal', html: payload.html }];
+      return [{ type: 'none' }];
     }
     if (artifact.artifactType === 'template_patch') {
       return [{ type: 'replace_template_form', payload: artifact.payload as TemplatePatchPayload }];
@@ -716,6 +782,7 @@ export class AiAssistantService {
     payload?: Record<string, unknown>;
   }): AiArtifactType {
     const { command, requestedArtifactType, context, html, formPatch, payload } = input;
+    const proposalLineEdits = normalizeProposalLineEdits(payload?.lineEdits);
 
     if (command === 'create_proposal') {
       if (
@@ -729,7 +796,11 @@ export class AiAssistantService {
     }
 
     if (command === 'patch_proposal') {
-      if (requestedArtifactType === 'proposal_patch' && context.capabilities.canPatchProposal && html) {
+      if (
+        requestedArtifactType === 'proposal_patch'
+        && context.capabilities.canPatchProposal
+        && (html || proposalLineEdits.length > 0)
+      ) {
         return 'proposal_patch';
       }
       return 'informational_response';
@@ -786,6 +857,88 @@ export class AiAssistantService {
 
     return this.createFreshSession(db, context.workspaceId, undefined, context);
   }
+
+  private normalizeRuntimePayload(
+    payload: Record<string, unknown> | undefined,
+    context: AiViewContext,
+    userMessage: string
+  ): Record<string, unknown> | undefined {
+    if (!payload) {
+      if (context.route !== AppRoute.PROPOSAL_REVIEW) {
+        return payload;
+      }
+      return {
+        scope: inferProposalPatchScope(userMessage)
+      };
+    }
+
+    if (context.route !== AppRoute.PROPOSAL_REVIEW) {
+      return payload;
+    }
+
+    return {
+      ...payload,
+      scope: normalizeProposalPatchScope(payload.scope) ?? inferProposalPatchScope(userMessage)
+    };
+  }
+
+  private async resolveProposalPatchTargets(context: AiViewContext, payload: ProposalPatchPayload): Promise<string[]> {
+    if (context.subject?.type !== 'proposal') {
+      return context.subject?.id ? [context.subject.id] : [];
+    }
+
+    const backing = (context.backingData && typeof context.backingData === 'object')
+      ? context.backingData as Record<string, unknown>
+      : {};
+    const batchId = extractString(backing.batchId);
+    const currentProposalId = context.subject.id;
+    const currentArticleKey = extractString(payload.targetArticleKey) ?? extractString(backing.articleKey);
+    const scope = payload.scope ?? 'current';
+
+    if (!batchId || scope === 'current') {
+      return [currentProposalId];
+    }
+
+    const queue = await this.workspaceRepository.listProposalReviewQueue(context.workspaceId, batchId);
+    if (scope === 'batch') {
+      return queue.queue.map((item) => item.proposalId);
+    }
+
+    if (!currentArticleKey) {
+      return [currentProposalId];
+    }
+
+    return queue.queue
+      .filter((item) => item.articleKey === currentArticleKey)
+      .map((item) => item.proposalId);
+  }
+
+  private didWorkingStateChangeDuringTurn(context: AiViewContext): boolean {
+    const subject = context.subject;
+    const workingState = context.workingState;
+    if (!subject?.id || !workingState?.versionToken) {
+      return false;
+    }
+    if (
+      (context.route !== AppRoute.PROPOSAL_REVIEW || subject.type !== 'proposal')
+      && (context.route !== AppRoute.TEMPLATES_AND_PROMPTS || subject.type !== 'template_pack')
+    ) {
+      return false;
+    }
+
+    try {
+      const schema = this.appWorkingStateService.getFormSchema({
+        workspaceId: context.workspaceId,
+        route: context.route,
+        entityType: subject.type,
+        entityId: subject.id
+      });
+      return Boolean(schema.versionToken && schema.versionToken !== workingState.versionToken);
+    } catch {
+      return false;
+    }
+  }
+
 
   private findSessionById(
     db: ReturnType<typeof openWorkspaceDatabase>,
@@ -1583,4 +1736,173 @@ function normalizeAssistantConfidenceScore(value: unknown): number | undefined {
     }
   }
   return undefined;
+}
+
+function normalizeProposalPatchScope(value: unknown): ProposalPatchScope | undefined {
+  if (value === 'current' || value === 'article' || value === 'batch') {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeProposalLineEdits(value: unknown): ProposalLineEditOperation[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const operations: ProposalLineEditOperation[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const expectedText = extractString(record.expectedText);
+    const lines = normalizeStringArray(record.lines);
+
+    if (record.type === 'replace_lines') {
+      const startLine = normalizePositiveInt(record.startLine);
+      const endLine = normalizePositiveInt(record.endLine);
+      if (!startLine || !endLine || startLine > endLine) {
+        continue;
+      }
+      operations.push({ type: 'replace_lines', startLine, endLine, lines, expectedText });
+      continue;
+    }
+
+    if (record.type === 'insert_after') {
+      const line = normalizeNonNegativeInt(record.line);
+      if (line === undefined) {
+        continue;
+      }
+      operations.push({ type: 'insert_after', line, lines, expectedText });
+      continue;
+    }
+
+    if (record.type === 'delete_lines') {
+      const startLine = normalizePositiveInt(record.startLine);
+      const endLine = normalizePositiveInt(record.endLine);
+      if (!startLine || !endLine || startLine > endLine) {
+        continue;
+      }
+      operations.push({ type: 'delete_lines', startLine, endLine, expectedText });
+    }
+  }
+
+  return operations;
+}
+
+function inferProposalPatchScope(userMessage: string): ProposalPatchScope {
+  const normalized = userMessage.trim().toLowerCase();
+  if (
+    /\b(all proposals|every proposal|entire review|whole review|entire batch|whole batch)\b/.test(normalized)
+  ) {
+    return 'batch';
+  }
+  if (/\b(this article|current article|article i[' ]?m viewing|article i'm viewing)\b/.test(normalized)) {
+    return 'article';
+  }
+  return 'current';
+}
+
+function applyProposalPatchToHtml(currentHtml: string, patch: ProposalPatchPayload): string {
+  if (patch.html && patch.html.trim()) {
+    return patch.html;
+  }
+
+  const lineEdits = patch.lineEdits ?? [];
+  if (lineEdits.length === 0) {
+    return currentHtml;
+  }
+
+  const lines = currentHtml.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const hadTrailingNewline = currentHtml.endsWith('\n');
+  let offset = 0;
+
+  for (const edit of lineEdits) {
+    if (edit.type === 'replace_lines') {
+      const startIndex = edit.startLine - 1 + offset;
+      const endIndex = edit.endLine - 1 + offset;
+      const currentSlice = lines.slice(startIndex, endIndex + 1).join('\n');
+      if (edit.expectedText && currentSlice !== edit.expectedText) {
+        throw new Error(`Proposal patch guard failed for lines ${edit.startLine}-${edit.endLine}.`);
+      }
+      lines.splice(startIndex, endIndex - startIndex + 1, ...edit.lines);
+      offset += edit.lines.length - (endIndex - startIndex + 1);
+      continue;
+    }
+
+    if (edit.type === 'insert_after') {
+      const insertIndex = Math.max(0, Math.min(lines.length, edit.line + offset));
+      const anchorIndex = insertIndex - 1;
+      if (edit.expectedText && anchorIndex >= 0) {
+        const currentLine = lines[anchorIndex] ?? '';
+        if (currentLine !== edit.expectedText) {
+          throw new Error(`Proposal patch guard failed for line ${edit.line}.`);
+        }
+      }
+      lines.splice(insertIndex, 0, ...edit.lines);
+      offset += edit.lines.length;
+      continue;
+    }
+
+    const startIndex = edit.startLine - 1 + offset;
+    const endIndex = edit.endLine - 1 + offset;
+    const currentSlice = lines.slice(startIndex, endIndex + 1).join('\n');
+    if (edit.expectedText && currentSlice !== edit.expectedText) {
+      throw new Error(`Proposal patch guard failed for lines ${edit.startLine}-${edit.endLine}.`);
+    }
+    lines.splice(startIndex, endIndex - startIndex + 1);
+    offset -= (endIndex - startIndex + 1);
+  }
+
+  const result = lines.join('\n');
+  return hadTrailingNewline && result && !result.endsWith('\n') ? `${result}\n` : result;
+}
+
+function buildProposalWorkingStatePatch(patch: ProposalPatchPayload): Record<string, unknown> {
+  const workingPatch: Record<string, unknown> = {};
+  if (typeof patch.html === 'string') workingPatch.html = patch.html;
+  if (typeof patch.title === 'string') workingPatch.title = patch.title;
+  if (typeof patch.rationale === 'string') workingPatch.rationale = patch.rationale;
+  if (typeof patch.rationaleSummary === 'string') workingPatch.rationaleSummary = patch.rationaleSummary;
+  if (typeof patch.aiNotes === 'string') workingPatch.aiNotes = patch.aiNotes;
+  return workingPatch;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+function normalizePositiveInt(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    return undefined;
+  }
+  return value;
+}
+
+function normalizeNonNegativeInt(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function looksLikeSuccessfulMutationClaim(response: string): boolean {
+  const normalized = response.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return [
+    /\bi updated\b/,
+    /\bi changed\b/,
+    /\bi fixed\b/,
+    /\bi converted\b/,
+    /\bupdated the\b/,
+    /\bchanged the\b/,
+    /\bconverted the\b/,
+    /\bapplied the\b/
+  ].some((pattern) => pattern.test(normalized));
 }

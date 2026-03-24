@@ -198,6 +198,14 @@ export interface ProposalReviewDecisionRequest {
   placementOverride?: ProposalPlacementSuggestion;
 }
 
+export interface ProposalReviewSaveWorkingCopyRequest {
+  workspaceId: EntityId;
+  proposalId: EntityId;
+  html: string;
+}
+
+export interface ProposalReviewSaveWorkingCopyResponse extends ProposalReviewDetailResponse {}
+
 export interface ProposalReviewDecisionResponse {
   workspaceId: EntityId;
   batchId: EntityId;
