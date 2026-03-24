@@ -52,9 +52,11 @@ rl.on('line', (line) => {
         response: 'I prepared a proposal candidate from the live article.',
         summary: 'Created a proposal candidate.',
         title: 'Batch 9 Commands',
+        confidenceScore: 0.81,
         rationale: 'The article needs a clearer opening.',
         html: '<h1>Batch 9 Commands</h1><p>Assistant proposal candidate.</p>',
         payload: {
+          confidenceScore: 0.81,
           proposedHtml: '<h1>Batch 9 Commands</h1><p>Assistant proposal candidate.</p>'
         }
       };
@@ -702,7 +704,8 @@ test.describe('command registry content model transitions', () => {
         }
       });
       expect(proposalDetail.ok).toBe(true);
-      const detail = proposalDetail.data as { diff: { afterHtml: string }; proposal: { id: string; updatedAtUtc: string; targetLocale?: string } };
+      const detail = proposalDetail.data as { diff: { afterHtml: string }; proposal: { id: string; updatedAtUtc: string; targetLocale?: string; confidenceScore?: number } };
+      expect(detail.proposal.confidenceScore).toBe(0.81);
 
       const proposalTurn = await harness.bus.execute({
         method: 'ai.assistant.message.send',

@@ -37,6 +37,8 @@ import {
   IconCode,
   IconFileText,
   IconTrash2,
+  IconPanelRight,
+  IconPanelLeft,
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
@@ -599,6 +601,8 @@ export const ProposalReview = () => {
   const [deleteTarget, setDeleteTarget] = useState<ProposalReviewBatchSummary | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
+  const [infoPanelOpen, setInfoPanelOpen] = useState(false);
+  const toggleInfoPanel = useCallback(() => setInfoPanelOpen((o) => !o), []);
   const [proposalWorkingCopy, setProposalWorkingCopy] = useState<{
     html: string;
     title?: string;
@@ -1171,22 +1175,8 @@ export const ProposalReview = () => {
                   {activeTab === 'source' && <SourcePanel html={workingHtml} />}
                   {activeTab === 'regions' && diff && <ChangeRegionsPanel regions={diff.changeRegions ?? []} />}
                 </div>
-              </>
-            )}
-          </div>
 
-          <div className="review-right">
-            {proposal && (
-              <>
-                <ConfidenceCard score={proposal.confidenceScore} />
-                <AISummaryCard
-                  rationaleSummary={proposalWorkingCopy?.rationaleSummary ?? proposal.rationaleSummary}
-                  aiNotes={proposalWorkingCopy?.rationale ?? proposal.aiNotes}
-                />
-                <PBIEvidenceCard pbis={relatedPbis} onSelectPBI={setSelectedPBI} />
-                <PlacementCard placement={proposal.suggestedPlacement} />
-
-                <div className="review-actions">
+                <div className="review-center-actions">
                   {proposal.reviewStatus === ProposalReviewStatus.PENDING_REVIEW ? (
                     <>
                       <div className="review-actions-row">
@@ -1208,7 +1198,6 @@ export const ProposalReview = () => {
                       {isEditProposal && (
                         <button
                           className="btn btn-ghost"
-                          style={{ width: '100%' }}
                           onClick={() => void handleDecision(ProposalReviewDecision.APPLY_TO_BRANCH)}
                           disabled={!!decidingAs}
                         >
@@ -1221,7 +1210,6 @@ export const ProposalReview = () => {
                       {proposal.action === ProposalAction.NO_IMPACT && (
                         <button
                           className="btn btn-ghost"
-                          style={{ width: '100%' }}
                           onClick={() => void handleDecision(ProposalReviewDecision.ARCHIVE)}
                           disabled={!!decidingAs}
                         >
@@ -1231,7 +1219,6 @@ export const ProposalReview = () => {
                           Archive
                         </button>
                       )}
-
                     </>
                   ) : (
                     <div style={{ textAlign: 'center', padding: 'var(--space-3)' }}>
@@ -1248,6 +1235,30 @@ export const ProposalReview = () => {
                 </div>
               </>
             )}
+          </div>
+
+          <div className={`review-right ${infoPanelOpen ? 'review-right--open' : ''}`}>
+            <button
+              className="proposal-info-toggle"
+              onClick={toggleInfoPanel}
+              title={infoPanelOpen ? 'Hide proposal info' : 'Show proposal info'}
+            >
+              {infoPanelOpen ? <IconPanelRight size={18} /> : <IconPanelLeft size={18} />}
+            </button>
+
+            <div className={`proposal-info-panel ${infoPanelOpen ? 'proposal-info-panel--open' : ''}`}>
+              {proposal && (
+                <>
+                  <ConfidenceCard score={proposal.confidenceScore} />
+                  <AISummaryCard
+                    rationaleSummary={proposalWorkingCopy?.rationaleSummary ?? proposal.rationaleSummary}
+                    aiNotes={proposalWorkingCopy?.rationale ?? proposal.aiNotes}
+                  />
+                  <PBIEvidenceCard pbis={relatedPbis} onSelectPBI={setSelectedPBI} />
+                  <PlacementCard placement={proposal.suggestedPlacement} />
+                </>
+              )}
+            </div>
 
             {allReviewed && !proposal && (
               <div className="card card-padded" style={{ textAlign: 'center' }}>

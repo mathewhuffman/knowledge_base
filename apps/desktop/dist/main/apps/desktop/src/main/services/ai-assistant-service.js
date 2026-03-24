@@ -326,6 +326,7 @@ class AiAssistantService {
             sourceRevisionId: extractString(subjectMeta.sourceRevisionId),
             targetTitle: payload.targetTitle,
             targetLocale: payload.targetLocale,
+            confidenceScore: payload.confidenceScore,
             rationale: payload.rationale,
             rationaleSummary: payload.rationaleSummary,
             aiNotes: payload.aiNotes,
@@ -386,9 +387,10 @@ class AiAssistantService {
             '  "summary": "optional short summary for non-chat artifacts only",',
             '  "rationale": "optional rationale",',
             '  "title": "optional short chat/session title or artifact title",',
+            '  "confidenceScore": "optional number from 0 to 1 for proposal candidates",',
             '  "html": "required for proposal_patch or draft_patch",',
             '  "formPatch": { "name"?: "...", "language"?: "...", "templateType"?: "...", "promptTemplate"?: "...", "toneRules"?: "...", "description"?: "...", "examples"?: "...", "active"?: true },',
-            '  "payload": { "targetTitle"?: "...", "targetLocale"?: "...", "sourceHtml"?: "...", "proposedHtml"?: "...", "metadata"?: {} }',
+            '  "payload": { "targetTitle"?: "...", "targetLocale"?: "...", "sourceHtml"?: "...", "proposedHtml"?: "...", "confidenceScore"?: 0.0, "metadata"?: {} }',
             '}',
             `Route: ${context.route}`,
             `Route label: ${context.routeLabel}`,
@@ -414,6 +416,7 @@ class AiAssistantService {
             '- Do not use command=patch_template for live form edits. The app now updates those forms from successful kb commands, not from parsed assistant JSON.',
             '- Only use proposal_candidate on article view when the user clearly asks to change, rewrite, update, or create a proposal for the article.',
             '- Use command=create_proposal only when you are explicitly creating a proposal candidate.',
+            '- Every proposal_candidate must include confidenceScore as a number between 0 and 1 based on the strength of the evidence.',
             '- Use command=patch_proposal only when you are explicitly returning a proposal patch.',
             '- Use command=patch_draft only when you are explicitly returning a draft patch.',
             '- For normal questions like "what page am I on", "can you see my inputs", explanations, summaries, navigation help, or workflow advice, use command=none and artifactType=informational_response.'
@@ -432,6 +435,7 @@ class AiAssistantService {
         const formPatch = parsed?.formPatch && typeof parsed.formPatch === 'object' ? parsed.formPatch : undefined;
         const payload = parsed?.payload && typeof parsed.payload === 'object' ? parsed.payload : undefined;
         const command = extractString(parsed?.command) ?? 'none';
+        const confidenceScore = normalizeAssistantConfidenceScore(parsed?.confidenceScore ?? payload?.confidenceScore);
         const artifactType = this.resolveFinalArtifactType({
             command,
             requestedArtifactType,
@@ -447,6 +451,7 @@ class AiAssistantService {
             summary,
             rationale: extractString(parsed?.rationale) ?? undefined,
             title: extractString(parsed?.title) ?? undefined,
+            confidenceScore,
             html,
             formPatch,
             payload
@@ -473,6 +478,7 @@ class AiAssistantService {
                 action: this.resolveProposalCandidateAction(context),
                 targetTitle: parsed.title ?? context.subject?.title,
                 targetLocale: context.subject?.locale,
+                confidenceScore: parsed.confidenceScore,
                 rationale: parsed.rationale ?? parsed.summary,
                 rationaleSummary: parsed.summary,
                 aiNotes: parsed.response,
@@ -1211,6 +1217,21 @@ function extractHtmlFromContext(context) {
         return extractString(backing.sourceHtml)
             ?? extractString(backing.previewHtml)
             ?? extractString(backing.proposedHtml);
+    }
+    return undefined;
+}
+function normalizeAssistantConfidenceScore(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        if (value > 1) {
+            return Math.max(0, Math.min(1, value / 100));
+        }
+        return Math.max(0, Math.min(1, value));
+    }
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Number.parseFloat(value);
+        if (!Number.isNaN(parsed)) {
+            return normalizeAssistantConfidenceScore(parsed);
+        }
     }
     return undefined;
 }

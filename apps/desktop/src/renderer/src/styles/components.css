@@ -3577,7 +3577,7 @@ code.agent-meta-value {
 /* --- Review Layout --- */
 .review-layout {
   display: grid;
-  grid-template-columns: 260px 1fr 300px;
+  grid-template-columns: 260px 1fr auto;
   gap: var(--space-4);
   height: 100%;
   min-height: 0;
@@ -3824,6 +3824,18 @@ code.agent-meta-value {
   text-align: center;
 }
 
+/* --- Review Actions (centered at bottom of center column) --- */
+.review-center-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+  margin-top: auto;
+  flex-shrink: 0;
+}
+
 .review-content-body {
   flex: 1;
   overflow-y: auto;
@@ -4029,6 +4041,55 @@ code.agent-meta-value {
   flex-direction: column;
   gap: var(--space-3);
   overflow-y: auto;
+  width: 48px;
+  min-width: 48px;
+  transition: width 0.25s ease, min-width 0.25s ease;
+}
+
+.review-right--open {
+  width: 300px;
+  min-width: 300px;
+}
+
+/* --- Proposal Info Toggle Button --- */
+.proposal-info-toggle {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.proposal-info-toggle:hover {
+  color: var(--color-text);
+  border-color: var(--color-primary);
+  background: var(--color-bg-hover);
+}
+
+/* --- Collapsible Proposal Info Panel --- */
+.proposal-info-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: max-height 0.25s ease, opacity 0.2s ease;
+}
+
+.proposal-info-panel--open {
+  max-height: 2000px;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .review-section-label {
@@ -4073,8 +4134,9 @@ code.agent-meta-value {
 }
 
 @media (max-width: 1200px) {
-  .review-layout {
-    grid-template-columns: 220px 1fr 280px;
+  .review-right--open {
+    width: 260px;
+    min-width: 260px;
   }
 }
 
@@ -4091,7 +4153,19 @@ code.agent-meta-value {
   }
 
   .review-right {
+    width: auto;
+    min-width: 0;
     overflow: visible;
+  }
+
+  .proposal-info-toggle {
+    display: none;
+  }
+
+  .proposal-info-panel {
+    max-height: none;
+    opacity: 1;
+    pointer-events: auto;
   }
 }
 
@@ -5387,6 +5461,56 @@ code.agent-meta-value {
 .template-analysis-suggestion-priority.high { color: var(--color-danger); }
 .template-analysis-suggestion-priority.medium { color: var(--color-warning); }
 .template-analysis-suggestion-priority.low { color: var(--color-text-muted); }
+
+/* --- Resizable textareas on Templates page --- */
+.resizable-textarea-wrapper {
+  display: flex;
+  flex-direction: column;
+}
+
+.template-resizable-textarea {
+  resize: none;
+  min-height: 60px;
+  max-height: 600px;
+  height: auto;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.resize-handle {
+  width: 100%;
+  height: 8px;
+  cursor: ns-resize;
+  background: var(--color-border);
+  border-bottom-left-radius: var(--radius-md);
+  border-bottom-right-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  touch-action: none;
+  user-select: none;
+  transition: background 0.15s ease;
+}
+
+.resize-handle::after {
+  content: '';
+  width: 32px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--color-text-muted);
+  opacity: 0.45;
+}
+
+.resize-handle:hover,
+.resize-handle:active {
+  background: var(--color-bg-subtle);
+}
+
+.resize-handle:hover::after,
+.resize-handle:active::after {
+  opacity: 0.75;
+}
 
 .template-editor-actions {
   display: flex;

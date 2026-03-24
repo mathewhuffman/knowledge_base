@@ -751,6 +751,8 @@ test.describe('kb cli desktop services', () => {
         'Create a dedicated food list duplicate article',
         '--rationale',
         'Food duplication is covered only conceptually today.',
+        '--metadata',
+        '{"targetTitle":"Duplicate Food Lists and Food Items (Portal)","confidenceScore":0.77}',
         '--json'
       ],
       {
@@ -781,6 +783,7 @@ test.describe('kb cli desktop services', () => {
     const proposalDetail = await repository.getProposalReviewDetail(created.id, payload.data.id);
     expect(proposalDetail.proposal.action).toBe('create');
     expect(proposalDetail.proposal.reviewStatus).toBe('pending_review');
+    expect(proposalDetail.proposal.confidenceScore).toBe(0.77);
     expect(proposalDetail.proposal.rationaleSummary).toContain('Food duplication');
   });
 });

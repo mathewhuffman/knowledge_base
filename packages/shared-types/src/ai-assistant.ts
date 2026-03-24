@@ -109,6 +109,7 @@ export interface ProposalCandidatePayload {
   action: 'create' | 'edit' | 'retire' | 'no_impact';
   targetTitle?: string;
   targetLocale?: string;
+  confidenceScore?: number;
   rationale?: string;
   rationaleSummary?: string;
   aiNotes?: string;

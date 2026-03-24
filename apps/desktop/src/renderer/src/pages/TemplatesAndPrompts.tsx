@@ -16,6 +16,7 @@ import { IconPlus, IconLayout, IconZap, IconTrash2, IconCheckCircle } from '../c
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
+import { usePersistedResize } from '../hooks/usePersistedResize';
 
 const NEW_TEMPLATE_ID = 'new-template-draft';
 
@@ -57,6 +58,10 @@ export const TemplatesAndPrompts = () => {
   const [isCreatingNew, setIsCreatingNew] = useState(false);
   const [draft, setDraft] = useState<ReturnType<typeof emptyForm>>(emptyForm());
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+
+  const prompt = usePersistedResize('tpl-prompt', 140);
+  const tone = usePersistedResize('tpl-tone', 100);
+  const examples = usePersistedResize('tpl-examples', 100);
 
   useEffect(() => {
     if (!activeWorkspace) return;
@@ -295,40 +300,49 @@ export const TemplatesAndPrompts = () => {
           {/* Prompt template */}
           <div className="template-field">
             <label className="template-field-label" htmlFor="tpl-prompt">Prompt template</label>
-            <textarea
-              id="tpl-prompt"
-              className="draft-source-editor"
-              style={{ minHeight: 140 }}
-              value={draft.promptTemplate}
-              onChange={(e) => setDraft((prev) => ({ ...prev, promptTemplate: e.target.value }))}
-              placeholder="Write a task-focused help article that covers..."
-            />
+            <div className="resizable-textarea-wrapper">
+              <textarea
+                id="tpl-prompt"
+                ref={prompt.textareaRef}
+                className="draft-source-editor template-resizable-textarea"
+                value={draft.promptTemplate}
+                onChange={(e) => setDraft((prev) => ({ ...prev, promptTemplate: e.target.value }))}
+                placeholder="Write a task-focused help article that covers..."
+              />
+              <div className="resize-handle" {...prompt.handleProps} />
+            </div>
           </div>
 
           {/* Tone rules */}
           <div className="template-field">
             <label className="template-field-label" htmlFor="tpl-tone">Tone / style guidance</label>
-            <textarea
-              id="tpl-tone"
-              className="draft-source-editor"
-              style={{ minHeight: 100 }}
-              value={draft.toneRules}
-              onChange={(e) => setDraft((prev) => ({ ...prev, toneRules: e.target.value }))}
-              placeholder="Use concise, direct instructions. Avoid jargon..."
-            />
+            <div className="resizable-textarea-wrapper">
+              <textarea
+                id="tpl-tone"
+                ref={tone.textareaRef}
+                className="draft-source-editor template-resizable-textarea"
+                value={draft.toneRules}
+                onChange={(e) => setDraft((prev) => ({ ...prev, toneRules: e.target.value }))}
+                placeholder="Use concise, direct instructions. Avoid jargon..."
+              />
+              <div className="resize-handle" {...tone.handleProps} />
+            </div>
           </div>
 
           {/* Example content */}
           <div className="template-field">
             <label className="template-field-label" htmlFor="tpl-examples">Example content</label>
-            <textarea
-              id="tpl-examples"
-              className="draft-source-editor"
-              style={{ minHeight: 100 }}
-              value={draft.examples ?? ''}
-              onChange={(e) => setDraft((prev) => ({ ...prev, examples: e.target.value }))}
-              placeholder="Paste or write an example article that follows this template..."
-            />
+            <div className="resizable-textarea-wrapper">
+              <textarea
+                id="tpl-examples"
+                ref={examples.textareaRef}
+                className="draft-source-editor template-resizable-textarea"
+                value={draft.examples ?? ''}
+                onChange={(e) => setDraft((prev) => ({ ...prev, examples: e.target.value }))}
+                placeholder="Paste or write an example article that follows this template..."
+              />
+              <div className="resize-handle" {...examples.handleProps} />
+            </div>
           </div>
 
           {/* Analysis results */}
