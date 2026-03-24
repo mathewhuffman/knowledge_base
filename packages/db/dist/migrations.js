@@ -596,6 +596,47 @@ exports.migrations = [
       CREATE INDEX IF NOT EXISTS idx_ai_artifacts_session_created
         ON ai_artifacts(session_id, created_at DESC);
     `
+    },
+    {
+        version: 13,
+        name: '0013_global_ai_history_threads',
+        description: 'Promote AI assistant sessions to workspace-scoped threads with active and history states.',
+        sql: `
+      DROP INDEX IF EXISTS idx_ai_sessions_scope;
+
+      ALTER TABLE ai_sessions ADD COLUMN title TEXT;
+      ALTER TABLE ai_sessions ADD COLUMN entity_title TEXT;
+      ALTER TABLE ai_sessions ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'closed';
+      ALTER TABLE ai_sessions ADD COLUMN last_message_at TEXT;
+      ALTER TABLE ai_sessions ADD COLUMN closed_at TEXT;
+      ALTER TABLE ai_sessions ADD COLUMN archived_at TEXT;
+
+      UPDATE ai_sessions
+      SET title = COALESCE(NULLIF(title, ''), 'Imported chat'),
+          lifecycle_status = CASE
+            WHEN lifecycle_status IS NULL OR lifecycle_status = '' THEN 'closed'
+            ELSE lifecycle_status
+          END,
+          last_message_at = COALESCE(
+            last_message_at,
+            (
+              SELECT MAX(created_at)
+              FROM ai_messages
+              WHERE ai_messages.session_id = ai_sessions.id
+            ),
+            updated_at
+          ),
+          closed_at = CASE
+            WHEN lifecycle_status = 'closed' AND closed_at IS NULL THEN updated_at
+            ELSE closed_at
+          END;
+
+      CREATE INDEX IF NOT EXISTS idx_ai_sessions_lifecycle
+        ON ai_sessions(workspace_id, lifecycle_status, updated_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_ai_sessions_last_message
+        ON ai_sessions(workspace_id, last_message_at DESC, updated_at DESC);
+    `
     }
 ];
 function getMigrationStatements() {

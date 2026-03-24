@@ -47,29 +47,42 @@ export const TemplatesAndPrompts = () => {
   const analyzeMutation = useIpcMutation<TemplatePackDetail>('template.pack.analyze');
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isCreatingNew, setIsCreatingNew] = useState(false);
   const [draft, setDraft] = useState<ReturnType<typeof emptyForm>>(emptyForm());
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
 
   useEffect(() => {
     if (!activeWorkspace) return;
+    setIsCreatingNew(false);
+    setSelectedId(null);
+    setDraft(emptyForm());
     void listQuery.execute({ workspaceId: activeWorkspace.id, includeInactive: true });
   }, [activeWorkspace]);
 
+  const templates: TemplatePackDetail[] = listQuery.data?.templates ?? [];
+
   useEffect(() => {
-    const firstId = listQuery.data?.templates[0]?.id;
-    if (!selectedId && firstId) {
+    const firstId = templates[0]?.id;
+    if (isCreatingNew) {
+      return;
+    }
+    if (selectedId && templates.some((template) => template.id === selectedId)) {
+      return;
+    }
+    if (firstId) {
       setSelectedId(firstId);
     }
-  }, [listQuery.data, selectedId]);
+  }, [isCreatingNew, selectedId, templates]);
 
-  const templates: TemplatePackDetail[] = listQuery.data?.templates ?? [];
   const selected: TemplatePackDetail | null = useMemo(
     () => templates.find((template) => template.id === selectedId) ?? null,
     [templates, selectedId]
   );
 
   useEffect(() => {
-    if (selected) {
+    if (isCreatingNew) {
+      setDraft(emptyForm());
+    } else if (selected) {
       setDraft({
         ...selected,
         description: selected.description ?? '',
@@ -78,7 +91,7 @@ export const TemplatesAndPrompts = () => {
     } else if (!selectedId) {
       setDraft(emptyForm());
     }
-  }, [selected, selectedId]);
+  }, [isCreatingNew, selected, selectedId]);
 
   const templateVersionToken = useMemo(
     () => `${selectedId ?? 'new'}:${selected?.updatedAtUtc ?? 'draft'}:${JSON.stringify(draft)}`,
@@ -146,7 +159,7 @@ export const TemplatesAndPrompts = () => {
   }
 
   const busy = saveMutation.loading || deleteMutation.loading || analyzeMutation.loading;
-  const isNewTemplate = !selectedId;
+  const isNewTemplate = isCreatingNew;
   const canSave = draft.name.trim() && draft.promptTemplate.trim() && draft.toneRules.trim();
 
   return (
@@ -158,6 +171,7 @@ export const TemplatesAndPrompts = () => {
           <button
             className="btn btn-primary"
             onClick={() => {
+              setIsCreatingNew(true);
               setSelectedId(null);
               setDraft(emptyForm());
             }}
@@ -345,6 +359,7 @@ export const TemplatesAndPrompts = () => {
                   active: draft.active,
                 });
                 if (saved) {
+                  setIsCreatingNew(false);
                   setSelectedId(saved.id);
                   await refresh();
                 }
@@ -399,6 +414,7 @@ export const TemplatesAndPrompts = () => {
           if (!selectedId) return;
           await deleteMutation.mutate({ workspaceId: activeWorkspace.id, templatePackId: selectedId });
           setShowDeleteDialog(false);
+          setIsCreatingNew(false);
           setSelectedId(null);
           setDraft(emptyForm());
           await refresh();

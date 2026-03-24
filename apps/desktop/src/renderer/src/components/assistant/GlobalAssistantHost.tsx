@@ -6,24 +6,29 @@ import { AssistantTranscript } from './AssistantTranscript';
 import { AssistantArtifactCard } from './AssistantArtifactCard';
 import { AssistantComposer } from './AssistantComposer';
 import { AssistantEmptyState } from './AssistantEmptyState';
+import { AssistantHistoryList } from './AssistantHistoryList';
 import { IconAlertCircle, IconRefreshCw } from '../icons';
 
 export function AssistantPanelContent({ embedded = false }: { embedded?: boolean }) {
   const {
     routeContext,
     session,
+    sessions,
     messages,
     artifact,
     loading,
     error,
+    historyOpen,
+    setHistoryOpen,
     sendMessage,
     resetSession,
+    createSession,
+    openSession,
+    deleteSession,
     applyArtifact,
     rejectArtifact
   } = useAiAssistant();
 
-  // Detect stale artifacts by checking if the artifact's base version token
-  // differs from the current working state version token
   const isStale = useMemo(() => {
     if (!artifact || artifact.status !== 'pending') return false;
     if (!routeContext?.workingState?.versionToken) return false;
@@ -36,65 +41,97 @@ export function AssistantPanelContent({ embedded = false }: { embedded?: boolean
     && (artifact.status === 'pending' || artifact.status === 'applied');
   const showTranscript = messages.length > 0;
 
+  const isResumedSession = session && session.route !== routeContext?.route;
+
   return (
-    <aside className={`ai-panel${embedded ? ' ai-panel--embedded' : ''}`} role="complementary" aria-label="AI Assistant">
-      <AssistantHeader
-        context={routeContext}
-        session={session}
-        artifact={artifact}
-        loading={loading}
-        onReset={() => void resetSession()}
-      />
-
-      <div className="ai-panel__body">
-        {showArtifact && artifact && (
-          <div className="ai-panel__artifact-slot">
-            <AssistantArtifactCard
-              artifact={artifact}
-              stale={isStale}
-              loading={loading}
-              onApply={() => void applyArtifact()}
-              onReject={() => void rejectArtifact()}
-            />
-          </div>
-        )}
-
-        {showTranscript ? (
-          <AssistantTranscript messages={messages} loading={loading} />
-        ) : (
-          !loading && <AssistantEmptyState context={routeContext} />
-        )}
-
-        {loading && !showTranscript && (
-          <div className="ai-panel__loading" role="status" aria-label="Loading">
-            <div className="ai-typing ai-typing--large">
-              <span /><span /><span />
-            </div>
-            <span>Starting assistant...</span>
-          </div>
-        )}
+    <aside
+      className={[
+        'ai-panel',
+        embedded && 'ai-panel--embedded',
+        historyOpen && 'ai-panel--history-open'
+      ].filter(Boolean).join(' ')}
+      role="complementary"
+      aria-label="AI Assistant"
+    >
+      {/* History sidebar — slides in from the left */}
+      <div className={`ai-panel__history-sidebar${historyOpen ? ' open' : ''}`}>
+        <div className="ai-panel__history-sidebar-inner">
+          <AssistantHistoryList
+            sessions={sessions}
+            activeSessionId={session?.id}
+            loading={loading}
+            onOpen={(sessionId) => void openSession(sessionId)}
+            onDelete={(sessionId) => void deleteSession(sessionId)}
+            onNewChat={() => void createSession()}
+            onClose={() => setHistoryOpen(false)}
+          />
+        </div>
       </div>
 
-      {error && (
-        <div className="ai-panel__error" role="alert">
-          <IconAlertCircle size={14} />
-          <span>{error}</span>
-          <button
-            type="button"
-            className="ai-panel__error-retry"
+      {/* Main chat column */}
+      <div className="ai-panel__chat">
+        <AssistantHeader
+          context={routeContext}
+          session={session}
+          artifact={artifact}
+          loading={loading}
+          historyOpen={historyOpen}
+          sessionCount={sessions.length}
+          isResumedSession={!!isResumedSession}
+          onCreateSession={() => void createSession()}
+          onToggleHistory={() => setHistoryOpen(!historyOpen)}
+        />
+
+        <div className="ai-panel__body">
+          {showArtifact && artifact && (
+            <div className="ai-panel__artifact-slot">
+              <AssistantArtifactCard
+                artifact={artifact}
+                stale={isStale}
+                loading={loading}
+                onApply={() => void applyArtifact()}
+                onReject={() => void rejectArtifact()}
+              />
+            </div>
+          )}
+
+          {showTranscript ? (
+            <AssistantTranscript messages={messages} loading={loading} />
+          ) : (
+            !loading && <AssistantEmptyState context={routeContext} />
+          )}
+
+          {loading && !showTranscript && (
+            <div className="ai-panel__loading" role="status" aria-label="Loading">
+              <div className="ai-typing ai-typing--large">
+                <span /><span /><span />
+              </div>
+              <span>Starting assistant...</span>
+            </div>
+          )}
+        </div>
+
+        {error && (
+          <div className="ai-panel__error" role="alert">
+            <IconAlertCircle size={14} />
+            <span>{error}</span>
+            <button
+              type="button"
+              className="ai-panel__error-retry"
             onClick={() => void resetSession()}
             title="Reset and retry"
           >
-            <IconRefreshCw size={12} />
-          </button>
-        </div>
-      )}
+              <IconRefreshCw size={12} />
+            </button>
+          </div>
+        )}
 
-      <AssistantComposer
-        context={routeContext}
-        loading={loading}
-        onSend={sendMessage}
-      />
+        <AssistantComposer
+          context={routeContext}
+          loading={loading}
+          onSend={sendMessage}
+        />
+      </div>
     </aside>
   );
 }

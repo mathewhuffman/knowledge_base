@@ -1,6 +1,6 @@
 import type { AiViewContext, AiSessionRecord, AiArtifactRecord } from '@kb-vault/shared-types';
 import { AppRoute } from '@kb-vault/shared-types';
-import { IconRefreshCw, IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool } from '../icons';
+import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconClock, IconPlus, IconAlertCircle } from '../icons';
 
 const ROUTE_ICONS: Partial<Record<AppRoute, React.ReactNode>> = {
   [AppRoute.ARTICLE_EXPLORER]: <IconFileText size={14} />,
@@ -30,10 +30,24 @@ interface AssistantHeaderProps {
   session: AiSessionRecord | null;
   artifact: AiArtifactRecord | null;
   loading: boolean;
-  onReset: () => void;
+  historyOpen: boolean;
+  sessionCount: number;
+  isResumedSession: boolean;
+  onCreateSession: () => void;
+  onToggleHistory: () => void;
 }
 
-export function AssistantHeader({ context, session, artifact, loading, onReset }: AssistantHeaderProps) {
+export function AssistantHeader({
+  context,
+  session,
+  artifact,
+  loading,
+  historyOpen,
+  sessionCount,
+  isResumedSession,
+  onCreateSession,
+  onToggleHistory
+}: AssistantHeaderProps) {
   const routeIcon = context ? ROUTE_ICONS[context.route] ?? <IconGlobe size={14} /> : <IconGlobe size={14} />;
   const status = statusLabel(session, artifact);
   const caps = context ? capabilityTags(context) : [];
@@ -50,21 +64,41 @@ export function AssistantHeader({ context, session, artifact, loading, onReset }
             <span className="ai-header__locale-badge">{context.subject.locale.toUpperCase()}</span>
           )}
         </div>
-        <button
-          type="button"
-          className="ai-header__reset"
-          onClick={onReset}
-          disabled={loading || !session}
-          title="Reset conversation"
-          aria-label="Reset conversation"
-        >
-          <IconRefreshCw size={12} />
-        </button>
+        <div className="ai-header__actions">
+          <button
+            type="button"
+            className={`ai-header__history${historyOpen ? ' active' : ''}`}
+            onClick={onToggleHistory}
+            disabled={loading}
+            title={historyOpen ? 'Close chat history' : 'Open chat history'}
+            aria-label={historyOpen ? 'Close chat history' : 'Open chat history'}
+          >
+            <IconClock size={12} />
+            <span>{sessionCount}</span>
+          </button>
+          <button
+            type="button"
+            className="ai-header__new"
+            onClick={onCreateSession}
+            disabled={loading}
+            title="Start a new chat"
+            aria-label="Start a new chat"
+          >
+            <IconPlus size={12} />
+          </button>
+        </div>
       </div>
 
-      {context?.subject?.title && (
-        <div className="ai-header__subject" title={context.subject.title}>
-          {context.subject.title}
+      {(session?.title || context?.subject?.title) && (
+        <div className="ai-header__subject" title={session?.title || context?.subject?.title || undefined}>
+          {session?.title || context?.subject?.title}
+        </div>
+      )}
+
+      {isResumedSession && (
+        <div className="ai-header__resumed" role="status">
+          <IconAlertCircle size={12} />
+          <span>Resumed from <strong>{session?.route ?? 'another page'}</strong> — now using current page context</span>
         </div>
       )}
 

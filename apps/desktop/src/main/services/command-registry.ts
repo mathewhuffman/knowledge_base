@@ -89,7 +89,11 @@ import {
   type AiAssistantArtifactDecisionRequest,
   type AiAssistantContextGetRequest,
   type AiAssistantMessageSendRequest,
+  type AiAssistantSessionCreateRequest,
+  type AiAssistantSessionDeleteRequest,
   type AiAssistantSessionGetRequest,
+  type AiAssistantSessionListRequest,
+  type AiAssistantSessionOpenRequest,
   type AiAssistantSessionResetRequest
 } from '@kb-vault/shared-types';
 import { ZendeskClient } from '@kb-vault/zendesk-client';
@@ -1845,10 +1849,70 @@ export function registerCoreCommands(bus: CommandBus, jobs: JobRegistry, workspa
   bus.register('ai.assistant.session.get', async (payload) => {
     try {
       const input = payload as AiAssistantSessionGetRequest;
-      if (!input?.workspaceId || !input.route) {
-        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.get requires workspaceId and route');
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.get requires workspaceId');
       }
       return { ok: true, data: await aiAssistantService.getSession(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.session.list', async (payload) => {
+    try {
+      const input = payload as AiAssistantSessionListRequest;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.list requires workspaceId');
+      }
+      return { ok: true, data: await aiAssistantService.listSessions(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.session.create', async (payload) => {
+    try {
+      const input = payload as AiAssistantSessionCreateRequest;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.create requires workspaceId');
+      }
+      return { ok: true, data: await aiAssistantService.createSession(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.session.open', async (payload) => {
+    try {
+      const input = payload as AiAssistantSessionOpenRequest;
+      if (!input?.workspaceId || !input.sessionId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.open requires workspaceId and sessionId');
+      }
+      return { ok: true, data: await aiAssistantService.openSession(input) };
+    } catch (error) {
+      if ((error as Error).message.includes('not found')) {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.session.delete', async (payload) => {
+    try {
+      const input = payload as AiAssistantSessionDeleteRequest;
+      if (!input?.workspaceId || !input.sessionId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.delete requires workspaceId and sessionId');
+      }
+      return { ok: true, data: await aiAssistantService.deleteSession(input) };
     } catch (error) {
       if ((error as Error).message.includes('not found')) {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);

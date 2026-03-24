@@ -1683,10 +1683,70 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
     bus.register('ai.assistant.session.get', async (payload) => {
         try {
             const input = payload;
-            if (!input?.workspaceId || !input.route) {
-                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.get requires workspaceId and route');
+            if (!input?.workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.get requires workspaceId');
             }
             return { ok: true, data: await aiAssistantService.getSession(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('ai.assistant.session.list', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.list requires workspaceId');
+            }
+            return { ok: true, data: await aiAssistantService.listSessions(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('ai.assistant.session.create', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.create requires workspaceId');
+            }
+            return { ok: true, data: await aiAssistantService.createSession(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('ai.assistant.session.open', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.sessionId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.open requires workspaceId and sessionId');
+            }
+            return { ok: true, data: await aiAssistantService.openSession(input) };
+        }
+        catch (error) {
+            if (error.message.includes('not found')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('ai.assistant.session.delete', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.sessionId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.session.delete requires workspaceId and sessionId');
+            }
+            return { ok: true, data: await aiAssistantService.deleteSession(input) };
         }
         catch (error) {
             if (error.message.includes('not found')) {

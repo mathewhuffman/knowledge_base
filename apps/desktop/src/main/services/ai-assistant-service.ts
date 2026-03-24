@@ -12,8 +12,13 @@ import {
   type AiAssistantArtifactDecisionResponse,
   type AiAssistantContextGetRequest,
   type AiAssistantMessageSendRequest,
+  type AiAssistantSessionCreateRequest,
+  type AiAssistantSessionDeleteRequest,
   type AiAssistantSessionGetRequest,
   type AiAssistantSessionGetResponse,
+  type AiAssistantSessionListRequest,
+  type AiAssistantSessionListResponse,
+  type AiAssistantSessionOpenRequest,
   type AiAssistantSessionResetRequest,
   type AiAssistantTurnResponse,
   type AiAssistantUiAction,
@@ -22,6 +27,7 @@ import {
   type AiMessageRole,
   type AiScopeType,
   type AiSessionRecord,
+  type AiSessionLifecycleStatus,
   type AiSessionStatus,
   type AiViewContext,
   type DraftPatchPayload,
@@ -40,14 +46,20 @@ interface AiSessionRow {
   id: string;
   workspaceId: string;
   scopeType: AiScopeType;
+  title: string;
   route: AppRoute;
   entityType: string | null;
   entityId: string | null;
+  entityTitle: string | null;
+  lifecycleStatus: AiSessionLifecycleStatus;
   status: AiSessionStatus;
   runtimeSessionId: string | null;
   latestArtifactId: string | null;
+  lastMessageAtUtc: string | null;
   createdAtUtc: string;
   updatedAtUtc: string;
+  closedAtUtc: string | null;
+  archivedAtUtc: string | null;
 }
 
 interface AiMessageRow {
@@ -77,6 +89,7 @@ interface AiArtifactRow {
 }
 
 type RuntimeResultPayload = {
+  command?: string;
   artifactType?: AiArtifactType;
   response?: string;
   summary?: string;
@@ -103,7 +116,9 @@ export class AiAssistantService {
     await this.workspaceRepository.getWorkspace(input.workspaceId);
     const db = await this.openAssistantDb(input.workspaceId);
     try {
-      const session = this.findSession(db, input.workspaceId, input.route, input.entityType, input.entityId);
+      const session = input.sessionId
+        ? this.findSessionById(db, input.workspaceId, input.sessionId)
+        : this.findActiveSession(db, input.workspaceId);
       if (!session) {
         return {
           workspaceId: input.workspaceId,
@@ -116,6 +131,95 @@ export class AiAssistantService {
         session: this.mapSessionRow(session),
         messages: this.listMessages(db, session.id),
         artifact: session.latestArtifactId ? this.getArtifact(db, input.workspaceId, session.latestArtifactId) : undefined
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  async listSessions(input: AiAssistantSessionListRequest): Promise<AiAssistantSessionListResponse> {
+    await this.workspaceRepository.getWorkspace(input.workspaceId);
+    const db = await this.openAssistantDb(input.workspaceId);
+    try {
+      const sessions = this.listSessionsForWorkspace(db, input.workspaceId, input.includeArchived ?? false);
+      return {
+        workspaceId: input.workspaceId,
+        activeSessionId: sessions.find((session) => session.lifecycleStatus === 'active')?.id,
+        sessions: sessions.map((session) => this.mapSessionRow(session))
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  async createSession(input: AiAssistantSessionCreateRequest): Promise<AiAssistantSessionGetResponse> {
+    await this.workspaceRepository.getWorkspace(input.workspaceId);
+    const db = await this.openAssistantDb(input.workspaceId);
+    try {
+      const session = this.createFreshSession(db, input.workspaceId, input.title);
+      return {
+        workspaceId: input.workspaceId,
+        session: this.mapSessionRow(session),
+        messages: []
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  async openSession(input: AiAssistantSessionOpenRequest): Promise<AiAssistantSessionGetResponse> {
+    await this.workspaceRepository.getWorkspace(input.workspaceId);
+    const db = await this.openAssistantDb(input.workspaceId);
+    try {
+      const session = this.activateSession(db, input.workspaceId, input.sessionId);
+      return {
+        workspaceId: input.workspaceId,
+        session: this.mapSessionRow(session),
+        messages: this.listMessages(db, session.id),
+        artifact: session.latestArtifactId ? this.getArtifact(db, input.workspaceId, session.latestArtifactId) : undefined
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  async deleteSession(input: AiAssistantSessionDeleteRequest): Promise<AiAssistantSessionGetResponse> {
+    await this.workspaceRepository.getWorkspace(input.workspaceId);
+    const db = await this.openAssistantDb(input.workspaceId);
+    try {
+      const session = this.requireSessionById(db, input.workspaceId, input.sessionId);
+      const deleteParams = {
+        workspaceId: input.workspaceId,
+        sessionId: input.sessionId
+      };
+      db.run(`DELETE FROM ai_artifacts WHERE workspace_id = @workspaceId AND session_id = @sessionId`, deleteParams);
+      db.run(`DELETE FROM ai_messages WHERE workspace_id = @workspaceId AND session_id = @sessionId`, deleteParams);
+      db.run(`DELETE FROM ai_sessions WHERE workspace_id = @workspaceId AND id = @sessionId`, deleteParams);
+
+      const nextActive = this.findActiveSession(db, input.workspaceId);
+      if (nextActive) {
+        return {
+          workspaceId: input.workspaceId,
+          session: this.mapSessionRow(nextActive),
+          messages: this.listMessages(db, nextActive.id),
+          artifact: nextActive.latestArtifactId ? this.getArtifact(db, input.workspaceId, nextActive.latestArtifactId) : undefined
+        };
+      }
+
+      const nextClosed = this.listSessionsForWorkspace(db, input.workspaceId, false)[0];
+      if (nextClosed) {
+        const activated = this.activateSession(db, input.workspaceId, nextClosed.id);
+        return {
+          workspaceId: input.workspaceId,
+          session: this.mapSessionRow(activated),
+          messages: this.listMessages(db, activated.id),
+          artifact: activated.latestArtifactId ? this.getArtifact(db, input.workspaceId, activated.latestArtifactId) : undefined
+        };
+      }
+
+      return {
+        workspaceId: input.workspaceId,
+        messages: []
       };
     } finally {
       db.close();
@@ -138,10 +242,13 @@ export class AiAssistantService {
         `UPDATE ai_sessions
          SET status = 'idle',
              latest_artifact_id = NULL,
+             title = @title,
+             last_message_at = NULL,
              updated_at = @updatedAt
          WHERE workspace_id = @workspaceId AND id = @sessionId`,
         {
           ...input,
+          title: this.defaultSessionTitle(),
           updatedAt: new Date().toISOString()
         }
       );
@@ -161,7 +268,8 @@ export class AiAssistantService {
     const context = input.context;
     const db = await this.openAssistantDb(input.workspaceId);
     try {
-      const session = this.ensureSession(db, context);
+      const session = this.ensureSession(db, context, input.sessionId);
+      const userMessageTimestamp = new Date().toISOString();
       this.insertMessage(db, {
         id: randomUUID(),
         sessionId: session.id,
@@ -169,10 +277,11 @@ export class AiAssistantService {
         role: 'user',
         messageKind: 'chat',
         content: input.message.trim(),
-        createdAtUtc: new Date().toISOString()
+        metadata: this.buildContextMetadata(context),
+        createdAtUtc: userMessageTimestamp
       });
 
-      this.updateSessionStatus(db, session.id, input.workspaceId, 'running');
+      this.updateSessionStatus(db, session.id, input.workspaceId, 'running', context, userMessageTimestamp, input.message.trim());
 
       const kbAccessMode = await this.resolveWorkspaceKbAccessMode(input.workspaceId);
       const runtimeResult = await this.agentRuntime.runAssistantChat(
@@ -218,7 +327,11 @@ export class AiAssistantService {
         role: 'assistant',
         messageKind: artifact.artifactType === 'informational_response' ? 'chat' : 'artifact',
         content: parsed.response,
-        metadata: { artifactId: artifact.id, artifactType: artifact.artifactType },
+        metadata: {
+          artifactId: artifact.id,
+          artifactType: artifact.artifactType,
+          ...this.buildContextMetadata(context)
+        },
         createdAtUtc: new Date().toISOString()
       });
 
@@ -228,7 +341,10 @@ export class AiAssistantService {
         session.id,
         runtimeResult.sessionId,
         autoApply ? 'idle' : 'has_pending_artifact',
-        artifact.id
+        artifact.id,
+        context,
+        assistantMessage.createdAtUtc,
+        parsed.title
       );
 
       const refreshedSession = this.requireSessionById(db, input.workspaceId, session.id);
@@ -404,11 +520,12 @@ export class AiAssistantService {
       'Return only valid JSON.',
       'JSON schema:',
       '{',
+      '  "command": "none | create_proposal | patch_proposal | patch_draft | patch_template",',
       '  "artifactType": "informational_response | proposal_candidate | proposal_patch | draft_patch | template_patch | clarification_request",',
       '  "response": "assistant-visible message",',
       '  "summary": "optional short summary for non-chat artifacts only",',
       '  "rationale": "optional rationale",',
-      '  "title": "optional title",',
+      '  "title": "optional short chat/session title or artifact title",',
       '  "html": "required for proposal_patch or draft_patch",',
       '  "formPatch": { "name"?: "...", "language"?: "...", "templateType"?: "...", "promptTemplate"?: "...", "toneRules"?: "...", "description"?: "...", "examples"?: "...", "active"?: true },',
       '  "payload": { "targetTitle"?: "...", "targetLocale"?: "...", "sourceHtml"?: "...", "proposedHtml"?: "...", "metadata"?: {} }',
@@ -425,12 +542,22 @@ export class AiAssistantService {
       'Rules:',
       '- Use working state as the source of truth when it exists.',
       '- Do not silently publish, finalize, or persist user content.',
+      '- Any mutating result must include an explicit command. Without a valid command, the result will be treated as informational_response.',
       '- If the user is asking a question, greeting you, asking for explanation, or chatting back and forth, use informational_response.',
       '- For informational_response, return only the user-facing response text. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
+      '- On the first meaningful reply in a new chat, include a short human-readable title in "title" based on the user request.',
       '- For informational_response, omit summary unless it is genuinely needed for internal bookkeeping.',
       '- If you are editing draft or proposal HTML, put the full replacement HTML in "html".',
       '- If you are editing a template, return only changed fields in "formPatch".',
-      '- Only use proposal_candidate on article view when the user clearly asks to change, rewrite, update, or create a proposal for the article.'
+      '- Template edits apply live in the form only when you return command=patch_template with artifactType=template_patch and a non-empty formPatch.',
+      '- Never say you already changed, updated, patched, or applied a template field unless you are returning command=patch_template with the changed fields in formPatch.',
+      '- If you are not returning command=patch_template, describe the change as a suggestion only and do not imply the UI field changed.',
+      '- Only use proposal_candidate on article view when the user clearly asks to change, rewrite, update, or create a proposal for the article.',
+      '- Use command=create_proposal only when you are explicitly creating a proposal candidate.',
+      '- Use command=patch_proposal only when you are explicitly returning a proposal patch.',
+      '- Use command=patch_draft only when you are explicitly returning a draft patch.',
+      '- Use command=patch_template only when you are explicitly returning a template patch.',
+      '- For normal questions like "what page am I on", "can you see my inputs", explanations, summaries, navigation help, or workflow advice, use command=none and artifactType=informational_response.'
     ].filter(Boolean).join('\n\n');
   }
 
@@ -441,22 +568,35 @@ export class AiAssistantService {
   ): Required<Pick<RuntimeResultPayload, 'artifactType' | 'response' | 'summary'>> & RuntimeResultPayload {
     const parsed = extractJsonObject(resultPayload);
     const allowed = new Set(this.allowedArtifactTypes(context));
-    const fallbackArtifactType = this.defaultArtifactType(context, userMessage);
-    const artifactType = parsed?.artifactType && allowed.has(parsed.artifactType as AiArtifactType)
+    const requestedArtifactType = parsed?.artifactType && allowed.has(parsed.artifactType as AiArtifactType)
       ? parsed.artifactType as AiArtifactType
-      : fallbackArtifactType;
+      : 'informational_response';
     const rawResponse = extractString(parsed?.response) ?? extractString(parsed?.summary) ?? extractAssistantText(resultPayload);
     const response = unwrapAssistantDisplayText(rawResponse) ?? 'Assistant completed the request.';
     const summary = extractString(parsed?.summary) ?? response;
+    const html = extractString(parsed?.html) ?? undefined;
+    const formPatch = parsed?.formPatch && typeof parsed.formPatch === 'object' ? parsed.formPatch as TemplatePatchPayload : undefined;
+    const payload = parsed?.payload && typeof parsed.payload === 'object' ? parsed.payload as Record<string, unknown> : undefined;
+    const command = extractString(parsed?.command) ?? 'none';
+    const artifactType = this.resolveFinalArtifactType({
+      command,
+      requestedArtifactType,
+      context,
+      html,
+      formPatch,
+      payload
+    });
+
     return {
+      command,
       artifactType,
       response,
       summary,
       rationale: extractString(parsed?.rationale) ?? undefined,
       title: extractString(parsed?.title) ?? undefined,
-      html: extractString(parsed?.html) ?? undefined,
-      formPatch: parsed?.formPatch && typeof parsed.formPatch === 'object' ? parsed.formPatch as TemplatePatchPayload : undefined,
-      payload: parsed?.payload && typeof parsed.payload === 'object' ? parsed.payload as Record<string, unknown> : undefined
+      html,
+      formPatch,
+      payload
     };
   }
 
@@ -534,16 +674,6 @@ export class AiAssistantService {
     );
   }
 
-  private defaultArtifactType(context: AiViewContext, userMessage: string): AiArtifactType {
-    if (context.capabilities.canPatchDraft) return 'draft_patch';
-    if (context.capabilities.canPatchProposal) return 'proposal_patch';
-    if (context.capabilities.canPatchTemplate) return 'template_patch';
-    if (context.capabilities.canCreateProposal) {
-      return looksLikeArticleChangeRequest(userMessage) ? 'proposal_candidate' : 'informational_response';
-    }
-    return 'informational_response';
-  }
-
   private allowedArtifactTypes(context: AiViewContext): AiArtifactType[] {
     const allowed: AiArtifactType[] = ['informational_response', 'clarification_request'];
     if (context.capabilities.canCreateProposal) allowed.push('proposal_candidate');
@@ -570,6 +700,51 @@ export class AiAssistantService {
     return 'create';
   }
 
+  private resolveFinalArtifactType(input: {
+    command: string;
+    requestedArtifactType: AiArtifactType;
+    context: AiViewContext;
+    html?: string;
+    formPatch?: TemplatePatchPayload;
+    payload?: Record<string, unknown>;
+  }): AiArtifactType {
+    const { command, requestedArtifactType, context, html, formPatch, payload } = input;
+
+    if (command === 'create_proposal') {
+      if (
+        requestedArtifactType === 'proposal_candidate'
+        && context.capabilities.canCreateProposal
+        && (extractString(payload?.proposedHtml) || html)
+      ) {
+        return 'proposal_candidate';
+      }
+      return 'informational_response';
+    }
+
+    if (command === 'patch_proposal') {
+      if (requestedArtifactType === 'proposal_patch' && context.capabilities.canPatchProposal && html) {
+        return 'proposal_patch';
+      }
+      return 'informational_response';
+    }
+
+    if (command === 'patch_draft') {
+      if (requestedArtifactType === 'draft_patch' && context.capabilities.canPatchDraft && html) {
+        return 'draft_patch';
+      }
+      return 'informational_response';
+    }
+
+    if (command === 'patch_template') {
+      if (requestedArtifactType === 'template_patch' && context.capabilities.canPatchTemplate && formPatch && Object.keys(formPatch).length > 0) {
+        return 'template_patch';
+      }
+      return 'informational_response';
+    }
+
+    return requestedArtifactType === 'clarification_request' ? 'clarification_request' : 'informational_response';
+  }
+
   private normalizeProposalAction(value: ProposalCandidatePayload['action']): ProposalAction {
     switch (value) {
       case 'create': return ProposalAction.CREATE;
@@ -583,91 +758,226 @@ export class AiAssistantService {
     const workspace = await this.workspaceRepository.getWorkspace(workspaceId);
     const dbPath = path.join(workspace.path, '.meta', DEFAULT_DB_FILE);
     applyWorkspaceMigrations(dbPath);
-    return openWorkspaceDatabase(dbPath);
+    const db = openWorkspaceDatabase(dbPath);
+    this.migrateLegacyArticleSessions(db, workspaceId);
+    return db;
   }
 
-  private ensureSession(db: ReturnType<typeof openWorkspaceDatabase>, context: AiViewContext): AiSessionRow {
-    const existing = this.findSession(db, context.workspaceId, context.route, context.subject?.type, context.subject?.id);
-    if (existing) {
-      return existing;
+  private ensureSession(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    context: AiViewContext,
+    sessionId?: string
+  ): AiSessionRow {
+    if (sessionId) {
+      return this.activateSession(db, context.workspaceId, sessionId, context);
     }
-    const now = new Date().toISOString();
-    const id = randomUUID();
-    db.run(
-      `INSERT INTO ai_sessions (
-        id, workspace_id, scope_type, route, entity_type, entity_id, status, runtime_session_id, latest_artifact_id, created_at, updated_at
-      ) VALUES (
-        @id, @workspaceId, @scopeType, @route, @entityType, @entityId, 'idle', NULL, NULL, @createdAt, @updatedAt
-      )`,
-      {
-        id,
-        workspaceId: context.workspaceId,
-        scopeType: context.subject ? 'entity' : 'page',
-        route: context.route,
-        entityType: context.subject?.type ?? null,
-        entityId: context.subject?.id ?? null,
-        createdAt: now,
-        updatedAt: now
-      }
-    );
-    return this.requireSessionById(db, context.workspaceId, id);
+
+    const active = this.findActiveSession(db, context.workspaceId);
+    if (active) {
+      return this.activateSession(db, context.workspaceId, active.id, context);
+    }
+
+    return this.createFreshSession(db, context.workspaceId, undefined, context);
   }
 
-  private findSession(
+  private findSessionById(
     db: ReturnType<typeof openWorkspaceDatabase>,
     workspaceId: string,
-    route: AppRoute,
-    entityType?: string,
-    entityId?: string
+    sessionId: string
   ): AiSessionRow | undefined {
     return db.get<AiSessionRow>(
       `SELECT id,
               workspace_id as workspaceId,
               scope_type as scopeType,
+              title,
               route,
               entity_type as entityType,
               entity_id as entityId,
+              entity_title as entityTitle,
+              lifecycle_status as lifecycleStatus,
               status,
               runtime_session_id as runtimeSessionId,
               latest_artifact_id as latestArtifactId,
+              last_message_at as lastMessageAtUtc,
               created_at as createdAtUtc,
-              updated_at as updatedAtUtc
+              updated_at as updatedAtUtc,
+              closed_at as closedAtUtc,
+              archived_at as archivedAtUtc
        FROM ai_sessions
        WHERE workspace_id = @workspaceId
-         AND route = @route
-         AND COALESCE(entity_type, '') = COALESCE(@entityType, '')
-         AND COALESCE(entity_id, '') = COALESCE(@entityId, '')
+         AND id = @sessionId
        LIMIT 1`,
       {
         workspaceId,
-        route,
-        entityType: entityType ?? null,
-        entityId: entityId ?? null
+        sessionId
       }
     ) ?? undefined;
   }
 
-  private requireSessionById(db: ReturnType<typeof openWorkspaceDatabase>, workspaceId: string, sessionId: string): AiSessionRow {
-    const row = db.get<AiSessionRow>(
+  private findActiveSession(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string
+  ): AiSessionRow | undefined {
+    return db.get<AiSessionRow>(
       `SELECT id,
               workspace_id as workspaceId,
               scope_type as scopeType,
+              title,
               route,
               entity_type as entityType,
               entity_id as entityId,
+              entity_title as entityTitle,
+              lifecycle_status as lifecycleStatus,
               status,
               runtime_session_id as runtimeSessionId,
               latest_artifact_id as latestArtifactId,
+              last_message_at as lastMessageAtUtc,
               created_at as createdAtUtc,
-              updated_at as updatedAtUtc
+              updated_at as updatedAtUtc,
+              closed_at as closedAtUtc,
+              archived_at as archivedAtUtc
        FROM ai_sessions
-       WHERE workspace_id = @workspaceId AND id = @sessionId`,
-      { workspaceId, sessionId }
+       WHERE workspace_id = @workspaceId
+         AND lifecycle_status = 'active'
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      { workspaceId }
+    ) ?? undefined;
+  }
+
+  private listSessionsForWorkspace(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    includeArchived: boolean
+  ): AiSessionRow[] {
+    return db.all<AiSessionRow>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              scope_type as scopeType,
+              title,
+              route,
+              entity_type as entityType,
+              entity_id as entityId,
+              entity_title as entityTitle,
+              lifecycle_status as lifecycleStatus,
+              status,
+              runtime_session_id as runtimeSessionId,
+              latest_artifact_id as latestArtifactId,
+              last_message_at as lastMessageAtUtc,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc,
+              closed_at as closedAtUtc,
+              archived_at as archivedAtUtc
+       FROM ai_sessions
+       WHERE workspace_id = @workspaceId
+         AND (@includeArchived = 1 OR lifecycle_status != 'archived')
+       ORDER BY CASE lifecycle_status WHEN 'active' THEN 0 WHEN 'closed' THEN 1 ELSE 2 END,
+                COALESCE(last_message_at, updated_at) DESC,
+                created_at DESC`,
+      {
+        workspaceId,
+        includeArchived: includeArchived ? 1 : 0
+      }
     );
+  }
+
+  private requireSessionById(db: ReturnType<typeof openWorkspaceDatabase>, workspaceId: string, sessionId: string): AiSessionRow {
+    const row = this.findSessionById(db, workspaceId, sessionId);
     if (!row) {
       throw new Error('AI assistant session not found');
     }
     return row;
+  }
+
+  private createFreshSession(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    title?: string,
+    context?: AiViewContext
+  ): AiSessionRow {
+    this.closeActiveSessions(db, workspaceId);
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    db.run(
+      `INSERT INTO ai_sessions (
+        id, workspace_id, scope_type, title, route, entity_type, entity_id, entity_title, lifecycle_status, status,
+        runtime_session_id, latest_artifact_id, last_message_at, created_at, updated_at, closed_at, archived_at
+      ) VALUES (
+        @id, @workspaceId, 'global', @title, @route, @entityType, @entityId, @entityTitle, 'active', 'idle',
+        NULL, NULL, NULL, @createdAt, @updatedAt, NULL, NULL
+      )`,
+      {
+        id,
+        workspaceId,
+        title: title?.trim() || this.defaultSessionTitle(),
+        route: context?.route ?? AppRoute.KB_VAULT_HOME,
+        entityType: context?.subject?.type ?? null,
+        entityId: context?.subject?.id ?? null,
+        entityTitle: context?.subject?.title ?? null,
+        createdAt: now,
+        updatedAt: now
+      }
+    );
+    return this.requireSessionById(db, workspaceId, id);
+  }
+
+  private activateSession(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    sessionId: string,
+    context?: AiViewContext
+  ): AiSessionRow {
+    const session = this.requireSessionById(db, workspaceId, sessionId);
+    const now = new Date().toISOString();
+    this.closeActiveSessions(db, workspaceId, sessionId);
+    db.run(
+      `UPDATE ai_sessions
+       SET lifecycle_status = 'active',
+           closed_at = NULL,
+           route = COALESCE(@route, route),
+           entity_type = COALESCE(@entityType, entity_type),
+           entity_id = COALESCE(@entityId, entity_id),
+           entity_title = COALESCE(@entityTitle, entity_title),
+           updated_at = @updatedAt
+       WHERE workspace_id = @workspaceId AND id = @sessionId`,
+      {
+        workspaceId,
+        sessionId,
+        route: context?.route ?? null,
+        entityType: context?.subject?.type ?? null,
+        entityId: context?.subject?.id ?? null,
+        entityTitle: context?.subject?.title ?? null,
+        updatedAt: now
+      }
+    );
+    return this.requireSessionById(db, workspaceId, sessionId);
+  }
+
+  private closeActiveSessions(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    exceptSessionId?: string
+  ): void {
+    const now = new Date().toISOString();
+    db.run(
+      `UPDATE ai_sessions
+       SET lifecycle_status = 'closed',
+           closed_at = CASE WHEN lifecycle_status = 'active' THEN @closedAt ELSE closed_at END,
+           updated_at = @updatedAt
+       WHERE workspace_id = @workspaceId
+         AND lifecycle_status = 'active'
+         AND (@exceptSessionId IS NULL OR id != @exceptSessionId)`,
+      {
+        workspaceId,
+        exceptSessionId: exceptSessionId ?? null,
+        closedAt: now,
+        updatedAt: now
+      }
+    );
+  }
+
+  private defaultSessionTitle(): string {
+    return 'New chat';
   }
 
   private mapSessionRow(row: AiSessionRow): AiSessionRecord {
@@ -675,14 +985,20 @@ export class AiAssistantService {
       id: row.id,
       workspaceId: row.workspaceId,
       scopeType: row.scopeType,
+      title: row.title,
       route: row.route,
       entityType: row.entityType as AiSessionRecord['entityType'],
       entityId: row.entityId ?? undefined,
+      entityTitle: row.entityTitle ?? undefined,
+      lifecycleStatus: row.lifecycleStatus,
       status: row.status,
       runtimeSessionId: row.runtimeSessionId ?? undefined,
       latestArtifactId: row.latestArtifactId ?? undefined,
+      lastMessageAtUtc: row.lastMessageAtUtc ?? undefined,
       createdAtUtc: row.createdAtUtc,
-      updatedAtUtc: row.updatedAtUtc
+      updatedAtUtc: row.updatedAtUtc,
+      closedAtUtc: row.closedAtUtc ?? undefined,
+      archivedAtUtc: row.archivedAtUtc ?? undefined
     };
   }
 
@@ -862,17 +1178,36 @@ export class AiAssistantService {
     db: ReturnType<typeof openWorkspaceDatabase>,
     sessionId: string,
     workspaceId: string,
-    status: AiSessionStatus
+    status: AiSessionStatus,
+    context?: AiViewContext,
+    lastMessageAtUtc?: string,
+    titleHint?: string
   ): void {
+    const nextTitle = titleHint?.trim()
+      && this.requireSessionById(db, workspaceId, sessionId).title === this.defaultSessionTitle()
+      ? this.summarizeSessionTitle(titleHint)
+      : null;
     db.run(
       `UPDATE ai_sessions
        SET status = @status,
+           title = COALESCE(@title, title),
+           route = COALESCE(@route, route),
+           entity_type = COALESCE(@entityType, entity_type),
+           entity_id = COALESCE(@entityId, entity_id),
+           entity_title = COALESCE(@entityTitle, entity_title),
+           last_message_at = COALESCE(@lastMessageAt, last_message_at),
            updated_at = @updatedAt
        WHERE workspace_id = @workspaceId AND id = @sessionId`,
       {
         sessionId,
         workspaceId,
         status,
+        title: nextTitle,
+        route: context?.route ?? null,
+        entityType: context?.subject?.type ?? null,
+        entityId: context?.subject?.id ?? null,
+        entityTitle: context?.subject?.title ?? null,
+        lastMessageAt: lastMessageAtUtc ?? null,
         updatedAt: new Date().toISOString()
       }
     );
@@ -884,13 +1219,25 @@ export class AiAssistantService {
     sessionId: string,
     runtimeSessionId: string | undefined,
     status: AiSessionStatus,
-    latestArtifactId?: string
+    latestArtifactId?: string,
+    context?: AiViewContext,
+    lastMessageAtUtc?: string,
+    titleOverride?: string
   ): void {
     db.run(
       `UPDATE ai_sessions
        SET runtime_session_id = COALESCE(@runtimeSessionId, runtime_session_id),
            status = @status,
            latest_artifact_id = COALESCE(@latestArtifactId, latest_artifact_id),
+           title = CASE
+             WHEN @title IS NOT NULL AND (title IS NULL OR title = '' OR title = @defaultTitle) THEN @title
+             ELSE title
+           END,
+           route = COALESCE(@route, route),
+           entity_type = COALESCE(@entityType, entity_type),
+           entity_id = COALESCE(@entityId, entity_id),
+           entity_title = COALESCE(@entityTitle, entity_title),
+           last_message_at = COALESCE(@lastMessageAt, last_message_at),
            updated_at = @updatedAt
        WHERE workspace_id = @workspaceId AND id = @sessionId`,
       {
@@ -899,9 +1246,135 @@ export class AiAssistantService {
         runtimeSessionId: runtimeSessionId ?? null,
         status,
         latestArtifactId: latestArtifactId ?? null,
+        title: titleOverride?.trim() ? this.summarizeSessionTitle(titleOverride) : null,
+        defaultTitle: this.defaultSessionTitle(),
+        route: context?.route ?? null,
+        entityType: context?.subject?.type ?? null,
+        entityId: context?.subject?.id ?? null,
+        entityTitle: context?.subject?.title ?? null,
+        lastMessageAt: lastMessageAtUtc ?? null,
         updatedAt: new Date().toISOString()
       }
     );
+  }
+
+  private summarizeSessionTitle(message: string): string {
+    const collapsed = message.replace(/\s+/g, ' ').trim();
+    if (!collapsed) return this.defaultSessionTitle();
+    return collapsed.slice(0, 56);
+  }
+
+  private buildContextMetadata(context: AiViewContext): Record<string, unknown> {
+    return {
+      route: context.route,
+      routeLabel: context.routeLabel,
+      subjectType: context.subject?.type,
+      subjectId: context.subject?.id,
+      subjectTitle: context.subject?.title,
+      locale: context.subject?.locale,
+      versionToken: context.workingState?.versionToken
+    };
+  }
+
+  private migrateLegacyArticleSessions(db: ReturnType<typeof openWorkspaceDatabase>, workspaceId: string): void {
+    const legacySessions = db.all<{
+      id: string;
+      localeVariantId: string;
+      branchId: string | null;
+      status: string;
+      createdAtUtc: string;
+      updatedAtUtc: string;
+    }>(
+      `SELECT id,
+              locale_variant_id as localeVariantId,
+              branch_id as branchId,
+              status,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+       FROM article_ai_sessions
+       WHERE workspace_id = @workspaceId`,
+      { workspaceId }
+    );
+
+    for (const legacySession of legacySessions) {
+      const alreadyImported = db.get<{ id: string }>(
+        `SELECT id
+         FROM ai_sessions
+         WHERE workspace_id = @workspaceId AND entity_id = @entityId AND created_at = @createdAt
+         LIMIT 1`,
+        {
+          workspaceId,
+          entityId: legacySession.branchId ?? legacySession.localeVariantId,
+          createdAt: legacySession.createdAtUtc
+        }
+      );
+      if (alreadyImported) {
+        continue;
+      }
+
+      const sessionId = randomUUID();
+      db.run(
+        `INSERT INTO ai_sessions (
+          id, workspace_id, scope_type, title, route, entity_type, entity_id, entity_title, lifecycle_status, status,
+          runtime_session_id, latest_artifact_id, last_message_at, created_at, updated_at, closed_at, archived_at
+        ) VALUES (
+          @id, @workspaceId, 'entity', @title, @route, @entityType, @entityId, NULL, 'closed', 'idle',
+          NULL, NULL, @lastMessageAt, @createdAt, @updatedAt, @closedAt, NULL
+        )`,
+        {
+          id: sessionId,
+          workspaceId,
+          title: legacySession.branchId ? 'Imported draft chat' : 'Imported article chat',
+          route: legacySession.branchId ? AppRoute.DRAFTS : AppRoute.ARTICLE_EXPLORER,
+          entityType: legacySession.branchId ? 'draft_branch' : 'article',
+          entityId: legacySession.branchId ?? legacySession.localeVariantId,
+          lastMessageAt: legacySession.updatedAtUtc,
+          createdAt: legacySession.createdAtUtc,
+          updatedAt: legacySession.updatedAtUtc,
+          closedAt: legacySession.updatedAtUtc
+        }
+      );
+
+      const legacyMessages = db.all<{
+        id: string;
+        role: AiMessageRole;
+        messageKind: AiMessageKind;
+        content: string;
+        metadataJson: string | null;
+        createdAtUtc: string;
+      }>(
+        `SELECT id,
+                role,
+                message_kind as messageKind,
+                content,
+                metadata_json as metadataJson,
+                created_at as createdAtUtc
+         FROM article_ai_messages
+         WHERE session_id = @sessionId
+         ORDER BY created_at ASC`,
+        { sessionId: legacySession.id }
+      );
+
+      for (const legacyMessage of legacyMessages) {
+        db.run(
+          `INSERT INTO ai_messages (
+            id, session_id, workspace_id, role, message_kind, content, metadata_json, created_at
+          ) VALUES (
+            @id, @sessionId, @workspaceId, @role, @messageKind, @content, @metadataJson, @createdAt
+          )`,
+          {
+            id: randomUUID(),
+            sessionId,
+            workspaceId,
+            role: legacyMessage.role,
+            messageKind: legacyMessage.messageKind,
+            content: legacyMessage.content,
+            metadataJson: legacyMessage.metadataJson,
+            createdAt: legacyMessage.createdAtUtc
+          }
+        );
+      }
+    }
   }
 }
 

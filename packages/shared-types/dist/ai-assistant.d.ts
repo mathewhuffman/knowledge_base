@@ -4,6 +4,7 @@ export type AiWorkingStateKind = 'article_html' | 'proposal_html' | 'template_pa
 export type AiArtifactType = 'informational_response' | 'proposal_candidate' | 'proposal_patch' | 'draft_patch' | 'template_patch' | 'navigation_suggestion' | 'clarification_request';
 export type AiScopeType = 'global' | 'page' | 'entity';
 export type AiSessionStatus = 'idle' | 'running' | 'has_pending_artifact' | 'error';
+export type AiSessionLifecycleStatus = 'active' | 'closed' | 'archived';
 export type AiArtifactStatus = 'pending' | 'applied' | 'rejected' | 'superseded';
 export type AiMessageRole = 'system' | 'user' | 'assistant';
 export type AiMessageKind = 'chat' | 'artifact' | 'decision' | 'warning';
@@ -39,14 +40,20 @@ export interface AiSessionRecord {
     id: string;
     workspaceId: string;
     scopeType: AiScopeType;
+    title: string;
     route: AppRoute;
     entityType?: AiSubjectType;
     entityId?: string;
+    entityTitle?: string;
+    lifecycleStatus: AiSessionLifecycleStatus;
     status: AiSessionStatus;
     runtimeSessionId?: string;
     latestArtifactId?: string;
+    lastMessageAtUtc?: string;
     createdAtUtc: string;
     updatedAtUtc: string;
+    closedAtUtc?: string;
+    archivedAtUtc?: string;
 }
 export interface AiMessageRecord {
     id: string;
@@ -125,9 +132,7 @@ export interface AiAssistantContextGetRequest {
 }
 export interface AiAssistantSessionGetRequest {
     workspaceId: string;
-    route: AppRoute;
-    entityType?: AiSubjectType;
-    entityId?: string;
+    sessionId?: string;
 }
 export interface AiAssistantSessionGetResponse {
     workspaceId: string;
@@ -135,8 +140,18 @@ export interface AiAssistantSessionGetResponse {
     messages: AiMessageRecord[];
     artifact?: AiArtifactRecord;
 }
+export interface AiAssistantSessionListRequest {
+    workspaceId: string;
+    includeArchived?: boolean;
+}
+export interface AiAssistantSessionListResponse {
+    workspaceId: string;
+    activeSessionId?: string;
+    sessions: AiSessionRecord[];
+}
 export interface AiAssistantMessageSendRequest {
     workspaceId: string;
+    sessionId?: string;
     context: AiViewContext;
     message: string;
 }
@@ -149,6 +164,18 @@ export interface AiAssistantTurnResponse {
     uiActions: AiAssistantUiAction[];
 }
 export interface AiAssistantSessionResetRequest {
+    workspaceId: string;
+    sessionId: string;
+}
+export interface AiAssistantSessionCreateRequest {
+    workspaceId: string;
+    title?: string;
+}
+export interface AiAssistantSessionOpenRequest {
+    workspaceId: string;
+    sessionId: string;
+}
+export interface AiAssistantSessionDeleteRequest {
     workspaceId: string;
     sessionId: string;
 }

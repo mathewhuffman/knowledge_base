@@ -23,6 +23,8 @@ export type AiScopeType = 'global' | 'page' | 'entity';
 
 export type AiSessionStatus = 'idle' | 'running' | 'has_pending_artifact' | 'error';
 
+export type AiSessionLifecycleStatus = 'active' | 'closed' | 'archived';
+
 export type AiArtifactStatus = 'pending' | 'applied' | 'rejected' | 'superseded';
 
 export type AiMessageRole = 'system' | 'user' | 'assistant';
@@ -65,14 +67,20 @@ export interface AiSessionRecord {
   id: string;
   workspaceId: string;
   scopeType: AiScopeType;
+  title: string;
   route: AppRoute;
   entityType?: AiSubjectType;
   entityId?: string;
+  entityTitle?: string;
+  lifecycleStatus: AiSessionLifecycleStatus;
   status: AiSessionStatus;
   runtimeSessionId?: string;
   latestArtifactId?: string;
+  lastMessageAtUtc?: string;
   createdAtUtc: string;
   updatedAtUtc: string;
+  closedAtUtc?: string;
+  archivedAtUtc?: string;
 }
 
 export interface AiMessageRecord {
@@ -150,9 +158,7 @@ export interface AiAssistantContextGetRequest {
 
 export interface AiAssistantSessionGetRequest {
   workspaceId: string;
-  route: AppRoute;
-  entityType?: AiSubjectType;
-  entityId?: string;
+  sessionId?: string;
 }
 
 export interface AiAssistantSessionGetResponse {
@@ -162,8 +168,20 @@ export interface AiAssistantSessionGetResponse {
   artifact?: AiArtifactRecord;
 }
 
+export interface AiAssistantSessionListRequest {
+  workspaceId: string;
+  includeArchived?: boolean;
+}
+
+export interface AiAssistantSessionListResponse {
+  workspaceId: string;
+  activeSessionId?: string;
+  sessions: AiSessionRecord[];
+}
+
 export interface AiAssistantMessageSendRequest {
   workspaceId: string;
+  sessionId?: string;
   context: AiViewContext;
   message: string;
 }
@@ -178,6 +196,21 @@ export interface AiAssistantTurnResponse {
 }
 
 export interface AiAssistantSessionResetRequest {
+  workspaceId: string;
+  sessionId: string;
+}
+
+export interface AiAssistantSessionCreateRequest {
+  workspaceId: string;
+  title?: string;
+}
+
+export interface AiAssistantSessionOpenRequest {
+  workspaceId: string;
+  sessionId: string;
+}
+
+export interface AiAssistantSessionDeleteRequest {
   workspaceId: string;
   sessionId: string;
 }
