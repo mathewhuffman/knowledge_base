@@ -8,6 +8,8 @@ import {
   type ArticleDetailResponse,
   type ArticleRelationRecord,
   type ArticleAiSessionResponse,
+  type DraftBranchGetResponse,
+  type DraftBranchSaveResponse,
   type TemplatePackSummary,
   type ExplorerNode,
   type SearchResult,
@@ -35,6 +37,7 @@ import {
   IconImage,
   IconChevronRight,
   IconChevronDown,
+  IconChevronLeft,
   IconZap,
   IconSend,
   IconCheckCircle,
@@ -42,9 +45,9 @@ import {
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
-import { buildArticlePreviewDocument } from '../utils/previewDocument';
 import { CodeEditor } from '../components/editor/CodeEditor';
 import { EditorPane } from '../components/editor/EditorPane';
+import { ArticleModeToggle, ArticleSurface, type ArticleSurfaceMode } from '../components/article/ArticleSurface';
 
 type Filter = 'all' | 'live' | 'drafts' | 'retired' | 'conflicted';
 
@@ -1071,6 +1074,10 @@ export const ArticleExplorer = () => {
   const latestSyncQuery = useIpc<ZendeskSyncRunRecord | null>('zendesk.sync.getLatest');
   const latestSuccessfulSyncQuery = useIpc<ZendeskSyncRunRecord | null>('zendesk.sync.getLatestSuccessful');
   const previewStyleQuery = useIpc<PreviewStyleResponse>('article.preview.styles.get');
+  const createDraftBranchMutation = useIpcMutation<DraftBranchGetResponse>('draft.branch.create');
+  const saveDraftBranchMutation = useIpcMutation<DraftBranchSaveResponse>('draft.branch.save');
+  const { mutate: mutateCreateDraftBranch, loading: creatingDraftBranch, error: createDraftBranchError } = createDraftBranchMutation;
+  const { mutate: mutateSaveDraftBranch, loading: savingDraftBranch, error: saveDraftBranchError } = saveDraftBranchMutation;
 
   const [activeFilter, setActiveFilter] = useState<Filter>('all');
   const [searchText, setSearchText] = useState('');
@@ -1090,6 +1097,11 @@ export const ArticleExplorer = () => {
     detail: null,
     revisions: []
   });
+  const [articleSurfaceMode, setArticleSurfaceMode] = useState<ArticleSurfaceMode>('preview');
+  const [articleEditorHtml, setArticleEditorHtml] = useState('');
+  const [savedArticleHtml, setSavedArticleHtml] = useState('');
+  const [articleEditBranchId, setArticleEditBranchId] = useState<string | null>(null);
+  const [articleSaveMessage, setArticleSaveMessage] = useState<string | null>(null);
 
   // Fetch tree and sync status when workspace changes
   useEffect(() => {
@@ -1443,6 +1455,106 @@ export const ArticleExplorer = () => {
     await openArticleDetail(node, 'relations');
   }, [tree, openArticleDetail]);
 
+  useEffect(() => {
+    if (!detailPanel.detail) return;
+
+    const nextHtml = detailPanel.detail.sourceHtml || detailPanel.detail.previewHtml || '';
+    setArticleEditorHtml(nextHtml);
+    setSavedArticleHtml(nextHtml);
+    setArticleSaveMessage(null);
+  }, [detailPanel.detail?.revision.id, detailPanel.detail?.sourceHtml, detailPanel.detail?.previewHtml]);
+
+  useEffect(() => {
+    setArticleEditBranchId(null);
+    setArticleSaveMessage(null);
+  }, [detailPanel.familyId, detailPanel.localeVariantId]);
+
+  const handleRestoreArticleEdit = useCallback(() => {
+    setArticleEditorHtml(savedArticleHtml);
+    setArticleSaveMessage(null);
+  }, [savedArticleHtml]);
+
+  const handleSaveArticleEdit = useCallback(async () => {
+    if (!activeWorkspace || !detailPanel.detail) return;
+
+    let branchId = articleEditBranchId;
+    let expectedHeadRevisionId: string | undefined;
+
+    if (!branchId) {
+      const createdBranch = await mutateCreateDraftBranch({
+        workspaceId: activeWorkspace.id,
+        localeVariantId: detailPanel.localeVariantId,
+        name: `${detailPanel.familyTitle} edits`,
+        sourceHtml: savedArticleHtml || detailPanel.detail.sourceHtml || '',
+        baseRevisionId: detailPanel.detail.revision.id
+      });
+      if (!createdBranch) return;
+      branchId = createdBranch.branch.id;
+      expectedHeadRevisionId = createdBranch.branch.headRevisionId;
+      setArticleEditBranchId(branchId);
+    }
+
+    const savedBranch = await mutateSaveDraftBranch({
+      workspaceId: activeWorkspace.id,
+      branchId,
+      html: articleEditorHtml,
+      expectedHeadRevisionId
+    });
+    if (!savedBranch) return;
+
+    setArticleEditBranchId(savedBranch.branch.id);
+    setSavedArticleHtml(savedBranch.editor.html);
+    setArticleEditorHtml(savedBranch.editor.html);
+    setArticleSaveMessage(`Saved to draft branch ${savedBranch.branch.name}.`);
+    setDetailPanel((current) => {
+      if (!current.detail) return current;
+      return {
+        ...current,
+        localeVariants: current.localeVariants.map((locale) => (
+          locale.localeVariantId === current.localeVariantId
+            ? {
+                ...locale,
+                revision: {
+                  ...locale.revision,
+                  revisionId: savedBranch.branch.headRevisionId,
+                  revisionNumber: savedBranch.branch.headRevisionNumber,
+                  state: RevisionState.DRAFT_BRANCH,
+                  draftCount: Math.max(locale.revision.draftCount, 1)
+                }
+              }
+            : locale
+        )),
+        detail: {
+          ...current.detail,
+          previewHtml: savedBranch.editor.previewHtml,
+          sourceHtml: savedBranch.editor.html,
+          revision: {
+            ...current.detail.revision,
+            id: savedBranch.branch.headRevisionId,
+            revisionNumber: savedBranch.branch.headRevisionNumber,
+            revisionType: RevisionState.DRAFT_BRANCH,
+            updatedAtUtc: savedBranch.branch.updatedAtUtc
+          }
+        }
+      };
+    });
+    void treeQuery.execute({ workspaceId: activeWorkspace.id });
+  }, [
+    activeWorkspace,
+    articleEditBranchId,
+    articleEditorHtml,
+    detailPanel.detail,
+    detailPanel.familyTitle,
+    detailPanel.localeVariantId,
+    mutateCreateDraftBranch,
+    mutateSaveDraftBranch,
+    savedArticleHtml,
+    treeQuery
+  ]);
+
+  const articleEditorError = createDraftBranchError ?? saveDraftBranchError;
+  const savingArticleEdit = creatingDraftBranch || savingDraftBranch;
+
   const filters: { id: Filter; label: string; count: number }[] = [
     { id: 'all', label: 'All Articles', count: filterCounts.all },
     { id: 'live', label: 'Live', count: filterCounts.live },
@@ -1505,100 +1617,25 @@ export const ArticleExplorer = () => {
       return <EmptyState title="No article details" description="This article could not be loaded." />;
     }
 
-    const selectedLocaleInfo = detailPanel.localeVariants.find(
-      (v) => v.localeVariantId === detailPanel.localeVariantId
-    );
-
     return (
       <>
-        {/* Breadcrumb */}
-        <Breadcrumb items={[
-          { label: 'Articles', onClick: () => setDetailPanel((s) => ({ ...s, open: false })) },
-          { label: detailPanel.familyTitle },
-        ]} />
-
-        {/* Header meta row */}
-        <div className="detail-header">
-          <div className="detail-header-meta">
-            <StatusChip status={selectedLocaleInfo ? revisionStateToBadge(selectedLocaleInfo.revision.state) : 'live'} />
-            {selectedLocaleInfo && selectedLocaleInfo.revision.draftCount > 0 && (
-              <Badge variant="primary">{selectedLocaleInfo.revision.draftCount} draft{selectedLocaleInfo.revision.draftCount !== 1 ? 's' : ''}</Badge>
-            )}
-            {selectedLocaleInfo?.hasConflicts && (
-              <Badge variant="danger">Conflict</Badge>
-            )}
-          </div>
-          {selectedLocaleInfo?.revision.updatedAtUtc && (() => {
-            const info = formatSyncAge(selectedLocaleInfo.revision.updatedAtUtc);
-            return (
-              <span className={`sync-freshness-badge sync-freshness-badge--${info.freshness}`}>
-                {info.label}
-              </span>
-            );
-          })()}
-        </div>
-
-        {/* Locale selector */}
-        {detailPanel.localeVariants.length > 1 && (
-          <div className="detail-locale-selector">
-            <label className="detail-locale-label">
-              <IconGlobe size={11} /> Locale variant
-            </label>
-            <select
-              className="input input-sm"
-              value={detailPanel.localeVariantId}
-              onChange={async (event) => {
-                const nextLocaleVariantId = event.target.value;
-                const node = tree.find((item) => item.familyId === detailPanel.familyId);
-                const fallbackNode = node ?? {
-                  familyId: detailPanel.familyId,
-                  title: detailPanel.familyTitle,
-                  familyStatus: RevisionState.LIVE,
-                  locales: detailPanel.localeVariants
-                };
-                await openArticleDetail(fallbackNode, detailPanel.activeTab, nextLocaleVariantId);
-              }}
-            >
-              {detailPanel.localeVariants.map((locale) => (
-                <option key={locale.localeVariantId} value={locale.localeVariantId}>
-                  {locale.locale}{locale.revision.draftCount > 0 ? ` (${locale.revision.draftCount} drafts)` : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-
-        {/* Tab bar */}
-        <div className="detail-tab-bar" role="tablist">
-          {DETAIL_TAB_CONFIG.map((tab) => (
-            <button
-              key={tab.id}
-              role="tab"
-              aria-selected={detailPanel.activeTab === tab.id}
-              className={`detail-tab${detailPanel.activeTab === tab.id ? ' active' : ''}`}
-              onClick={() => setDetailPanel((current) => ({ ...current, activeTab: tab.id }))}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
 
         {/* Tab content */}
         {detailPanel.activeTab === 'preview' && (
           (detailPanel.detail.sourceHtml || detailPanel.detail.previewHtml) ? (
             <>
-              <div className="detail-preview-frame-card">
-                <iframe
-                  key={`${detailPanel.familyId}-${detailPanel.localeVariantId}-${detailPanel.activeTab}`}
-                  className="detail-preview-frame"
-                  title={`Article preview ${detailPanel.familyTitle}`}
-                  srcDoc={buildArticlePreviewDocument(
-                    detailPanel.detail.previewHtml || detailPanel.detail.sourceHtml || '',
-                    detailPanel.familyTitle,
-                    previewStyleQuery.data?.css ?? ''
-                  )}
-                />
-              </div>
+              <ArticleSurface
+                mode={articleSurfaceMode}
+                html={articleEditorHtml}
+                styleCss={previewStyleQuery.data?.css ?? ''}
+                title={`Article preview ${detailPanel.familyTitle}`}
+                onChange={setArticleEditorHtml}
+                savedHtml={savedArticleHtml}
+                onSave={() => void handleSaveArticleEdit()}
+                onRestore={handleRestoreArticleEdit}
+                saving={savingArticleEdit}
+                error={articleEditorError}
+              />
               <PlaceholderBlocks placeholders={detailPanel.detail.placeholders} />
             </>
           ) : (
@@ -1871,6 +1908,91 @@ export const ArticleExplorer = () => {
         onClose={() => setDetailPanel((state) => ({ ...state, open: false }))}
         title={detailPanel.familyTitle}
         variant="fullscreen"
+        customHeader={(() => {
+          const selectedLocaleInfo = detailPanel.localeVariants.find(
+            (v) => v.localeVariantId === detailPanel.localeVariantId
+          );
+          return (
+            <div className="article-detail-toolbar">
+              {/* Top row: back button, title, badges, locale, sync age */}
+              <div className="article-detail-toolbar-top">
+                <button
+                  className="article-detail-back"
+                  onClick={() => setDetailPanel((s) => ({ ...s, open: false }))}
+                  aria-label="Back to articles"
+                >
+                  <IconChevronLeft size={16} />
+                </button>
+                <div className="article-detail-title-group">
+                  <h2 className="article-detail-title">{detailPanel.familyTitle}</h2>
+                  <div className="article-detail-badges">
+                    <StatusChip status={selectedLocaleInfo ? revisionStateToBadge(selectedLocaleInfo.revision.state) : 'live'} />
+                    {selectedLocaleInfo && selectedLocaleInfo.revision.draftCount > 0 && (
+                      <Badge variant="primary">{selectedLocaleInfo.revision.draftCount} draft{selectedLocaleInfo.revision.draftCount !== 1 ? 's' : ''}</Badge>
+                    )}
+                    {selectedLocaleInfo?.hasConflicts && (
+                      <Badge variant="danger">Conflict</Badge>
+                    )}
+                  </div>
+                </div>
+                <div className="article-detail-toolbar-end">
+                  {detailPanel.activeTab === 'preview' && (
+                    <ArticleModeToggle mode={articleSurfaceMode} onChange={setArticleSurfaceMode} compact />
+                  )}
+                  {articleSaveMessage && detailPanel.activeTab === 'preview' && (
+                    <span className="article-surface-header__note">{articleSaveMessage}</span>
+                  )}
+                  {detailPanel.localeVariants.length > 1 && (
+                    <select
+                      className="article-detail-locale-select"
+                      value={detailPanel.localeVariantId}
+                      onChange={async (event) => {
+                        const nextLocaleVariantId = event.target.value;
+                        const node = tree.find((item) => item.familyId === detailPanel.familyId);
+                        const fallbackNode = node ?? {
+                          familyId: detailPanel.familyId,
+                          title: detailPanel.familyTitle,
+                          familyStatus: RevisionState.LIVE,
+                          locales: detailPanel.localeVariants
+                        };
+                        await openArticleDetail(fallbackNode, detailPanel.activeTab, nextLocaleVariantId);
+                      }}
+                    >
+                      {detailPanel.localeVariants.map((locale) => (
+                        <option key={locale.localeVariantId} value={locale.localeVariantId}>
+                          {locale.locale}{locale.revision.draftCount > 0 ? ` (${locale.revision.draftCount} drafts)` : ''}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {selectedLocaleInfo?.revision.updatedAtUtc && (() => {
+                    const info = formatSyncAge(selectedLocaleInfo.revision.updatedAtUtc);
+                    return (
+                      <span className={`sync-freshness-badge sync-freshness-badge--${info.freshness}`}>
+                        {info.label}
+                      </span>
+                    );
+                  })()}
+                </div>
+              </div>
+              {/* Tab bar */}
+              <div className="article-detail-tab-bar" role="tablist">
+                {DETAIL_TAB_CONFIG.map((tab) => (
+                  <button
+                    key={tab.id}
+                    role="tab"
+                    aria-selected={detailPanel.activeTab === tab.id}
+                    className={`article-detail-tab${detailPanel.activeTab === tab.id ? ' active' : ''}`}
+                    onClick={() => setDetailPanel((current) => ({ ...current, activeTab: tab.id }))}
+                  >
+                    <tab.icon size={12} />
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
       >
         {renderDetailContent()}
       </Drawer>

@@ -14,6 +14,7 @@ const job_runner_1 = require("./services/job-runner");
 const shared_types_1 = require("@kb-vault/shared-types");
 const command_registry_1 = require("./services/command-registry");
 const mcp_bridge_service_1 = require("./services/mcp-bridge-service");
+const app_preferences_1 = require("./services/app-preferences");
 const commandBus = new command_bus_1.CommandBus();
 const jobs = new job_runner_1.JobRegistry();
 let mcpBridge = null;
@@ -67,7 +68,20 @@ async function bootstrapApp() {
                 appVersion: electron_1.app.getVersion(),
                 environment: process.env.NODE_ENV ?? 'development',
                 featureFlags: config.featureFlags,
-                defaultWorkspaceRoot: workspace_root_1.DEFAULT_WORKSPACE_ROOT
+                defaultWorkspaceRoot: workspace_root_1.DEFAULT_WORKSPACE_ROOT,
+                uiPreferences: {
+                    sidebarCollapsed: (0, app_preferences_1.getSidebarCollapsedPreference)()
+                }
+            }
+        };
+    });
+    commandBus.register('system.preferences.setSidebarCollapsed', async (payload) => {
+        const collapsed = payload?.collapsed === true;
+        (0, app_preferences_1.setSidebarCollapsedPreference)(collapsed);
+        return {
+            ok: true,
+            data: {
+                sidebarCollapsed: collapsed
             }
         };
     });

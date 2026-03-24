@@ -10,9 +10,11 @@ interface DrawerProps {
   /** Use "wide" for article detail drawers (560px instead of 420px) */
   /** Use "fullscreen" for full-screen article reader experience */
   variant?: 'default' | 'wide' | 'fullscreen';
+  /** Replace the default header with a custom one (fullscreen variant only) */
+  customHeader?: ReactNode;
 }
 
-export function Drawer({ open, onClose, title, children, footer, variant = 'default' }: DrawerProps) {
+export function Drawer({ open, onClose, title, children, footer, variant = 'default', customHeader }: DrawerProps) {
   if (!open) return null;
 
   const drawerClass = `drawer${
@@ -23,12 +25,14 @@ export function Drawer({ open, onClose, title, children, footer, variant = 'defa
     <>
       <div className="drawer-backdrop" onClick={onClose} />
       <aside className={drawerClass} role="dialog" aria-modal="true" aria-label={title}>
-        <div className="drawer-header">
-          <h2 className="drawer-title">{title}</h2>
-          <button className="btn btn-ghost btn-icon" onClick={onClose} aria-label="Close">
-            <IconX size={16} />
-          </button>
-        </div>
+        {customHeader ?? (
+          <div className="drawer-header">
+            <h2 className="drawer-title">{title}</h2>
+            <button className="btn btn-ghost btn-icon" onClick={onClose} aria-label="Close">
+              <IconX size={16} />
+            </button>
+          </div>
+        )}
         <div className="drawer-body">{children}</div>
         {footer && <div className="drawer-footer">{footer}</div>}
       </aside>

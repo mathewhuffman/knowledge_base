@@ -3560,7 +3560,6 @@ export class WorkspaceRepository {
     await this.ensureWorkspaceDb(workspace.path);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
-      const proposalId = randomUUID();
       const now = new Date().toISOString();
       const metadata = normalizeProposalMetadata(params.metadata);
       const hasStructuredContent = Boolean(
@@ -3604,7 +3603,20 @@ export class WorkspaceRepository {
       const confidenceScore = normalizeConfidenceScore(params.confidenceScore ?? metadata.confidenceScore);
       const reviewStatus = ProposalReviewStatus.PENDING_REVIEW;
       const status: ProposalDecision = ProposalDecision.DEFER;
-      const queueOrder = (
+      const sourceRevisionId = params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null;
+
+      const existingProposal = this.findOpenMatchingProposal(workspaceDb, {
+        workspaceId: params.workspaceId,
+        batchId: params.batchId,
+        action: params.action,
+        localeVariantId: params.localeVariantId,
+        familyId: identity.familyId,
+        targetTitle,
+        targetLocale
+      });
+
+      const proposalId = existingProposal?.id ?? randomUUID();
+      const queueOrder = existingProposal?.queueOrder ?? (
         workspaceDb.get<{ nextOrder: number }>(
           `SELECT COALESCE(MAX(queue_order), 0) + 1 as nextOrder
            FROM proposals
@@ -3617,47 +3629,92 @@ export class WorkspaceRepository {
         proposedHtml: params.proposedHtml ?? extractString(metadata.proposedHtml) ?? '',
         metadata
       });
-      workspaceDb.run(
-        `INSERT INTO proposals (
-          id, workspace_id, batch_id, action, locale_variant_id, branch_id, status, rationale, generated_at, updated_at,
-          review_status, queue_order, family_id, source_revision_id, target_title, target_locale, confidence_score,
-          rationale_summary, ai_notes, suggested_placement_json, source_html_path, proposed_html_path, metadata_json,
-          decision_payload_json, decided_at, agent_session_id
-        ) VALUES (
-          @id, @workspaceId, @batchId, @action, @localeVariantId, @branchId, @status, @rationale, @generatedAt, @updatedAt,
-          @reviewStatus, @queueOrder, @familyId, @sourceRevisionId, @targetTitle, @targetLocale, @confidenceScore,
-          @rationaleSummary, @aiNotes, @suggestedPlacementJson, @sourceHtmlPath, @proposedHtmlPath, @metadataJson,
-          @decisionPayloadJson, @decidedAt, @sessionId
-        )`,
-        {
-          id: proposalId,
-          workspaceId: params.workspaceId,
-          batchId: params.batchId,
-          action: params.action,
-          localeVariantId: params.localeVariantId ?? null,
-          branchId: null,
-          status,
-          rationale,
-          generatedAt: now,
-          updatedAt: now,
-          reviewStatus,
-          queueOrder,
-          familyId: identity.familyId ?? null,
-          sourceRevisionId: params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null,
-          targetTitle: targetTitle ?? null,
-          targetLocale: targetLocale ?? null,
-          confidenceScore: confidenceScore ?? null,
-          rationaleSummary: rationaleSummary ?? null,
-          aiNotes: aiNotes ?? null,
-          suggestedPlacementJson: suggestedPlacement ? JSON.stringify(suggestedPlacement) : null,
-          sourceHtmlPath: artifacts.sourceHtmlPath ?? null,
-          proposedHtmlPath: artifacts.proposedHtmlPath ?? null,
-          metadataJson: Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null,
-          decisionPayloadJson: null,
-          decidedAt: null,
-          sessionId: params._sessionId ?? null
-        }
-      );
+      if (existingProposal) {
+        workspaceDb.run(
+          `UPDATE proposals
+           SET locale_variant_id = COALESCE(@localeVariantId, locale_variant_id),
+               status = @status,
+               rationale = @rationale,
+               updated_at = @updatedAt,
+               review_status = @reviewStatus,
+               family_id = COALESCE(@familyId, family_id),
+               source_revision_id = COALESCE(@sourceRevisionId, source_revision_id),
+               target_title = COALESCE(@targetTitle, target_title),
+               target_locale = COALESCE(@targetLocale, target_locale),
+               confidence_score = COALESCE(@confidenceScore, confidence_score),
+               rationale_summary = COALESCE(@rationaleSummary, rationale_summary),
+               ai_notes = COALESCE(@aiNotes, ai_notes),
+               suggested_placement_json = COALESCE(@suggestedPlacementJson, suggested_placement_json),
+               source_html_path = COALESCE(@sourceHtmlPath, source_html_path),
+               proposed_html_path = COALESCE(@proposedHtmlPath, proposed_html_path),
+               metadata_json = COALESCE(@metadataJson, metadata_json),
+               agent_session_id = COALESCE(@sessionId, agent_session_id)
+           WHERE workspace_id = @workspaceId AND id = @proposalId`,
+          {
+            proposalId,
+            workspaceId: params.workspaceId,
+            localeVariantId: params.localeVariantId ?? null,
+            status,
+            rationale: rationale ?? null,
+            updatedAt: now,
+            reviewStatus,
+            familyId: identity.familyId ?? null,
+            sourceRevisionId,
+            targetTitle: targetTitle ?? null,
+            targetLocale: targetLocale ?? null,
+            confidenceScore: confidenceScore ?? null,
+            rationaleSummary: rationaleSummary ?? null,
+            aiNotes: aiNotes ?? null,
+            suggestedPlacementJson: suggestedPlacement ? JSON.stringify(suggestedPlacement) : null,
+            sourceHtmlPath: artifacts.sourceHtmlPath ?? null,
+            proposedHtmlPath: artifacts.proposedHtmlPath ?? null,
+            metadataJson: Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null,
+            sessionId: params._sessionId ?? null
+          }
+        );
+      } else {
+        workspaceDb.run(
+          `INSERT INTO proposals (
+            id, workspace_id, batch_id, action, locale_variant_id, branch_id, status, rationale, generated_at, updated_at,
+            review_status, queue_order, family_id, source_revision_id, target_title, target_locale, confidence_score,
+            rationale_summary, ai_notes, suggested_placement_json, source_html_path, proposed_html_path, metadata_json,
+            decision_payload_json, decided_at, agent_session_id
+          ) VALUES (
+            @id, @workspaceId, @batchId, @action, @localeVariantId, @branchId, @status, @rationale, @generatedAt, @updatedAt,
+            @reviewStatus, @queueOrder, @familyId, @sourceRevisionId, @targetTitle, @targetLocale, @confidenceScore,
+            @rationaleSummary, @aiNotes, @suggestedPlacementJson, @sourceHtmlPath, @proposedHtmlPath, @metadataJson,
+            @decisionPayloadJson, @decidedAt, @sessionId
+          )`,
+          {
+            id: proposalId,
+            workspaceId: params.workspaceId,
+            batchId: params.batchId,
+            action: params.action,
+            localeVariantId: params.localeVariantId ?? null,
+            branchId: null,
+            status,
+            rationale,
+            generatedAt: now,
+            updatedAt: now,
+            reviewStatus,
+            queueOrder,
+            familyId: identity.familyId ?? null,
+            sourceRevisionId,
+            targetTitle: targetTitle ?? null,
+            targetLocale: targetLocale ?? null,
+            confidenceScore: confidenceScore ?? null,
+            rationaleSummary: rationaleSummary ?? null,
+            aiNotes: aiNotes ?? null,
+            suggestedPlacementJson: suggestedPlacement ? JSON.stringify(suggestedPlacement) : null,
+            sourceHtmlPath: artifacts.sourceHtmlPath ?? null,
+            proposedHtmlPath: artifacts.proposedHtmlPath ?? null,
+            metadataJson: Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null,
+            decisionPayloadJson: null,
+            decidedAt: null,
+            sessionId: params._sessionId ?? null
+          }
+        );
+      }
 
       if (params.relatedPbiIds?.length) {
         const uniquePbiIds = Array.from(new Set(params.relatedPbiIds.filter(Boolean)));
@@ -3676,34 +3733,41 @@ export class WorkspaceRepository {
 
       await this.syncBatchReviewStatus(workspaceDb, params.workspaceId, params.batchId);
 
-      return this.mapProposalRow({
-        id: proposalId,
-        workspaceId: params.workspaceId,
-        batchId: params.batchId,
-        action: params.action,
-        localeVariantId: params.localeVariantId ?? null,
-        branchId: null,
-        status,
-        rationale: rationale ?? null,
-        generatedAtUtc: now,
-        updatedAtUtc: now,
-        reviewStatus,
-        queueOrder,
-        familyId: identity.familyId ?? null,
-        sourceRevisionId: params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null,
-        targetTitle: targetTitle ?? null,
-        targetLocale: targetLocale ?? null,
-        confidenceScore: confidenceScore ?? null,
-        rationaleSummary: rationaleSummary ?? null,
-        aiNotes: aiNotes ?? null,
-        suggestedPlacementJson: suggestedPlacement ? JSON.stringify(suggestedPlacement) : null,
-        sourceHtmlPath: artifacts.sourceHtmlPath ?? null,
-        proposedHtmlPath: artifacts.proposedHtmlPath ?? null,
-        metadataJson: Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null,
-        decisionPayloadJson: null,
-        decidedAtUtc: null,
-        sessionId: params._sessionId ?? null
-      });
+      const row = workspaceDb.get<ProposalDbRow>(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.id = @proposalId
+      `, { proposalId });
+      if (!row) {
+        throw new Error('Failed to load saved proposal');
+      }
+
+      return this.mapProposalRow(row);
     } finally {
       workspaceDb.close();
     }
@@ -6680,6 +6744,56 @@ export class WorkspaceRepository {
       targetTitle: targetTitle || undefined,
       targetLocale: targetLocale || undefined
     };
+  }
+
+  private findOpenMatchingProposal(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    payload: {
+      workspaceId: string;
+      batchId: string;
+      action: ProposalAction;
+      localeVariantId?: string;
+      familyId?: string;
+      targetTitle?: string;
+      targetLocale?: string;
+    }
+  ): { id: string; queueOrder: number } | null {
+    const normalizedTitle = payload.targetTitle?.trim().toLowerCase() ?? null;
+    const normalizedLocale = payload.targetLocale?.trim().toLowerCase() ?? null;
+
+    return workspaceDb.get<{ id: string; queueOrder: number }>(`
+      SELECT id,
+             queue_order as queueOrder
+      FROM proposals
+      WHERE workspace_id = @workspaceId
+        AND batch_id = @batchId
+        AND action = @action
+        AND review_status IN ('pending_review', 'deferred')
+        AND (
+          (@localeVariantId IS NOT NULL AND locale_variant_id = @localeVariantId)
+          OR (@localeVariantId IS NULL AND @familyId IS NOT NULL AND family_id = @familyId)
+          OR (
+            @localeVariantId IS NULL
+            AND @familyId IS NULL
+            AND @normalizedTitle IS NOT NULL
+            AND lower(coalesce(target_title, '')) = @normalizedTitle
+            AND (
+              @normalizedLocale IS NULL
+              OR lower(coalesce(target_locale, '')) = @normalizedLocale
+            )
+          )
+        )
+      ORDER BY updated_at DESC, generated_at DESC
+      LIMIT 1
+    `, {
+      workspaceId: payload.workspaceId,
+      batchId: payload.batchId,
+      action: payload.action,
+      localeVariantId: payload.localeVariantId ?? null,
+      familyId: payload.familyId ?? null,
+      normalizedTitle,
+      normalizedLocale
+    }) ?? null;
   }
 
   private buildFallbackProposalHtml(

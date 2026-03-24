@@ -820,8 +820,10 @@ export class CursorAcpRuntime {
   private readonly transports = new Map<KbAccessMode, CursorTransport>();
   private readonly cursorSessionIds = new Map<string, { mode: KbAccessMode; acpSessionId: string }>();
   private readonly cursorSessionLookup = new Map<string, { localSessionId: string; mode: KbAccessMode }>();
-  private readonly activeStreamEmitters = new Map<string, (payload: Omit<AgentStreamingPayload, 'sessionId' | 'atUtc'>) => void>();
+  private readonly activeStreamEmitters = new Map<string, (payload: Omit<AgentStreamingPayload, 'sessionId' | 'atUtc'>) => Promise<void> | void>();
   private readonly promptMessageChunks = new Map<string, string[]>();
+  private readonly pendingSessionOperations = new Map<string, Set<Promise<unknown>>>();
+  private readonly sessionActivityAt = new Map<string, number>();
   private readonly debugLogger: RuntimeDebugLogger;
   private readonly configuredMcpServers: AcpMcpServerConfig[];
   private runtimeMcpServers: AcpMcpServerConfig[] = [];
@@ -854,6 +856,54 @@ export class CursorAcpRuntime {
 
   private log(message: string, details?: unknown): void {
     this.debugLogger(message, details);
+  }
+
+  private markSessionActivity(sessionId: string): void {
+    this.sessionActivityAt.set(sessionId, Date.now());
+  }
+
+  private trackSessionOperation<T>(sessionId: string, operation: Promise<T>): Promise<T> {
+    const pending = this.pendingSessionOperations.get(sessionId) ?? new Set<Promise<unknown>>();
+    pending.add(operation);
+    this.pendingSessionOperations.set(sessionId, pending);
+    this.markSessionActivity(sessionId);
+    operation.finally(() => {
+      const active = this.pendingSessionOperations.get(sessionId);
+      if (!active) {
+        return;
+      }
+      active.delete(operation);
+      if (active.size === 0) {
+        this.pendingSessionOperations.delete(sessionId);
+      }
+      this.markSessionActivity(sessionId);
+    });
+    return operation;
+  }
+
+  private async waitForSessionToSettle(sessionId: string, idleMs = 350, maxWaitMs = 5000): Promise<void> {
+    const startedAt = Date.now();
+    this.markSessionActivity(sessionId);
+    this.log('agent.runtime.session_finalize_wait_begin', { sessionId, idleMs, maxWaitMs });
+
+    while (Date.now() - startedAt < maxWaitMs) {
+      const pending = this.pendingSessionOperations.get(sessionId);
+      if (pending && pending.size > 0) {
+        await Promise.allSettled(Array.from(pending));
+        continue;
+      }
+
+      const lastActivityAt = this.sessionActivityAt.get(sessionId) ?? startedAt;
+      const idleForMs = Date.now() - lastActivityAt;
+      if (idleForMs >= idleMs) {
+        this.log('agent.runtime.session_finalize_wait_complete', { sessionId, idleForMs });
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, idleMs - idleForMs)));
+    }
+
+    this.log('agent.runtime.session_finalize_wait_timeout', { sessionId, maxWaitMs });
   }
 
   getSession(sessionId: string) {
@@ -1016,11 +1066,13 @@ export class CursorAcpRuntime {
     const transcriptPath = await this.ensureTranscriptPath(session.id, runId);
     const toolCalls: AgentRunResult['toolCalls'] = [];
     const rawOutput: string[] = [];
+    const timeoutMs = Math.max(request.timeoutMs ?? this.config.requestTimeoutMs, 120_000);
+    this.markSessionActivity(session.id);
     this.log('agent.runtime.batch_analysis_begin', {
       workspaceId: request.workspaceId,
       batchId: request.batchId,
       locale: request.locale,
-      timeoutMs: request.timeoutMs ?? this.config.requestTimeoutMs
+      timeoutMs
     });
 
     try {
@@ -1039,9 +1091,12 @@ export class CursorAcpRuntime {
         },
         toolCalls,
         isCancelled,
-        request.timeoutMs ?? this.config.requestTimeoutMs
+        timeoutMs
       );
+      await this.waitForSessionToSettle(session.id);
       const endedAt = new Date().toISOString();
+      session.updatedAtUtc = endedAt;
+      session.status = 'idle';
       return {
         sessionId: session.id,
         kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
@@ -1061,7 +1116,10 @@ export class CursorAcpRuntime {
         batchId: request.batchId,
         error: error instanceof Error ? error.message : String(error)
       });
+      await this.waitForSessionToSettle(session.id);
       const endedAt = new Date().toISOString();
+      session.updatedAtUtc = endedAt;
+      session.status = 'idle';
       return {
         sessionId: session.id,
         kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
@@ -1076,14 +1134,12 @@ export class CursorAcpRuntime {
         message: error instanceof Error ? error.message : String(error)
       };
     } finally {
-      session.updatedAtUtc = new Date().toISOString();
-      session.status = 'idle';
       this.log('agent.runtime.batch_analysis_complete', {
         workspaceId: request.workspaceId,
         batchId: request.batchId,
         sessionId: session.id
       });
-    }
+      }
   }
 
   async runArticleEdit(
@@ -1352,13 +1408,19 @@ export class CursorAcpRuntime {
     this.promptMessageChunks.set(session.id, []);
     try {
       // Log runtime mode in transcript so CLI-mode runs are identifiable in history
-      await this.appendTranscriptLine(
+      await this.trackSessionOperation(
         session.id,
-        'system',
-        'runtime_mode',
-        JSON.stringify({ kbAccessMode: mode, provider: provider.provider, terminalEnabled: provider.terminalEnabled })
+        this.appendTranscriptLine(
+          session.id,
+          'system',
+          'runtime_mode',
+          JSON.stringify({ kbAccessMode: mode, provider: provider.provider, terminalEnabled: provider.terminalEnabled })
+        )
       );
-      emit({ kind: 'session_started', data: { ...requestEnvelope, kbAccessMode: mode }, message: 'Session started' });
+      await this.trackSessionOperation(
+        session.id,
+        Promise.resolve(emit({ kind: 'session_started', data: { ...requestEnvelope, kbAccessMode: mode }, message: 'Session started' }))
+      );
       const requestEnvelopeString = JSON.stringify(requestEnvelope);
       const promptText = await this.buildPromptText(session, taskPayload);
 
@@ -1369,7 +1431,7 @@ export class CursorAcpRuntime {
       };
 
       const transcriptPath = this.transcripts.get(session.id) ?? '';
-      const response = await this.executeWithRetry(
+      const { transport, acpSessionId } = await this.executeWithRetry(
         async () => {
           const transport = this.getTransport(provider.mode);
           this.log('agent.runtime.ensure_initialized_start', {
@@ -1387,60 +1449,66 @@ export class CursorAcpRuntime {
             kbAccessMode: provider.mode
           });
           const acpSessionId = await this.ensureAcpSession(session);
-          const requestPayload = {
-            sessionId: acpSessionId,
-            prompt: [
-              {
-                type: 'text',
-                text: promptText
-              }
-            ]
-          };
-          this.log('agent.runtime.prompt_send', {
-            workspaceId: session.workspaceId,
-            sessionId: session.id,
-            acpSessionId,
-            task: taskPayload.task,
-            kbAccessMode: provider.mode,
-            promptLength: promptText.length
-          });
-          const response = await transport.request(
-            'session/prompt',
-            requestPayload,
-            timeoutMs,
-            session.id
-          );
-          this.log('agent.runtime.prompt_response', {
-            workspaceId: session.workspaceId,
-            sessionId: session.id,
-            hasError: Boolean(response.error)
-          });
-          if (response.error) {
-            throw new Error(response.error.message);
-          }
-          const result = response.result && typeof response.result === 'object'
-            ? { ...(response.result as Record<string, unknown>) }
-            : {};
-          const assembledText = this.consumePromptMessageText(session.id);
-          if (assembledText) {
-            result.text = assembledText;
-            if (!Array.isArray(result.content)) {
-              result.content = [{ type: 'text', text: assembledText }];
-            }
-          }
-          return result;
+          return { transport, acpSessionId };
         },
         3,
         isCancelled
+      ) as { transport: CursorTransport; acpSessionId: string };
+      const requestPayload = {
+        sessionId: acpSessionId,
+        prompt: [
+          {
+            type: 'text',
+            text: promptText
+          }
+        ]
+      };
+      this.log('agent.runtime.prompt_send', {
+        workspaceId: session.workspaceId,
+        sessionId: session.id,
+        acpSessionId,
+        task: taskPayload.task,
+        kbAccessMode: provider.mode,
+        promptLength: promptText.length
+      });
+      const response = await transport.request(
+        'session/prompt',
+        requestPayload,
+        timeoutMs,
+        session.id
       );
+      this.log('agent.runtime.prompt_response', {
+        workspaceId: session.workspaceId,
+        sessionId: session.id,
+        hasError: Boolean(response.error)
+      });
+      if (response.error) {
+        throw new Error(response.error.message);
+      }
+      const result = response.result && typeof response.result === 'object'
+        ? { ...(response.result as Record<string, unknown>) }
+        : {};
+      const assembledText = this.consumePromptMessageText(session.id);
+      if (assembledText) {
+        result.text = assembledText;
+        if (!Array.isArray(result.content)) {
+          result.content = [{ type: 'text', text: assembledText }];
+        }
+      }
 
-      emit({ kind: 'result', data: response, message: 'Run complete' });
-      await appendFile(
-        transcriptPath,
-        `${JSON.stringify({ atUtc: new Date().toISOString(), direction: 'to_agent', event: requestEnvelopeString, payload: requestEnvelopeString })}\n`,
-        'utf8'
+      await this.trackSessionOperation(
+        session.id,
+        Promise.resolve(emit({ kind: 'result', data: response, message: 'Run complete' }))
       );
-      return response;
+      await this.trackSessionOperation(
+        session.id,
+        appendFile(
+          transcriptPath,
+          `${JSON.stringify({ atUtc: new Date().toISOString(), direction: 'to_agent', event: requestEnvelopeString, payload: requestEnvelopeString })}\n`,
+          'utf8'
+        )
+      );
+      return result;
     } finally {
       this.activeStreamEmitters.delete(session.id);
       this.promptMessageChunks.delete(session.id);
@@ -1560,10 +1628,11 @@ export class CursorAcpRuntime {
         this.promptMessageChunks.set(localSessionId, chunks);
       }
     }
+    this.markSessionActivity(localSessionId);
 
     const payload = JSON.stringify(message.params);
     if (!isHiddenAgentThoughtUpdate(message.params)) {
-      await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
+      await this.trackSessionOperation(localSessionId, this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload));
     }
 
     // Audit and enforce CLI-mode tool calls from ACP session updates so they appear in tool call history
@@ -1588,15 +1657,18 @@ export class CursorAcpRuntime {
             kind: params.update.kind,
             reason: policy.reason
           });
-          await this.appendTranscriptLine(
+          await this.trackSessionOperation(
             localSessionId,
-            'system',
-            'cli_tool_policy_violation',
-            JSON.stringify({
-              toolName: params.update.title,
-              kind: params.update.kind,
-              reason: policy.reason
-            })
+            this.appendTranscriptLine(
+              localSessionId,
+              'system',
+              'cli_tool_policy_violation',
+              JSON.stringify({
+                toolName: params.update.title,
+                kind: params.update.kind,
+                reason: policy.reason
+              })
+            )
           );
           this.getTransport('cli').abortPromptSession(params.sessionId, policy.reason);
         }
@@ -1608,11 +1680,14 @@ export class CursorAcpRuntime {
       return;
     }
 
-    emit({
-      kind: 'progress',
-      data: message.params,
-      message: params.update?.sessionUpdate ? `session/update:${params.update.sessionUpdate}` : 'session/update'
-    });
+    await this.trackSessionOperation(
+      localSessionId,
+      Promise.resolve(emit({
+        kind: 'progress',
+        data: message.params,
+        message: params.update?.sessionUpdate ? `session/update:${params.update.sessionUpdate}` : 'session/update'
+      }))
+    );
   }
 
   private consumePromptMessageText(sessionId: string): string {
@@ -1627,6 +1702,7 @@ export class CursorAcpRuntime {
     const filePath = path.join(transcriptDir, `${runId}.jsonl`);
     this.transcripts.set(sessionId, filePath);
     await appendFile(filePath, `${JSON.stringify({ atUtc: new Date().toISOString(), direction: 'system', event: 'transcript_start', payload: runId })}\n`, 'utf8');
+    this.markSessionActivity(sessionId);
     return filePath;
   }
 
@@ -1908,6 +1984,7 @@ export class CursorAcpRuntime {
     if (!path) {
       return;
     }
+    this.markSessionActivity(sessionId);
     await appendFile(
       path,
       `${JSON.stringify({
@@ -1918,6 +1995,7 @@ export class CursorAcpRuntime {
       })}\n`,
       'utf8'
     );
+    this.markSessionActivity(sessionId);
   }
 
   private registerToolImplementations(server: McpToolServer, toolContext: AgentRuntimeToolContext): void {

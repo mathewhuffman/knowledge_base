@@ -9,6 +9,7 @@ import { JobRegistry } from './services/job-runner';
 import { IPC_CHANNELS, type AppWorkingStatePatchAppliedEvent, type RpcRequest, type RpcResponse, type JobEvent } from '@kb-vault/shared-types';
 import { registerCoreCommands } from './services/command-registry';
 import { McpBridgeService } from './services/mcp-bridge-service';
+import { getSidebarCollapsedPreference, setSidebarCollapsedPreference } from './services/app-preferences';
 
 const commandBus = new CommandBus();
 const jobs = new JobRegistry();
@@ -69,7 +70,22 @@ async function bootstrapApp() {
         appVersion: app.getVersion(),
         environment: process.env.NODE_ENV ?? 'development',
         featureFlags: config.featureFlags,
-        defaultWorkspaceRoot: DEFAULT_WORKSPACE_ROOT
+        defaultWorkspaceRoot: DEFAULT_WORKSPACE_ROOT,
+        uiPreferences: {
+          sidebarCollapsed: getSidebarCollapsedPreference()
+        }
+      }
+    } as RpcResponse;
+  });
+
+  commandBus.register('system.preferences.setSidebarCollapsed', async (payload) => {
+    const collapsed = (payload as { collapsed?: unknown } | undefined)?.collapsed === true;
+    setSidebarCollapsedPreference(collapsed);
+
+    return {
+      ok: true,
+      data: {
+        sidebarCollapsed: collapsed
       }
     } as RpcResponse;
   });

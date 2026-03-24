@@ -1,4 +1,4 @@
-function normalizePreviewHtml(rawHtml?: string | null): string {
+export function normalizePreviewHtml(rawHtml?: string | null): string {
   if (!rawHtml) return '';
 
   const withoutScripts = rawHtml.replace(/<script[\s\S]*?<\/script>/gi, '');
@@ -16,6 +16,15 @@ type PreviewDocumentOptions = {
   extraCss?: string;
 };
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export function buildArticlePreviewDocument(
   rawHtml: string,
   previewTitle: string,
@@ -23,7 +32,6 @@ export function buildArticlePreviewDocument(
   options?: PreviewDocumentOptions
 ): string {
   const articleBody = normalizePreviewHtml(rawHtml) || '<p>No preview content found.</p>';
-  const extraCss = options?.extraCss ?? '';
   return `
 <!doctype html>
 <html lang="en">
@@ -34,8 +42,18 @@ export function buildArticlePreviewDocument(
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; img-src 'self' data: https:; style-src 'unsafe-inline'; font-src 'self' data: https:; media-src https:; connect-src https:; frame-src 'none'; script-src 'none';"
     />
-    <title>${previewTitle}</title>
-    <style>
+    <title>${escapeHtml(previewTitle)}</title>
+    <style>${buildArticlePreviewStyles(styleCss, options?.extraCss)}</style>
+  </head>
+  <body>
+    <main id="kbv-zendesk-preview-host">${articleBody}</main>
+  </body>
+</html>
+  `.trim();
+}
+
+export function buildArticlePreviewStyles(styleCss: string, extraCss = ''): string {
+  return `
       :root {
         --kbv-default-bg: #ffffff;
       }
@@ -71,7 +89,7 @@ export function buildArticlePreviewDocument(
         width: min(1120px, 100%);
         max-width: 100%;
         margin: 0 auto;
-        padding: 0 clamp(16px, 3vw, 32px) 8px;
+        padding: 16px clamp(16px, 3vw, 32px) 8px;
         box-sizing: border-box;
         background: var(--kbv-default-bg);
         min-height: auto;
@@ -136,13 +154,8 @@ export function buildArticlePreviewDocument(
         white-space: pre-wrap;
         word-break: break-word;
       }
-    </style>
-    <style>${styleCss}</style>
-    <style>${extraCss}</style>
-  </head>
-  <body>
-    <main id="kbv-zendesk-preview-host">${articleBody}</main>
-  </body>
-</html>
+
+      ${styleCss}
+      ${extraCss}
   `.trim();
 }

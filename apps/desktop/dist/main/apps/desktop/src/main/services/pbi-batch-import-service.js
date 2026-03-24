@@ -428,6 +428,13 @@ function normalizePriority(value) {
     const key = value.trim().toLowerCase();
     return PRIORITY_ORDER[key];
 }
+function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function containsIgnoreKeyword(normalizedTitle, keyword) {
+    const pattern = new RegExp(`(^|[^a-z0-9])${escapeRegExp(keyword).replace(/\\ /g, '\\s+')}($|[^a-z0-9])`);
+    return pattern.test(normalizedTitle);
+}
 function isTechnicalRow(title, type) {
     const normalizedTitle = title.toLowerCase();
     if (type && TECHNICAL_TYPES.has(type.trim().toLowerCase())) {
@@ -435,5 +442,5 @@ function isTechnicalRow(title, type) {
             return true;
         }
     }
-    return IGNORE_KEYWORDS.some((keyword) => normalizedTitle.includes(keyword));
+    return IGNORE_KEYWORDS.some((keyword) => containsIgnoreKeyword(normalizedTitle, keyword));
 }

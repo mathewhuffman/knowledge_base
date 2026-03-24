@@ -2460,7 +2460,7 @@ export function registerCoreCommands(
       return;
     }
     const workspaceMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
-    const kbAccessMode = input.kbAccessMode ?? workspaceMode;
+    let kbAccessMode = input.kbAccessMode ?? workspaceMode;
     const providerHealth = await agentRuntime.checkHealth(input.workspaceId, kbAccessMode, workspaceMode);
     const selectedProvider = providerHealth.providers[kbAccessMode];
     if (!selectedProvider.ok) {
@@ -2500,24 +2500,75 @@ export function registerCoreCommands(
       kbAccessMode,
       workspaceId: input.workspaceId
     };
-    const result = await agentRuntime.runBatchAnalysis(
-      { ...input, kbAccessMode },
-      (stream: AgentStreamingPayload) => {
+    const runAnalysis = async (mode: KbAccessMode) => {
+      streamMetadata.kbAccessMode = mode;
+      return agentRuntime.runBatchAnalysis(
+        { ...input, kbAccessMode: mode },
+        (stream: AgentStreamingPayload) => {
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: stream.kind === 'result' ? 100 : 35,
+            message: JSON.stringify(stream),
+            metadata: streamMetadata
+          });
+        },
+        isCancelled
+      );
+    };
+
+    let result = await runAnalysis(kbAccessMode);
+
+    if (result.status === 'ok' && kbAccessMode === 'cli') {
+      const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
+      const cliPolicyViolations = result.toolCalls.filter((toolCall) =>
+        toolCall.allowed === false
+        && typeof toolCall.reason === 'string'
+        && toolCall.reason.includes('CLI mode forbids')
+      );
+
+      if (proposalQueue.queue.length === 0 && cliPolicyViolations.length > 0 && providerHealth.providers.mcp.ok) {
+        logger.warn('[agent.analysis.run] cli analysis created no proposals after policy violations; retrying in mcp', {
+          jobId: payload.jobId,
+          batchId: input.batchId,
+          workspaceId: input.workspaceId,
+          violationCount: cliPolicyViolations.length
+        });
         emit({
           id: payload.jobId,
           command: payload.command,
           state: JobState.RUNNING,
-          progress: stream.kind === 'result' ? 100 : 35,
-          message: JSON.stringify(stream),
-          metadata: streamMetadata
+          progress: 55,
+          message: 'CLI analysis hit blocked tool usage and created no proposals. Retrying in MCP mode.',
+          metadata: {
+            ...streamMetadata,
+            kbAccessMode: 'mcp'
+          }
         });
-      },
-      isCancelled
-    );
+        kbAccessMode = 'mcp';
+        result = await runAnalysis('mcp');
+      }
+    }
+
+    emit({
+      id: payload.jobId,
+      command: payload.command,
+      state: JobState.RUNNING,
+      progress: 92,
+      message: 'Finalizing analysis run...',
+      metadata: {
+        ...streamMetadata,
+        status: result.status,
+        sessionId: result.sessionId
+      }
+    });
+
     logger.info('[agent.analysis.run] runtime finished', {
       jobId: payload.jobId,
       batchId: input.batchId,
       status: result.status,
+      kbAccessMode,
       toolCalls: result.toolCalls.length,
       transcriptPath: result.transcriptPath
     });

@@ -8,6 +8,18 @@ import { AiAssistantProvider } from './components/assistant/AssistantContext';
 import { GlobalAssistantHost } from './components/assistant/GlobalAssistantHost';
 
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'kbv:sidebar-collapsed';
+
+interface BootData {
+  workspaceRoot?: string;
+  appVersion?: string;
+  environment?: string;
+  featureFlags?: Record<string, boolean>;
+  defaultWorkspaceRoot?: string;
+  uiPreferences?: {
+    sidebarCollapsed?: boolean;
+  };
+}
 
 declare global {
   interface Window {
@@ -15,14 +27,59 @@ declare global {
   }
 }
 
+function loadSidebarCollapsedFromLocalStorage(): boolean | null {
+  try {
+    const raw = window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
+    if (raw === null) {
+      console.log('[renderer] sidebar localStorage missing');
+      return null;
+    }
+
+    const value = raw === 'true';
+    console.log('[renderer] sidebar localStorage read', { raw, value });
+    return value;
+  } catch (error) {
+    console.warn('[renderer] sidebar localStorage read failed', String(error));
+    return null;
+  }
+}
+
+function saveSidebarCollapsedToLocalStorage(collapsed: boolean): void {
+  try {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(collapsed));
+    console.log('[renderer] sidebar localStorage write', { collapsed });
+  } catch (error) {
+    console.warn('[renderer] sidebar localStorage write failed', String(error));
+  }
+}
+
 function AppShell() {
   const [activeRoute, setActiveRoute] = useState<AppRoute>(AppRoute.KB_VAULT_HOME);
-  const [boot, setBoot] = useState<RpcResponse | null>(null);
+  const [boot, setBoot] = useState<RpcResponse<BootData> | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadSidebarCollapsedFromLocalStorage() ?? false);
   const { activeWorkspace } = useWorkspace();
 
-  const toggleSidebar = useCallback(() => setSidebarCollapsed((c) => !c), []);
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      console.log('[renderer] sidebar toggle', { current, next });
+      saveSidebarCollapsedToLocalStorage(next);
+      void window.kbv
+        .invoke('system.preferences.setSidebarCollapsed', { collapsed: next })
+        .then((response) => {
+          console.log('[renderer] sidebar preference persisted', {
+            ok: response.ok,
+            requested: next,
+            returned: response.data
+          });
+        })
+        .catch((error: unknown) => {
+          console.error('[renderer] sidebar preference persist failed', String(error));
+        });
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     if (!window.kbv) {
@@ -32,10 +89,41 @@ function AppShell() {
     const startedAt = performance.now();
 
     window.kbv
-      .invoke('system.boot', { timestamp: new Date().toISOString() })
+      .invoke<BootData>('system.boot', { timestamp: new Date().toISOString() })
       .then((response) => {
         console.log('[renderer] system.boot', { elapsedMs: performance.now() - startedAt, ok: response.ok });
         setBoot(response);
+        if (response.ok) {
+          const localValue = loadSidebarCollapsedFromLocalStorage();
+          const mainValue = response.data?.uiPreferences?.sidebarCollapsed === true;
+          console.log('[renderer] sidebar boot preferences', {
+            localValue,
+            mainValue
+          });
+
+          if (localValue !== null && localValue !== mainValue) {
+            console.warn('[renderer] sidebar preference mismatch; reconciling toward local value', {
+              localValue,
+              mainValue
+            });
+            setSidebarCollapsed(localValue);
+            void window.kbv
+              .invoke('system.preferences.setSidebarCollapsed', { collapsed: localValue })
+              .then((persistResponse) => {
+                console.log('[renderer] sidebar preference reconciled', {
+                  ok: persistResponse.ok,
+                  collapsed: localValue
+                });
+              })
+              .catch((error: unknown) => {
+                console.error('[renderer] sidebar reconciliation failed', String(error));
+              });
+            return;
+          }
+
+          setSidebarCollapsed(mainValue);
+          saveSidebarCollapsedToLocalStorage(mainValue);
+        }
       })
       .catch((error: unknown) => {
         setBootError(String(error));

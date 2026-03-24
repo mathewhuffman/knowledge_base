@@ -47,6 +47,7 @@ import { buildPreviewDiffHtml } from '../utils/previewDiff';
 import { buildArticlePreviewDocument } from '../utils/previewDocument';
 import { CodeEditor } from '../components/editor/CodeEditor';
 import { EditorPane } from '../components/editor/EditorPane';
+import { ArticleModeToggle, ArticleSurface, type ArticleSurfaceMode } from '../components/article/ArticleSurface';
 
 const { diffHtml } = diffEngine;
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
@@ -112,6 +113,21 @@ const PREVIEW_DIFF_FRAME_CSS = `
     padding: 0.35rem 0.5rem;
     margin-left: -0.5rem;
     margin-right: -0.5rem;
+  }
+
+  li.kbv-preview-diff-added,
+  li.kbv-preview-diff-removed {
+    list-style-position: inside;
+  }
+
+  li.kbv-preview-diff-added::before,
+  li.kbv-preview-diff-removed::before,
+  p.kbv-preview-diff-added::before,
+  p.kbv-preview-diff-removed::before,
+  div.kbv-preview-diff-added::before,
+  div.kbv-preview-diff-removed::before {
+    left: 0.5rem !important;
+    right: auto !important;
   }
 `;
 
@@ -366,34 +382,6 @@ function QueueItem({
   );
 }
 
-function PreviewPanel({
-  html,
-  styleCss,
-  title,
-}: {
-  html: string;
-  styleCss: string;
-  title: string;
-}) {
-  if (!html) {
-    return (
-      <div className="html-preview" style={{ textAlign: 'center', color: 'var(--color-text-muted)' }}>
-        No content available
-      </div>
-    );
-  }
-
-  return (
-    <div className="detail-preview-frame-card proposal-review-preview-frame-card">
-      <iframe
-        className="detail-preview-frame proposal-review-preview-frame"
-        title={title}
-        srcDoc={buildArticlePreviewDocument(html, title, styleCss)}
-      />
-    </div>
-  );
-}
-
 function PreviewDiffPanel({
   beforeHtml,
   afterHtml,
@@ -421,6 +409,7 @@ function PreviewDiffPanel({
         className="detail-preview-frame proposal-review-preview-frame"
         title={title}
         srcDoc={buildArticlePreviewDocument(diffHtml, title, styleCss, { extraCss: PREVIEW_DIFF_FRAME_CSS })}
+        sandbox="allow-same-origin"
       />
     </div>
   );
@@ -766,6 +755,7 @@ export const ProposalReview = () => {
   } | null>(null);
   const [sourceEditorHtml, setSourceEditorHtml] = useState('');
   const [savedSourceHtml, setSavedSourceHtml] = useState('');
+  const [previewMode, setPreviewMode] = useState<ArticleSurfaceMode>('preview');
   const containerRef = useRef<HTMLDivElement>(null);
 
   const batchSummaries = batchListIpc.data?.batches ?? [];
@@ -818,6 +808,40 @@ export const ProposalReview = () => {
   }, [activeWorkspace?.id, resetBatchList, resetList, resetDetail, loadBatchSummaries, previewStyleQuery.execute]);
 
   useEffect(() => {
+    if (!activeWorkspace) {
+      return;
+    }
+
+    const unsubscribe = window.kbv.emitJobEvents((event) => {
+      if (event.command !== 'agent.analysis.run') return;
+      if (event.state !== 'SUCCEEDED') return;
+
+      const metadata = (event as { metadata?: { batchId?: unknown; workspaceId?: unknown } }).metadata;
+      const batchId = typeof metadata?.batchId === 'string' ? metadata.batchId : null;
+      const workspaceId = typeof metadata?.workspaceId === 'string' ? metadata.workspaceId : activeWorkspace.id;
+
+      if (workspaceId !== activeWorkspace.id) {
+        return;
+      }
+
+      void loadBatchSummaries();
+
+      if (batchId && selectedBatchId === batchId) {
+        void executeList({ workspaceId: activeWorkspace.id, batchId });
+        if (selectedProposalId) {
+          void executeDetail({ workspaceId: activeWorkspace.id, proposalId: selectedProposalId });
+        }
+      }
+    });
+
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, [activeWorkspace?.id, executeDetail, executeList, loadBatchSummaries, selectedBatchId, selectedProposalId]);
+
+  useEffect(() => {
     if (!activeWorkspace) return;
     const targetProposalId = window.sessionStorage.getItem(PROPOSAL_REVIEW_TARGET_KEY);
     if (!targetProposalId) return;
@@ -848,10 +872,12 @@ export const ProposalReview = () => {
   }, [selectedProposalId]);
 
   useEffect(() => {
+    if (!detail?.proposal?.id) return;
     setProposalWorkingCopy(null);
   }, [detail?.proposal.id, detail?.diff?.afterHtml]);
 
   useEffect(() => {
+    if (!detail?.proposal?.id && !proposalWorkingCopy?.html) return;
     const nextHtml = proposalWorkingCopy?.html ?? detail?.diff?.afterHtml ?? '';
     setSourceEditorHtml(nextHtml);
     setSavedSourceHtml(nextHtml);
@@ -901,8 +927,7 @@ export const ProposalReview = () => {
     });
     setSavedSourceHtml(nextHtml);
     setSourceEditorHtml(nextHtml);
-    await executeDetail({ workspaceId: activeWorkspace.id, proposalId: proposal.id });
-  }, [activeWorkspace, proposal?.id, sourceEditorHtml, mutateSaveWorkingCopy, executeDetail]);
+  }, [activeWorkspace, proposal?.id, sourceEditorHtml, mutateSaveWorkingCopy, proposalWorkingCopy?.rationale]);
 
   const handleRestoreSource = useCallback(() => {
     setSourceEditorHtml(savedSourceHtml);
@@ -1013,6 +1038,7 @@ export const ProposalReview = () => {
   const hasDiff = !!diff?.sourceDiff?.lines?.length;
   const previewDiffBeforeHtml = persistedDiff?.beforeHtml ?? '';
   const previewDiffAfterHtml = workingHtml;
+  const previewSurfaceHtml = sourceEditorHtml;
 
   useRegisterAiAssistantView({
     enabled: Boolean(activeWorkspace && proposal && diff),
@@ -1320,6 +1346,9 @@ export const ProposalReview = () => {
                   </div>
                   {navigation && (
                     <div className="review-center-nav">
+                      {activeTab === 'preview' && (
+                        <ArticleModeToggle mode={previewMode} onChange={setPreviewMode} compact />
+                      )}
                       <button
                         className="review-center-nav-btn"
                         disabled={!navigation.previousProposalId}
@@ -1385,10 +1414,17 @@ export const ProposalReview = () => {
                   }`}
                 >
                   {activeTab === 'preview' && (
-                    <PreviewPanel
-                      html={workingHtml}
+                    <ArticleSurface
+                      mode={previewMode}
+                      html={previewSurfaceHtml}
                       styleCss={previewStyleQuery.data?.css ?? ''}
                       title={proposalWorkingCopy?.title ?? proposal?.targetTitle ?? 'Proposal preview'}
+                      onChange={setSourceEditorHtml}
+                      savedHtml={savedSourceHtml}
+                      onSave={() => void handleSaveSource()}
+                      onRestore={handleRestoreSource}
+                      saving={savingWorkingCopy}
+                      error={saveWorkingCopyError}
                     />
                   )}
                   {activeTab === 'preview-diff' && (

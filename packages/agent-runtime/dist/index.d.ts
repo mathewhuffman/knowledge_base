@@ -46,6 +46,8 @@ export declare class CursorAcpRuntime {
     private readonly cursorSessionLookup;
     private readonly activeStreamEmitters;
     private readonly promptMessageChunks;
+    private readonly pendingSessionOperations;
+    private readonly sessionActivityAt;
     private readonly debugLogger;
     private readonly configuredMcpServers;
     private runtimeMcpServers;
@@ -53,6 +55,9 @@ export declare class CursorAcpRuntime {
     private readonly runtimeOptions;
     constructor(workspaceRoot: string, toolContext: AgentRuntimeToolContext, runtimeOptions?: KbRuntimeOptions, debugLogger?: RuntimeDebugLogger);
     private log;
+    private markSessionActivity;
+    private trackSessionOperation;
+    private waitForSessionToSettle;
     getSession(sessionId: string): AgentSessionRecord | null;
     setMcpServerConfigs(configs: ReadonlyArray<Record<string, unknown>>): void;
     listSessions(workspaceId: string, includeClosed?: boolean): AgentSessionRecord[];

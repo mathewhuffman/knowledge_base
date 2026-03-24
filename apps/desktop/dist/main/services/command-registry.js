@@ -2267,7 +2267,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             return;
         }
         const workspaceMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
-        const kbAccessMode = input.kbAccessMode ?? workspaceMode;
+        let kbAccessMode = input.kbAccessMode ?? workspaceMode;
         const providerHealth = await agentRuntime.checkHealth(input.workspaceId, kbAccessMode, workspaceMode);
         const selectedProvider = providerHealth.providers[kbAccessMode];
         if (!selectedProvider.ok) {
@@ -2301,20 +2301,64 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             kbAccessMode,
             workspaceId: input.workspaceId
         };
-        const result = await agentRuntime.runBatchAnalysis({ ...input, kbAccessMode }, (stream) => {
-            emit({
-                id: payload.jobId,
-                command: payload.command,
-                state: shared_types_2.JobState.RUNNING,
-                progress: stream.kind === 'result' ? 100 : 35,
-                message: JSON.stringify(stream),
-                metadata: streamMetadata
-            });
-        }, isCancelled);
+        const runAnalysis = async (mode) => {
+            streamMetadata.kbAccessMode = mode;
+            return agentRuntime.runBatchAnalysis({ ...input, kbAccessMode: mode }, (stream) => {
+                emit({
+                    id: payload.jobId,
+                    command: payload.command,
+                    state: shared_types_2.JobState.RUNNING,
+                    progress: stream.kind === 'result' ? 100 : 35,
+                    message: JSON.stringify(stream),
+                    metadata: streamMetadata
+                });
+            }, isCancelled);
+        };
+        let result = await runAnalysis(kbAccessMode);
+        if (result.status === 'ok' && kbAccessMode === 'cli') {
+            const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
+            const cliPolicyViolations = result.toolCalls.filter((toolCall) => toolCall.allowed === false
+                && typeof toolCall.reason === 'string'
+                && toolCall.reason.includes('CLI mode forbids'));
+            if (proposalQueue.queue.length === 0 && cliPolicyViolations.length > 0 && providerHealth.providers.mcp.ok) {
+                logger_1.logger.warn('[agent.analysis.run] cli analysis created no proposals after policy violations; retrying in mcp', {
+                    jobId: payload.jobId,
+                    batchId: input.batchId,
+                    workspaceId: input.workspaceId,
+                    violationCount: cliPolicyViolations.length
+                });
+                emit({
+                    id: payload.jobId,
+                    command: payload.command,
+                    state: shared_types_2.JobState.RUNNING,
+                    progress: 55,
+                    message: 'CLI analysis hit blocked tool usage and created no proposals. Retrying in MCP mode.',
+                    metadata: {
+                        ...streamMetadata,
+                        kbAccessMode: 'mcp'
+                    }
+                });
+                kbAccessMode = 'mcp';
+                result = await runAnalysis('mcp');
+            }
+        }
+        emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: shared_types_2.JobState.RUNNING,
+            progress: 92,
+            message: 'Finalizing analysis run...',
+            metadata: {
+                ...streamMetadata,
+                status: result.status,
+                sessionId: result.sessionId
+            }
+        });
         logger_1.logger.info('[agent.analysis.run] runtime finished', {
             jobId: payload.jobId,
             batchId: input.batchId,
             status: result.status,
+            kbAccessMode,
             toolCalls: result.toolCalls.length,
             transcriptPath: result.transcriptPath
         });

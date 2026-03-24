@@ -511,6 +511,15 @@ function normalizePriority(value: string): 'low' | 'medium' | 'high' | 'urgent' 
   return PRIORITY_ORDER[key];
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function containsIgnoreKeyword(normalizedTitle: string, keyword: string): boolean {
+  const pattern = new RegExp(`(^|[^a-z0-9])${escapeRegExp(keyword).replace(/\\ /g, '\\s+')}($|[^a-z0-9])`);
+  return pattern.test(normalizedTitle);
+}
+
 function isTechnicalRow(title: string, type?: string): boolean {
   const normalizedTitle = title.toLowerCase();
   if (type && TECHNICAL_TYPES.has(type.trim().toLowerCase())) {
@@ -518,5 +527,5 @@ function isTechnicalRow(title: string, type?: string): boolean {
       return true;
     }
   }
-  return IGNORE_KEYWORDS.some((keyword) => normalizedTitle.includes(keyword));
+  return IGNORE_KEYWORDS.some((keyword) => containsIgnoreKeyword(normalizedTitle, keyword));
 }
