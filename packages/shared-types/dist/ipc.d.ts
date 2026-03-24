@@ -4,6 +4,7 @@ export declare const IPC_CHANNELS: {
     JOB_INVOKE: string;
     JOB_CANCEL: string;
     JOB_EVENT: string;
+    APP_WORKING_STATE_EVENT: string;
 };
 export interface RpcRequest {
     method: string;

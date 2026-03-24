@@ -17,6 +17,7 @@ export function AssistantPanelContent({ embedded = false }: { embedded?: boolean
     messages,
     artifact,
     loading,
+    sending,
     error,
     historyOpen,
     setHistoryOpen,
@@ -40,8 +41,6 @@ export function AssistantPanelContent({ embedded = false }: { embedded?: boolean
     && artifact.artifactType !== 'informational_response'
     && (artifact.status === 'pending' || artifact.status === 'applied');
   const showTranscript = messages.length > 0;
-
-  const isResumedSession = session && session.route !== routeContext?.route;
 
   return (
     <aside
@@ -77,7 +76,6 @@ export function AssistantPanelContent({ embedded = false }: { embedded?: boolean
           loading={loading}
           historyOpen={historyOpen}
           sessionCount={sessions.length}
-          isResumedSession={!!isResumedSession}
           onCreateSession={() => void createSession()}
           onToggleHistory={() => setHistoryOpen(!historyOpen)}
         />
@@ -96,7 +94,7 @@ export function AssistantPanelContent({ embedded = false }: { embedded?: boolean
           )}
 
           {showTranscript ? (
-            <AssistantTranscript messages={messages} loading={loading} />
+            <AssistantTranscript messages={messages} loading={sending} />
           ) : (
             !loading && <AssistantEmptyState context={routeContext} />
           )}
@@ -128,7 +126,7 @@ export function AssistantPanelContent({ embedded = false }: { embedded?: boolean
 
         <AssistantComposer
           context={routeContext}
-          loading={loading}
+          loading={sending}
           onSend={sendMessage}
         />
       </div>
@@ -137,7 +135,7 @@ export function AssistantPanelContent({ embedded = false }: { embedded?: boolean
 }
 
 export function GlobalAssistantHost() {
-  const { open, setOpen, messages, loading } = useAiAssistant();
+  const { open, setOpen, messages, loading, sending } = useAiAssistant();
 
   const hasUnread = useMemo(() => {
     if (open) return false;
@@ -152,7 +150,7 @@ export function GlobalAssistantHost() {
     <>
       <AssistantLauncher
         open={open}
-        loading={loading}
+        loading={loading || sending}
         hasUnread={hasUnread}
         onToggle={handleToggle}
       />

@@ -283,7 +283,8 @@ export class AiAssistantService {
 
       this.updateSessionStatus(db, session.id, input.workspaceId, 'running', context, userMessageTimestamp, input.message.trim());
 
-      const kbAccessMode = await this.resolveWorkspaceKbAccessMode(input.workspaceId);
+      const workspaceKbAccessMode = await this.resolveWorkspaceKbAccessMode(input.workspaceId);
+      const kbAccessMode = context.capabilities.canUseUnsavedWorkingState ? 'cli' : workspaceKbAccessMode;
       const runtimeResult = await this.agentRuntime.runAssistantChat(
         {
           workspaceId: input.workspaceId,
@@ -548,15 +549,14 @@ export class AiAssistantService {
       '- On the first meaningful reply in a new chat, include a short human-readable title in "title" based on the user request.',
       '- For informational_response, omit summary unless it is genuinely needed for internal bookkeeping.',
       '- If you are editing draft or proposal HTML, put the full replacement HTML in "html".',
-      '- If you are editing a template, return only changed fields in "formPatch".',
-      '- Template edits apply live in the form only when you return command=patch_template with artifactType=template_patch and a non-empty formPatch.',
-      '- Never say you already changed, updated, patched, or applied a template field unless you are returning command=patch_template with the changed fields in formPatch.',
-      '- If you are not returning command=patch_template, describe the change as a suggestion only and do not imply the UI field changed.',
+      '- For live form edits such as Templates & Prompts, use the kb CLI commands as the source of truth: call `kb app get-form-schema` first when needed, then call `kb app patch-form`.',
+      '- After a successful `kb app patch-form`, respond with informational_response that accurately summarizes the applied change.',
+      '- If the kb command does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.',
+      '- Do not use command=patch_template for live form edits. The app now updates those forms from successful kb commands, not from parsed assistant JSON.',
       '- Only use proposal_candidate on article view when the user clearly asks to change, rewrite, update, or create a proposal for the article.',
       '- Use command=create_proposal only when you are explicitly creating a proposal candidate.',
       '- Use command=patch_proposal only when you are explicitly returning a proposal patch.',
       '- Use command=patch_draft only when you are explicitly returning a draft patch.',
-      '- Use command=patch_template only when you are explicitly returning a template patch.',
       '- For normal questions like "what page am I on", "can you see my inputs", explanations, summaries, navigation help, or workflow advice, use command=none and artifactType=informational_response.'
     ].filter(Boolean).join('\n\n');
   }
@@ -871,8 +871,7 @@ export class AiAssistantService {
        FROM ai_sessions
        WHERE workspace_id = @workspaceId
          AND (@includeArchived = 1 OR lifecycle_status != 'archived')
-       ORDER BY CASE lifecycle_status WHEN 'active' THEN 0 WHEN 'closed' THEN 1 ELSE 2 END,
-                COALESCE(last_message_at, updated_at) DESC,
+       ORDER BY COALESCE(last_message_at, created_at) DESC,
                 created_at DESC`,
       {
         workspaceId,
@@ -928,7 +927,6 @@ export class AiAssistantService {
     context?: AiViewContext
   ): AiSessionRow {
     const session = this.requireSessionById(db, workspaceId, sessionId);
-    const now = new Date().toISOString();
     this.closeActiveSessions(db, workspaceId, sessionId);
     db.run(
       `UPDATE ai_sessions
@@ -937,8 +935,7 @@ export class AiAssistantService {
            route = COALESCE(@route, route),
            entity_type = COALESCE(@entityType, entity_type),
            entity_id = COALESCE(@entityId, entity_id),
-           entity_title = COALESCE(@entityTitle, entity_title),
-           updated_at = @updatedAt
+           entity_title = COALESCE(@entityTitle, entity_title)
        WHERE workspace_id = @workspaceId AND id = @sessionId`,
       {
         workspaceId,
@@ -946,8 +943,7 @@ export class AiAssistantService {
         route: context?.route ?? null,
         entityType: context?.subject?.type ?? null,
         entityId: context?.subject?.id ?? null,
-        entityTitle: context?.subject?.title ?? null,
-        updatedAt: now
+        entityTitle: context?.subject?.title ?? null
       }
     );
     return this.requireSessionById(db, workspaceId, sessionId);
@@ -962,16 +958,14 @@ export class AiAssistantService {
     db.run(
       `UPDATE ai_sessions
        SET lifecycle_status = 'closed',
-           closed_at = CASE WHEN lifecycle_status = 'active' THEN @closedAt ELSE closed_at END,
-           updated_at = @updatedAt
+           closed_at = CASE WHEN lifecycle_status = 'active' THEN @closedAt ELSE closed_at END
        WHERE workspace_id = @workspaceId
          AND lifecycle_status = 'active'
          AND (@exceptSessionId IS NULL OR id != @exceptSessionId)`,
       {
         workspaceId,
         exceptSessionId: exceptSessionId ?? null,
-        closedAt: now,
-        updatedAt: now
+        closedAt: now
       }
     );
   }

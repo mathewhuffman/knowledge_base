@@ -9,7 +9,8 @@ import {
   type AiAssistantUiAction,
   type AiMessageRecord,
   type AiSessionRecord,
-  type AiViewContext
+  type AiViewContext,
+  type AppWorkingStatePatchAppliedEvent
 } from '@kb-vault/shared-types';
 
 const OPTIMISTIC_MESSAGE_PREFIX = 'optimistic:';
@@ -30,6 +31,7 @@ type RouteRegistration = {
   key: string;
   context: AiViewContext;
   applyUiActions?: (actions: AiAssistantUiAction[]) => void;
+  applyWorkingStatePatch?: (patch: Record<string, unknown>, event: AppWorkingStatePatchAppliedEvent) => void;
 };
 
 type AssistantContextValue = {
@@ -43,6 +45,7 @@ type AssistantContextValue = {
   messages: AiMessageRecord[];
   artifact: AiArtifactRecord | null;
   loading: boolean;
+  sending: boolean;
   error: string | null;
   sendMessage: (message: string) => Promise<void>;
   resetSession: () => Promise<void>;
@@ -55,6 +58,18 @@ type AssistantContextValue = {
 };
 
 const AssistantContext = createContext<AssistantContextValue | null>(null);
+
+function sessionSortValue(session: AiSessionRecord): number {
+  return new Date(session.lastMessageAtUtc ?? session.createdAtUtc).getTime();
+}
+
+function sortSessionsChronologically(sessions: AiSessionRecord[]): AiSessionRecord[] {
+  return [...sessions].sort((left, right) => {
+    const delta = sessionSortValue(right) - sessionSortValue(left);
+    if (delta !== 0) return delta;
+    return new Date(right.createdAtUtc).getTime() - new Date(left.createdAtUtc).getTime();
+  });
+}
 
 const ROUTE_LABELS: Record<AppRoute, string> = {
   [AppRoute.WORKSPACE_SWITCHER]: 'Workspace Switcher',
@@ -87,12 +102,23 @@ export function AiAssistantProvider({
   const [messages, setMessages] = useState<AiMessageRecord[]>([]);
   const [artifact, setArtifact] = useState<AiArtifactRecord | null>(null);
   const [loading, setLoading] = useState(false);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const applyActionsRef = useRef<RouteRegistration['applyUiActions']>();
+  const applyWorkingStatePatchRef = useRef<RouteRegistration['applyWorkingStatePatch']>();
+  const sessionRef = useRef<AiSessionRecord | null>(null);
 
   useEffect(() => {
     applyActionsRef.current = registration?.applyUiActions;
   }, [registration]);
+
+  useEffect(() => {
+    applyWorkingStatePatchRef.current = registration?.applyWorkingStatePatch;
+  }, [registration]);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
 
   const fallbackContext = useMemo<AiViewContext | null>(() => {
     if (!workspaceId) return null;
@@ -124,6 +150,59 @@ export function AiAssistantProvider({
 
   const routeContext = registration?.context ?? fallbackContext;
 
+  useEffect(() => {
+    if (!window.kbv?.invoke) {
+      return;
+    }
+    if (!registration?.context.workspaceId || !registration.context.subject?.id || !registration.context.workingState) {
+      return;
+    }
+    const entityType = registration.context.subject.type;
+    if (entityType !== 'template_pack' && entityType !== 'proposal' && entityType !== 'draft_branch') {
+      return;
+    }
+
+    void window.kbv.invoke('app.workingState.register', {
+      workspaceId: registration.context.workspaceId,
+      route: registration.context.route,
+      entityType,
+      entityId: registration.context.subject.id,
+      versionToken: registration.context.workingState.versionToken,
+      currentValues: registration.context.workingState.payload
+    });
+
+    return () => {
+      void window.kbv.invoke('app.workingState.unregister', {
+        workspaceId: registration.context.workspaceId,
+        route: registration.context.route,
+        entityType,
+        entityId: registration.context.subject?.id
+      });
+    };
+  }, [registration]);
+
+  useEffect(() => {
+    if (!window.kbv?.emitAppWorkingStateEvents) {
+      return;
+    }
+    const unsubscribe = window.kbv.emitAppWorkingStateEvents((event) => {
+      const current = registration;
+      if (!current?.context.subject?.id) {
+        return;
+      }
+      if (
+        current.context.workspaceId !== event.workspaceId
+        || current.context.route !== event.route
+        || current.context.subject.type !== event.entityType
+        || current.context.subject.id !== event.entityId
+      ) {
+        return;
+      }
+      applyWorkingStatePatchRef.current?.(event.appliedPatch, event);
+    });
+    return () => unsubscribe();
+  }, [registration]);
+
   const runUiActions = useCallback((actions: AiAssistantUiAction[]) => {
     if (actions.length === 0) return;
     for (const action of actions) {
@@ -138,7 +217,7 @@ export function AiAssistantProvider({
     if (!nextSession) return;
     setSessions((current) => {
       const remaining = current.filter((sessionItem) => sessionItem.id !== nextSession.id);
-      return [nextSession, ...remaining];
+      return sortSessionsChronologically([nextSession, ...remaining]);
     });
   }, []);
 
@@ -153,7 +232,7 @@ export function AiAssistantProvider({
     if (!response.ok || !response.data) {
       throw new Error(response.error?.message ?? 'Failed to load assistant history.');
     }
-    setSessions(response.data.sessions ?? []);
+    setSessions(sortSessionsChronologically(response.data.sessions ?? []));
     return response.data;
   }, []);
 
@@ -196,6 +275,7 @@ export function AiAssistantProvider({
       setSessions([]);
       setMessages([]);
       setArtifact(null);
+      setSending(false);
       setHistoryOpen(false);
       return;
     }
@@ -208,6 +288,7 @@ export function AiAssistantProvider({
         setSessions([]);
         setMessages([]);
         setArtifact(null);
+        setSending(false);
       })
       .finally(() => setLoading(false));
   }, [refreshWorkspaceAssistant, workspaceId]);
@@ -291,11 +372,13 @@ export function AiAssistantProvider({
 
   const sendMessage = useCallback(async (message: string) => {
     const trimmedMessage = message.trim();
-    if (!routeContext || !trimmedMessage) return;
+    if (!routeContext || !trimmedMessage || sending) return;
+
+    const targetSessionId = session?.id ?? null;
 
     const optimisticMessage: AiMessageRecord = {
       id: `${OPTIMISTIC_MESSAGE_PREFIX}${Date.now()}`,
-      sessionId: session?.id ?? 'pending-session',
+      sessionId: targetSessionId ?? 'pending-session',
       workspaceId: routeContext.workspaceId,
       role: 'user',
       messageKind: 'chat',
@@ -304,12 +387,12 @@ export function AiAssistantProvider({
     };
 
     setMessages((current) => [...current, optimisticMessage]);
-    setLoading(true);
+    setSending(true);
     setError(null);
     try {
       const response = await window.kbv.invoke<AiAssistantTurnResponse>('ai.assistant.message.send', {
         workspaceId: routeContext.workspaceId,
-        sessionId: session?.id,
+        sessionId: targetSessionId ?? undefined,
         context: routeContext,
         message: trimmedMessage
       });
@@ -318,19 +401,26 @@ export function AiAssistantProvider({
         setError(response.error?.message ?? 'Failed to send assistant message.');
         return;
       }
-      setSession(response.data.session);
       upsertSession(response.data.session);
-      setMessages(normalizeMessages(response.data.messages));
-      setArtifact(response.data.artifact ?? null);
-      runUiActions(response.data.uiActions);
       await loadSessionList(routeContext.workspaceId);
+      const currentSession = sessionRef.current;
+      const shouldHydrateCurrent =
+        currentSession?.id === response.data.session.id
+        || (!currentSession && !targetSessionId)
+        || currentSession?.id === targetSessionId;
+      if (shouldHydrateCurrent) {
+        setSession(response.data.session);
+        setMessages(normalizeMessages(response.data.messages ?? []));
+        setArtifact(response.data.artifact ?? null);
+        runUiActions(response.data.uiActions ?? []);
+      }
     } catch (err) {
       setMessages((current) => current.filter((item) => item.id !== optimisticMessage.id));
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      setSending(false);
     }
-  }, [loadSessionList, routeContext, runUiActions, session?.id, upsertSession]);
+  }, [loadSessionList, routeContext, runUiActions, sending, session?.id, upsertSession]);
 
   const resetSession = useCallback(async () => {
     if (!routeContext || !session) return;
@@ -406,6 +496,7 @@ export function AiAssistantProvider({
     messages,
     artifact,
     loading,
+    sending,
     error,
     sendMessage,
     resetSession,
@@ -423,6 +514,7 @@ export function AiAssistantProvider({
     handleArtifactDecision,
     historyOpen,
     loading,
+    sending,
     messages,
     open,
     openSession,
@@ -449,13 +541,19 @@ export function useRegisterAiAssistantView(config: {
   enabled: boolean;
   context: AiViewContext;
   applyUiActions?: (actions: AiAssistantUiAction[]) => void;
+  applyWorkingStatePatch?: (patch: Record<string, unknown>, event: AppWorkingStatePatchAppliedEvent) => void;
 }) {
   const { registerView } = useAiAssistant();
   const applyRef = useRef(config.applyUiActions);
+  const applyWorkingStatePatchRef = useRef(config.applyWorkingStatePatch);
 
   useEffect(() => {
     applyRef.current = config.applyUiActions;
   }, [config.applyUiActions]);
+
+  useEffect(() => {
+    applyWorkingStatePatchRef.current = config.applyWorkingStatePatch;
+  }, [config.applyWorkingStatePatch]);
 
   const registrationKey = useMemo(() => {
     const subject = config.context.subject;
@@ -472,10 +570,13 @@ export function useRegisterAiAssistantView(config: {
   useEffect(() => {
     if (!config.enabled) return;
     const applyUiActions = (actions: AiAssistantUiAction[]) => applyRef.current?.(actions);
+    const applyWorkingStatePatch = (patch: Record<string, unknown>, event: AppWorkingStatePatchAppliedEvent) =>
+      applyWorkingStatePatchRef.current?.(patch, event);
     return registerView({
       key: registrationKey,
       context: config.context,
-      applyUiActions
+      applyUiActions,
+      applyWorkingStatePatch
     });
   }, [config.enabled, contextSignature, registerView, registrationKey]);
 }

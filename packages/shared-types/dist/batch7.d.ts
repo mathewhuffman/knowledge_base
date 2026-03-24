@@ -189,6 +189,17 @@ export interface ProposalReviewDecisionResponse {
     retiredAtUtc?: string;
     summary: ProposalReviewSummaryCounts;
 }
+export interface ProposalReviewDeleteRequest {
+    workspaceId: EntityId;
+    proposalId: EntityId;
+}
+export interface ProposalReviewDeleteResponse {
+    workspaceId: EntityId;
+    batchId: EntityId;
+    deletedProposalId: EntityId;
+    batchStatus: PBIBatchStatus | 'proposed';
+    summary: ProposalReviewSummaryCounts;
+}
 export interface ProposalIngestRequest {
     workspaceId: EntityId;
     batchId: EntityId;

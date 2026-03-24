@@ -36,7 +36,7 @@ interface GroupedSessions {
 function groupByDate(sessions: AiSessionRecord[]): GroupedSessions[] {
   const groups = new Map<string, AiSessionRecord[]>();
   for (const s of sessions) {
-    const label = dateGroupLabel(s.lastMessageAtUtc ?? s.updatedAtUtc);
+    const label = dateGroupLabel(s.lastMessageAtUtc ?? s.createdAtUtc);
     const list = groups.get(label) ?? [];
     list.push(s);
     groups.set(label, list);
@@ -141,14 +141,9 @@ export function AssistantHistoryList({
                       <span className="ai-history__title">{session.title || 'Untitled chat'}</span>
                       {session.id === activeSessionId && <span className="ai-history__badge">Current</span>}
                     </div>
-                    {session.entityTitle && (
-                      <div className="ai-history__meta">
-                        <span>{session.entityTitle}</span>
-                      </div>
-                    )}
                     <div className="ai-history__time">
                       <IconClock size={11} />
-                      <span>{formatSessionTime(session.lastMessageAtUtc ?? session.updatedAtUtc)}</span>
+                      <span>{formatSessionTime(session.lastMessageAtUtc ?? session.createdAtUtc)}</span>
                     </div>
                   </button>
                   <button

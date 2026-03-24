@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { TemplatePackType, type TemplatePackDetail, type TemplatePackListResponse } from '@kb-vault/shared-types';
+import {
+  AppRoute,
+  TemplatePackType,
+  buildAppWorkingStateVersionToken,
+  type TemplatePackDetail,
+  type TemplatePackListResponse
+} from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/Badge';
 import { EmptyState } from '../components/EmptyState';
@@ -10,7 +16,8 @@ import { IconPlus, IconLayout, IconZap, IconTrash2, IconCheckCircle } from '../c
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
-import { AppRoute, type AiAssistantUiAction } from '@kb-vault/shared-types';
+
+const NEW_TEMPLATE_ID = 'new-template-draft';
 
 const TEMPLATE_TYPE_OPTIONS = [
   { value: TemplatePackType.STANDARD_HOW_TO, label: 'Standard How-To' },
@@ -60,6 +67,27 @@ export const TemplatesAndPrompts = () => {
   }, [activeWorkspace]);
 
   const templates: TemplatePackDetail[] = listQuery.data?.templates ?? [];
+  const visibleTemplates = useMemo<TemplatePackDetail[]>(() => {
+    if (!activeWorkspace || !isCreatingNew) return templates;
+    return [
+      {
+        id: NEW_TEMPLATE_ID,
+        workspaceId: activeWorkspace.id,
+        name: draft.name || 'Untitled template',
+        language: draft.language,
+        promptTemplate: draft.promptTemplate,
+        toneRules: draft.toneRules,
+        examples: draft.examples,
+        active: draft.active,
+        updatedAtUtc: '',
+        templateType: draft.templateType,
+        description: draft.description || 'No description yet.',
+        analysisSummary: draft.analysisSummary,
+        analysis: draft.analysis,
+      },
+      ...templates,
+    ];
+  }, [activeWorkspace, draft, isCreatingNew, templates]);
 
   useEffect(() => {
     const firstId = templates[0]?.id;
@@ -94,8 +122,13 @@ export const TemplatesAndPrompts = () => {
   }, [isCreatingNew, selected, selectedId]);
 
   const templateVersionToken = useMemo(
-    () => `${selectedId ?? 'new'}:${selected?.updatedAtUtc ?? 'draft'}:${JSON.stringify(draft)}`,
-    [draft, selected?.updatedAtUtc, selectedId]
+    () => buildAppWorkingStateVersionToken({
+      route: AppRoute.TEMPLATES_AND_PROMPTS,
+      entityType: 'template_pack',
+      entityId: selectedId ?? 'new-template',
+      currentValues: draft as Record<string, unknown>
+    }),
+    [draft, selectedId]
   );
 
   useRegisterAiAssistantView({
@@ -120,7 +153,7 @@ export const TemplatesAndPrompts = () => {
         canCreateProposal: false,
         canPatchProposal: false,
         canPatchDraft: false,
-        canPatchTemplate: true,
+        canPatchTemplate: false,
         canUseUnsavedWorkingState: true
       },
       backingData: {
@@ -129,16 +162,12 @@ export const TemplatesAndPrompts = () => {
         persistedTemplate: selected
       }
     },
-    applyUiActions: (actions: AiAssistantUiAction[]) => {
-      actions.forEach((action) => {
-        if (action.type === 'replace_template_form') {
-          setDraft((prev) => ({
-            ...prev,
-            ...action.payload,
-            templateType: (action.payload.templateType as TemplatePackType | undefined) ?? prev.templateType
-          }));
-        }
-      });
+    applyWorkingStatePatch: (patch) => {
+      setDraft((prev) => ({
+        ...prev,
+        ...patch,
+        templateType: (patch.templateType as TemplatePackType | undefined) ?? prev.templateType
+      }));
     }
   });
 
@@ -188,15 +217,23 @@ export const TemplatesAndPrompts = () => {
             <LoadingState message="Loading template packs..." />
           ) : listQuery.error && !listQuery.data ? (
             <ErrorState title="Unable to load templates" description={listQuery.error} />
-          ) : templates.length === 0 ? (
+          ) : visibleTemplates.length === 0 ? (
             <EmptyState icon={<IconLayout size={32} />} title="No templates yet" description="Create your first local template pack." />
           ) : (
-            templates.map((template) => (
+            visibleTemplates.map((template) => (
               <button
                 key={template.id}
                 type="button"
-                className={`template-card${template.id === selectedId ? ' selected' : ''}`}
-                onClick={() => setSelectedId(template.id)}
+                className={`template-card${(template.id === selectedId || (isCreatingNew && template.id === NEW_TEMPLATE_ID)) ? ' selected' : ''}`}
+                onClick={() => {
+                  if (template.id === NEW_TEMPLATE_ID) {
+                    setIsCreatingNew(true);
+                    setSelectedId(null);
+                    return;
+                  }
+                  setIsCreatingNew(false);
+                  setSelectedId(template.id);
+                }}
               >
                 <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--space-2)' }}>
                   <span className="template-card-title">{template.name}</span>

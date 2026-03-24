@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
-import { ProposalAction, type SearchPayload } from '@kb-vault/shared-types';
+import { ProposalAction, type AppWorkingStatePatchRequest, type AppWorkingStateSchemaRequest, type SearchPayload } from '@kb-vault/shared-types';
 import { WorkspaceRepository } from './workspace-repository';
+import { AppWorkingStateService } from './app-working-state-service';
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -47,7 +48,10 @@ export class KbCliLoopbackService {
   private baseUrl: string | null = null;
   private authToken = randomUUID();
 
-  constructor(private readonly workspaceRepository: WorkspaceRepository) {}
+  constructor(
+    private readonly workspaceRepository: WorkspaceRepository,
+    private readonly appWorkingStateService: AppWorkingStateService
+  ) {}
 
   async start(): Promise<void> {
     if (this.server && this.baseUrl) {
@@ -143,8 +147,10 @@ export class KbCliLoopbackService {
           'GET /workspaces/:workspaceId/sections',
           'GET /workspaces/:workspaceId/templates',
           'GET /workspaces/:workspaceId/templates/:templatePackId',
+          'GET /workspaces/:workspaceId/app/form-schema',
           'GET /workspaces/:workspaceId/pbis/:pbiId',
           'POST /workspaces/:workspaceId/articles/related',
+          'POST /workspaces/:workspaceId/app/patch-form',
           'POST /workspaces/:workspaceId/proposals/create',
           'POST /workspaces/:workspaceId/proposals/edit',
           'POST /workspaces/:workspaceId/proposals/retire',
@@ -279,6 +285,27 @@ export class KbCliLoopbackService {
         return;
       }
 
+      if (request.method === 'GET' && segments[2] === 'app' && segments[3] === 'form-schema') {
+        const routeParam = url.searchParams.get('route');
+        const entityTypeParam = url.searchParams.get('entityType');
+        const entityIdParam = url.searchParams.get('entityId');
+        if (!routeParam || !entityTypeParam || !entityIdParam) {
+          sendJson(response, 400, {
+            ok: false,
+            error: 'route, entityType, and entityId are required'
+          });
+          return;
+        }
+        const payload = this.appWorkingStateService.getFormSchema({
+          workspaceId,
+          route: routeParam as AppWorkingStateSchemaRequest['route'],
+          entityType: entityTypeParam as AppWorkingStateSchemaRequest['entityType'],
+          entityId: entityIdParam
+        });
+        sendJson(response, 200, payload);
+        return;
+      }
+
       if (request.method === 'GET' && segments[2] === 'pbis' && segments[3]) {
         const pbiId = decodeURIComponent(segments[3]);
         const pbi = await this.workspaceRepository.getPBIRecord(workspaceId, pbiId);
@@ -321,6 +348,38 @@ export class KbCliLoopbackService {
           ...result,
           results: result.relations
         });
+        return;
+      }
+
+      if (request.method === 'POST' && segments[2] === 'app' && segments[3] === 'patch-form') {
+        const body = await readJsonBody(request);
+        const routeValue = typeof body.route === 'string' ? body.route : '';
+        const entityTypeValue = typeof body.entityType === 'string' ? body.entityType : '';
+        const entityIdValue = typeof body.entityId === 'string' ? body.entityId : '';
+        const patchValue = body.patch;
+        if (!routeValue || !entityTypeValue || !entityIdValue) {
+          sendJson(response, 400, {
+            ok: false,
+            error: 'route, entityType, and entityId are required'
+          });
+          return;
+        }
+        if (!patchValue || typeof patchValue !== 'object' || Array.isArray(patchValue)) {
+          sendJson(response, 400, {
+            ok: false,
+            error: 'patch must be an object'
+          });
+          return;
+        }
+        const result = this.appWorkingStateService.patchForm({
+          workspaceId,
+          route: routeValue as AppWorkingStatePatchRequest['route'],
+          entityType: entityTypeValue as AppWorkingStatePatchRequest['entityType'],
+          entityId: entityIdValue,
+          versionToken: typeof body.versionToken === 'string' ? body.versionToken : undefined,
+          patch: patchValue as Record<string, unknown>
+        });
+        sendJson(response, result.ok ? 200 : 409, result);
         return;
       }
 

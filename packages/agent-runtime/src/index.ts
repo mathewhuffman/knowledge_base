@@ -375,6 +375,8 @@ function buildCliTaskPrompt(
     '- `kb batch-context --workspace-id <workspace-id> --batch-id <batch-id> --json`',
     '- `kb find-related-articles --workspace-id <workspace-id> --batch-id <batch-id> --json`',
     '- `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`',
+    '- `kb app get-form-schema --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --json`',
+    '- `kb app patch-form --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --version-token <version-token> --patch \'<json object>\' --json`',
     '- `kb --help` (and relevant subcommand help) to locate proposal-creation commands when needed'
   ].join('\n');
   const extraSections = [
@@ -459,6 +461,9 @@ function buildCliTaskPrompt(
       '- The preloaded prompt context is for orientation; use CLI output directly when you need to confirm or inspect source records.',
       '- Return only valid JSON in your final answer.',
       '- Do not include preamble, commentary about your reasoning, or markdown fences.',
+      '- For live form edits, use `kb app get-form-schema` first when you need editable fields/current values/version token, then use `kb app patch-form` to mutate the app.',
+      '- Never claim a field changed unless `kb app patch-form` succeeded.',
+      '- After a successful live form edit, return `artifactType=informational_response` with a truthful summary of what the command applied.',
       '- For informational chat, return only `artifactType` and `response`. Omit `summary`, `html`, `formPatch`, and `payload` unless they are needed.',
       '- Only return `proposal_candidate` when the user explicitly asks you to make or propose changes.',
       '',

@@ -29,11 +29,21 @@ interface JobEvent {
   endedAt?: string;
 }
 
+interface AppWorkingStatePatchAppliedEvent {
+  workspaceId: string;
+  route: string;
+  entityType: string;
+  entityId: string;
+  appliedPatch: Record<string, unknown>;
+  nextVersionToken: string;
+}
+
 const IPC_CHANNELS = {
   INVOKE: 'kbv:invoke',
   JOB_INVOKE: 'kbv:job:invoke',
   JOB_CANCEL: 'kbv:job:cancel',
-  JOB_EVENT: 'kbv:job:event'
+  JOB_EVENT: 'kbv:job:event',
+  APP_WORKING_STATE_EVENT: 'kbv:app-working-state:event'
 } as const;
 
 const invoke = async <T>(method: string, payload?: unknown): Promise<RpcResponse<T>> => {
@@ -53,9 +63,18 @@ const emitJobEvents = (cb: (event: JobEvent) => void) => {
   };
 };
 
+const emitAppWorkingStateEvents = (cb: (event: AppWorkingStatePatchAppliedEvent) => void) => {
+  const listener = (_event: Electron.IpcRendererEvent, data: AppWorkingStatePatchAppliedEvent) => cb(data);
+  ipcRenderer.on(IPC_CHANNELS.APP_WORKING_STATE_EVENT, listener);
+  return () => {
+    ipcRenderer.removeListener(IPC_CHANNELS.APP_WORKING_STATE_EVENT, listener);
+  };
+};
+
 contextBridge.exposeInMainWorld('kbv', {
   invoke,
   emitJobEvents,
+  emitAppWorkingStateEvents,
   startJob: (command: string, input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.JOB_INVOKE, { command, input }),
   cancelJob: (jobId: string) => ipcRenderer.invoke(IPC_CHANNELS.JOB_CANCEL, { jobId })
 });

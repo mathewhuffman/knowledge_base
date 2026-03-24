@@ -1,7 +1,7 @@
 # KB Vault — Project Breakdown
 **Version:** 1.0  
-**Date:** 2026-03-21  
-**Status:** Planning baseline  
+**Date:** 2026-03-23  
+**Status:** Planning baseline with initial app-command mutation slice implemented  
 **Product module:** KB Vault  
 **App shell:** Modular desktop app with KB Vault as the first module
 
@@ -316,7 +316,7 @@ Depending on proposal type:
    - from a live article, AI creates a proposal candidate that the user can `Create Proposal` or `Dismiss`
    - from a draft, AI returns a draft patch that updates the working copy
    - from Proposal Review, AI returns a proposal patch that updates the review working copy
-   - from Templates & Prompts, AI returns a template patch that updates the current form state
+   - from Templates & Prompts, AI executes an app working-state command that patches the current form state through the desktop app
 6. User remains the explicit decision-maker for any persisted change.
 
 ## 7.8 Publish selected drafts
@@ -465,7 +465,8 @@ Three primary ACP session types:
    - defaults to `informational_response` for normal conversation
 3. **Edit-capable assistant session**
    - used when the user asks for concrete changes in an allowed route context
-   - returns typed artifacts such as proposal candidates, proposal patches, draft patches, or template patches
+   - returns typed artifacts such as proposal candidates, proposal patches, or draft patches
+   - for live mutable forms, executes explicit KB app commands and reports only confirmed results
 
 ### Assistant result normalization
 Every assistant turn must be normalized before rendering in the transcript.
@@ -620,7 +621,7 @@ The assistant must support two distinct modes inside the same panel:
   - does not show proposal controls
 - **Change mode**
   - used when the user clearly asks the AI to make or propose changes
-  - returns a typed artifact based on route capabilities
+  - returns a typed artifact based on route capabilities or executes an explicit app mutation command for live form edits
   - may show explicit decision controls such as `Create Proposal` or `Dismiss`
 
 Article chat history should persist for each article or draft until the user chooses to reset it. The UI should provide a clear `Reset Chat` action that deletes that article’s chat history and starts a fresh conversation.
@@ -636,11 +637,14 @@ When the user asks the AI to make article changes, the resulting artifact should
 - live article context -> proposal candidate
 - draft context -> draft patch
 - proposal review context -> proposal patch
-- template context -> template patch
+- template context -> app working-state command (`kb app get-form-schema` / `kb app patch-form`) with confirmed UI mutation
 
 Live article requests for changes should not silently mutate the article view. They should create a proposal candidate first, and only after user confirmation should the app create a proposal record.
 
 Draft and proposal working-copy changes may update the visible screen immediately, but they remain user-controlled until the user saves, accepts, or dismisses the resulting work.
+
+Template and other form-based working-state changes must not be inferred from assistant prose.  
+They should update only after the assistant successfully executes a real app mutation command and the desktop app confirms the applied patch.
 
 ## 8.12 Templates and prompt packs
 The workspace must provide editable template and prompt management.
@@ -652,6 +656,14 @@ Users should be able to:
 - create new templates
 - ask AI to analyze current KB style and propose improved templates
 - assign template preferences by article type
+
+Template editing should use the generic app working-state mutation system rather than field-specific assistant JSON parsing.
+The initial implemented transport is:
+
+- `kb app get-form-schema --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --json`
+- `kb app patch-form --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --version-token ... --patch '{...}' --json`
+
+This contract is intentionally generic so additional editable screens can adopt the same pattern later.
 - maintain tone/style guidance inside the workspace
 
 Initial template types:
@@ -1293,13 +1305,31 @@ It should **not** have permission to:
 - modify OS-level secrets,
 - execute unrestricted local commands.
 
+For desktop-local mutable working states, the assistant may also use the scoped KB CLI app commands exposed by the desktop loopback service.
+Those commands are allowed only to mutate the currently registered route/entity working state inside the app, not durable external systems.
+
 ## 14.5 Output contract
-ACP responses should be normalized against a strict JSON schema before any proposal is stored.
+ACP responses for proposal and draft flows should still be normalized against a strict JSON schema before any proposal is stored.
 
 If the agent returns malformed data:
 1. attempt structured repair locally,
 2. if needed, re-ask the agent for schema-conformant output,
 3. do not silently coerce ambiguous outputs into accepted proposals.
+
+For live form mutations, the source of truth is not the JSON response body by itself.  
+The source of truth is the result of a real KB app command executed during the assistant turn.
+
+The implemented first-slice command contract is:
+
+- `kb app get-form-schema`
+  - returns editable fields, types, current values, and a version token for the active working state
+- `kb app patch-form`
+  - sends a structured patch to the desktop app loopback service
+  - validates route, entity type, entity id, allowed keys, and value types
+  - supports stale-state protection through `versionToken`
+  - returns `applied`, `appliedPatch`, `ignoredKeys`, `validationErrors`, and `nextVersionToken`
+
+The assistant must not claim a field changed unless `kb app patch-form` succeeded.
 
 ## 14.6 Agent notes
 The agent must be allowed to return notes at:
@@ -1308,6 +1338,58 @@ The agent must be allowed to return notes at:
 - per-proposal level
 
 These notes are stored and shown to the user as supporting context, not hidden system reasoning.
+
+## 14.7 App working-state mutation model
+KB Vault should use one generic desktop mutation primitive for live editable forms:
+
+- transport: `kb app get-form-schema` and `kb app patch-form`
+- target identity: `workspaceId`, `route`, `entityType`, `entityId`
+- concurrency control: `versionToken`
+- patch payload: `Record<string, unknown>`
+
+The desktop app should maintain a registry of currently mutable working states.  
+Each registered screen provides:
+
+- route
+- entity type
+- entity id
+- current version token
+- current values
+- allowed field schema
+- page/entity-specific validator
+
+The first implemented vertical slice is:
+
+- route: `templates_and_prompts`
+- entity type: `template_pack`
+- supported fields:
+  - `name`
+  - `language`
+  - `templateType`
+  - `promptTemplate`
+  - `toneRules`
+  - `description`
+  - `examples`
+  - `active`
+
+This replaces the earlier template-specific approach where assistant prose or returned JSON was parsed after the fact and treated as if a mutation had already happened.
+
+## 14.8 Current implementation status
+Implemented as of March 23, 2026:
+
+- shared generic app working-state request/response types
+- desktop main-process working-state mutation service
+- loopback routes for form schema lookup and patch application
+- KB CLI shim support for `kb app get-form-schema` and `kb app patch-form`
+- template-pack validator and apply flow
+- renderer registration for template working state
+- assistant runtime guidance updated to require real KB app commands for live template edits
+
+Still to implement:
+
+- assistant end-to-end tests proving the model executes the new commands during live template edits
+- full removal of legacy template-patch artifact behavior
+- expansion of the same system to drafts, proposal review, settings, and future editable forms
 
 ---
 

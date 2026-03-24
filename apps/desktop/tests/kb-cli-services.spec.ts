@@ -4,7 +4,8 @@ import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { test, expect } from '@playwright/test';
-import { CliHealthFailure } from '@kb-vault/shared-types';
+import { AppRoute, CliHealthFailure, TemplatePackType } from '@kb-vault/shared-types';
+import { AppWorkingStateService } from '../src/main/services/app-working-state-service';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
 import { KbCliLoopbackService } from '../src/main/services/kb-cli-loopback-service';
 import { KbCliRuntimeService } from '../src/main/services/kb-cli-runtime-service';
@@ -14,6 +15,7 @@ const execFileAsync = promisify(execFile);
 test.describe('kb cli desktop services', () => {
   let workspaceRoot: string;
   let repository: WorkspaceRepository;
+  let appWorkingStateService: AppWorkingStateService;
   let loopbackService: KbCliLoopbackService;
   let cliRuntimeService: KbCliRuntimeService;
 
@@ -21,7 +23,8 @@ test.describe('kb cli desktop services', () => {
     workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-cli-services-'));
     await mkdir(workspaceRoot, { recursive: true });
     repository = new WorkspaceRepository(workspaceRoot);
-    loopbackService = new KbCliLoopbackService(repository);
+    appWorkingStateService = new AppWorkingStateService(() => undefined);
+    loopbackService = new KbCliLoopbackService(repository, appWorkingStateService);
     cliRuntimeService = new KbCliRuntimeService(loopbackService, repository);
     await loopbackService.start();
   });
@@ -299,6 +302,7 @@ test.describe('kb cli desktop services', () => {
       expect(helpJson.ok).toBe(true);
       expect(helpJson.command).toBe('help');
       expect(helpJson.data?.commands).toContain('proposal create');
+      expect(helpJson.data?.commands).toContain('app patch-form');
 
       const proposalHelp = await execFileAsync('kb', ['proposal', '--json'], {
         env: {
@@ -316,6 +320,23 @@ test.describe('kb cli desktop services', () => {
       expect(proposalHelpJson.data?.subcommands).toContain('create');
       expect(proposalHelpJson.data?.options).toContain('--metadata');
       expect(proposalHelpJson.data?.examples?.[0]).toContain('--metadata');
+
+      const appHelp = await execFileAsync('kb', ['app', '--json'], {
+        env: {
+          ...process.env,
+          ...env
+        }
+      });
+      const appHelpJson = JSON.parse(appHelp.stdout) as {
+        ok?: boolean;
+        command?: string;
+        data?: { subcommands?: string[]; options?: string[] };
+      };
+      expect(appHelpJson.ok).toBe(true);
+      expect(appHelpJson.command).toBe('help');
+      expect(appHelpJson.data?.subcommands).toContain('get-form-schema');
+      expect(appHelpJson.data?.subcommands).toContain('patch-form');
+      expect(appHelpJson.data?.options).toContain('--patch-file');
     } finally {
       if (previousBinary === undefined) {
         delete process.env.KBV_KB_CLI_BINARY;
@@ -362,8 +383,10 @@ test.describe('kb cli desktop services', () => {
       'GET /workspaces/:workspaceId/sections',
       'GET /workspaces/:workspaceId/templates',
       'GET /workspaces/:workspaceId/templates/:templatePackId',
+      'GET /workspaces/:workspaceId/app/form-schema',
       'GET /workspaces/:workspaceId/pbis/:pbiId',
       'POST /workspaces/:workspaceId/articles/related',
+      'POST /workspaces/:workspaceId/app/patch-form',
       'POST /workspaces/:workspaceId/proposals/create',
       'POST /workspaces/:workspaceId/proposals/edit',
       'POST /workspaces/:workspaceId/proposals/retire',
@@ -485,6 +508,8 @@ test.describe('kb cli desktop services', () => {
     expect(payload.data.commands).toContain('proposal create');
     expect(payload.data.commands).toContain('proposal edit');
     expect(payload.data.commands).toContain('proposal retire');
+    expect(payload.data.commands).toContain('app get-form-schema');
+    expect(payload.data.commands).toContain('app patch-form');
   });
 
   test('builds CLI prompt guidance that pins the shim binary and proposal commands', () => {
@@ -498,6 +523,189 @@ test.describe('kb cli desktop services', () => {
     expect(promptSuffix).toContain(`${binaryPath} proposal create --workspace-id <workspace-id> --batch-id <batch-id>`);
     expect(promptSuffix).toContain(`${binaryPath} proposal edit --workspace-id <workspace-id> --batch-id <batch-id>`);
     expect(promptSuffix).toContain(`${binaryPath} proposal retire --workspace-id <workspace-id> --batch-id <batch-id>`);
+    expect(promptSuffix).toContain(`${binaryPath} app get-form-schema --workspace-id <workspace-id> --route templates_and_prompts`);
+    expect(promptSuffix).toContain(`${binaryPath} app patch-form --workspace-id <workspace-id> --route templates_and_prompts`);
+  });
+
+  test('serves form schema and applies validated form patches through loopback and kb shim', async () => {
+    const workspaceId = 'workspace-template-patch';
+    const templateId = 'template-pack-1';
+
+    appWorkingStateService.register({
+      workspaceId,
+      route: AppRoute.TEMPLATES_AND_PROMPTS,
+      entityType: 'template_pack',
+      entityId: templateId,
+      versionToken: `seed:${templateId}`,
+      currentValues: {
+        name: 'Standard How-To',
+        language: 'en-us',
+        templateType: TemplatePackType.STANDARD_HOW_TO,
+        promptTemplate: 'Write a clear how-to.',
+        toneRules: 'Be concise.',
+        description: 'Base template',
+        examples: 'Example body',
+        active: true
+      }
+    });
+
+    const baseUrl = loopbackService.getBaseUrl()!;
+    const headers = { Authorization: `Bearer ${loopbackService.getAuthToken()}` };
+
+    const schemaResp = await fetch(
+      `${baseUrl}/workspaces/${encodeURIComponent(workspaceId)}/app/form-schema?route=${encodeURIComponent(AppRoute.TEMPLATES_AND_PROMPTS)}&entityType=template_pack&entityId=${encodeURIComponent(templateId)}`,
+      { headers }
+    );
+    expect(schemaResp.ok).toBe(true);
+    const schemaJson = await schemaResp.json() as {
+      ok: boolean;
+      fields: Array<{ key: string }>;
+      currentValues: { promptTemplate: string };
+      versionToken: string;
+    };
+    expect(schemaJson.ok).toBe(true);
+    expect(schemaJson.fields.some((field) => field.key === 'promptTemplate')).toBe(true);
+    expect(schemaJson.currentValues.promptTemplate).toBe('Write a clear how-to.');
+
+    const patchResp = await fetch(
+      `${baseUrl}/workspaces/${encodeURIComponent(workspaceId)}/app/patch-form`,
+      {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          route: AppRoute.TEMPLATES_AND_PROMPTS,
+          entityType: 'template_pack',
+          entityId: templateId,
+          versionToken: schemaJson.versionToken,
+          patch: {
+            promptTemplate: 'Write a clearer task-focused article.',
+            active: false
+          }
+        })
+      }
+    );
+    expect(patchResp.ok).toBe(true);
+    const patchJson = await patchResp.json() as {
+      ok: boolean;
+      applied: boolean;
+      appliedPatch: { promptTemplate: string; active: boolean };
+      currentValues: { promptTemplate: string; active: boolean };
+    };
+    expect(patchJson.ok).toBe(true);
+    expect(patchJson.applied).toBe(true);
+    expect(patchJson.appliedPatch.promptTemplate).toBe('Write a clearer task-focused article.');
+    expect(patchJson.appliedPatch.active).toBe(false);
+    expect(patchJson.currentValues?.promptTemplate).toBe('Write a clearer task-focused article.');
+
+    cliRuntimeService.applyProcessEnv();
+    const env = {
+      ...process.env,
+      ...cliRuntimeService.getEnvironment()
+    };
+    const { stdout: schemaStdout } = await execFileAsync('kb', [
+      'app',
+      'get-form-schema',
+      '--workspace-id',
+      workspaceId,
+      '--route',
+      AppRoute.TEMPLATES_AND_PROMPTS,
+      '--entity-type',
+      'template_pack',
+      '--entity-id',
+      templateId,
+      '--json'
+    ], { env });
+    const cliSchema = JSON.parse(schemaStdout) as { ok: boolean; data: { currentValues: { active: boolean } } };
+    expect(cliSchema.ok).toBe(true);
+    expect(cliSchema.data.currentValues.active).toBe(false);
+
+    const { stdout: patchStdout } = await execFileAsync('kb', [
+      'app',
+      'patch-form',
+      '--workspace-id',
+      workspaceId,
+      '--route',
+      AppRoute.TEMPLATES_AND_PROMPTS,
+      '--entity-type',
+      'template_pack',
+      '--entity-id',
+      templateId,
+      '--patch',
+      JSON.stringify({ toneRules: 'Lead with the direct answer.' }),
+      '--json'
+    ], { env });
+    const cliPatch = JSON.parse(patchStdout) as { ok: boolean; data: { applied: boolean; appliedPatch: { toneRules: string } } };
+    expect(cliPatch.ok).toBe(true);
+    expect(cliPatch.data.applied).toBe(true);
+    expect(cliPatch.data.appliedPatch.toneRules).toBe('Lead with the direct answer.');
+  });
+
+  test('rejects stale versions and unknown keys for form patches', async () => {
+    const workspaceId = 'workspace-template-validation';
+
+    appWorkingStateService.register({
+      workspaceId,
+      route: AppRoute.TEMPLATES_AND_PROMPTS,
+      entityType: 'template_pack',
+      entityId: 'template-1',
+      versionToken: 'current-token',
+      currentValues: {
+        name: 'Template One',
+        language: 'en-us',
+        templateType: TemplatePackType.STANDARD_HOW_TO,
+        promptTemplate: 'Prompt',
+        toneRules: 'Tone',
+        description: '',
+        examples: '',
+        active: true
+      }
+    });
+
+    const baseUrl = loopbackService.getBaseUrl()!;
+    const headers = {
+      Authorization: `Bearer ${loopbackService.getAuthToken()}`,
+      'content-type': 'application/json'
+    };
+
+    const staleResp = await fetch(
+      `${baseUrl}/workspaces/${encodeURIComponent(workspaceId)}/app/patch-form`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          route: AppRoute.TEMPLATES_AND_PROMPTS,
+          entityType: 'template_pack',
+          entityId: 'template-1',
+          versionToken: 'stale-token',
+          patch: { promptTemplate: 'Updated prompt' }
+        })
+      }
+    );
+    expect(staleResp.status).toBe(409);
+    const staleJson = await staleResp.json() as { ok: boolean; validationErrors: Array<{ key?: string }> };
+    expect(staleJson.ok).toBe(false);
+    expect(staleJson.validationErrors[0]?.key).toBe('versionToken');
+
+    const invalidResp = await fetch(
+      `${baseUrl}/workspaces/${encodeURIComponent(workspaceId)}/app/patch-form`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          route: AppRoute.TEMPLATES_AND_PROMPTS,
+          entityType: 'template_pack',
+          entityId: 'template-1',
+          patch: { unsupportedField: 'nope' }
+        })
+      }
+    );
+    expect(invalidResp.status).toBe(409);
+    const invalidJson = await invalidResp.json() as { ok: boolean; validationErrors: Array<{ key?: string }> };
+    expect(invalidJson.ok).toBe(false);
+    expect(invalidJson.validationErrors[0]?.key).toBe('unsupportedField');
   });
 
   test('creates proposal review records through the local kb shim', async () => {

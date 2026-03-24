@@ -17,6 +17,7 @@ const logger_1 = require("./logger");
 const kb_cli_loopback_service_1 = require("./kb-cli-loopback-service");
 const kb_cli_runtime_service_1 = require("./kb-cli-runtime-service");
 const ai_assistant_service_1 = require("./ai-assistant-service");
+const app_working_state_service_1 = require("./app-working-state-service");
 const ZENDESK_PREVIEW_STYLE_TOKENS = {
     base_font_size: '16px',
     bg_color: '#ffffff',
@@ -219,7 +220,7 @@ function buildArticleAiPrompt(params) {
         `User request: ${params.request.message.trim()}`
     ].filter(Boolean).join('\n\n');
 }
-function registerCoreCommands(bus, jobs, workspaceRoot) {
+function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent) {
     const workspaceRepository = new workspace_repository_1.WorkspaceRepository(workspaceRoot);
     const zendeskSyncService = new zendesk_sync_service_1.ZendeskSyncService(workspaceRepository);
     const pbiBatchImportService = new pbi_batch_import_service_1.PBIBatchImportService(workspaceRepository);
@@ -422,7 +423,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             return { ok: true, ...created };
         }
     };
-    const kbCliLoopback = new kb_cli_loopback_service_1.KbCliLoopbackService(workspaceRepository);
+    const appWorkingStateService = new app_working_state_service_1.AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
+    const kbCliLoopback = new kb_cli_loopback_service_1.KbCliLoopbackService(workspaceRepository, appWorkingStateService);
     const kbCliRuntime = new kb_cli_runtime_service_1.KbCliRuntimeService(kbCliLoopback, workspaceRepository);
     const agentRuntime = new agent_runtime_1.CursorAcpRuntime(workspaceRoot, runtimeToolContext, {
         getCliHealth: (workspaceId) => kbCliRuntime.checkHealth(workspaceId),
@@ -1665,6 +1667,21 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
         }
     });
+    bus.register('proposal.review.delete', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.proposalId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.review.delete requires workspaceId and proposalId');
+            }
+            return { ok: true, data: await workspaceRepository.deleteProposalReview(input.workspaceId, input.proposalId) };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'Proposal not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
     bus.register('ai.assistant.context.get', async (payload) => {
         try {
             const input = payload;
@@ -1812,6 +1829,56 @@ function registerCoreCommands(bus, jobs, workspaceRoot) {
             if (error.message.includes('not found')) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
             }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('app.workingState.register', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.route || !input.entityType || !input.entityId || !input.versionToken || !input.currentValues) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'app.workingState.register requires workspaceId, route, entityType, entityId, versionToken, and currentValues');
+            }
+            appWorkingStateService.register(input);
+            return { ok: true, data: { registered: true } };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('app.workingState.unregister', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.route || !input.entityType || !input.entityId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'app.workingState.unregister requires workspaceId, route, entityType, and entityId');
+            }
+            appWorkingStateService.unregister(input);
+            return { ok: true, data: { unregistered: true } };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('app.workingState.getFormSchema', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.route || !input.entityType || !input.entityId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'app.workingState.getFormSchema requires workspaceId, route, entityType, and entityId');
+            }
+            return { ok: true, data: appWorkingStateService.getFormSchema(input) };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('app.workingState.patchForm', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input.route || !input.entityType || !input.entityId || !input.patch) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'app.workingState.patchForm requires workspaceId, route, entityType, entityId, and patch');
+            }
+            return { ok: true, data: appWorkingStateService.patchForm(input) };
+        }
+        catch (error) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
         }
     });

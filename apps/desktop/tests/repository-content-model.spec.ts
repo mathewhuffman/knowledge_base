@@ -214,9 +214,35 @@ test.describe('workspace repository content model', () => {
     expect(detail.diff.changeRegions.length).toBeGreaterThan(0);
     expect(detail.navigation.total).toBe(1);
 
+    const deleted = await repository.deleteProposalReview(created.id, proposal.id);
+    expect(deleted.deletedProposalId).toBe(proposal.id);
+    expect(deleted.summary.total).toBe(0);
+    await expect(repository.getProposalReviewDetail(created.id, proposal.id)).rejects.toThrow('Proposal not found');
+
+    const queueAfterDelete = await repository.listProposalReviewQueue(created.id, batch.id);
+    expect(queueAfterDelete.summary.total).toBe(0);
+    expect(queueAfterDelete.queue).toHaveLength(0);
+
+    const proposalDir = path.join(created.path, 'proposals', proposal.id);
+    await expect(rm(proposalDir, { recursive: true })).rejects.toThrow();
+
+    const replacement = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      targetTitle: 'Create & Edit Chat Channels',
+      targetLocale: 'en-us',
+      confidenceScore: 0.92,
+      rationaleSummary: 'Update the assignment steps to match the new dashboard flow.',
+      aiNotes: 'The title stays the same but steps 3-5 change.',
+      sourceHtml: '<h1>Create & Edit Chat Channels</h1>\n<p>Old flow.</p>',
+      proposedHtml: '<h1>Create & Edit Chat Channels</h1>\n<p>New team dashboard flow.</p>',
+      relatedPbiIds: [pbiId as string]
+    });
+
     const decision = await repository.decideProposalReview({
       workspaceId: created.id,
-      proposalId: proposal.id,
+      proposalId: replacement.id,
       decision: ProposalReviewDecision.ACCEPT,
       note: 'Looks good.'
     });

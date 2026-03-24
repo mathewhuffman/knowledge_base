@@ -110,7 +110,6 @@ export function AssistantComposer({ context, loading, onSend }: AssistantCompose
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
           rows={1}
-          disabled={loading && !draft}
           aria-label="Message to assistant"
         />
         <button

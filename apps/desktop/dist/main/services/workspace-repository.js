@@ -3091,6 +3091,101 @@ class WorkspaceRepository {
             workspaceDb.close();
         }
     }
+    async deleteProposalReview(workspaceId, proposalId) {
+        const workspace = await this.getWorkspace(workspaceId);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const existing = workspaceDb.get(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.workspace_id = @workspaceId AND p.id = @proposalId
+      `, { workspaceId, proposalId });
+            if (!existing) {
+                throw new Error('Proposal not found');
+            }
+            const batch = await this.getPBIBatch(workspaceId, existing.batchId);
+            workspaceDb.exec('BEGIN IMMEDIATE');
+            try {
+                workspaceDb.run(`DELETE FROM proposal_pbi_links
+           WHERE proposal_id = @proposalId`, { proposalId });
+                workspaceDb.run(`DELETE FROM proposals
+           WHERE workspace_id = @workspaceId AND id = @proposalId`, { workspaceId, proposalId });
+                workspaceDb.exec('COMMIT');
+            }
+            catch (error) {
+                workspaceDb.exec('ROLLBACK');
+                throw error;
+            }
+            await promises_1.default.rm(node_path_1.default.join(workspace.path, 'proposals', proposalId), { recursive: true, force: true });
+            const remainingRows = workspaceDb.all(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.workspace_id = @workspaceId AND p.batch_id = @batchId
+        ORDER BY p.queue_order ASC, p.generated_at ASC
+      `, { workspaceId, batchId: existing.batchId });
+            const remaining = remainingRows.map((row) => this.hydrateProposalDisplayFields(this.mapProposalRow(row), workspaceDb));
+            return {
+                workspaceId,
+                batchId: existing.batchId,
+                deletedProposalId: proposalId,
+                batchStatus: batch.status,
+                summary: summarizeProposalStatuses(remaining)
+            };
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
     async decideProposalReview(input) {
         const workspace = await this.getWorkspace(input.workspaceId);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));

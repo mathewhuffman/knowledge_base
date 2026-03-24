@@ -1,6 +1,6 @@
 import type { AiViewContext, AiSessionRecord, AiArtifactRecord } from '@kb-vault/shared-types';
 import { AppRoute } from '@kb-vault/shared-types';
-import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconClock, IconPlus, IconAlertCircle } from '../icons';
+import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconClock, IconPlus } from '../icons';
 
 const ROUTE_ICONS: Partial<Record<AppRoute, React.ReactNode>> = {
   [AppRoute.ARTICLE_EXPLORER]: <IconFileText size={14} />,
@@ -32,7 +32,6 @@ interface AssistantHeaderProps {
   loading: boolean;
   historyOpen: boolean;
   sessionCount: number;
-  isResumedSession: boolean;
   onCreateSession: () => void;
   onToggleHistory: () => void;
 }
@@ -44,7 +43,6 @@ export function AssistantHeader({
   loading,
   historyOpen,
   sessionCount,
-  isResumedSession,
   onCreateSession,
   onToggleHistory
 }: AssistantHeaderProps) {
@@ -94,14 +92,6 @@ export function AssistantHeader({
           {session?.title || context?.subject?.title}
         </div>
       )}
-
-      {isResumedSession && (
-        <div className="ai-header__resumed" role="status">
-          <IconAlertCircle size={12} />
-          <span>Resumed from <strong>{session?.route ?? 'another page'}</strong> — now using current page context</span>
-        </div>
-      )}
-
       <div className="ai-header__meta">
         {caps.map((tag) => (
           <span key={tag} className="ai-header__cap-tag">{tag}</span>

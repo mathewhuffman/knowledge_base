@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import {
   AppRoute,
+  type PBIBatchDeleteRequest,
   ProposalReviewStatus,
   ProposalReviewDecision,
   type ProposalReviewBatchListResponse,
@@ -22,6 +23,7 @@ import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
 import { LoadingState } from '../components/LoadingState';
 import { ErrorState } from '../components/ErrorState';
+import { ConfirmationDialog } from '../components/ConfirmationDialog';
 import { Badge } from '../components/Badge';
 import { Kbd } from '../components/Kbd';
 import { Modal } from '../components/Modal';
@@ -35,6 +37,7 @@ import {
   IconEye,
   IconCode,
   IconFileText,
+  IconTrash2,
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
@@ -490,33 +493,36 @@ function PlacementCard({ placement }: { placement?: ProposalPlacementSuggestion 
 function ProposalBatchRow({
   batch,
   onOpen,
+  onDelete,
 }: {
   batch: ProposalReviewBatchSummary;
   onOpen: () => void;
+  onDelete: (batch: ProposalReviewBatchSummary) => void;
 }) {
   const reviewedCount = batch.proposalCount - batch.pendingReviewCount;
   const progress = batch.proposalCount > 0 ? (reviewedCount / batch.proposalCount) * 100 : 0;
+  const openCellProps = {
+    className: 'proposal-batch-open-cell',
+    onClick: onOpen,
+    onKeyDown: (event: ReactKeyboardEvent<HTMLTableCellElement>) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        onOpen();
+      }
+    },
+    role: 'button' as const,
+    tabIndex: 0,
+  };
 
   return (
-    <tr
-      className="proposal-batch-table-row"
-      onClick={onOpen}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          onOpen();
-        }
-      }}
-      role="button"
-      tabIndex={0}
-    >
-      <td style={{ fontWeight: 'var(--weight-medium)' }}>
+    <tr className="proposal-batch-table-row">
+      <td {...openCellProps} style={{ fontWeight: 'var(--weight-medium)' }}>
         <div>{batch.batchName}</div>
         <div className="proposal-batch-secondary">{batch.sourceFileName}</div>
       </td>
-      <td style={{ color: 'var(--color-text-secondary)' }}>{formatDate(batch.importedAtUtc)}</td>
-      <td>{batch.proposalCount}</td>
-      <td>
+      <td {...openCellProps} style={{ color: 'var(--color-text-secondary)' }}>{formatDate(batch.importedAtUtc)}</td>
+      <td {...openCellProps}>{batch.proposalCount}</td>
+      <td {...openCellProps}>
         <div className="proposal-batch-progress">
           <span>{reviewedCount} / {batch.proposalCount}</span>
           <div className="progress-bar proposal-batch-progress-bar">
@@ -524,28 +530,50 @@ function ProposalBatchRow({
           </div>
         </div>
       </td>
-      <td>
+      <td {...openCellProps}>
         {batch.pendingReviewCount > 0 ? (
           <span>{batch.pendingReviewCount} pending</span>
         ) : (
           <span className="proposal-batch-empty-note">All reviewed</span>
         )}
       </td>
-      <td>
+      <td {...openCellProps}>
         <Badge variant={batchStatusVariant(batch.batchStatus)}>
           {BATCH_STATUS_LABEL[batch.batchStatus] ?? batch.batchStatus}
         </Badge>
       </td>
-      <td className="proposal-batch-actions-cell">
-        <button
-          className="btn btn-primary btn-xs"
-          onClick={(event) => {
-            event.stopPropagation();
-            onOpen();
-          }}
-        >
-          {batch.pendingReviewCount > 0 ? 'Review' : 'Open'}
-        </button>
+      <td
+        className="proposal-batch-actions-cell"
+        onClick={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="proposal-batch-actions">
+          <button
+            type="button"
+            className="btn btn-primary btn-xs"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpen();
+            }}
+          >
+            {batch.pendingReviewCount > 0 ? 'Review' : 'Open'}
+          </button>
+          <button
+            type="button"
+            className="proposal-batch-delete"
+            title="Delete proposal set"
+            aria-label="Delete proposal set"
+            onMouseDown={(event) => {
+              event.stopPropagation();
+            }}
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete(batch);
+            }}
+          >
+            <IconTrash2 size={14} />
+          </button>
+        </div>
       </td>
     </tr>
   );
@@ -568,6 +596,10 @@ export const ProposalReview = () => {
   const [activeTab, setActiveTab] = useState<ContentTab>('preview');
   const [decidingAs, setDecidingAs] = useState<ProposalReviewDecision | null>(null);
   const [selectedPBI, setSelectedPBI] = useState<PBIRecord | null>(null);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<ProposalReviewBatchSummary | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
   const [proposalWorkingCopy, setProposalWorkingCopy] = useState<{
     html: string;
     title?: string;
@@ -706,6 +738,42 @@ export const ProposalReview = () => {
       setDecidingAs(null);
     }
   }, [activeWorkspace?.id, selectedProposalId, mutateDecision, refreshCurrentBatch, navigation?.nextProposalId, executeDetail]);
+
+  const handleDelete = useCallback(async () => {
+    if (!activeWorkspace || !deleteTarget) return;
+    setDeletingBatchId(deleteTarget.batchId);
+    setDeleteError(null);
+    try {
+      const payload: PBIBatchDeleteRequest = {
+        workspaceId: activeWorkspace.id,
+        batchId: deleteTarget.batchId
+      };
+      const response = await window.kbv.invoke<{ workspaceId: string; batchId: string }>('pbiBatch.delete', payload);
+      if (!response.ok) {
+        setDeleteError(response.error?.message ?? 'Failed to delete proposal set');
+        return;
+      }
+      setShowDeleteDialog(false);
+      setDeleteTarget(null);
+      setSelectedBatchId(null);
+      setSelectedProposalId(null);
+      setSelectedPBI(null);
+      setProposalWorkingCopy(null);
+      resetList();
+      resetDetail();
+      await loadBatchSummaries();
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : 'Failed to delete proposal set');
+    } finally {
+      setDeletingBatchId(null);
+    }
+  }, [
+    activeWorkspace,
+    deleteTarget,
+    loadBatchSummaries,
+    resetDetail,
+    resetList
+  ]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -897,7 +965,16 @@ export const ProposalReview = () => {
                 </thead>
                 <tbody>
                   {batchSummaries.map((batch) => (
-                    <ProposalBatchRow key={batch.batchId} batch={batch} onOpen={() => openBatch(batch.batchId)} />
+                    <ProposalBatchRow
+                      key={batch.batchId}
+                      batch={batch}
+                      onOpen={() => openBatch(batch.batchId)}
+                      onDelete={(batchItem) => {
+                        setDeleteTarget(batchItem);
+                        setDeleteError(null);
+                        setShowDeleteDialog(true);
+                      }}
+                    />
                   ))}
                 </tbody>
               </table>
@@ -1241,6 +1318,27 @@ export const ProposalReview = () => {
         </div>
       </div>
       <PBIDetailModal pbi={selectedPBI} open={selectedPBI != null} onClose={() => setSelectedPBI(null)} />
+      <ConfirmationDialog
+        open={showDeleteDialog}
+        title="Delete Proposal"
+        message={
+          <>
+            <p>Are you sure you want to delete <strong>{deleteTarget?.batchName || 'this proposal set'}</strong>?</p>
+            <p>This will permanently remove the proposal set, its proposals, and the imported PBI rows tied to that batch.</p>
+            {deleteError && <p className="confirmation-dialog__error">{deleteError}</p>}
+          </>
+        }
+        confirmText={deletingBatchId ? 'Deleting...' : 'Delete Proposal Set'}
+        variant="danger"
+        isProcessing={Boolean(deletingBatchId)}
+        onClose={() => {
+          if (deletingBatchId) return;
+          setShowDeleteDialog(false);
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+        onConfirm={handleDelete}
+      />
     </>
   );
 };

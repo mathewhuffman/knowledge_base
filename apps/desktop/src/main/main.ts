@@ -6,7 +6,7 @@ import { loadConfig } from './config/config-loader';
 import { logger } from './services/logger';
 import { CommandBus } from './services/command-bus';
 import { JobRegistry } from './services/job-runner';
-import { IPC_CHANNELS, type RpcRequest, type RpcResponse, type JobEvent } from '@kb-vault/shared-types';
+import { IPC_CHANNELS, type AppWorkingStatePatchAppliedEvent, type RpcRequest, type RpcResponse, type JobEvent } from '@kb-vault/shared-types';
 import { registerCoreCommands } from './services/command-registry';
 import { McpBridgeService } from './services/mcp-bridge-service';
 
@@ -94,7 +94,18 @@ async function bootstrapApp() {
 
   process.env.KBV_ACP_CWD = appRoot;
 
-  const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = registerCoreCommands(commandBus, jobs, workspaceRoot);
+  const emitAppWorkingStateEvent = (event: AppWorkingStatePatchAppliedEvent) => {
+    BrowserWindow.getAllWindows().forEach((win) => {
+      win.webContents.send(IPC_CHANNELS.APP_WORKING_STATE_EVENT, event);
+    });
+  };
+
+  const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = registerCoreCommands(
+    commandBus,
+    jobs,
+    workspaceRoot,
+    emitAppWorkingStateEvent
+  );
   kbCliLoopback = cliLoopback;
   mcpBridge = new McpBridgeService(agentRuntime);
   await mcpBridge.start();

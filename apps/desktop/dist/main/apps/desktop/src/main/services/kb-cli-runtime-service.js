@@ -16,6 +16,9 @@ function buildKbCliShimSource() {
     const createProposalExample = JSON.stringify(`kb proposal create --workspace-id <workspaceId> --batch-id <batchId> --session-id <sessionId> --note "Create Duplicate Food Lists and Food Items (Portal)" --rationale "No duplicate-specific article exists; create one for the portal duplicate flow." --pbi-ids 102,103 --metadata '{"targetTitle":"Duplicate Food Lists and Food Items (Portal)","proposedHtml":"<h1>Duplicate Food Lists and Food Items (Portal)</h1><p>...</p>"}' --json`);
     const editProposalExample = JSON.stringify(`kb proposal edit --workspace-id <workspaceId> --batch-id <batchId> --session-id <sessionId> --locale-variant-id <localeVariantId> --note "Edit Create a Food List" --rationale "Add the new management flow." --pbi-ids 101 --metadata '{"targetTitle":"Create a Food List","proposedHtml":"<h1>Create a Food List</h1><p>...</p>"}' --json`);
     const editProposalFileExample = JSON.stringify(`kb proposal edit --workspace-id <workspaceId> --batch-id <batchId> --session-id <sessionId> --locale-variant-id <localeVariantId> --note "Edit Create a Food List" --rationale "Add the new management flow." --pbi-ids 101 --metadata-file /tmp/create-food-list-metadata.json --json`);
+    const getFormSchemaExample = JSON.stringify(`kb app get-form-schema --workspace-id <workspaceId> --route templates_and_prompts --entity-type template_pack --entity-id <templatePackId> --json`);
+    const patchFormExample = JSON.stringify(`kb app patch-form --workspace-id <workspaceId> --route templates_and_prompts --entity-type template_pack --entity-id <templatePackId> --version-token <versionToken> --patch '{"promptTemplate":"hello world"}' --json`);
+    const patchFormFileExample = JSON.stringify(`kb app patch-form --workspace-id <workspaceId> --route templates_and_prompts --entity-type template_pack --entity-id <templatePackId> --patch-file /tmp/template-patch.json --json`);
     return `#!/usr/bin/env node
 'use strict';
 
@@ -138,6 +141,52 @@ function getJsonMetadata(options, command, jsonMode) {
   return undefined;
 }
 
+function getJsonObjectOption(options, directKey, fileKey, command, jsonMode) {
+  const directValue = getString(options, directKey);
+  const fileValue = getString(options, fileKey);
+
+  if (directValue && fileValue) {
+    fail(command, 'Use only one of --' + directKey.replace(/[A-Z]/g, (char) => '-' + char.toLowerCase()) + ' or --' + fileKey.replace(/[A-Z]/g, (char) => '-' + char.toLowerCase()), 'VALIDATION_ERROR', jsonMode);
+  }
+
+  if (fileValue) {
+    try {
+      const raw = fs.readFileSync(fileValue, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        fail(command, '--' + fileKey.replace(/[A-Z]/g, (char) => '-' + char.toLowerCase()) + ' must contain a JSON object', 'VALIDATION_ERROR', jsonMode);
+      }
+      return parsed;
+    } catch (error) {
+      fail(
+        command,
+        error instanceof Error ? 'Unable to read --' + fileKey.replace(/[A-Z]/g, (char) => '-' + char.toLowerCase()) + ': ' + error.message : 'Unable to read JSON file option',
+        'VALIDATION_ERROR',
+        jsonMode
+      );
+    }
+  }
+
+  if (directValue) {
+    try {
+      const parsed = JSON.parse(directValue);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        fail(command, '--' + directKey.replace(/[A-Z]/g, (char) => '-' + char.toLowerCase()) + ' must be a JSON object', 'VALIDATION_ERROR', jsonMode);
+      }
+      return parsed;
+    } catch (error) {
+      fail(
+        command,
+        error instanceof Error ? 'Unable to parse --' + directKey.replace(/[A-Z]/g, (char) => '-' + char.toLowerCase()) + ': ' + error.message : 'Unable to parse JSON option',
+        'VALIDATION_ERROR',
+        jsonMode
+      );
+    }
+  }
+
+  return undefined;
+}
+
 function getBaseUrl() {
   return process.env.KB_AGENT_API_BASE_URL
     || process.env.KBV_KB_CLI_BASE_URL
@@ -219,10 +268,33 @@ function buildRootHelp() {
       'get-article',
       'get-article-manual',
       'get-article-family',
+      'app get-form-schema',
+      'app patch-form',
       'proposal create',
       'proposal edit',
       'proposal retire',
       'help'
+    ]
+  };
+}
+
+function buildAppHelp() {
+  return {
+    usage: 'kb app <get-form-schema|patch-form> --workspace-id <workspaceId> --route <route> --entity-type <entityType> --entity-id <entityId> [options] --json',
+    subcommands: ['get-form-schema', 'patch-form'],
+    options: [
+      '--workspace-id',
+      '--route',
+      '--entity-type',
+      '--entity-id',
+      '--version-token',
+      '--patch',
+      '--patch-file'
+    ],
+    examples: [
+      ${getFormSchemaExample},
+      ${patchFormExample},
+      ${patchFormFileExample}
     ]
   };
 }
@@ -308,12 +380,21 @@ async function resolveArticle(workspaceId, options, command, jsonMode) {
       write({ ok: true, command: 'help', data: buildProposalHelp() }, jsonMode);
       return;
     }
+    if (positionals[0] === 'app' || subcommand === 'app') {
+      write({ ok: true, command: 'help', data: buildAppHelp() }, jsonMode);
+      return;
+    }
     write({ ok: true, command: 'help', data: buildRootHelp() }, jsonMode);
     return;
   }
 
   if (command === 'proposal' && !subcommand) {
     write({ ok: true, command: 'help', data: buildProposalHelp() }, jsonMode);
+    return;
+  }
+
+  if (command === 'app' && !subcommand) {
+    write({ ok: true, command: 'help', data: buildAppHelp() }, jsonMode);
     return;
   }
 
@@ -386,6 +467,45 @@ async function resolveArticle(workspaceId, options, command, jsonMode) {
           '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/families/' + encodeURIComponent(familyId)
         );
         write({ ok: true, command, data: payload }, true);
+        return;
+      }
+      case 'app': {
+        const action = subcommand;
+        if (!action || !['get-form-schema', 'patch-form'].includes(action)) {
+          fail(command, 'app subcommand must be get-form-schema or patch-form', 'VALIDATION_ERROR', jsonMode);
+        }
+        const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
+        const route = requireOption(options, 'route', command, jsonMode);
+        const entityType = requireOption(options, 'entityType', command, jsonMode);
+        const entityId = requireOption(options, 'entityId', command, jsonMode);
+
+        if (action === 'get-form-schema') {
+          const payload = await requestJson(
+            'GET',
+            '/workspaces/' + encodeURIComponent(workspaceId) + '/app/form-schema',
+            { route, entityType, entityId }
+          );
+          write({ ok: true, command: 'app ' + action, data: payload }, true);
+          return;
+        }
+
+        const patch = getJsonObjectOption(options, 'patch', 'patchFile', command, jsonMode);
+        if (!patch) {
+          fail(command, 'Either --patch or --patch-file is required', 'VALIDATION_ERROR', jsonMode);
+        }
+        const payload = await requestJson(
+          'POST',
+          '/workspaces/' + encodeURIComponent(workspaceId) + '/app/patch-form',
+          undefined,
+          {
+            route,
+            entityType,
+            entityId,
+            versionToken: getString(options, 'versionToken'),
+            patch
+          }
+        );
+        write({ ok: true, command: 'app ' + action, data: payload }, true);
         return;
       }
       case 'proposal': {
@@ -510,10 +630,16 @@ class KbCliRuntimeService {
             `- \`${binaryPath} proposal edit --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --locale-variant-id <locale-variant-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata '{"targetTitle":"<article title>","proposedHtml":"<html>...</html>"}' --json\``,
             `- \`${binaryPath} proposal edit --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --locale-variant-id <locale-variant-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata-file /tmp/proposal-metadata.json --json\``,
             `- \`${binaryPath} proposal retire --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --locale-variant-id <locale-variant-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata '{"targetTitle":"<article title>"}' --json\``,
+            'The form-editing commands you need are also available through this binary:',
+            `- \`${binaryPath} app get-form-schema --workspace-id <workspace-id> --route templates_and_prompts --entity-type template_pack --entity-id <entity-id> --json\``,
+            `- \`${binaryPath} app patch-form --workspace-id <workspace-id> --route templates_and_prompts --entity-type template_pack --entity-id <entity-id> --version-token <version-token> --patch '{"promptTemplate":"..."}' --json\``,
+            `- \`${binaryPath} app patch-form --workspace-id <workspace-id> --route templates_and_prompts --entity-type template_pack --entity-id <entity-id> --patch-file /tmp/template-patch.json --json\``,
             'For create proposals, always include `metadata.targetTitle`.',
             'For create/edit proposals, include the full final article HTML in `metadata.proposedHtml` when you have it.',
+            'For live form edits, load the form schema first when you need field names or the current version token.',
+            'Never claim a form field changed unless `kb app patch-form` succeeded.',
             'If the HTML is too large or awkward for an inline JSON shell argument, write the metadata JSON to a temporary file and use `--metadata-file` instead of narrating escaping strategy.',
-            `If syntax is unclear, call \`${binaryPath} help --json\` or \`${binaryPath} proposal --json\` before trying a resource command.`
+            `If syntax is unclear, call \`${binaryPath} help --json\`, \`${binaryPath} proposal --json\`, or \`${binaryPath} app --json\` before trying a resource command.`
         ].join('\n');
     }
     async checkHealth(workspaceId) {

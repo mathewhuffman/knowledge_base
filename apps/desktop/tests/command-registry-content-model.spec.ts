@@ -276,11 +276,50 @@ test.describe('command registry content model transitions', () => {
     expect(detailResp.ok).toBe(true);
     expect((detailResp.data as { diff: { changeRegions: unknown[] } }).diff.changeRegions.length).toBeGreaterThan(0);
 
+    const deleteResp = await bus.execute({
+      method: 'proposal.review.delete',
+      payload: {
+        workspaceId: workspace.id,
+        proposalId: proposal.id
+      }
+    });
+    expect(deleteResp.ok).toBe(true);
+    expect((deleteResp.data as { deletedProposalId: string }).deletedProposalId).toBe(proposal.id);
+
+    const listAfterDeleteResp = await bus.execute({
+      method: 'proposal.review.list',
+      payload: {
+        workspaceId: workspace.id,
+        batchId: imported.batch.id
+      }
+    });
+    expect(listAfterDeleteResp.ok).toBe(true);
+    expect((listAfterDeleteResp.data as { summary: { total: number } }).summary.total).toBe(0);
+
+    const replacementResp = await bus.execute({
+      method: 'proposal.ingest',
+      payload: {
+        workspaceId: workspace.id,
+        batchId: imported.batch.id,
+        action: 'edit',
+        targetTitle: 'Create & Edit Chat Channels',
+        targetLocale: 'en-us',
+        confidenceScore: 0.88,
+        rationaleSummary: 'Reflect the new dashboard assignment path.',
+        aiNotes: 'Steps 2-4 need updates.',
+        sourceHtml: '<p>Old assignment flow.</p>',
+        proposedHtml: '<p>New assignment flow.</p>',
+        relatedPbiIds: [rows[0].id]
+      }
+    });
+    expect(replacementResp.ok).toBe(true);
+    const replacementProposal = replacementResp.data as { id: string };
+
     const decideResp = await bus.execute({
       method: 'proposal.review.decide',
       payload: {
         workspaceId: workspace.id,
-        proposalId: proposal.id,
+        proposalId: replacementProposal.id,
         decision: 'accept',
         note: 'Ship it into a new draft.'
       }

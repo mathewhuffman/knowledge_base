@@ -4,7 +4,8 @@ export const IPC_CHANNELS = {
   INVOKE: 'kbv:invoke',
   JOB_INVOKE: 'kbv:job:invoke',
   JOB_CANCEL: 'kbv:job:cancel',
-  JOB_EVENT: 'kbv:job:event'
+  JOB_EVENT: 'kbv:job:event',
+  APP_WORKING_STATE_EVENT: 'kbv:app-working-state:event'
 };
 
 export interface RpcRequest {
