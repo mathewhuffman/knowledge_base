@@ -24,12 +24,9 @@ function safePragma(db, pragma) {
 }
 function openDatabase({ dbPath }) {
     node_fs_1.default.mkdirSync(node_path_1.default.dirname(dbPath), { recursive: true });
-    console.error('[sqlite-open] new BetterSqlite3 start', { dbPath });
     const db = new better_sqlite3_1.default(dbPath);
-    console.error('[sqlite-open] new BetterSqlite3 created', { dbPath, hasRun: true });
     safePragma(db, 'journal_mode = WAL');
     safePragma(db, 'foreign_keys = ON');
-    console.error('[sqlite-open] better-sqlite3 init complete', { dbPath });
     return wrapDatabase(db);
 }
 function wrapDatabase(db) {

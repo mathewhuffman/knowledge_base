@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getSidebarCollapsedPreference = getSidebarCollapsedPreference;
+exports.getStoredSidebarCollapsedPreference = getStoredSidebarCollapsedPreference;
 exports.setSidebarCollapsedPreference = setSidebarCollapsedPreference;
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
@@ -47,6 +48,12 @@ function writePreferences(preferences) {
 function getSidebarCollapsedPreference() {
     const collapsed = readPreferences().ui?.sidebarCollapsed === true;
     logger_1.logger.info('app-preferences.getSidebarCollapsedPreference', { collapsed });
+    return collapsed;
+}
+function getStoredSidebarCollapsedPreference() {
+    const value = readPreferences().ui?.sidebarCollapsed;
+    const collapsed = typeof value === 'boolean' ? value : null;
+    logger_1.logger.info('app-preferences.getStoredSidebarCollapsedPreference', { collapsed });
     return collapsed;
 }
 function setSidebarCollapsedPreference(collapsed) {

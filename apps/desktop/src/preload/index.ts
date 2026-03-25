@@ -27,6 +27,7 @@ interface JobEvent {
   message?: string;
   startedAt?: string;
   endedAt?: string;
+  metadata?: Record<string, unknown>;
 }
 
 interface AppWorkingStatePatchAppliedEvent {

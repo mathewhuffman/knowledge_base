@@ -120,6 +120,9 @@ importers:
       '@types/node':
         specifier: ^20.19.37
         version: 20.19.37
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
   packages/db:
     dependencies:
@@ -133,16 +136,35 @@ importers:
       '@types/node':
         specifier: ^20.19.37
         version: 20.19.37
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
   packages/diff-engine: {}
 
-  packages/html-preview: {}
+  packages/html-preview:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
-  packages/mcp-server: {}
+  packages/mcp-server:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
-  packages/shared-types: {}
+  packages/shared-types:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
-  packages/zendesk-client: {}
+  packages/zendesk-client:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
 packages:
 

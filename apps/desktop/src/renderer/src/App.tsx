@@ -57,7 +57,7 @@ function AppShell() {
   const [activeRoute, setActiveRoute] = useState<AppRoute>(AppRoute.KB_VAULT_HOME);
   const [boot, setBoot] = useState<RpcResponse<BootData> | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadSidebarCollapsedFromLocalStorage() ?? false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const { activeWorkspace } = useWorkspace();
 
   const toggleSidebar = useCallback(() => {
@@ -95,34 +95,39 @@ function AppShell() {
         setBoot(response);
         if (response.ok) {
           const localValue = loadSidebarCollapsedFromLocalStorage();
-          const mainValue = response.data?.uiPreferences?.sidebarCollapsed === true;
+          const mainPreference = response.data?.uiPreferences?.sidebarCollapsed;
+          const mainValue = typeof mainPreference === 'boolean' ? mainPreference : null;
           console.log('[renderer] sidebar boot preferences', {
             localValue,
             mainValue
           });
 
-          if (localValue !== null && localValue !== mainValue) {
-            console.warn('[renderer] sidebar preference mismatch; reconciling toward local value', {
-              localValue,
-              mainValue
+          if (mainValue !== null) {
+            setSidebarCollapsed(mainValue);
+            saveSidebarCollapsedToLocalStorage(mainValue);
+            return;
+          }
+
+          if (localValue !== null) {
+            console.warn('[renderer] sidebar preference missing in main process; restoring from local cache', {
+              localValue
             });
             setSidebarCollapsed(localValue);
             void window.kbv
               .invoke('system.preferences.setSidebarCollapsed', { collapsed: localValue })
               .then((persistResponse) => {
-                console.log('[renderer] sidebar preference reconciled', {
+                console.log('[renderer] sidebar preference restored from local cache', {
                   ok: persistResponse.ok,
                   collapsed: localValue
                 });
               })
               .catch((error: unknown) => {
-                console.error('[renderer] sidebar reconciliation failed', String(error));
+                console.error('[renderer] sidebar cache restore failed', String(error));
               });
             return;
           }
 
-          setSidebarCollapsed(mainValue);
-          saveSidebarCollapsedToLocalStorage(mainValue);
+          setSidebarCollapsed(false);
         }
       })
       .catch((error: unknown) => {

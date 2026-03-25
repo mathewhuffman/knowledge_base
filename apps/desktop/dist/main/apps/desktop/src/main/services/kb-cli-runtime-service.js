@@ -443,11 +443,22 @@ async function resolveArticle(workspaceId, options, command, jsonMode) {
       }
       case 'search-kb': {
         const workspaceId = requireOption(options, 'workspaceId', command, jsonMode);
-        const query = requireOption(options, 'query', command, jsonMode);
+        const query = getString(options, 'query', 'q');
+        const localeVariantIds = getCsvList(options, 'localeVariantIds', 'localeVariantId');
+        const familyIds = getCsvList(options, 'familyIds', 'familyId');
+        const revisionIds = getCsvList(options, 'revisionIds', 'revisionId');
+        if (!query && localeVariantIds.length === 0 && familyIds.length === 0 && revisionIds.length === 0) {
+          fail(command, 'Provide --query, --locale-variant-ids, --family-ids, or --revision-ids', 'VALIDATION_ERROR', jsonMode);
+        }
         const payload = await requestJson(
           'GET',
           '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/search',
-          { query }
+          {
+            query,
+            localeVariantIds: localeVariantIds.join(','),
+            familyIds: familyIds.join(','),
+            revisionIds: revisionIds.join(',')
+          }
         );
         write({ ok: true, command, data: payload }, true);
         return;

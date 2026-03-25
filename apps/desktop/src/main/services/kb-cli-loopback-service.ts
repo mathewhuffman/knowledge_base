@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import { ProposalAction, type AppWorkingStatePatchRequest, type AppWorkingStateSchemaRequest, type SearchPayload } from '@kb-vault/shared-types';
@@ -41,6 +41,46 @@ function clampLimit(value: unknown): number | undefined {
     return 100;
   }
   return normalized;
+}
+
+function parseCsvParam(url: URL, key: string): string[] | undefined {
+  const value = url.searchParams.get(key)?.trim();
+  if (!value) {
+    return undefined;
+  }
+  const parts = value.split(',').map((item) => item.trim()).filter(Boolean);
+  return parts.length > 0 ? parts : undefined;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function buildProposalIdempotencyKey(action: ProposalAction, body: Record<string, unknown>): string {
+  const normalized = {
+    action,
+    batchId: typeof body.batchId === 'string' ? body.batchId.trim() : '',
+    sessionId: typeof body.sessionId === 'string' ? body.sessionId.trim() : '',
+    localeVariantId: typeof body.localeVariantId === 'string' ? body.localeVariantId.trim() : '',
+    note: typeof body.note === 'string' ? body.note.trim() : '',
+    rationale: typeof body.rationale === 'string' ? body.rationale.trim() : '',
+    pbiIds: Array.isArray(body.pbiIds)
+      ? body.pbiIds.map((value) => String(value).trim()).filter(Boolean).sort()
+      : [],
+    metadata: body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+      ? body.metadata as Record<string, unknown>
+      : {}
+  };
+  return createHash('sha256').update(stableStringify(normalized)).digest('hex');
 }
 
 export class KbCliLoopbackService {
@@ -207,7 +247,10 @@ export class KbCliLoopbackService {
           includeArchived: parseBoolean(url.searchParams.get('includeArchived')),
           changedWithinHours: url.searchParams.get('changedWithinHours')
             ? Number(url.searchParams.get('changedWithinHours'))
-            : undefined
+            : undefined,
+          localeVariantIds: parseCsvParam(url, 'localeVariantIds'),
+          familyIds: parseCsvParam(url, 'familyIds'),
+          revisionIds: parseCsvParam(url, 'revisionIds')
         };
         const result = await this.workspaceRepository.searchArticles(workspaceId, payload);
         sendJson(response, 200, { ok: true, ...result });
@@ -405,6 +448,7 @@ export class KbCliLoopbackService {
           batchId,
           action,
           _sessionId: typeof body.sessionId === 'string' ? body.sessionId : '',
+          idempotencyKey: buildProposalIdempotencyKey(action, body),
           localeVariantId: typeof body.localeVariantId === 'string' ? body.localeVariantId : undefined,
           note: typeof body.note === 'string' ? body.note : '',
           rationale: typeof body.rationale === 'string' ? body.rationale : undefined,

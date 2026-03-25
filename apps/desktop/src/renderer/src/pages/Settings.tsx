@@ -30,6 +30,34 @@ const LOCALE_OPTIONS = [
   { value: 'ja-jp', label: 'Japanese (ja-JP)' },
 ];
 
+const ACP_MODEL_OPTIONS: AgentRuntimeModelOption[] = [
+  { id: 'composer-2[fast=true]', provider: 'Cursor', name: 'Composer 2', costs: { inputUsdPerMillion: 0.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.2, outputUsdPerMillion: 2.5 } },
+  { id: 'composer-1.5[]', provider: 'Cursor', name: 'Composer 1.5', costs: { inputUsdPerMillion: 3.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.35, outputUsdPerMillion: 17.5 } },
+  { id: 'gpt-5.3-codex[reasoning=medium,fast=false]', provider: 'OpenAI', name: 'Codex 5.3', costs: { inputUsdPerMillion: 1.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.175, outputUsdPerMillion: 14 } },
+  { id: 'gpt-5.4[reasoning=medium,context=272k,fast=false]', provider: 'OpenAI', name: 'GPT-5.4', costs: { inputUsdPerMillion: 2.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.25, outputUsdPerMillion: 15 } },
+  { id: 'claude-sonnet-4-6[thinking=true,context=200k,effort=medium]', provider: 'Anthropic', name: 'Sonnet 4.6', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'claude-opus-4-6[thinking=true,context=200k,effort=high,fast=false]', provider: 'Anthropic', name: 'Opus 4.6', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'claude-opus-4-5[thinking=true]', provider: 'Anthropic', name: 'Opus 4.5', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gpt-5.2[reasoning=medium,fast=false]', provider: 'OpenAI', name: 'GPT-5.2', costs: { inputUsdPerMillion: 1.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.175, outputUsdPerMillion: 14 } },
+  { id: 'gemini-3.1-pro[]', provider: 'Google', name: 'Gemini 3.1 Pro', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gpt-5.4-mini[reasoning=medium]', provider: 'OpenAI', name: 'GPT-5.4 Mini', costs: { inputUsdPerMillion: 0.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.075, outputUsdPerMillion: 4.5 } },
+  { id: 'gpt-5.4-nano[reasoning=medium]', provider: 'OpenAI', name: 'GPT-5.4 Nano', costs: { inputUsdPerMillion: 0.2, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.02, outputUsdPerMillion: 1.25 } },
+  { id: 'claude-haiku-4-5[thinking=true]', provider: 'Anthropic', name: 'Haiku 4.5', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gpt-5.3-codex-spark[reasoning=medium]', provider: 'OpenAI', name: 'Codex 5.3 Spark', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'grok-4-20[thinking=true]', provider: 'xAI', name: 'Grok 4.20', costs: { inputUsdPerMillion: 2, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.2, outputUsdPerMillion: 6 } },
+  { id: 'claude-sonnet-4-5[thinking=true,context=200k]', provider: 'Anthropic', name: 'Sonnet 4.5', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gpt-5.2-codex[reasoning=medium,fast=false]', provider: 'OpenAI', name: 'Codex 5.2', costs: { inputUsdPerMillion: 1.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.175, outputUsdPerMillion: 14 } },
+  { id: 'gpt-5.1-codex-max[reasoning=medium,fast=false]', provider: 'OpenAI', name: 'Codex 5.1 Max', costs: { inputUsdPerMillion: 1.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.125, outputUsdPerMillion: 10 } },
+  { id: 'gpt-5.1[reasoning=medium]', provider: 'OpenAI', name: 'GPT-5.1', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gemini-3-pro[]', provider: 'Google', name: 'Gemini 3 Pro', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gemini-3-flash[]', provider: 'Google', name: 'Gemini 3 Flash', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gpt-5.1-codex-mini[reasoning=medium]', provider: 'OpenAI', name: 'Codex 5.1 Mini', costs: { inputUsdPerMillion: 0.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.025, outputUsdPerMillion: 2 } },
+  { id: 'claude-sonnet-4[thinking=false,context=200k]', provider: 'Anthropic', name: 'Sonnet 4', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'gpt-5-mini[]', provider: 'OpenAI', name: 'GPT-5 Mini', costs: { inputUsdPerMillion: 0.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.025, outputUsdPerMillion: 2 } },
+  { id: 'gemini-2.5-flash[]', provider: 'Google', name: 'Gemini 2.5 Flash', costs: { inputUsdPerMillion: null, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: null, outputUsdPerMillion: null } },
+  { id: 'kimi-k2.5[]', provider: 'Moonshot', name: 'Kimi K2.5', costs: { inputUsdPerMillion: 0.6, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.1, outputUsdPerMillion: 3 } },
+];
+
 /* ------------------------------------------------------------------ */
 /* Connection test result type                                         */
 /* ------------------------------------------------------------------ */
@@ -727,9 +755,12 @@ export const Settings = () => {
   const [defaultLocale, setDefaultLocale] = useState('');
   const [enabledLocales, setEnabledLocales] = useState<string[]>([]);
   const [agentModelId, setAgentModelId] = useState('');
+  const [acpModelId, setAcpModelId] = useState('');
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [runtimeSaveSuccess, setRuntimeSaveSuccess] = useState(false);
   const [runtimeValidationError, setRuntimeValidationError] = useState('');
+  const [acpRuntimeSaveSuccess, setAcpRuntimeSaveSuccess] = useState(false);
+  const [acpRuntimeValidationError, setAcpRuntimeValidationError] = useState('');
 
   useEffect(() => {
     if (activeWorkspace) {
@@ -745,6 +776,7 @@ export const Settings = () => {
       setDefaultLocale(settingsQuery.data.defaultLocale);
       setEnabledLocales(settingsQuery.data.enabledLocales);
       setAgentModelId(settingsQuery.data.agentModelId ?? '');
+      setAcpModelId(settingsQuery.data.acpModelId ?? '');
     }
   }, [settingsQuery.data]);
 
@@ -823,6 +855,36 @@ export const Settings = () => {
     }
   };
 
+  const handleSaveAcpRuntime = async () => {
+    if (!activeWorkspace) {
+      return;
+    }
+
+    setAcpRuntimeValidationError('');
+    setAcpRuntimeSaveSuccess(false);
+    if (!acpModelId.trim()) {
+      setAcpRuntimeValidationError('Select an ACP model before saving.');
+      return;
+    }
+
+    const savedAcpModelId = settingsQuery.data?.acpModelId ?? '';
+    if (acpModelId === savedAcpModelId) {
+      setAcpRuntimeSaveSuccess(true);
+      setTimeout(() => setAcpRuntimeSaveSuccess(false), 2000);
+      return;
+    }
+
+    const result = await settingsMutation.mutate({
+      workspaceId: activeWorkspace.id,
+      acpModelId
+    });
+    if (result) {
+      settingsQuery.execute({ workspaceId: activeWorkspace.id });
+      setAcpRuntimeSaveSuccess(true);
+      setTimeout(() => setAcpRuntimeSaveSuccess(false), 2000);
+    }
+  };
+
   const sections = [
     { id: 'zendesk', label: 'Zendesk Connection' },
     { id: 'locales', label: 'Locales' },
@@ -849,6 +911,7 @@ export const Settings = () => {
 
   const selectedModel = runtimeOptionsQuery.data?.modelCatalog?.find((model) => model.id === agentModelId);
   const modelOptions = runtimeOptionsQuery.data?.modelCatalog ?? [];
+  const selectedAcpModel = ACP_MODEL_OPTIONS.find((model) => model.id === acpModelId) ?? null;
 
   return (
     <>
@@ -1008,15 +1071,57 @@ export const Settings = () => {
                     )}
                   </div>
 
-                  {runtimeValidationError && (
-                    <span className="settings-inline-error">{runtimeValidationError}</span>
-                  )}
+                    {runtimeValidationError && (
+                      <span className="settings-inline-error">{runtimeValidationError}</span>
+                    )}
 
                   <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
                     <button className="btn btn-primary" onClick={handleSaveAgentRuntime} disabled={settingsMutation.loading || runtimeOptionsQuery.loading || modelOptions.length === 0}>
                       {settingsMutation.loading ? 'Saving...' : 'Save AI Model'}
                     </button>
                     {runtimeSaveSuccess && (
+                      <span className="settings-inline-success">
+                        <IconCheckCircle size={14} /> Saved
+                      </span>
+                    )}
+                    {settingsMutation.error && <span className="settings-inline-error">{settingsMutation.error}</span>}
+                  </div>
+
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-1)' }}>
+                      <label className="settings-label" style={{ marginBottom: 0 }}>ACP Model</label>
+                    </div>
+                    <select
+                      className="select"
+                      value={acpModelId}
+                      onChange={(e) => setAcpModelId(e.target.value)}
+                    >
+                      <option value="" disabled>Select ACP model...</option>
+                      {ACP_MODEL_OPTIONS.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {`${model.name} (${model.id})`}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedAcpModel && (
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', marginTop: 'var(--space-1)', fontFamily: 'var(--font-mono)' }}>
+                        {formatModelCost(selectedAcpModel)}
+                      </div>
+                    )}
+                    <div className="settings-hint" style={{ marginTop: 'var(--space-2)' }}>
+                      Uses the exact ACP <code>modelId</code> value when creating agent sessions.
+                    </div>
+                  </div>
+
+                  {acpRuntimeValidationError && (
+                    <span className="settings-inline-error">{acpRuntimeValidationError}</span>
+                  )}
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                    <button className="btn btn-primary" onClick={handleSaveAcpRuntime} disabled={settingsMutation.loading}>
+                      {settingsMutation.loading ? 'Saving...' : 'Save ACP Model'}
+                    </button>
+                    {acpRuntimeSaveSuccess && (
                       <span className="settings-inline-success">
                         <IconCheckCircle size={14} /> Saved
                       </span>

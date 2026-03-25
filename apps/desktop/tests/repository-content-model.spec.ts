@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { test, expect } from '@playwright/test';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
+import { BatchAnalysisOrchestrator } from '../src/main/services/batch-analysis-orchestrator';
 import {
   ArticleAiPresetAction,
   DraftBranchStatus,
@@ -19,11 +20,13 @@ import {
 test.describe('workspace repository content model', () => {
   let workspaceRoot: string;
   let repository: WorkspaceRepository;
+  let orchestrator: BatchAnalysisOrchestrator;
 
   test.beforeEach(async () => {
     workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch2-repo-'));
     await mkdir(workspaceRoot, { recursive: true });
     repository = new WorkspaceRepository(workspaceRoot);
+    orchestrator = new BatchAnalysisOrchestrator(repository);
   });
 
   test.afterEach(async () => {
@@ -144,6 +147,722 @@ test.describe('workspace repository content model', () => {
         kbAccessMode: 'broken' as 'mcp'
       })
     ).rejects.toThrow('kbAccessMode must be mcp or cli');
+  });
+
+  test('persists batch analysis orchestration iterations and worker reports', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchOrchestration-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 88',
+      'sprint-88.csv',
+      'imports/sprint-88.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const iteration = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'planning',
+      role: 'planner',
+      status: 'running',
+      summary: 'Synthesizing the approved plan.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-1'
+    });
+    await repository.recordBatchAnalysisStageEvent({
+      id: randomUUID(),
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'planning',
+      role: 'planner',
+      eventType: 'iteration_started',
+      status: 'running',
+      summary: 'Synthesizing the approved plan.',
+      sessionId: 'session-1',
+      agentModelId: 'gpt-5.4',
+      outstandingDiscoveredWorkCount: 0,
+      executionCounts: {
+        total: 0,
+        create: 0,
+        edit: 0,
+        retire: 0,
+        noImpact: 0,
+        executed: 0,
+        blocked: 0,
+        rejected: 0
+      },
+      createdAtUtc: new Date().toISOString()
+    });
+
+    await repository.recordBatchAnalysisPlan({
+      id: randomUUID(),
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'planning',
+      role: 'planner',
+      verdict: 'draft',
+      planVersion: 1,
+      summary: 'Draft plan covering one edit.',
+      coverage: [
+        {
+          pbiId: 'pbi-88',
+          outcome: 'covered',
+          planItemIds: ['plan-item-1']
+        }
+      ],
+      items: [
+        {
+          planItemId: 'plan-item-1',
+          pbiIds: ['pbi-88'],
+          action: 'edit',
+          targetType: 'article',
+          targetTitle: 'Existing article',
+          reason: 'The workflow changed.',
+          evidence: [{ kind: 'pbi', ref: 'PBI-88', summary: 'The PBI describes an updated workflow.' }],
+          confidence: 0.84,
+          executionStatus: 'pending'
+        }
+      ],
+      openQuestions: [],
+      createdAtUtc: new Date().toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-1'
+    });
+
+    const approvedPlanId = randomUUID();
+    await repository.recordBatchAnalysisPlan({
+      id: approvedPlanId,
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'planning',
+      role: 'planner',
+      verdict: 'approved',
+      planVersion: 1,
+      summary: 'Approved plan covering one edit.',
+      coverage: [
+        {
+          pbiId: 'pbi-88',
+          outcome: 'covered',
+          planItemIds: ['plan-item-1']
+        }
+      ],
+      items: [
+        {
+          planItemId: 'plan-item-1',
+          pbiIds: ['pbi-88'],
+          action: 'edit',
+          targetType: 'article',
+          targetTitle: 'Existing article',
+          reason: 'The workflow changed.',
+          evidence: [{ kind: 'pbi', ref: 'PBI-88', summary: 'The PBI describes an updated workflow.' }],
+          confidence: 0.84,
+          executionStatus: 'approved'
+        }
+      ],
+      openQuestions: [],
+      createdAtUtc: new Date().toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-2'
+    });
+
+    await repository.recordBatchPlanReview({
+      id: randomUUID(),
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'plan_reviewing',
+      role: 'plan-reviewer',
+      verdict: 'approved',
+      summary: 'The plan covers the batch and has no missed article work.',
+      didAccountForEveryPbi: true,
+      hasMissingCreates: false,
+      hasMissingEdits: false,
+      hasTargetIssues: false,
+      hasOverlapOrConflict: false,
+      foundAdditionalArticleWork: false,
+      underScopedKbImpact: false,
+      createdAtUtc: new Date().toISOString(),
+      planId: approvedPlanId,
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-3'
+    });
+
+    await repository.updateBatchAnalysisPlanItemStatuses({
+      workspaceId: created.id,
+      planId: approvedPlanId,
+      statuses: [{ planItemId: 'plan-item-1', executionStatus: 'executed' }]
+    });
+
+    await repository.recordBatchWorkerExecutionReport({
+      id: randomUUID(),
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'building',
+      role: 'worker',
+      summary: 'Executed one approved edit.',
+      status: 'completed',
+      executedItems: [
+        {
+          planItemId: 'plan-item-1',
+          action: 'edit',
+          status: 'executed',
+          artifactIds: ['proposal-1']
+        }
+      ],
+      discoveredWork: [
+        {
+          discoveryId: 'discovery-1',
+          sourceWorkerRunId: 'worker-run-1',
+          discoveredAction: 'create',
+          suspectedTarget: 'New onboarding article',
+          reason: 'A related workflow had no existing article.',
+          evidence: [{ kind: 'pbi', ref: 'PBI-88', summary: 'Mentions a new onboarding branch.' }],
+          linkedPbiIds: ['pbi-88'],
+          confidence: 0.73,
+          requiresPlanAmendment: true,
+          status: 'pending_review'
+        }
+      ],
+      blockerNotes: [],
+      createdAtUtc: new Date().toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-1'
+    });
+
+    await repository.recordBatchFinalReview({
+      id: randomUUID(),
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'final_reviewing',
+      role: 'final-reviewer',
+      verdict: 'approved',
+      summary: 'Final review approved the batch outputs.',
+      allPbisMapped: true,
+      planExecutionComplete: true,
+      hasMissingArticleChanges: false,
+      hasUnresolvedDiscoveredWork: false,
+      createdAtUtc: new Date().toISOString(),
+      planId: approvedPlanId,
+      workerReportId: 'worker-report-final',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-4'
+    });
+
+    await repository.updateBatchAnalysisIteration({
+      workspaceId: created.id,
+      iterationId: iteration.id,
+      stage: 'approved',
+      role: 'final-reviewer',
+      status: 'completed',
+      approvedPlanId,
+      lastReviewVerdict: 'approved',
+      outstandingDiscoveredWorkCount: 1,
+      executionCounts: {
+        total: 1,
+        create: 0,
+        edit: 1,
+        retire: 0,
+        noImpact: 0,
+        executed: 1,
+        blocked: 0,
+        rejected: 0
+      },
+      endedAtUtc: new Date().toISOString()
+    });
+    await repository.recordBatchAnalysisStageEvent({
+      id: randomUUID(),
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'approved',
+      role: 'final-reviewer',
+      eventType: 'iteration_completed',
+      status: 'completed',
+      summary: 'Final review approved the batch outputs.',
+      sessionId: 'session-4',
+      agentModelId: 'gpt-5.4',
+      approvedPlanId,
+      lastReviewVerdict: 'approved',
+      outstandingDiscoveredWorkCount: 1,
+      executionCounts: {
+        total: 1,
+        create: 0,
+        edit: 1,
+        retire: 0,
+        noImpact: 0,
+        executed: 1,
+        blocked: 0,
+        rejected: 0
+      },
+      createdAtUtc: new Date().toISOString()
+    });
+
+    const snapshot = await repository.getBatchAnalysisSnapshot(created.id, batch.id);
+    expect(snapshot.latestIteration?.stage).toBe('approved');
+    expect(snapshot.latestIteration?.role).toBe('final-reviewer');
+    expect(snapshot.latestIteration?.executionCounts.edit).toBe(1);
+    expect(snapshot.latestApprovedPlan?.id).toBe(approvedPlanId);
+    expect(snapshot.latestPlanReview?.verdict).toBe('approved');
+    expect(snapshot.latestApprovedPlan?.items[0]?.executionStatus).toBe('executed');
+    expect(snapshot.latestWorkerReport?.summary).toContain('Executed one approved edit');
+    expect(snapshot.latestFinalReview?.verdict).toBe('approved');
+    expect(snapshot.discoveredWork).toHaveLength(1);
+    expect(snapshot.discoveredWork[0]?.suspectedTarget).toBe('New onboarding article');
+
+    const runtimeStatus = await repository.getBatchAnalysisRuntimeStatus(created.id, batch.id);
+    expect(runtimeStatus?.stage).toBe('approved');
+    expect(runtimeStatus?.role).toBe('final-reviewer');
+    expect(runtimeStatus?.latestEventType).toBe('iteration_completed');
+
+    const eventStream = await repository.getBatchAnalysisEventStream(created.id, batch.id, 10);
+    expect(eventStream.events.length).toBeGreaterThan(0);
+    expect(eventStream.events.some((event) => event.eventType === 'iteration_started')).toBeTruthy();
+    expect(eventStream.events.some((event) => event.eventType === 'iteration_completed')).toBeTruthy();
+  });
+
+  test('humanizes collapsed planner text when parsing plan results', async () => {
+    const iteration = {
+      id: randomUUID(),
+      workspaceId: 'workspace-1',
+      batchId: 'batch-1',
+      iteration: 1,
+    } as Awaited<ReturnType<WorkspaceRepository['createBatchAnalysisIteration']>>;
+
+    const plan = orchestrator.parsePlannerResult({
+      workspaceId: 'workspace-1',
+      batchId: 'batch-1',
+      iteration,
+      planVersion: 1,
+      resultText: JSON.stringify({
+        summary: 'OnecandidatePBIwasfullyassessed.Thestrongestplanistocreateanewstandalonearticle.',
+        coverage: [
+          {
+            pbiId: 'pbi-1',
+            outcome: 'covered',
+            planItemIds: ['plan-1'],
+            notes: 'Existingnearbycoverageappearsadjacentratherthansufficient.'
+          }
+        ],
+        items: [
+          {
+            planItemId: 'plan-1',
+            pbiIds: ['pbi-1'],
+            action: 'create',
+            targetType: 'new_article',
+            targetTitle: 'DuplicateaFoodItem',
+            reason: 'ThePBIdescribesadistinctduplicatefooditemworkflow.',
+            evidence: [
+              {
+                kind: 'pbi',
+                ref: 'pbi-1',
+                summary: 'Acceptancecriteriarequireaprefilledcreatemodesidesheet.'
+              }
+            ],
+            confidence: 0.9,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: ['Shouldthisbeastandalonearticleoracross-link?']
+      })
+    });
+
+    expect(plan.summary).toContain('One candidate PBI');
+    expect(plan.coverage[0]?.notes).toContain('Existing nearby coverage');
+    expect(plan.items[0]?.targetTitle).toBe('Duplicate a Food Item');
+    expect(plan.items[0]?.reason).toContain('distinct duplicate food item workflow');
+    expect(plan.items[0]?.evidence[0]?.summary).toContain('prefilled create mode side sheet');
+    expect(plan.openQuestions[0]).toContain('Should this be a standalone article');
+  });
+
+  test('matches collapsed plan titles to spaced proposal titles during worker execution', async () => {
+    const executedItems = (orchestrator as any).buildExecutedItems(
+      [
+        {
+          planItemId: 'plan-1',
+          pbiIds: ['pbi-1'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'DuplicateaFoodItem',
+          reason: 'Distinct duplicate workflow.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Duplicate flow.' }],
+          confidence: 0.9,
+          executionStatus: 'pending'
+        }
+      ],
+      [
+        {
+          proposalId: 'proposal-1',
+          action: 'create',
+          articleLabel: 'Duplicate a Food Item'
+        }
+      ],
+      {
+        status: 'ok',
+        sessionId: 'session-1',
+        startedAtUtc: new Date().toISOString(),
+        endedAtUtc: new Date().toISOString(),
+        message: 'Worker execution completed successfully.'
+      }
+    );
+
+    expect(executedItems).toHaveLength(1);
+    expect(executedItems[0]?.status).toBe('executed');
+    expect(executedItems[0]?.proposalId).toBe('proposal-1');
+  });
+
+  test('returns inspection history for superseded plans, deltas, and transcript linkage', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchInspection-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 89',
+      'sprint-89.csv',
+      'imports/sprint-89.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const iteration = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'planning',
+      role: 'planner',
+      status: 'running',
+      summary: 'Inspection test iteration.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session'
+    });
+
+    const initialPlanId = randomUUID();
+    await repository.recordBatchAnalysisPlan({
+      id: initialPlanId,
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'planning',
+      role: 'planner',
+      verdict: 'draft',
+      planVersion: 1,
+      summary: 'Initial draft plan.',
+      coverage: [{ pbiId: 'pbi-89', outcome: 'covered', planItemIds: ['plan-item-89'] }],
+      items: [{
+        planItemId: 'plan-item-89',
+        pbiIds: ['pbi-89'],
+        action: 'edit',
+        targetType: 'article',
+        targetTitle: 'Policy article',
+        reason: 'Process changed.',
+        evidence: [{ kind: 'pbi', ref: 'PBI-89', summary: 'Describes a new process.' }],
+        confidence: 0.8,
+        executionStatus: 'pending'
+      }],
+      openQuestions: ['Verify adjacent article impact'],
+      createdAtUtc: new Date().toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session'
+    });
+
+    const revisedPlanId = randomUUID();
+    await repository.recordBatchAnalysisPlan({
+      id: revisedPlanId,
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'plan_revision',
+      role: 'planner',
+      verdict: 'approved',
+      planVersion: 2,
+      summary: 'Revised approved plan.',
+      coverage: [{ pbiId: 'pbi-89', outcome: 'covered', planItemIds: ['plan-item-89', 'plan-item-90'] }],
+      items: [
+        {
+          planItemId: 'plan-item-89',
+          pbiIds: ['pbi-89'],
+          action: 'edit',
+          targetType: 'article',
+          targetTitle: 'Policy article',
+          reason: 'Process changed.',
+          evidence: [{ kind: 'pbi', ref: 'PBI-89', summary: 'Describes a new process.' }],
+          confidence: 0.8,
+          executionStatus: 'approved'
+        },
+        {
+          planItemId: 'plan-item-90',
+          pbiIds: ['pbi-89'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'Escalation article',
+          reason: 'Related guidance is missing.',
+          evidence: [{ kind: 'review', ref: 'review-1', summary: 'Reviewer found missing article work.' }],
+          confidence: 0.72,
+          executionStatus: 'approved'
+        }
+      ],
+      openQuestions: [],
+      createdAtUtc: new Date().toISOString(),
+      supersedesPlanId: initialPlanId,
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session-2'
+    });
+
+    await repository.recordBatchPlanReview({
+      id: 'review-1',
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'plan_reviewing',
+      role: 'plan-reviewer',
+      verdict: 'needs_revision',
+      summary: 'Plan missed a related article.',
+      didAccountForEveryPbi: true,
+      hasMissingCreates: true,
+      hasMissingEdits: false,
+      hasTargetIssues: false,
+      hasOverlapOrConflict: false,
+      foundAdditionalArticleWork: true,
+      underScopedKbImpact: true,
+      delta: {
+        summary: 'Add the missing escalation article.',
+        requestedChanges: ['Create the escalation article.'],
+        missingPbiIds: [],
+        missingCreates: ['Escalation article'],
+        missingEdits: [],
+        additionalArticleWork: ['Escalation article'],
+        targetCorrections: [],
+        overlapConflicts: []
+      },
+      createdAtUtc: new Date().toISOString(),
+      planId: initialPlanId,
+      agentModelId: 'gpt-5.4',
+      sessionId: 'review-session'
+    });
+
+    await repository.recordBatchAnalysisRun({
+      workspaceId: created.id,
+      batchId: batch.id,
+      sessionId: 'worker-session',
+      kbAccessMode: 'mcp',
+      agentModelId: 'gpt-5.4',
+      status: 'complete',
+      startedAtUtc: new Date().toISOString(),
+      endedAtUtc: new Date().toISOString(),
+      transcriptPath: 'transcripts/worker-session.jsonl',
+      toolCalls: [],
+      rawOutput: ['done']
+    });
+
+    await repository.recordBatchWorkerExecutionReport({
+      id: 'worker-report-1',
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'building',
+      role: 'worker',
+      summary: 'Executed the revised plan.',
+      status: 'needs_amendment',
+      planId: revisedPlanId,
+      executedItems: [{
+        planItemId: 'plan-item-89',
+        action: 'edit',
+        status: 'executed'
+      }],
+      discoveredWork: [{
+        discoveryId: 'discovery-89',
+        sourceWorkerRunId: 'worker-report-1',
+        discoveredAction: 'edit',
+        suspectedTarget: 'Support checklist article',
+        reason: 'Neighboring checklist also changed.',
+        evidence: [{ kind: 'article', ref: 'article-2', summary: 'Checklist references outdated process.' }],
+        linkedPbiIds: ['pbi-89'],
+        confidence: 0.67,
+        requiresPlanAmendment: true,
+        status: 'pending_review'
+      }],
+      blockerNotes: [],
+      createdAtUtc: new Date().toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'worker-session'
+    });
+
+    await repository.recordBatchPlanAmendment({
+      id: 'amendment-1',
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      approvedPlanId: revisedPlanId,
+      sourceWorkerReportId: 'worker-report-1',
+      sourceDiscoveryIds: ['discovery-89'],
+      proposedPlanId: revisedPlanId,
+      reviewId: 'review-2',
+      status: 'approved',
+      summary: 'Approved the worker discovery amendment.',
+      createdAtUtc: new Date().toISOString(),
+      updatedAtUtc: new Date().toISOString()
+    });
+
+    await repository.recordBatchFinalReview({
+      id: 'final-review-1',
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'final_reviewing',
+      role: 'final-reviewer',
+      verdict: 'needs_rework',
+      summary: 'One checklist update is still missing.',
+      allPbisMapped: true,
+      planExecutionComplete: false,
+      hasMissingArticleChanges: true,
+      hasUnresolvedDiscoveredWork: false,
+      delta: {
+        summary: 'Update the support checklist article.',
+        requestedRework: ['Edit the support checklist article.'],
+        uncoveredPbiIds: [],
+        missingArticleChanges: ['Support checklist article'],
+        duplicateRiskTitles: [],
+        unnecessaryChanges: [],
+        unresolvedAmbiguities: []
+      },
+      createdAtUtc: new Date().toISOString(),
+      planId: revisedPlanId,
+      workerReportId: 'worker-report-1',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'final-session'
+    });
+
+    const inspection = await repository.getBatchAnalysisInspection(created.id, batch.id);
+    expect(inspection.snapshot.latestApprovedPlan?.id).toBe(revisedPlanId);
+    expect(inspection.plans).toHaveLength(2);
+    expect(inspection.supersededPlans.map((plan) => plan.id)).toContain(initialPlanId);
+    expect(inspection.reviewDeltas).toHaveLength(1);
+    expect(inspection.reviewDeltas[0]?.delta.additionalArticleWork).toContain('Escalation article');
+    expect(inspection.amendments).toHaveLength(1);
+    expect(inspection.finalReviewReworkPlans).toHaveLength(1);
+    expect(inspection.finalReviewReworkPlans[0]?.delta.missingArticleChanges).toContain('Support checklist article');
+    expect(inspection.timeline.some((entry) => entry.artifactType === 'amendment')).toBeTruthy();
+    expect(inspection.transcriptLinks.some((entry) => entry.sessionId === 'planner-session')).toBeTruthy();
+    expect(inspection.transcriptLinks.some((entry) => entry.transcriptPath === 'transcripts/worker-session.jsonl')).toBeTruthy();
+  });
+
+  test('blocks final approval when hard correctness gates fail', async () => {
+    const plan = {
+      id: 'plan-1',
+      workspaceId: 'ws-1',
+      batchId: 'batch-1',
+      iterationId: 'iter-1',
+      iteration: 1,
+      stage: 'planning' as const,
+      role: 'planner' as const,
+      verdict: 'approved' as const,
+      planVersion: 1,
+      summary: 'Approved plan',
+      coverage: [{ pbiId: 'pbi-1', outcome: 'covered' as const, planItemIds: ['item-1'] }],
+      items: [{
+        planItemId: 'item-1',
+        pbiIds: ['pbi-1'],
+        action: 'edit' as const,
+        targetType: 'article' as const,
+        targetTitle: 'Article A',
+        reason: 'Needs update',
+        evidence: [],
+        confidence: 0.9,
+        executionStatus: 'approved' as const
+      }],
+      openQuestions: [],
+      createdAtUtc: new Date().toISOString()
+    };
+    const workerReport = {
+      id: 'worker-1',
+      workspaceId: 'ws-1',
+      batchId: 'batch-1',
+      iterationId: 'iter-1',
+      iteration: 1,
+      stage: 'building' as const,
+      role: 'worker' as const,
+      summary: 'Worker said it finished.',
+      status: 'completed' as const,
+      planId: 'plan-1',
+      executedItems: [],
+      discoveredWork: [{
+        discoveryId: 'disc-1',
+        sourceWorkerRunId: 'worker-1',
+        discoveredAction: 'edit' as const,
+        suspectedTarget: 'Article B',
+        reason: 'Found missed related article.',
+        evidence: [],
+        linkedPbiIds: ['pbi-1'],
+        confidence: 0.7,
+        requiresPlanAmendment: true,
+        status: 'pending_review' as const
+      }],
+      blockerNotes: [],
+      createdAtUtc: new Date().toISOString()
+    };
+    const finalReview = {
+      id: 'final-1',
+      workspaceId: 'ws-1',
+      batchId: 'batch-1',
+      iterationId: 'iter-1',
+      iteration: 1,
+      stage: 'final_reviewing' as const,
+      role: 'final-reviewer' as const,
+      verdict: 'approved' as const,
+      summary: 'Looks good.',
+      allPbisMapped: true,
+      planExecutionComplete: true,
+      hasMissingArticleChanges: false,
+      hasUnresolvedDiscoveredWork: false,
+      createdAtUtc: new Date().toISOString(),
+      planId: 'plan-1',
+      workerReportId: 'worker-1'
+    };
+
+    const validation = orchestrator.validateFinalApproval({ plan, workerReport, finalReview });
+    expect(validation.ok).toBe(false);
+    expect(validation.reasons.join(' ')).toContain('unresolved discovered work');
+    expect(validation.reasons.join(' ')).toContain('no worker execution result');
   });
 
   test('builds proposal review queue, detail payload, and persists decisions', async () => {
@@ -847,5 +1566,64 @@ test.describe('workspace repository content model', () => {
 
     const refreshedTree = await repository.getExplorerTree(created.id);
     expect(refreshedTree[0].locales[0].revision.updatedAtUtc).toBe('2026-03-22T16:45:00.000Z');
+  });
+
+  test('backfills legacy ai_runs into orchestration history during migration repair', async () => {
+    const created = await repository.createWorkspace({
+      name: `LegacyBatchRepair-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Legacy Sprint',
+      'legacy.csv',
+      'imports/legacy.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.recordBatchAnalysisRun({
+      workspaceId: created.id,
+      batchId: batch.id,
+      sessionId: 'legacy-session-1',
+      kbAccessMode: 'mcp',
+      agentModelId: 'gpt-5.4',
+      status: 'complete',
+      startedAtUtc: new Date().toISOString(),
+      endedAtUtc: new Date().toISOString(),
+      promptTemplate: 'Legacy single-run prompt.',
+      transcriptPath: 'transcripts/legacy-session-1.jsonl',
+      toolCalls: [],
+      rawOutput: ['legacy ok'],
+      message: 'Legacy batch analysis completed before orchestration rollout.'
+    });
+
+    const health = await repository.getMigrationHealth(created.id);
+    expect(health.workspaces).toHaveLength(1);
+    expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledLegacyIterations).toBeGreaterThan(0);
+    expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledLegacyWorkerReports).toBeGreaterThan(0);
+    expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledStageEvents).toBeGreaterThan(0);
+
+    const snapshot = await repository.getBatchAnalysisSnapshot(created.id, batch.id);
+    expect(snapshot.latestIteration?.stage).toBe('approved');
+    expect(snapshot.latestWorkerReport?.summary).toContain('Legacy batch analysis completed');
+
+    const runtimeStatus = await repository.getBatchAnalysisRuntimeStatus(created.id, batch.id);
+    expect(runtimeStatus?.stage).toBe('approved');
+    expect(runtimeStatus?.latestEventType).toBe('iteration_completed');
+
+    const eventStream = await repository.getBatchAnalysisEventStream(created.id, batch.id, 10);
+    expect(eventStream.events.some((event) => event.eventType === 'iteration_started')).toBeTruthy();
+    expect(eventStream.events.some((event) => event.eventType === 'iteration_completed')).toBeTruthy();
   });
 });

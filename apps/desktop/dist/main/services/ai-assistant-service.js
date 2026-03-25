@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AiAssistantService = void 0;
+const node_fs_1 = require("node:fs");
 const node_crypto_1 = require("node:crypto");
 const node_path_1 = __importDefault(require("node:path"));
 const shared_types_1 = require("@kb-vault/shared-types");
@@ -193,12 +194,14 @@ class AiAssistantService {
                 localeVariantId: this.resolveRuntimeLocaleVariantId(context),
                 sessionId: session.runtimeSessionId ?? undefined,
                 kbAccessMode,
+                sessionMode: 'agent',
                 locale: context.subject?.locale,
                 prompt: this.buildAskPrompt(context, input.message, this.listMessages(db, session.id)),
                 sessionType: 'assistant_chat'
             }, () => undefined, () => false);
             const directWorkingStateMutationApplied = this.didWorkingStateChangeDuringTurn(context);
-            const parsed = this.parseRuntimeResult(runtimeResult.resultPayload, context, input.message, directWorkingStateMutationApplied);
+            const transcriptFallbackText = await this.extractTranscriptAssistantText(runtimeResult.transcriptPath);
+            const parsed = this.parseRuntimeResult(runtimeResult.resultPayload, context, input.message, directWorkingStateMutationApplied, transcriptFallbackText, runtimeResult.status === 'error' ? runtimeResult.message : undefined);
             const artifact = this.insertArtifact(db, {
                 sessionId: session.id,
                 workspaceId: input.workspaceId,
@@ -410,9 +413,10 @@ class AiAssistantService {
             .map((item) => `${item.role.toUpperCase()} (${item.messageKind}): ${item.content}`)
             .join('\n');
         return [
-            'You are the KB Vault global AI assistant in ask mode.',
-            'Return only valid JSON.',
-            'JSON schema:',
+            'You are the KB Vault global AI assistant.',
+            'For normal conversational help, explanations, summaries, and workflow guidance, answer in plain text.',
+            'Only return JSON when you are intentionally requesting an artifact action such as creating a proposal, patching a proposal, patching a draft, or patching a template.',
+            'When you do return JSON, use this schema:',
             '{',
             '  "command": "none | create_proposal | patch_proposal | patch_draft | patch_template",',
             '  "artifactType": "informational_response | proposal_candidate | proposal_patch | draft_patch | template_patch | clarification_request",',
@@ -437,9 +441,10 @@ class AiAssistantService {
             'Rules:',
             '- Use working state as the source of truth when it exists.',
             '- Do not silently publish, finalize, or persist user content.',
-            '- Any mutating result must include an explicit command. Without a valid command, the result will be treated as informational_response.',
-            '- If the user is asking a question, greeting you, asking for explanation, or chatting back and forth, use informational_response.',
-            '- For informational_response, return only the user-facing response text. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
+            '- Any mutating result must include an explicit command and valid JSON. Without a valid command, the result will be treated as informational_response.',
+            '- If the user is asking a question, greeting you, asking for explanation, or chatting back and forth, prefer a plain-text answer instead of JSON.',
+            '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
+            '- If you choose JSON for informational_response, return only the user-facing response text. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
             '- On the first meaningful reply in a new chat, include a short human-readable title in "title" based on the user request.',
             '- For informational_response, omit summary unless it is genuinely needed for internal bookkeeping.',
             '- For draft edits, return the full replacement HTML in "html".',
@@ -461,14 +466,18 @@ class AiAssistantService {
             '- For normal questions like "what page am I on", "can you see my inputs", explanations, summaries, navigation help, or workflow advice, use command=none and artifactType=informational_response.'
         ].filter(Boolean).join('\n\n');
     }
-    parseRuntimeResult(resultPayload, context, userMessage, directWorkingStateMutationApplied = false) {
+    parseRuntimeResult(resultPayload, context, userMessage, directWorkingStateMutationApplied = false, transcriptFallbackText, runtimeFailureMessage) {
         const parsed = extractJsonObject(resultPayload);
         const allowed = new Set(this.allowedArtifactTypes(context));
         const requestedArtifactType = parsed?.artifactType && allowed.has(parsed.artifactType)
             ? parsed.artifactType
             : 'informational_response';
-        const rawResponse = extractString(parsed?.response) ?? extractString(parsed?.summary) ?? extractAssistantText(resultPayload);
-        const response = unwrapAssistantDisplayText(rawResponse) ?? 'Assistant completed the request.';
+        const rawResponse = extractString(parsed?.response)
+            ?? extractString(parsed?.summary)
+            ?? extractAssistantText(resultPayload)
+            ?? transcriptFallbackText
+            ?? runtimeFailureMessage;
+        const response = unwrapAssistantDisplayText(rawResponse) ?? 'I ran into a runtime error before the assistant produced a reply.';
         const summary = extractString(parsed?.summary) ?? response;
         const html = extractString(parsed?.html) ?? undefined;
         const formPatch = parsed?.formPatch && typeof parsed.formPatch === 'object' ? parsed.formPatch : undefined;
@@ -656,6 +665,68 @@ class AiAssistantService {
         const db = (0, db_1.openWorkspaceDatabase)(dbPath);
         this.migrateLegacyArticleSessions(db, workspaceId);
         return db;
+    }
+    async extractTranscriptAssistantText(transcriptPath) {
+        if (!transcriptPath) {
+            return undefined;
+        }
+        try {
+            const text = await node_fs_1.promises.readFile(transcriptPath, 'utf8');
+            const chunkParts = [];
+            const candidates = [];
+            for (const rawLine of text.split('\n')) {
+                const line = rawLine.trim();
+                if (!line)
+                    continue;
+                let parsedLine = null;
+                try {
+                    parsedLine = JSON.parse(line);
+                }
+                catch {
+                    continue;
+                }
+                if (!parsedLine || parsedLine.direction !== 'from_agent') {
+                    continue;
+                }
+                if (parsedLine.event === 'response' && typeof parsedLine.payload === 'string') {
+                    try {
+                        const payload = JSON.parse(parsedLine.payload);
+                        const candidate = extractAssistantText(payload.result);
+                        if (candidate) {
+                            candidates.push(candidate);
+                        }
+                    }
+                    catch {
+                        // ignore malformed transcript response payloads
+                    }
+                    continue;
+                }
+                if (parsedLine.event === 'session_update' && typeof parsedLine.payload === 'string') {
+                    try {
+                        const payload = JSON.parse(parsedLine.payload);
+                        const chunkText = payload.update?.sessionUpdate === 'agent_message_chunk'
+                            ? extractString(payload.update.content?.text)
+                            : undefined;
+                        if (chunkText) {
+                            appendAssistantTranscriptChunk(chunkParts, chunkText);
+                        }
+                    }
+                    catch {
+                        // ignore malformed transcript update payloads
+                    }
+                }
+            }
+            const chunkCandidate = collapseAssistantTranscriptText(chunkParts.join(''));
+            if (chunkCandidate) {
+                candidates.push(chunkCandidate);
+            }
+            return candidates
+                .map((candidate) => candidate.trim())
+                .find(Boolean);
+        }
+        catch {
+            return undefined;
+        }
     }
     ensureSession(db, context, sessionId) {
         if (sessionId) {
@@ -1267,6 +1338,46 @@ function unwrapAssistantDisplayText(value) {
         return parsedResponse;
     }
     return value;
+}
+function collapseAssistantTranscriptText(value) {
+    let current = value;
+    while (current.trim().length >= 64 && current.length % 2 === 0) {
+        const midpoint = current.length / 2;
+        const left = current.slice(0, midpoint);
+        const right = current.slice(midpoint);
+        if (!left.trim() || left !== right) {
+            break;
+        }
+        current = left;
+    }
+    return current.trim();
+}
+function findAssistantTranscriptChunkOverlap(left, right) {
+    const maxOverlap = Math.min(left.length, right.length);
+    for (let overlap = maxOverlap; overlap >= 24; overlap -= 1) {
+        if (left.slice(-overlap) === right.slice(0, overlap)) {
+            return overlap;
+        }
+    }
+    return 0;
+}
+function appendAssistantTranscriptChunk(chunks, text) {
+    if (!text.trim()) {
+        return;
+    }
+    const assembled = chunks.join('');
+    if (!assembled) {
+        chunks.push(text);
+        return;
+    }
+    if (assembled.endsWith(text)) {
+        return;
+    }
+    const overlap = findAssistantTranscriptChunkOverlap(assembled, text);
+    const suffix = overlap > 0 ? text.slice(overlap) : text;
+    if (suffix) {
+        chunks.push(suffix);
+    }
 }
 function stringifyResult(value) {
     if (typeof value === 'string' && value.trim()) {

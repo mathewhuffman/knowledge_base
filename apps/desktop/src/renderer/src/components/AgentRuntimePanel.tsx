@@ -1,10 +1,14 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type {
   AgentHealthCheckResponse,
+  BatchAnalysisInspectionResponse,
+  BatchAnalysisEventStreamResponse,
+  BatchAnalysisRuntimeStatus,
   AgentSessionRecord,
   AgentTranscriptLine,
   AgentToolCallAudit,
   AgentStreamingPayload,
+  BatchAnalysisSnapshotResponse,
   KbAccessMode,
   KbAccessHealth,
   PersistedAgentAnalysisRun,
@@ -38,9 +42,49 @@ import {
   IconServer,
 } from './icons';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
+import { BatchAnalysisInspector } from './batch-analysis/BatchAnalysisInspector';
 
 function parseModeFromUnknown(value: unknown): KbAccessMode | null {
   return value === 'mcp' || value === 'cli' ? value : null;
+}
+
+function parseRuntimeStatusFromUnknown(value: unknown): BatchAnalysisRuntimeStatus | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const candidate = value as Partial<BatchAnalysisRuntimeStatus>;
+  if (typeof candidate.workspaceId !== 'string' || typeof candidate.batchId !== 'string') {
+    return null;
+  }
+  return {
+    workspaceId: candidate.workspaceId,
+    batchId: candidate.batchId,
+    iterationId: typeof candidate.iterationId === 'string' ? candidate.iterationId : undefined,
+    iteration: typeof candidate.iteration === 'number' ? candidate.iteration : undefined,
+    iterationStatus: candidate.iterationStatus,
+    stage: candidate.stage,
+    role: candidate.role,
+    agentModelId: typeof candidate.agentModelId === 'string' ? candidate.agentModelId : undefined,
+    sessionId: typeof candidate.sessionId === 'string' ? candidate.sessionId : undefined,
+    approvedPlanId: typeof candidate.approvedPlanId === 'string' ? candidate.approvedPlanId : undefined,
+    lastReviewVerdict: candidate.lastReviewVerdict,
+    outstandingDiscoveredWorkCount: typeof candidate.outstandingDiscoveredWorkCount === 'number' ? candidate.outstandingDiscoveredWorkCount : 0,
+    executionCounts: candidate.executionCounts ?? {
+      total: 0,
+      create: 0,
+      edit: 0,
+      retire: 0,
+      noImpact: 0,
+      executed: 0,
+      blocked: 0,
+      rejected: 0,
+    },
+    stageStartedAtUtc: typeof candidate.stageStartedAtUtc === 'string' ? candidate.stageStartedAtUtc : undefined,
+    stageEndedAtUtc: typeof candidate.stageEndedAtUtc === 'string' ? candidate.stageEndedAtUtc : undefined,
+    updatedAtUtc: typeof candidate.updatedAtUtc === 'string' ? candidate.updatedAtUtc : undefined,
+    latestEventId: typeof candidate.latestEventId === 'string' ? candidate.latestEventId : undefined,
+    latestEventType: candidate.latestEventType,
+  };
 }
 
 /* ---------- Helpers ---------- */
@@ -1342,6 +1386,11 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const [currentRunModel, setCurrentRunModel] = useState<string | null>(null);
   const [stickyHistorySessionId, setStickyHistorySessionId] = useState<string | null>(null);
   const [persistedRun, setPersistedRun] = useState<PersistedAgentAnalysisRun | null>(null);
+  const [persistedOrchestration, setPersistedOrchestration] = useState<BatchAnalysisSnapshotResponse | null>(null);
+  const [persistedInspection, setPersistedInspection] = useState<BatchAnalysisInspectionResponse | null>(null);
+  const [persistedRuntimeStatus, setPersistedRuntimeStatus] = useState<BatchAnalysisRuntimeStatus | null>(null);
+  const [persistedEventStream, setPersistedEventStream] = useState<BatchAnalysisEventStreamResponse | null>(null);
+  const [liveRuntimeStatus, setLiveRuntimeStatus] = useState<BatchAnalysisRuntimeStatus | null>(null);
   const [persistedTranscriptLines, setPersistedTranscriptLines] = useState<AgentTranscriptLine[]>([]);
   const [persistedHistoryLoading, setPersistedHistoryLoading] = useState(false);
   const [persistedHistoryError, setPersistedHistoryError] = useState<string | null>(null);
@@ -1418,23 +1467,50 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     setPersistedHistoryLoading(true);
     setPersistedHistoryError(null);
     try {
-      const response = await window.kbv.invoke<PersistedAgentAnalysisRunResponse>('agent.analysis.latest', {
-        workspaceId,
-        batchId,
-        limit: 0,
-      }) as RpcResponse<PersistedAgentAnalysisRunResponse>;
+      const [response, inspectionResponse, runtimeResponse, eventStreamResponse] = await Promise.all([
+        window.kbv.invoke<PersistedAgentAnalysisRunResponse>('agent.analysis.latest', {
+          workspaceId,
+          batchId,
+          limit: 0,
+        }) as Promise<RpcResponse<PersistedAgentAnalysisRunResponse>>,
+        window.kbv.invoke<BatchAnalysisInspectionResponse>('batch.analysis.inspection.get', {
+          workspaceId,
+          batchId,
+        }) as Promise<RpcResponse<BatchAnalysisInspectionResponse>>,
+        window.kbv.invoke<BatchAnalysisRuntimeStatus | null>('batch.analysis.runtime.get', {
+          workspaceId,
+          batchId,
+        }) as Promise<RpcResponse<BatchAnalysisRuntimeStatus | null>>,
+        window.kbv.invoke<BatchAnalysisEventStreamResponse>('batch.analysis.events.get', {
+          workspaceId,
+          batchId,
+          limit: 50,
+        }) as Promise<RpcResponse<BatchAnalysisEventStreamResponse>>,
+      ]);
 
       if (response.ok && response.data) {
         setPersistedRun(response.data.run);
+        setPersistedOrchestration(response.data.orchestration ?? null);
+        setPersistedInspection(inspectionResponse.ok ? (inspectionResponse.data ?? null) : null);
+        setPersistedRuntimeStatus(runtimeResponse.ok ? (runtimeResponse.data ?? null) : null);
+        setPersistedEventStream(eventStreamResponse.ok ? (eventStreamResponse.data ?? null) : null);
         setPersistedTranscriptLines(response.data.lines ?? []);
         return;
       }
 
       setPersistedRun(null);
+      setPersistedOrchestration(null);
+      setPersistedInspection(null);
+      setPersistedRuntimeStatus(null);
+      setPersistedEventStream(null);
       setPersistedTranscriptLines([]);
       setPersistedHistoryError(response.error?.message ?? 'Saved analysis unavailable');
     } catch (err) {
       setPersistedRun(null);
+      setPersistedOrchestration(null);
+      setPersistedInspection(null);
+      setPersistedRuntimeStatus(null);
+      setPersistedEventStream(null);
       setPersistedTranscriptLines([]);
       setPersistedHistoryError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1460,6 +1536,18 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       const eventModel = (event as { metadata?: { agentModelId?: unknown } })?.metadata?.agentModelId;
       if (typeof eventModel === 'string' && eventModel.trim()) {
         setCurrentRunModel(eventModel.trim());
+      }
+      const orchestration = parseRuntimeStatusFromUnknown(
+        (event as { metadata?: { orchestration?: unknown } })?.metadata?.orchestration
+      );
+      if (orchestration) {
+        setLiveRuntimeStatus(orchestration);
+        if (orchestration.agentModelId?.trim()) {
+          setCurrentRunModel(orchestration.agentModelId.trim());
+        }
+        if (orchestration.sessionId?.trim()) {
+          setResolvedSessionId(orchestration.sessionId.trim());
+        }
       }
 
       setJobState(event.state);
@@ -1517,6 +1605,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
         if (payloadSessionId) {
           setStickyHistorySessionId(payloadSessionId);
         }
+        setLiveRuntimeStatus(null);
         void refreshSessions();
         void refreshPersistedHistory();
         if (payloadSessionId) {
@@ -1556,6 +1645,15 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const displaySessionId = (shouldUseLiveHistory ? activeLiveSessionId : null) ?? persistedRun?.sessionId ?? persistedRun?.id ?? activeLiveSessionId ?? null;
   const runtimeMode = (shouldUseLiveHistory ? activeSession?.kbAccessMode : null) ?? currentRunMode ?? persistedRun?.kbAccessMode ?? activeSession?.kbAccessMode ?? null;
   const runtimeModel = currentRunModel ?? persistedRun?.agentModelId ?? null;
+  const orchestrationIteration = liveRuntimeStatus ?? persistedRuntimeStatus ?? persistedOrchestration?.latestIteration ?? null;
+  const inspectionCounts = persistedInspection ? {
+    plans: persistedInspection.plans.length,
+    reviews: persistedInspection.reviews.length,
+    amendments: persistedInspection.amendments.length,
+    finalReviews: persistedInspection.finalReviews.length,
+    transcriptLinks: persistedInspection.transcriptLinks.length,
+    stageEvents: persistedEventStream?.events.length ?? 0,
+  } : null;
   const transcriptLines = shouldUseLiveHistory
     ? liveTranscriptLines
     : (persistedTranscriptLines.length > 0 ? persistedTranscriptLines : liveTranscriptLines);
@@ -1601,6 +1699,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     setEvents([]);
     setCurrentRunMode(null);
     setCurrentRunModel(null);
+    setLiveRuntimeStatus(null);
     setStickyHistorySessionId(null);
     terminalStateHandledRef.current = false;
     setJobState('QUEUED');
@@ -1643,7 +1742,11 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const hasHistory = Boolean(activeLiveSessionId || persistedRun);
   const shouldShowStartButton = !isRunning && !(startOnOpen && !hasHistory && !isDone);
   const canCopy =
-    visibleTranscriptLines.length > 0 || toolCalls.length > 0 || visibleEvents.length > 0 || persistedRawOutput.length > 0;
+    visibleTranscriptLines.length > 0
+    || toolCalls.length > 0
+    || visibleEvents.length > 0
+    || persistedRawOutput.length > 0
+    || (persistedEventStream?.events.length ?? 0) > 0;
 
   useEffect(() => {
     if (!startOnOpen) {
@@ -1710,6 +1813,20 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     if (progress > 0) {
       chunks.push(`Progress: ${progress}%`);
     }
+    if (orchestrationIteration) {
+      chunks.push(`Iteration: ${orchestrationIteration.iteration}`);
+      chunks.push(`Stage: ${orchestrationIteration.stage}`);
+      chunks.push(`Role: ${orchestrationIteration.role}`);
+      chunks.push(`Outstanding discoveries: ${orchestrationIteration.outstandingDiscoveredWorkCount}`);
+    }
+    if (inspectionCounts) {
+      chunks.push(`Plans tracked: ${inspectionCounts.plans}`);
+      chunks.push(`Reviews tracked: ${inspectionCounts.reviews}`);
+      chunks.push(`Amendments tracked: ${inspectionCounts.amendments}`);
+      chunks.push(`Final reviews tracked: ${inspectionCounts.finalReviews}`);
+      chunks.push(`Transcript links tracked: ${inspectionCounts.transcriptLinks}`);
+      chunks.push(`Stage events tracked: ${inspectionCounts.stageEvents}`);
+    }
 
     chunks.push('');
     chunks.push('Transcript');
@@ -1762,8 +1879,29 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       });
     }
 
+    chunks.push('');
+    chunks.push('Stage Events');
+    chunks.push('------------');
+    if (!persistedEventStream || persistedEventStream.events.length === 0) {
+      chunks.push('No persisted stage events');
+    } else {
+      persistedEventStream.events.forEach((event) => {
+        chunks.push(`[${formatTimestamp(event.createdAtUtc)}] ${event.eventType} ${event.stage} ${event.role}`);
+        if (event.summary) {
+          chunks.push(`Summary: ${event.summary}`);
+        }
+        if (event.lastReviewVerdict) {
+          chunks.push(`Verdict: ${event.lastReviewVerdict}`);
+        }
+        if (event.details) {
+          chunks.push(formatPayload(JSON.stringify(event.details, null, 2)));
+        }
+        chunks.push('');
+      });
+    }
+
     return chunks.join('\n');
-  }, [activeSession, batchId, jobState, persistedRawOutput, persistedRun, progress, toolCalls, visibleEvents, visibleTranscriptLines]);
+  }, [activeSession, batchId, inspectionCounts, jobState, orchestrationIteration, persistedEventStream, persistedRawOutput, persistedRun, progress, toolCalls, visibleEvents, visibleTranscriptLines]);
 
   const copyAnalysisContents = useCallback(() => {
     if (!canCopy) {
@@ -1854,6 +1992,38 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
                 <span className="agent-meta-value" style={{ fontFamily: 'var(--font-mono)' }}>{runtimeModel}</span>
               </div>
             )}
+            {!persistedInspection && orchestrationIteration?.iteration != null && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Iteration</span>
+                <span className="agent-meta-value">{orchestrationIteration.iteration}</span>
+              </div>
+            )}
+            {!persistedInspection && orchestrationIteration?.stage && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Stage</span>
+                <span className="agent-meta-value">{orchestrationIteration.stage}</span>
+              </div>
+            )}
+            {!persistedInspection && orchestrationIteration?.role && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Role</span>
+                <span className="agent-meta-value">{orchestrationIteration.role}</span>
+              </div>
+            )}
+            {!persistedInspection && orchestrationIteration && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Discoveries</span>
+                <span className="agent-meta-value">{orchestrationIteration.outstandingDiscoveredWorkCount}</span>
+              </div>
+            )}
+            {!persistedInspection && inspectionCounts && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Artifacts</span>
+                <span className="agent-meta-value">
+                  {inspectionCounts.plans} plans, {inspectionCounts.reviews} reviews, {inspectionCounts.finalReviews} finals, {inspectionCounts.stageEvents} stage events
+                </span>
+              </div>
+            )}
             {!activeSession && persistedRun?.endedAtUtc && (
               <div className="agent-meta-pair">
                 <span className="agent-meta-label">Ended</span>
@@ -1861,6 +2031,16 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
               </div>
             )}
           </div>
+
+          {/* Multi-stage batch analysis inspector */}
+          {persistedInspection && (
+            <BatchAnalysisInspector
+              inspection={persistedInspection}
+              runtimeStatus={liveRuntimeStatus ?? persistedRuntimeStatus}
+              eventStream={persistedEventStream}
+              isRunning={isRunning}
+            />
+          )}
 
           <div className="tab-bar">
             <button

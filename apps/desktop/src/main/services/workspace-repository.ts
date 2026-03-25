@@ -44,6 +44,28 @@ import {
   type ArticleRelationUpsertRequest,
   type KbAccessMode,
   type AgentToolCallAudit,
+  type BatchAnalysisExecutionCounts,
+  type BatchAnalysisEventStreamResponse,
+  type BatchAnalysisRuntimeStatus,
+  type BatchAnalysisStageEventDetails,
+  type BatchAnalysisStageEventRecord,
+  type BatchAnalysisFinalReviewDeltaRecord,
+  type BatchAnalysisInspectionResponse,
+  type BatchAnalysisIterationRecord,
+  type BatchAnalysisReviewDeltaRecord,
+  type BatchPlanAmendment,
+  type BatchAnalysisPlan,
+  type BatchAnalysisSnapshotResponse,
+  type BatchAnalysisStageStatus,
+  type BatchAnalysisArtifactVerdict,
+  type BatchAnalysisIterationStatus,
+  type BatchAnalysisTimelineEntry,
+  type BatchAnalysisTranscriptLink,
+  type BatchDiscoveredWorkItem,
+  type BatchFinalReview,
+  type BatchPlanItem,
+  type BatchPlanReview,
+  type BatchWorkerExecutionReport,
   type PersistedAgentAnalysisRun,
   type PBIRecord,
   type PBIBatchRecord,
@@ -51,6 +73,7 @@ import {
   type LineageRecord,
   type PlaceholderToken,
   type WorkspaceRoutePayload,
+  type WorkspaceBatchAnalysisRepairSummary,
   type ArticleFamilyRecord,
   type LocaleVariantRecord,
   type RevisionRecord,
@@ -150,7 +173,16 @@ const WORKSPACE_SCOPED_DB_TABLES = [
   'zendesk_sync_runs',
   'article_relation_runs',
   'article_relations',
-  'article_relation_overrides'
+  'article_relation_overrides',
+  'batch_analysis_iterations',
+  'batch_analysis_plans',
+  'batch_analysis_plan_items',
+  'batch_analysis_reviews',
+  'batch_analysis_worker_reports',
+  'batch_analysis_discovered_work',
+  'batch_analysis_final_reviews',
+  'batch_analysis_amendments',
+  'batch_analysis_stage_events'
 ] as const;
 const PBIBATCH_STATUS_SEQUENCE: Array<PBIBatchStatus> = [
   PBIBatchStatus.IMPORTED,
@@ -310,6 +342,7 @@ export interface WorkspaceMigrationHealth {
   workspaceDbVersion: number;
   repaired: boolean;
   exists: boolean;
+  batchAnalysisRepair?: WorkspaceBatchAnalysisRepairSummary;
 }
 
 export interface WorkspaceMigrationHealthReport {
@@ -317,6 +350,34 @@ export interface WorkspaceMigrationHealthReport {
   workspaceId: string | null;
   workspaces: WorkspaceMigrationHealth[];
 }
+
+const ACP_ALLOWED_MODEL_IDS = new Set([
+  'composer-2[fast=true]',
+  'composer-1.5[]',
+  'gpt-5.3-codex[reasoning=medium,fast=false]',
+  'gpt-5.4[reasoning=medium,context=272k,fast=false]',
+  'claude-sonnet-4-6[thinking=true,context=200k,effort=medium]',
+  'claude-opus-4-6[thinking=true,context=200k,effort=high,fast=false]',
+  'claude-opus-4-5[thinking=true]',
+  'gpt-5.2[reasoning=medium,fast=false]',
+  'gemini-3.1-pro[]',
+  'gpt-5.4-mini[reasoning=medium]',
+  'gpt-5.4-nano[reasoning=medium]',
+  'claude-haiku-4-5[thinking=true]',
+  'gpt-5.3-codex-spark[reasoning=medium]',
+  'grok-4-20[thinking=true]',
+  'claude-sonnet-4-5[thinking=true,context=200k]',
+  'gpt-5.2-codex[reasoning=medium,fast=false]',
+  'gpt-5.1-codex-max[reasoning=medium,fast=false]',
+  'gpt-5.1[reasoning=medium]',
+  'gemini-3-pro[]',
+  'gemini-3-flash[]',
+  'gpt-5.1-codex-mini[reasoning=medium]',
+  'claude-sonnet-4[thinking=false,context=200k]',
+  'gpt-5-mini[]',
+  'gemini-2.5-flash[]',
+  'kimi-k2.5[]'
+]);
 
 export class WorkspaceRepository {
   private readonly catalogDbPath: string;
@@ -336,6 +397,14 @@ export class WorkspaceRepository {
     const withoutMarkers = withoutAnsi.replace(/\s+\((?:current|default)[^)]+\)\s*$/i, '').trim();
     const normalized = withoutMarkers.split(/\s+-\s+/, 1)[0]?.trim() ?? withoutMarkers;
     return normalized || undefined;
+  }
+
+  private normalizeAcpModelId(modelId?: string | null): string | undefined {
+    const normalized = this.normalizeAgentModelId(modelId);
+    if (!normalized || !ACP_ALLOWED_MODEL_IDS.has(normalized)) {
+      return undefined;
+    }
+    return normalized;
   }
 
   async listWorkspaces(): Promise<WorkspaceRecord[]> {
@@ -389,9 +458,10 @@ export class WorkspaceRepository {
           enabled_locales: string;
           kb_access_mode: string | null;
           agent_model_id: string | null;
+          acp_model_id: string | null;
         }>(
           `SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
-            , kb_access_mode, agent_model_id
+            , kb_access_mode, agent_model_id, acp_model_id
            FROM workspace_settings WHERE workspace_id = @workspaceId`,
           { workspaceId: id }
         );
@@ -404,16 +474,17 @@ export class WorkspaceRepository {
             defaultLocale: settings.default_locale,
             enabledLocales: safeParseLocales(settings.enabled_locales),
             kbAccessMode: normalizeKbAccessMode(settings.kb_access_mode),
-            agentModelId: this.normalizeAgentModelId(settings.agent_model_id)
+            agentModelId: this.normalizeAgentModelId(settings.agent_model_id),
+            acpModelId: this.normalizeAcpModelId(settings.acp_model_id)
           };
         }
 
         const enabledLocales = safeParseLocales(row.enabled_locales);
         workspaceDb.run(
           `INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, acp_model_id, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @acpModelId, @updatedAt
           )`,
           {
             workspaceId: id,
@@ -423,6 +494,7 @@ export class WorkspaceRepository {
             enabledLocales: JSON.stringify(enabledLocales),
             kbAccessMode: DEFAULT_KB_ACCESS_MODE,
             agentModelId: null,
+            acpModelId: null,
             updatedAt: new Date().toISOString()
           }
         );
@@ -434,7 +506,8 @@ export class WorkspaceRepository {
           defaultLocale: row.default_locale,
           enabledLocales,
           kbAccessMode: DEFAULT_KB_ACCESS_MODE,
-          agentModelId: undefined
+          agentModelId: undefined,
+          acpModelId: undefined
         };
       } finally {
         workspaceDb.close();
@@ -468,9 +541,10 @@ export class WorkspaceRepository {
           enabled_locales: string;
           kb_access_mode: string | null;
           agent_model_id: string | null;
+          acp_model_id: string | null;
         }>(
           `SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
-            , kb_access_mode, agent_model_id
+            , kb_access_mode, agent_model_id, acp_model_id
            FROM workspace_settings WHERE workspace_id = @workspaceId`,
           { workspaceId: payload.workspaceId }
         );
@@ -486,7 +560,8 @@ export class WorkspaceRepository {
           payload.defaultLocale === undefined &&
           payload.enabledLocales === undefined &&
           payload.kbAccessMode === undefined &&
-          payload.agentModelId === undefined
+          payload.agentModelId === undefined &&
+          payload.acpModelId === undefined
         ) {
           throw new Error('No settings provided');
         }
@@ -509,6 +584,9 @@ export class WorkspaceRepository {
         if (typeof payload.agentModelId === 'string' && !payload.agentModelId.trim()) {
           throw new Error('agentModelId cannot be empty');
         }
+        if (typeof payload.acpModelId === 'string' && !payload.acpModelId.trim()) {
+          throw new Error('acpModelId cannot be empty');
+        }
 
         const enabledLocales = payload.enabledLocales?.length
           ? normalizeLocales(payload.enabledLocales)
@@ -520,6 +598,9 @@ export class WorkspaceRepository {
         const nextAgentModelId = payload.agentModelId !== undefined
           ? this.normalizeAgentModelId(payload.agentModelId)
           : this.normalizeAgentModelId(existing?.agent_model_id);
+        const nextAcpModelId = payload.acpModelId !== undefined
+          ? this.normalizeAcpModelId(payload.acpModelId)
+          : this.normalizeAcpModelId(existing?.acp_model_id);
 
         if (!nextSubdomain) {
           throw new Error('zendeskSubdomain cannot be empty');
@@ -539,9 +620,9 @@ export class WorkspaceRepository {
 
         workspaceDb.run(
           `INSERT OR REPLACE INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, acp_model_id, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @acpModelId, @updatedAt
           )`,
           {
             workspaceId: payload.workspaceId,
@@ -551,6 +632,7 @@ export class WorkspaceRepository {
             enabledLocales: JSON.stringify(normalizedEnabledLocales),
             kbAccessMode: nextKbAccessMode,
             agentModelId: nextAgentModelId ?? null,
+            acpModelId: nextAcpModelId ?? null,
             updatedAt: now
           }
         );
@@ -580,7 +662,8 @@ export class WorkspaceRepository {
           defaultLocale: nextDefaultLocale,
           enabledLocales: normalizedEnabledLocales,
           kbAccessMode: nextKbAccessMode,
-          agentModelId: nextAgentModelId
+          agentModelId: nextAgentModelId,
+          acpModelId: nextAcpModelId
         };
       } finally {
         workspaceDb.close();
@@ -660,9 +743,9 @@ export class WorkspaceRepository {
       try {
         workspaceDb.run(
           `INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, acp_model_id, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @acpModelId, @updatedAt
           )`,
           {
             workspaceId: id,
@@ -672,6 +755,7 @@ export class WorkspaceRepository {
             enabledLocales: JSON.stringify(enabledLocales),
             kbAccessMode: DEFAULT_KB_ACCESS_MODE,
             agentModelId: null,
+            acpModelId: null,
             updatedAt: now
           }
         );
@@ -765,7 +849,6 @@ export class WorkspaceRepository {
 
   async getWorkspaceList(): Promise<WorkspaceListItem[]> {
     const startedAt = Date.now();
-    logger.info('workspace-repository.getWorkspaceList quick start');
     let catalog: ReturnType<typeof openWorkspaceDatabase>;
     try {
       catalog = await this.openCatalogWithRecovery();
@@ -778,14 +861,12 @@ export class WorkspaceRepository {
       return [];
     }
 
-    let itemCount = 0;
     try {
       const catalogRows = catalog.all<CatalogWorkspaceRow>(`
         SELECT id, name, path, created_at, updated_at, last_opened_at, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, state, is_default
         FROM workspaces
         ORDER BY name COLLATE NOCASE
       `);
-      itemCount = catalogRows.length;
       const items = catalogRows.map((row) => ({
         ...mapWorkspaceRow(row),
         articleCount: 0,
@@ -800,11 +881,6 @@ export class WorkspaceRepository {
       });
       return [];
     } finally {
-      const elapsedMs = Date.now() - startedAt;
-      logger.info('workspace-repository.getWorkspaceList quick path', {
-        elapsedMs,
-        count: itemCount
-      });
       catalog.close();
     }
   }
@@ -2226,8 +2302,12 @@ export class WorkspaceRepository {
   async searchArticles(workspaceId: string, payload: SearchPayload): Promise<SearchResponse> {
     const workspace = await this.getWorkspace(workspaceId);
     await this.ensureWorkspaceDb(workspace.path);
-    const query = payload.query.trim().toLowerCase();
-    if (!query) {
+    const query = (payload.query ?? '').trim().toLowerCase();
+    const localeVariantIdFilter = new Set(normalizeSearchIdList(payload.localeVariantIds));
+    const familyIdFilter = new Set(normalizeSearchIdList(payload.familyIds));
+    const revisionIdFilter = new Set(normalizeSearchIdList(payload.revisionIds));
+    const hasIdFilters = localeVariantIdFilter.size > 0 || familyIdFilter.size > 0 || revisionIdFilter.size > 0;
+    if (!query && !hasIdFilters) {
       return { workspaceId, total: 0, results: [] };
     }
 
@@ -2235,10 +2315,7 @@ export class WorkspaceRepository {
     try {
       const scope = normalizeSearchScope(payload.scope);
       const includeArchived = Boolean(payload.includeArchived);
-      const familyQueryParams = {
-        q: query,
-        includeArchived: includeArchived ? 1 : 0
-      };
+      const familyQueryParams = { q: query };
 
       const families = workspaceDb.all<{
         id: string;
@@ -2248,7 +2325,14 @@ export class WorkspaceRepository {
         category_id: string | null;
         retired_at: string | null;
       }>(
-        includeArchived
+        (hasIdFilters || !query)
+          ? (includeArchived
+            ? `SELECT id, title, external_key, section_id, category_id, retired_at
+               FROM article_families`
+            : `SELECT id, title, external_key, section_id, category_id, retired_at
+               FROM article_families
+               WHERE retired_at IS NULL`)
+          : includeArchived
           ? `SELECT id, title, external_key, section_id, category_id, retired_at
              FROM article_families
              WHERE lower(title) LIKE '%' || @q || '%' OR lower(external_key) LIKE '%' || @q || '%'`
@@ -2280,6 +2364,27 @@ export class WorkspaceRepository {
         updatedAtUtc: revision.updated_at,
         filePath: revision.file_path
       })));
+      const revisionsByVariant = new Map<string, Array<{
+        revisionId: string;
+        localeVariantId: string;
+        revisionNumber: number;
+        revisionType: RevisionState;
+        updatedAtUtc: string;
+        filePath: string;
+      }>>();
+      for (const revision of revisions) {
+        const normalizedRevision = {
+          revisionId: revision.id,
+          localeVariantId: revision.locale_variant_id,
+          revisionNumber: revision.revision_number,
+          revisionType: revision.revision_type,
+          updatedAtUtc: revision.updated_at,
+          filePath: revision.file_path
+        };
+        const existing = revisionsByVariant.get(normalizedRevision.localeVariantId) ?? [];
+        existing.push(normalizedRevision);
+        revisionsByVariant.set(normalizedRevision.localeVariantId, existing);
+      }
 
       const localeVariantToDraftCount = new Map<string, number>();
       const draftCounts = workspaceDb.all<{ locale_variant_id: string; total: number }>(
@@ -2310,57 +2415,73 @@ export class WorkspaceRepository {
       for (const family of families) {
         const familyVariants = variants.filter((variant) => variant.familyId === family.id);
         for (const variant of familyVariants) {
-          if (payload.locales?.length && !payload.locales.includes(variant.locale)) {
-            continue;
-          }
-
           const statusState = localeVariantStatus.get(variant.id);
-          const revision = revisionByVariant.get(variant.id);
+          const exactRevision = (revisionsByVariant.get(variant.id) ?? []).find((revision) => revisionIdFilter.has(revision.revisionId));
+          const revision = exactRevision ?? revisionByVariant.get(variant.id);
           if (!statusState || !revision) {
             continue;
           }
 
-          if (scope === 'retired' && !family.retired_at) {
-            continue;
-          }
-          if (scope === 'live' && family.retired_at) {
-            continue;
-          }
+          const directIdMatch = familyIdFilter.has(family.id) || localeVariantIdFilter.has(variant.id) || Boolean(exactRevision);
+          if (!directIdMatch) {
+            if (payload.locales?.length && !payload.locales.includes(variant.locale)) {
+              continue;
+            }
 
-          if (!passSearchScope(
-            statusState,
-            scope,
-            variantToDraftCount(localeVariantToDraftCount, variant.id),
-            payload.hasDrafts,
-            payload.includeConflicts,
-            payload.changedWithinHours,
-            revision.updatedAtUtc
-          )) {
-            continue;
+            if (scope === 'retired' && !family.retired_at) {
+              continue;
+            }
+            if (scope === 'live' && family.retired_at) {
+              continue;
+            }
+
+            if (!passSearchScope(
+              statusState,
+              scope,
+              variantToDraftCount(localeVariantToDraftCount, variant.id),
+              payload.hasDrafts,
+              payload.includeConflicts,
+              payload.changedWithinHours,
+              revision.updatedAtUtc
+            )) {
+              continue;
+            }
           }
 
           const hasRevisionFile = await this.fileExists(resolveRevisionPath(workspace.path, revision.filePath));
-          let matchSource: SearchSourceMatch = { context: 'title', snippet: family.title, scoreBoost: 1.5 };
-          if (hasRevisionFile) {
-            const sourceHtml = await this.readRevisionSource(
-              resolveRevisionPath(workspace.path, revision.filePath)
-            );
-            const match = findTextMatch(sourceHtml, query);
-            if (!match && family.external_key.toLowerCase().includes(query)) {
-              matchSource = {
-                context: 'metadata',
-                snippet: `external_key: ${family.external_key}`,
-                scoreBoost: 0.9
-              };
+          let matchSource: SearchSourceMatch = {
+            context: directIdMatch ? 'metadata' : 'title',
+            snippet: directIdMatch
+              ? `familyId=${family.id}; localeVariantId=${variant.id}; revisionId=${revision.revisionId}`
+              : family.title,
+            scoreBoost: directIdMatch ? 3 : 1.5
+          };
+          let queryMatched = !query;
+          if (query) {
+            if (hasRevisionFile) {
+              const sourceHtml = await this.readRevisionSource(
+                resolveRevisionPath(workspace.path, revision.filePath)
+              );
+              const match = findTextMatch(sourceHtml, query);
+              if (!match && family.external_key.toLowerCase().includes(query)) {
+                matchSource = {
+                  context: 'metadata',
+                  snippet: `external_key: ${family.external_key}`,
+                  scoreBoost: 0.9
+                };
+                queryMatched = true;
+              }
+              if (match) {
+                matchSource = match;
+                queryMatched = true;
+              }
             }
-            if (match) {
-              matchSource = match;
+            if (!queryMatched && family.title.toLowerCase().includes(query)) {
+              matchSource = { context: 'title', snippet: family.title, scoreBoost: 1.5 };
+              queryMatched = true;
             }
-          } else if (!family.title.toLowerCase().includes(query)) {
-            continue;
           }
-
-          if (!revision) {
+          if (!directIdMatch && !queryMatched) {
             continue;
           }
           const familyStatus = family.retired_at ? RevisionState.RETIRED : (statusState?.status ?? RevisionState.LIVE);
@@ -2374,7 +2495,7 @@ export class WorkspaceRepository {
             familyExternalKey: family.external_key,
             snippet: buildSearchSnippet(matchSource.snippet),
             matchContext: matchSource.context,
-            score: Number((matchSource.scoreBoost / Math.max(1, (payload.query.length / 3))).toFixed(3))
+            score: Number((matchSource.scoreBoost / Math.max(1, (query.length / 3) || 1)).toFixed(3))
           });
         }
       }
@@ -3567,11 +3688,899 @@ export class WorkspaceRepository {
     }
   }
 
+  async createBatchAnalysisIteration(params: {
+    workspaceId: string;
+    batchId: string;
+    stage: BatchAnalysisStageStatus;
+    role: BatchAnalysisIterationRecord['role'];
+    status: BatchAnalysisIterationStatus;
+    summary?: string;
+    agentModelId?: string;
+    sessionId?: string;
+    approvedPlanId?: string;
+    lastReviewVerdict?: BatchAnalysisArtifactVerdict;
+    outstandingDiscoveredWorkCount?: number;
+    executionCounts?: BatchAnalysisExecutionCounts;
+    startedAtUtc?: string;
+    endedAtUtc?: string;
+  }): Promise<BatchAnalysisIterationRecord> {
+    const workspace = await this.getWorkspace(params.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const now = new Date().toISOString();
+      const row = workspaceDb.get<{ nextIteration: number }>(
+        `SELECT COALESCE(MAX(iteration), 0) + 1 as nextIteration
+           FROM batch_analysis_iterations
+          WHERE workspace_id = @workspaceId AND batch_id = @batchId`,
+        { workspaceId: params.workspaceId, batchId: params.batchId }
+      );
+      const iteration = row?.nextIteration ?? 1;
+      const id = randomUUID();
+      const executionCounts = this.normalizeBatchAnalysisExecutionCounts(params.executionCounts);
+      workspaceDb.run(
+        `INSERT INTO batch_analysis_iterations (
+          id, workspace_id, batch_id, iteration, status, stage, role, summary, agent_model_id, session_id,
+          approved_plan_id, last_review_verdict, outstanding_discovered_work_count, execution_counts_json,
+          started_at, ended_at, created_at, updated_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iteration, @status, @stage, @role, @summary, @agentModelId, @sessionId,
+          @approvedPlanId, @lastReviewVerdict, @outstandingDiscoveredWorkCount, @executionCountsJson,
+          @startedAtUtc, @endedAtUtc, @createdAtUtc, @updatedAtUtc
+        )`,
+        {
+          id,
+          workspaceId: params.workspaceId,
+          batchId: params.batchId,
+          iteration,
+          status: params.status,
+          stage: params.stage,
+          role: params.role,
+          summary: params.summary ?? null,
+          agentModelId: params.agentModelId ?? null,
+          sessionId: params.sessionId ?? null,
+          approvedPlanId: params.approvedPlanId ?? null,
+          lastReviewVerdict: params.lastReviewVerdict ?? null,
+          outstandingDiscoveredWorkCount: params.outstandingDiscoveredWorkCount ?? 0,
+          executionCountsJson: JSON.stringify(executionCounts),
+          startedAtUtc: params.startedAtUtc ?? now,
+          endedAtUtc: params.endedAtUtc ?? null,
+          createdAtUtc: now,
+          updatedAtUtc: now
+        }
+      );
+
+      return {
+        id,
+        workspaceId: params.workspaceId,
+        batchId: params.batchId,
+        iteration,
+        status: params.status,
+        stage: params.stage,
+        role: params.role,
+        summary: params.summary,
+        agentModelId: params.agentModelId,
+        sessionId: params.sessionId,
+        approvedPlanId: params.approvedPlanId,
+        lastReviewVerdict: params.lastReviewVerdict,
+        outstandingDiscoveredWorkCount: params.outstandingDiscoveredWorkCount ?? 0,
+        executionCounts,
+        startedAtUtc: params.startedAtUtc ?? now,
+        endedAtUtc: params.endedAtUtc,
+        createdAtUtc: now,
+        updatedAtUtc: now
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async updateBatchAnalysisIteration(params: {
+    workspaceId: string;
+    iterationId: string;
+    status?: BatchAnalysisIterationStatus;
+    stage?: BatchAnalysisStageStatus;
+    role?: BatchAnalysisIterationRecord['role'];
+    summary?: string;
+    agentModelId?: string;
+    sessionId?: string;
+    approvedPlanId?: string;
+    lastReviewVerdict?: BatchAnalysisArtifactVerdict;
+    outstandingDiscoveredWorkCount?: number;
+    executionCounts?: BatchAnalysisExecutionCounts;
+    endedAtUtc?: string;
+  }): Promise<BatchAnalysisIterationRecord> {
+    const workspace = await this.getWorkspace(params.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const existing = this.getBatchAnalysisIterationRow(workspaceDb, params.workspaceId, params.iterationId);
+      if (!existing) {
+        throw new Error('Batch analysis iteration not found');
+      }
+      const updatedAtUtc = new Date().toISOString();
+      const executionCounts = params.executionCounts
+        ? this.normalizeBatchAnalysisExecutionCounts(params.executionCounts)
+        : this.parseBatchAnalysisExecutionCounts(existing.executionCountsJson);
+      workspaceDb.run(
+        `UPDATE batch_analysis_iterations
+            SET status = COALESCE(@status, status),
+                stage = COALESCE(@stage, stage),
+                role = COALESCE(@role, role),
+                summary = COALESCE(@summary, summary),
+                agent_model_id = COALESCE(@agentModelId, agent_model_id),
+                session_id = COALESCE(@sessionId, session_id),
+                approved_plan_id = COALESCE(@approvedPlanId, approved_plan_id),
+                last_review_verdict = COALESCE(@lastReviewVerdict, last_review_verdict),
+                outstanding_discovered_work_count = COALESCE(@outstandingDiscoveredWorkCount, outstanding_discovered_work_count),
+                execution_counts_json = @executionCountsJson,
+                ended_at = COALESCE(@endedAtUtc, ended_at),
+                updated_at = @updatedAtUtc
+          WHERE workspace_id = @workspaceId AND id = @iterationId`,
+        {
+          workspaceId: params.workspaceId,
+          iterationId: params.iterationId,
+          status: params.status ?? null,
+          stage: params.stage ?? null,
+          role: params.role ?? null,
+          summary: params.summary ?? null,
+          agentModelId: params.agentModelId ?? null,
+          sessionId: params.sessionId ?? null,
+          approvedPlanId: params.approvedPlanId ?? null,
+          lastReviewVerdict: params.lastReviewVerdict ?? null,
+          outstandingDiscoveredWorkCount: params.outstandingDiscoveredWorkCount ?? null,
+          executionCountsJson: JSON.stringify(executionCounts),
+          endedAtUtc: params.endedAtUtc ?? null,
+          updatedAtUtc
+        }
+      );
+      return {
+        id: existing.id,
+        workspaceId: existing.workspaceId,
+        batchId: existing.batchId,
+        iteration: existing.iteration,
+        status: params.status ?? existing.status,
+        stage: params.stage ?? existing.stage,
+        role: params.role ?? existing.role,
+        summary: params.summary ?? existing.summary ?? undefined,
+        agentModelId: params.agentModelId ?? existing.agentModelId ?? undefined,
+        sessionId: params.sessionId ?? existing.sessionId ?? undefined,
+        approvedPlanId: params.approvedPlanId ?? existing.approvedPlanId ?? undefined,
+        lastReviewVerdict: params.lastReviewVerdict ?? existing.lastReviewVerdict ?? undefined,
+        outstandingDiscoveredWorkCount: params.outstandingDiscoveredWorkCount ?? existing.outstandingDiscoveredWorkCount,
+        executionCounts,
+        startedAtUtc: existing.startedAtUtc,
+        endedAtUtc: params.endedAtUtc ?? existing.endedAtUtc ?? undefined,
+        createdAtUtc: existing.createdAtUtc,
+        updatedAtUtc
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async recordBatchWorkerExecutionReport(report: BatchWorkerExecutionReport): Promise<BatchWorkerExecutionReport> {
+    const workspace = await this.getWorkspace(report.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `INSERT INTO batch_analysis_worker_reports (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, summary, status, plan_id,
+          executed_items_json, blocker_notes_json, payload_json, agent_model_id, session_id, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, @role, @summary, @status, @planId,
+          @executedItemsJson, @blockerNotesJson, @payloadJson, @agentModelId, @sessionId, @createdAtUtc
+        )`,
+        {
+          id: report.id,
+          workspaceId: report.workspaceId,
+          batchId: report.batchId,
+          iterationId: report.iterationId,
+          iteration: report.iteration,
+          stage: report.stage,
+          role: report.role,
+          summary: report.summary,
+          status: report.status,
+          planId: report.planId ?? null,
+          executedItemsJson: JSON.stringify(report.executedItems),
+          blockerNotesJson: JSON.stringify(report.blockerNotes),
+          payloadJson: JSON.stringify(report),
+          agentModelId: report.agentModelId ?? null,
+          sessionId: report.sessionId ?? null,
+          createdAtUtc: report.createdAtUtc
+        }
+      );
+
+      for (const item of report.discoveredWork) {
+        workspaceDb.run(
+          `INSERT INTO batch_analysis_discovered_work (
+            id, workspace_id, batch_id, iteration_id, worker_report_id, discovery_id, discovered_action,
+            suspected_target, reason, evidence_json, linked_pbi_ids_json, confidence,
+            requires_plan_amendment, status, payload_json, created_at
+          ) VALUES (
+            @id, @workspaceId, @batchId, @iterationId, @workerReportId, @discoveryId, @discoveredAction,
+            @suspectedTarget, @reason, @evidenceJson, @linkedPbiIdsJson, @confidence,
+            @requiresPlanAmendment, @status, @payloadJson, @createdAtUtc
+          )`,
+          {
+            id: randomUUID(),
+            workspaceId: report.workspaceId,
+            batchId: report.batchId,
+            iterationId: report.iterationId,
+            workerReportId: report.id,
+            discoveryId: item.discoveryId,
+            discoveredAction: item.discoveredAction,
+            suspectedTarget: item.suspectedTarget,
+            reason: item.reason,
+            evidenceJson: JSON.stringify(item.evidence),
+            linkedPbiIdsJson: JSON.stringify(item.linkedPbiIds),
+            confidence: item.confidence,
+            requiresPlanAmendment: item.requiresPlanAmendment ? 1 : 0,
+            status: item.status ?? null,
+            payloadJson: JSON.stringify(item),
+            createdAtUtc: report.createdAtUtc
+          }
+        );
+      }
+
+      return report;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async recordBatchAnalysisPlan(plan: BatchAnalysisPlan): Promise<BatchAnalysisPlan> {
+    const workspace = await this.getWorkspace(plan.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `INSERT INTO batch_analysis_plans (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, verdict, plan_version, summary,
+          coverage_json, open_questions_json, payload_json, supersedes_plan_id, source_discovery_ids_json,
+          agent_model_id, session_id, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, @role, @verdict, @planVersion, @summary,
+          @coverageJson, @openQuestionsJson, @payloadJson, @supersedesPlanId, @sourceDiscoveryIdsJson,
+          @agentModelId, @sessionId, @createdAtUtc
+        )`,
+        {
+          id: plan.id,
+          workspaceId: plan.workspaceId,
+          batchId: plan.batchId,
+          iterationId: plan.iterationId,
+          iteration: plan.iteration,
+          stage: plan.stage,
+          role: plan.role,
+          verdict: plan.verdict,
+          planVersion: plan.planVersion,
+          summary: plan.summary,
+          coverageJson: JSON.stringify(plan.coverage),
+          openQuestionsJson: JSON.stringify(plan.openQuestions),
+          payloadJson: JSON.stringify(plan),
+          supersedesPlanId: plan.supersedesPlanId ?? null,
+          sourceDiscoveryIdsJson: plan.sourceDiscoveryIds ? JSON.stringify(plan.sourceDiscoveryIds) : null,
+          agentModelId: plan.agentModelId ?? null,
+          sessionId: plan.sessionId ?? null,
+          createdAtUtc: plan.createdAtUtc
+        }
+      );
+
+      for (const item of plan.items) {
+        workspaceDb.run(
+          `INSERT INTO batch_analysis_plan_items (
+            id, workspace_id, batch_id, plan_id, iteration_id, plan_item_id, pbi_ids_json, action, target_type,
+            target_article_id, target_family_id, target_title, reason, evidence_json, confidence,
+            depends_on_json, execution_status, created_at
+          ) VALUES (
+            @id, @workspaceId, @batchId, @planId, @iterationId, @planItemId, @pbiIdsJson, @action, @targetType,
+            @targetArticleId, @targetFamilyId, @targetTitle, @reason, @evidenceJson, @confidence,
+            @dependsOnJson, @executionStatus, @createdAtUtc
+          )`,
+          {
+            id: randomUUID(),
+            workspaceId: plan.workspaceId,
+            batchId: plan.batchId,
+            planId: plan.id,
+            iterationId: plan.iterationId,
+            planItemId: item.planItemId,
+            pbiIdsJson: JSON.stringify(item.pbiIds),
+            action: item.action,
+            targetType: item.targetType,
+            targetArticleId: item.targetArticleId ?? null,
+            targetFamilyId: item.targetFamilyId ?? null,
+            targetTitle: item.targetTitle,
+            reason: item.reason,
+            evidenceJson: JSON.stringify(item.evidence),
+            confidence: item.confidence,
+            dependsOnJson: item.dependsOn ? JSON.stringify(item.dependsOn) : null,
+            executionStatus: item.executionStatus,
+            createdAtUtc: plan.createdAtUtc
+          }
+        );
+      }
+
+      return plan;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async recordBatchPlanReview(review: BatchPlanReview): Promise<BatchPlanReview> {
+    const workspace = await this.getWorkspace(review.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `INSERT INTO batch_analysis_reviews (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, verdict, summary,
+          did_account_for_every_pbi, has_missing_creates, has_missing_edits, has_target_issues,
+          has_overlap_or_conflict, found_additional_article_work, under_scoped_kb_impact, delta_json,
+          plan_id, agent_model_id, session_id, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, @role, @verdict, @summary,
+          @didAccountForEveryPbi, @hasMissingCreates, @hasMissingEdits, @hasTargetIssues,
+          @hasOverlapOrConflict, @foundAdditionalArticleWork, @underScopedKbImpact, @deltaJson,
+          @planId, @agentModelId, @sessionId, @createdAtUtc
+        )`,
+        {
+          id: review.id,
+          workspaceId: review.workspaceId,
+          batchId: review.batchId,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          stage: review.stage,
+          role: review.role,
+          verdict: review.verdict,
+          summary: review.summary,
+          didAccountForEveryPbi: review.didAccountForEveryPbi ? 1 : 0,
+          hasMissingCreates: review.hasMissingCreates ? 1 : 0,
+          hasMissingEdits: review.hasMissingEdits ? 1 : 0,
+          hasTargetIssues: review.hasTargetIssues ? 1 : 0,
+          hasOverlapOrConflict: review.hasOverlapOrConflict ? 1 : 0,
+          foundAdditionalArticleWork: review.foundAdditionalArticleWork ? 1 : 0,
+          underScopedKbImpact: review.underScopedKbImpact ? 1 : 0,
+          deltaJson: review.delta ? JSON.stringify(review.delta) : null,
+          planId: review.planId ?? null,
+          agentModelId: review.agentModelId ?? null,
+          sessionId: review.sessionId ?? null,
+          createdAtUtc: review.createdAtUtc
+        }
+      );
+
+      return review;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async updateBatchAnalysisPlanItemStatuses(params: {
+    workspaceId: string;
+    planId: string;
+    statuses: Array<{ planItemId: string; executionStatus: BatchPlanItem['executionStatus'] }>;
+  }): Promise<void> {
+    if (params.statuses.length === 0) {
+      return;
+    }
+    const workspace = await this.getWorkspace(params.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const statement = workspaceDb.prepare(
+        `UPDATE batch_analysis_plan_items
+            SET execution_status = @executionStatus
+          WHERE workspace_id = @workspaceId AND plan_id = @planId AND plan_item_id = @planItemId`
+      );
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      try {
+        for (const status of params.statuses) {
+          statement.run({
+            workspaceId: params.workspaceId,
+            planId: params.planId,
+            planItemId: status.planItemId,
+            executionStatus: status.executionStatus
+          });
+        }
+        workspaceDb.exec('COMMIT');
+      } catch (error) {
+        workspaceDb.exec('ROLLBACK');
+        throw error;
+      }
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async updateBatchAnalysisDiscoveredWorkStatuses(params: {
+    workspaceId: string;
+    discoveryIds: string[];
+    status: BatchDiscoveredWorkItem['status'];
+  }): Promise<void> {
+    if (params.discoveryIds.length === 0) {
+      return;
+    }
+    const workspace = await this.getWorkspace(params.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const statement = workspaceDb.prepare(
+        `UPDATE batch_analysis_discovered_work
+            SET status = @status
+          WHERE workspace_id = @workspaceId AND discovery_id = @discoveryId`
+      );
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      try {
+        for (const discoveryId of Array.from(new Set(params.discoveryIds))) {
+          statement.run({
+            workspaceId: params.workspaceId,
+            discoveryId,
+            status: params.status
+          });
+        }
+        workspaceDb.exec('COMMIT');
+      } catch (error) {
+        workspaceDb.exec('ROLLBACK');
+        throw error;
+      }
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async recordBatchPlanAmendment(amendment: BatchPlanAmendment): Promise<BatchPlanAmendment> {
+    const workspace = await this.getWorkspace(amendment.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `INSERT INTO batch_analysis_amendments (
+          id, workspace_id, batch_id, iteration_id, approved_plan_id, source_worker_report_id,
+          source_discovery_ids_json, proposed_plan_id, review_id, status, summary, created_at, updated_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @approvedPlanId, @sourceWorkerReportId,
+          @sourceDiscoveryIdsJson, @proposedPlanId, @reviewId, @status, @summary, @createdAtUtc, @updatedAtUtc
+        )`,
+        {
+          id: amendment.id,
+          workspaceId: amendment.workspaceId,
+          batchId: amendment.batchId,
+          iterationId: amendment.iterationId,
+          approvedPlanId: amendment.approvedPlanId ?? null,
+          sourceWorkerReportId: amendment.sourceWorkerReportId,
+          sourceDiscoveryIdsJson: JSON.stringify(amendment.sourceDiscoveryIds),
+          proposedPlanId: amendment.proposedPlanId ?? null,
+          reviewId: amendment.reviewId ?? null,
+          status: amendment.status,
+          summary: amendment.summary,
+          createdAtUtc: amendment.createdAtUtc,
+          updatedAtUtc: amendment.updatedAtUtc
+        }
+      );
+      return amendment;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async recordBatchFinalReview(review: BatchFinalReview): Promise<BatchFinalReview> {
+    const workspace = await this.getWorkspace(review.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `INSERT INTO batch_analysis_final_reviews (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, verdict, summary,
+          all_pbis_mapped, plan_execution_complete, has_missing_article_changes, has_unresolved_discovered_work,
+          delta_json, plan_id, worker_report_id, agent_model_id, session_id, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, @role, @verdict, @summary,
+          @allPbisMapped, @planExecutionComplete, @hasMissingArticleChanges, @hasUnresolvedDiscoveredWork,
+          @deltaJson, @planId, @workerReportId, @agentModelId, @sessionId, @createdAtUtc
+        )`,
+        {
+          id: review.id,
+          workspaceId: review.workspaceId,
+          batchId: review.batchId,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          stage: review.stage,
+          role: review.role,
+          verdict: review.verdict,
+          summary: review.summary,
+          allPbisMapped: review.allPbisMapped ? 1 : 0,
+          planExecutionComplete: review.planExecutionComplete ? 1 : 0,
+          hasMissingArticleChanges: review.hasMissingArticleChanges ? 1 : 0,
+          hasUnresolvedDiscoveredWork: review.hasUnresolvedDiscoveredWork ? 1 : 0,
+          deltaJson: review.delta ? JSON.stringify(review.delta) : null,
+          planId: review.planId ?? null,
+          workerReportId: review.workerReportId ?? null,
+          agentModelId: review.agentModelId ?? null,
+          sessionId: review.sessionId ?? null,
+          createdAtUtc: review.createdAtUtc
+        }
+      );
+      return review;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async recordBatchAnalysisStageEvent(event: BatchAnalysisStageEventRecord): Promise<BatchAnalysisStageEventRecord> {
+    const workspace = await this.getWorkspace(event.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `INSERT INTO batch_analysis_stage_events (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, event_type, status, summary,
+          session_id, agent_model_id, approved_plan_id, last_review_verdict, outstanding_discovered_work_count,
+          execution_counts_json, details_json, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, @role, @eventType, @status, @summary,
+          @sessionId, @agentModelId, @approvedPlanId, @lastReviewVerdict, @outstandingDiscoveredWorkCount,
+          @executionCountsJson, @detailsJson, @createdAtUtc
+        )`,
+        {
+          id: event.id,
+          workspaceId: event.workspaceId,
+          batchId: event.batchId,
+          iterationId: event.iterationId,
+          iteration: event.iteration,
+          stage: event.stage,
+          role: event.role,
+          eventType: event.eventType,
+          status: event.status ?? null,
+          summary: event.summary ?? null,
+          sessionId: event.sessionId ?? null,
+          agentModelId: event.agentModelId ?? null,
+          approvedPlanId: event.approvedPlanId ?? null,
+          lastReviewVerdict: event.lastReviewVerdict ?? null,
+          outstandingDiscoveredWorkCount: event.outstandingDiscoveredWorkCount,
+          executionCountsJson: JSON.stringify(this.normalizeBatchAnalysisExecutionCounts(event.executionCounts)),
+          detailsJson: event.details ? JSON.stringify(event.details) : null,
+          createdAtUtc: event.createdAtUtc
+        }
+      );
+      return event;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getBatchAnalysisSnapshot(workspaceId: string, batchId: string): Promise<BatchAnalysisSnapshotResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const latestIteration = this.getLatestBatchAnalysisIterationFromDb(workspaceDb, workspaceId, batchId);
+      const latestPlan = this.getLatestBatchAnalysisPlanFromDb(workspaceDb, workspaceId, batchId);
+      const latestPlanReview = this.getLatestBatchAnalysisReviewFromDb(workspaceDb, workspaceId, batchId);
+      const latestWorkerReport = this.getLatestBatchAnalysisWorkerReportFromDb(workspaceDb, workspaceId, batchId);
+      const latestFinalReview = this.getLatestBatchAnalysisFinalReviewFromDb(workspaceDb, workspaceId, batchId);
+      const discoveredWork = workspaceDb.all<{ payloadJson: string }>(
+        `SELECT payload_json as payloadJson
+           FROM batch_analysis_discovered_work
+          WHERE workspace_id = @workspaceId AND batch_id = @batchId
+          ORDER BY created_at DESC`,
+        { workspaceId, batchId }
+      ).flatMap((row) => {
+        try {
+          return [JSON.parse(row.payloadJson) as BatchDiscoveredWorkItem];
+        } catch {
+          return [];
+        }
+      });
+
+      return {
+        workspaceId,
+        batchId,
+        latestIteration,
+        latestApprovedPlan: latestPlan?.verdict === 'approved' ? latestPlan : null,
+        latestPlanReview,
+        latestWorkerReport,
+        latestFinalReview,
+        discoveredWork
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getBatchAnalysisInspection(workspaceId: string, batchId: string): Promise<BatchAnalysisInspectionResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const snapshot = await this.getBatchAnalysisSnapshot(workspaceId, batchId);
+      const iterations = this.listBatchAnalysisIterationsFromDb(workspaceDb, workspaceId, batchId);
+      const plans = this.listBatchAnalysisPlansFromDb(workspaceDb, workspaceId, batchId);
+      const reviews = this.listBatchAnalysisReviewsFromDb(workspaceDb, workspaceId, batchId);
+      const workerReports = this.listBatchAnalysisWorkerReportsFromDb(workspaceDb, workspaceId, batchId);
+      const discoveredWork = this.listBatchAnalysisDiscoveredWorkFromDb(workspaceDb, workspaceId, batchId);
+      const amendments = this.listBatchAnalysisAmendmentsFromDb(workspaceDb, workspaceId, batchId);
+      const finalReviews = this.listBatchAnalysisFinalReviewsFromDb(workspaceDb, workspaceId, batchId);
+      const runs = this.listBatchAnalysisRunsFromDb(workspaceDb, workspaceId, batchId);
+      const latestApprovedPlanId = snapshot.latestApprovedPlan?.id;
+      const supersededPlans = plans.filter((plan) => plan.id !== latestApprovedPlanId);
+      const reviewDeltas: BatchAnalysisReviewDeltaRecord[] = reviews
+        .filter((review) => review.delta)
+        .map((review) => ({
+          reviewId: review.id,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          stage: review.stage,
+          verdict: review.verdict,
+          summary: review.summary,
+          createdAtUtc: review.createdAtUtc,
+          planId: review.planId,
+          delta: review.delta!
+        }));
+      const finalReviewReworkPlans: BatchAnalysisFinalReviewDeltaRecord[] = finalReviews
+        .filter((review) => review.delta && review.verdict === 'needs_rework')
+        .map((review) => ({
+          finalReviewId: review.id,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          verdict: review.verdict,
+          summary: review.summary,
+          createdAtUtc: review.createdAtUtc,
+          planId: review.planId,
+          workerReportId: review.workerReportId,
+          delta: review.delta!
+        }));
+      const transcriptLinks: BatchAnalysisTranscriptLink[] = [
+        ...iterations.flatMap((iteration) => iteration.sessionId ? [{
+          artifactType: 'iteration' as const,
+          artifactId: iteration.id,
+          iterationId: iteration.id,
+          iteration: iteration.iteration,
+          stage: iteration.stage,
+          role: iteration.role,
+          sessionId: iteration.sessionId,
+          agentModelId: iteration.agentModelId,
+          createdAtUtc: iteration.startedAtUtc
+        }] : []),
+        ...plans.flatMap((plan) => plan.sessionId ? [{
+          artifactType: 'plan' as const,
+          artifactId: plan.id,
+          iterationId: plan.iterationId,
+          iteration: plan.iteration,
+          stage: plan.stage,
+          role: plan.role,
+          sessionId: plan.sessionId,
+          agentModelId: plan.agentModelId,
+          createdAtUtc: plan.createdAtUtc
+        }] : []),
+        ...reviews.flatMap((review) => review.sessionId ? [{
+          artifactType: 'review' as const,
+          artifactId: review.id,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          stage: review.stage,
+          role: review.role,
+          sessionId: review.sessionId,
+          agentModelId: review.agentModelId,
+          createdAtUtc: review.createdAtUtc
+        }] : []),
+        ...workerReports.flatMap((report) => report.sessionId ? [{
+          artifactType: 'worker_report' as const,
+          artifactId: report.id,
+          iterationId: report.iterationId,
+          iteration: report.iteration,
+          stage: report.stage,
+          role: report.role,
+          sessionId: report.sessionId,
+          agentModelId: report.agentModelId,
+          createdAtUtc: report.createdAtUtc
+        }] : []),
+        ...amendments.map((amendment) => ({
+          artifactType: 'amendment' as const,
+          artifactId: amendment.id,
+          iterationId: amendment.iterationId,
+          stage: 'worker_discovery_review' as const,
+          role: 'planner' as const,
+          createdAtUtc: amendment.createdAtUtc
+        })),
+        ...finalReviews.flatMap((review) => review.sessionId ? [{
+          artifactType: 'final_review' as const,
+          artifactId: review.id,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          stage: review.stage,
+          role: review.role,
+          sessionId: review.sessionId,
+          agentModelId: review.agentModelId,
+          createdAtUtc: review.createdAtUtc
+        }] : []),
+        ...runs.flatMap((run) => run.sessionId ? [{
+          artifactType: 'run' as const,
+          artifactId: run.id,
+          stage: 'building' as const,
+          role: 'worker' as const,
+          sessionId: run.sessionId,
+          transcriptPath: run.transcriptPath,
+          agentModelId: run.agentModelId,
+          createdAtUtc: run.startedAtUtc
+        }] : [])
+      ].sort((left, right) => left.createdAtUtc.localeCompare(right.createdAtUtc));
+      const timeline: BatchAnalysisTimelineEntry[] = [
+        ...iterations.map((iteration) => ({
+          artifactType: 'iteration' as const,
+          artifactId: iteration.id,
+          iterationId: iteration.id,
+          iteration: iteration.iteration,
+          stage: iteration.stage,
+          role: iteration.role,
+          status: iteration.status,
+          verdict: iteration.lastReviewVerdict,
+          summary: iteration.summary,
+          sessionId: iteration.sessionId,
+          agentModelId: iteration.agentModelId,
+          createdAtUtc: iteration.startedAtUtc
+        })),
+        ...plans.map((plan) => ({
+          artifactType: 'plan' as const,
+          artifactId: plan.id,
+          iterationId: plan.iterationId,
+          iteration: plan.iteration,
+          stage: plan.stage,
+          role: plan.role,
+          verdict: plan.verdict,
+          summary: plan.summary,
+          relatedPlanId: plan.supersedesPlanId,
+          sessionId: plan.sessionId,
+          agentModelId: plan.agentModelId,
+          createdAtUtc: plan.createdAtUtc
+        })),
+        ...reviews.map((review) => ({
+          artifactType: 'review' as const,
+          artifactId: review.id,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          stage: review.stage,
+          role: review.role,
+          verdict: review.verdict,
+          summary: review.summary,
+          relatedPlanId: review.planId,
+          sessionId: review.sessionId,
+          agentModelId: review.agentModelId,
+          createdAtUtc: review.createdAtUtc
+        })),
+        ...workerReports.map((report) => ({
+          artifactType: 'worker_report' as const,
+          artifactId: report.id,
+          iterationId: report.iterationId,
+          iteration: report.iteration,
+          stage: report.stage,
+          role: report.role,
+          status: report.status,
+          summary: report.summary,
+          relatedPlanId: report.planId,
+          sessionId: report.sessionId,
+          agentModelId: report.agentModelId,
+          createdAtUtc: report.createdAtUtc
+        })),
+        ...amendments.map((amendment) => ({
+          artifactType: 'amendment' as const,
+          artifactId: amendment.id,
+          iterationId: amendment.iterationId,
+          stage: 'worker_discovery_review' as const,
+          role: 'planner' as const,
+          status: amendment.status,
+          summary: amendment.summary,
+          relatedPlanId: amendment.proposedPlanId ?? amendment.approvedPlanId,
+          relatedReviewId: amendment.reviewId,
+          relatedWorkerReportId: amendment.sourceWorkerReportId,
+          createdAtUtc: amendment.createdAtUtc
+        })),
+        ...finalReviews.map((review) => ({
+          artifactType: 'final_review' as const,
+          artifactId: review.id,
+          iterationId: review.iterationId,
+          iteration: review.iteration,
+          stage: review.stage,
+          role: review.role,
+          verdict: review.verdict,
+          summary: review.summary,
+          relatedPlanId: review.planId,
+          relatedWorkerReportId: review.workerReportId,
+          sessionId: review.sessionId,
+          agentModelId: review.agentModelId,
+          createdAtUtc: review.createdAtUtc
+        })),
+        ...runs.map((run) => ({
+          artifactType: 'run' as const,
+          artifactId: run.id,
+          stage: 'building' as const,
+          role: 'worker' as const,
+          status: run.status,
+          summary: run.message,
+          sessionId: run.sessionId,
+          agentModelId: run.agentModelId,
+          createdAtUtc: run.startedAtUtc
+        }))
+      ].sort((left, right) => left.createdAtUtc.localeCompare(right.createdAtUtc));
+
+      return {
+        workspaceId,
+        batchId,
+        snapshot,
+        iterations,
+        plans,
+        supersededPlans,
+        reviews,
+        reviewDeltas,
+        workerReports,
+        discoveredWork,
+        amendments,
+        finalReviews,
+        finalReviewReworkPlans,
+        timeline,
+        transcriptLinks
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getBatchAnalysisRuntimeStatus(workspaceId: string, batchId: string): Promise<BatchAnalysisRuntimeStatus | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const latestIteration = this.getLatestBatchAnalysisIterationFromDb(workspaceDb, workspaceId, batchId);
+      const latestEvent = this.getLatestBatchAnalysisStageEventFromDb(workspaceDb, workspaceId, batchId);
+      if (!latestIteration && !latestEvent) {
+        return null;
+      }
+      return {
+        workspaceId,
+        batchId,
+        iterationId: latestIteration?.id ?? latestEvent?.iterationId,
+        iteration: latestIteration?.iteration ?? latestEvent?.iteration,
+        iterationStatus: latestIteration?.status ?? latestEvent?.status,
+        stage: latestIteration?.stage ?? latestEvent?.stage,
+        role: latestIteration?.role ?? latestEvent?.role,
+        agentModelId: latestIteration?.agentModelId ?? latestEvent?.agentModelId,
+        sessionId: latestIteration?.sessionId ?? latestEvent?.sessionId,
+        approvedPlanId: latestIteration?.approvedPlanId ?? latestEvent?.approvedPlanId,
+        lastReviewVerdict: latestIteration?.lastReviewVerdict ?? latestEvent?.lastReviewVerdict,
+        outstandingDiscoveredWorkCount: latestIteration?.outstandingDiscoveredWorkCount ?? latestEvent?.outstandingDiscoveredWorkCount ?? 0,
+        executionCounts: latestIteration?.executionCounts ?? latestEvent?.executionCounts ?? this.normalizeBatchAnalysisExecutionCounts(),
+        stageStartedAtUtc: latestEvent?.createdAtUtc ?? latestIteration?.startedAtUtc,
+        stageEndedAtUtc: latestIteration?.endedAtUtc,
+        updatedAtUtc: latestIteration?.updatedAtUtc ?? latestEvent?.createdAtUtc,
+        latestEventId: latestEvent?.id,
+        latestEventType: latestEvent?.eventType
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getBatchAnalysisEventStream(workspaceId: string, batchId: string, limit = 100): Promise<BatchAnalysisEventStreamResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const normalizedLimit = Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 100;
+      return {
+        workspaceId,
+        batchId,
+        events: this.listBatchAnalysisStageEventsFromDb(workspaceDb, workspaceId, batchId, normalizedLimit)
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async createAgentProposal(params: {
     workspaceId: string;
     batchId: string;
     action: ProposalAction;
     _sessionId?: string;
+    idempotencyKey?: string;
     familyId?: string;
     localeVariantId?: string;
     sourceRevisionId?: string;
@@ -3594,6 +4603,9 @@ export class WorkspaceRepository {
     try {
       const now = new Date().toISOString();
       const metadata = normalizeProposalMetadata(params.metadata);
+      if (params.idempotencyKey?.trim() && !extractString(metadata._agentCommandKey)) {
+        metadata._agentCommandKey = params.idempotencyKey.trim();
+      }
       const hasStructuredContent = Boolean(
         params.sourceHtml?.trim()
         || params.proposedHtml?.trim()
@@ -3637,15 +4649,23 @@ export class WorkspaceRepository {
       const status: ProposalDecision = ProposalDecision.DEFER;
       const sourceRevisionId = params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null;
 
-      const existingProposal = this.findOpenMatchingProposal(workspaceDb, {
-        workspaceId: params.workspaceId,
-        batchId: params.batchId,
-        action: params.action,
-        localeVariantId: params.localeVariantId,
-        familyId: identity.familyId,
-        targetTitle,
-        targetLocale
-      });
+      const existingProposal =
+        (params.idempotencyKey?.trim()
+          ? this.findOpenProposalByIdempotencyKey(workspaceDb, {
+              workspaceId: params.workspaceId,
+              batchId: params.batchId,
+              idempotencyKey: params.idempotencyKey.trim()
+            })
+          : null)
+        ?? this.findOpenMatchingProposal(workspaceDb, {
+          workspaceId: params.workspaceId,
+          batchId: params.batchId,
+          action: params.action,
+          localeVariantId: params.localeVariantId,
+          familyId: identity.familyId,
+          targetTitle,
+          targetLocale
+        });
 
       const proposalId = existingProposal?.id ?? randomUUID();
       const queueOrder = existingProposal?.queueOrder ?? (
@@ -5591,19 +6611,26 @@ export class WorkspaceRepository {
         const existedBeforeCheck = await this.fileExists(dbPath);
         let repaired = false;
         let workspaceDbVersion = 0;
+        let batchAnalysisRepair: WorkspaceBatchAnalysisRepairSummary | undefined;
 
         if (existedBeforeCheck) {
           try {
             workspaceDbVersion = getWorkspaceMigrationVersion(dbPath);
+            const repairedResult = this.repairWorkspaceDb(dbPath);
+            workspaceDbVersion = repairedResult.appliedVersion;
+            batchAnalysisRepair = repairedResult.batchAnalysisRepair;
+            repaired = repaired || repairedResult.migrationCount > 0 || this.hasBatchAnalysisRepairChanges(repairedResult.batchAnalysisRepair);
           } catch {
             const repairedResult = this.repairWorkspaceDb(dbPath);
             workspaceDbVersion = repairedResult.appliedVersion;
-            repaired = true;
+            batchAnalysisRepair = repairedResult.batchAnalysisRepair;
+            repaired = repaired || repairedResult.migrationCount > 0 || this.hasBatchAnalysisRepairChanges(repairedResult.batchAnalysisRepair);
           }
         } else {
           const repairedResult = this.repairWorkspaceDb(dbPath);
           workspaceDbVersion = repairedResult.appliedVersion;
-          repaired = true;
+          batchAnalysisRepair = repairedResult.batchAnalysisRepair;
+          repaired = repaired || repairedResult.migrationCount > 0 || this.hasBatchAnalysisRepairChanges(repairedResult.batchAnalysisRepair);
         }
 
         const exists = await this.fileExists(dbPath);
@@ -5615,7 +6642,8 @@ export class WorkspaceRepository {
           workspaceDbPath: dbPath,
           workspaceDbVersion,
           repaired,
-          exists
+          exists,
+          batchAnalysisRepair
         });
       }
 
@@ -5639,14 +6667,8 @@ export class WorkspaceRepository {
       throw new Error(this.lastCatalogFailureMessage ?? 'Maximum call stack size exceeded');
     }
     try {
-      const catalogExists = await fs.access(this.catalogDbPath).then(() => true).catch(() => false);
-      logger.info('workspace-repository.openCatalogWithRecovery start', {
-        catalogDbPath: this.catalogDbPath,
-        catalogExists
-      });
       const catalog = ensureCatalogSchema(this.catalogDbPath);
       this.ensureCatalogDefaultWorkspaceColumn(catalog);
-      logger.info('workspace-repository.openCatalogWithRecovery success', { elapsedMs: Date.now() - startedAt });
       this.lastCatalogFailureMs = 0;
       this.lastCatalogFailureMessage = undefined;
       return catalog;
@@ -5692,7 +6714,12 @@ export class WorkspaceRepository {
   }
 
   private repairWorkspaceDb(dbPath: string) {
-    return applyWorkspaceMigrations(dbPath);
+    const migrationResult = applyWorkspaceMigrations(dbPath);
+    const batchAnalysisRepair = this.repairBatchAnalysisRolloutState(dbPath);
+    return {
+      ...migrationResult,
+      batchAnalysisRepair
+    };
   }
 
   private ensureCatalogDefaultWorkspaceColumn(catalog: ReturnType<typeof openWorkspaceDatabase>) {
@@ -5948,8 +6975,55 @@ export class WorkspaceRepository {
     this.repairWorkspaceDb(dbPath);
     this.ensureKbAccessModeColumn(dbPath);
     this.ensureAgentModelIdColumn(dbPath);
+    this.ensureAcpModelIdColumn(dbPath);
     this.ensureAiRunsAgentModelIdColumn(dbPath);
     return dbPath;
+  }
+
+  private hasBatchAnalysisRepairChanges(summary?: WorkspaceBatchAnalysisRepairSummary): boolean {
+    return Boolean(
+      summary
+      && (
+        summary.backfilledLegacyIterations > 0
+        || summary.backfilledLegacyWorkerReports > 0
+        || summary.backfilledStageEvents > 0
+        || summary.normalizedIterations > 0
+      )
+    );
+  }
+
+  private repairBatchAnalysisRolloutState(dbPath: string): WorkspaceBatchAnalysisRepairSummary {
+    const db = openWorkspaceDatabase(dbPath);
+    const summary: WorkspaceBatchAnalysisRepairSummary = {
+      backfilledLegacyIterations: 0,
+      backfilledLegacyWorkerReports: 0,
+      backfilledStageEvents: 0,
+      normalizedIterations: 0
+    };
+    try {
+      const tableNames = new Set(
+        db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table'`).map((row) => row.name)
+      );
+      if (!tableNames.has('batch_analysis_iterations')) {
+        return summary;
+      }
+
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        summary.backfilledLegacyIterations += this.backfillLegacyBatchAnalysisIterations(db);
+        summary.backfilledLegacyWorkerReports += this.backfillLegacyBatchAnalysisWorkerReports(db);
+        summary.normalizedIterations += this.normalizeBatchAnalysisIterations(db);
+        summary.backfilledStageEvents += this.backfillBatchAnalysisStageEvents(db);
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+
+      return summary;
+    } finally {
+      db.close();
+    }
   }
 
   private normalizeWorkspaceDbIdentity(dbPath: string, workspaceId: string): void {
@@ -6026,6 +7100,18 @@ export class WorkspaceRepository {
     }
   }
 
+  private ensureAcpModelIdColumn(dbPath: string) {
+    const db = openWorkspaceDatabase(dbPath);
+    try {
+      const columns = db.all<{ name: string }>(`PRAGMA table_info(workspace_settings)`).map((c) => c.name);
+      if (!columns.includes('acp_model_id')) {
+        db.exec(`ALTER TABLE workspace_settings ADD COLUMN acp_model_id TEXT`);
+      }
+    } finally {
+      db.close();
+    }
+  }
+
   private ensureAiRunsAgentModelIdColumn(dbPath: string) {
     const db = openWorkspaceDatabase(dbPath);
     try {
@@ -6036,6 +7122,1173 @@ export class WorkspaceRepository {
     } finally {
       db.close();
     }
+  }
+
+  private normalizeBatchAnalysisExecutionCounts(
+    counts?: Partial<BatchAnalysisExecutionCounts> | null
+  ): BatchAnalysisExecutionCounts {
+    return {
+      total: counts?.total ?? 0,
+      create: counts?.create ?? 0,
+      edit: counts?.edit ?? 0,
+      retire: counts?.retire ?? 0,
+      noImpact: counts?.noImpact ?? 0,
+      executed: counts?.executed ?? 0,
+      blocked: counts?.blocked ?? 0,
+      rejected: counts?.rejected ?? 0
+    };
+  }
+
+  private parseBatchAnalysisExecutionCounts(payload?: string | null): BatchAnalysisExecutionCounts {
+    if (!payload) {
+      return this.normalizeBatchAnalysisExecutionCounts();
+    }
+    try {
+      return this.normalizeBatchAnalysisExecutionCounts(JSON.parse(payload) as Partial<BatchAnalysisExecutionCounts>);
+    } catch {
+      return this.normalizeBatchAnalysisExecutionCounts();
+    }
+  }
+
+  private getBatchAnalysisIterationRow(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    iterationId: string
+  ) {
+    return db.get<{
+      id: string;
+      workspaceId: string;
+      batchId: string;
+      iteration: number;
+      status: BatchAnalysisIterationStatus;
+      stage: BatchAnalysisStageStatus;
+      role: BatchAnalysisIterationRecord['role'];
+      summary: string | null;
+      agentModelId: string | null;
+      sessionId: string | null;
+      approvedPlanId: string | null;
+      lastReviewVerdict: BatchAnalysisArtifactVerdict | null;
+      outstandingDiscoveredWorkCount: number;
+      executionCountsJson: string | null;
+      startedAtUtc: string;
+      endedAtUtc: string | null;
+      createdAtUtc: string;
+      updatedAtUtc: string;
+    }>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration,
+              status,
+              stage,
+              role,
+              summary,
+              agent_model_id as agentModelId,
+              session_id as sessionId,
+              approved_plan_id as approvedPlanId,
+              last_review_verdict as lastReviewVerdict,
+              outstanding_discovered_work_count as outstandingDiscoveredWorkCount,
+              execution_counts_json as executionCountsJson,
+              started_at as startedAtUtc,
+              ended_at as endedAtUtc,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+         FROM batch_analysis_iterations
+        WHERE workspace_id = @workspaceId AND id = @iterationId`,
+      { workspaceId, iterationId }
+    );
+  }
+
+  private mapBatchAnalysisIterationRow(
+    row: NonNullable<ReturnType<WorkspaceRepository['getBatchAnalysisIterationRow']>>
+  ): BatchAnalysisIterationRecord {
+    return {
+      id: row.id,
+      workspaceId: row.workspaceId,
+      batchId: row.batchId,
+      iteration: row.iteration,
+      status: row.status,
+      stage: row.stage,
+      role: row.role,
+      summary: row.summary ?? undefined,
+      agentModelId: row.agentModelId ?? undefined,
+      sessionId: row.sessionId ?? undefined,
+      approvedPlanId: row.approvedPlanId ?? undefined,
+      lastReviewVerdict: row.lastReviewVerdict ?? undefined,
+      outstandingDiscoveredWorkCount: row.outstandingDiscoveredWorkCount,
+      executionCounts: this.parseBatchAnalysisExecutionCounts(row.executionCountsJson),
+      startedAtUtc: row.startedAtUtc,
+      endedAtUtc: row.endedAtUtc ?? undefined,
+      createdAtUtc: row.createdAtUtc,
+      updatedAtUtc: row.updatedAtUtc
+    };
+  }
+
+  private getLatestBatchAnalysisIterationFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchAnalysisIterationRecord | null {
+    const row = db.get<ReturnType<WorkspaceRepository['getBatchAnalysisIterationRow']>>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration,
+              status,
+              stage,
+              role,
+              summary,
+              agent_model_id as agentModelId,
+              session_id as sessionId,
+              approved_plan_id as approvedPlanId,
+              last_review_verdict as lastReviewVerdict,
+              outstanding_discovered_work_count as outstandingDiscoveredWorkCount,
+              execution_counts_json as executionCountsJson,
+              started_at as startedAtUtc,
+              ended_at as endedAtUtc,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+         FROM batch_analysis_iterations
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY iteration DESC, updated_at DESC
+        LIMIT 1`,
+      { workspaceId, batchId }
+    );
+    return row ? this.mapBatchAnalysisIterationRow(row) : null;
+  }
+
+  private getLatestBatchAnalysisPlanFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchAnalysisPlan | null {
+    const row = db.get<{ id: string; payloadJson: string }>(
+      `SELECT id, payload_json as payloadJson
+         FROM batch_analysis_plans
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      { workspaceId, batchId }
+    );
+    if (!row?.payloadJson) {
+      return null;
+    }
+    try {
+      const plan = JSON.parse(row.payloadJson) as BatchAnalysisPlan;
+      const itemStatuses = new Map(
+        db.all<{ planItemId: string; executionStatus: BatchPlanItem['executionStatus'] }>(
+          `SELECT plan_item_id as planItemId, execution_status as executionStatus
+             FROM batch_analysis_plan_items
+            WHERE workspace_id = @workspaceId AND plan_id = @planId`,
+          { workspaceId, planId: row.id }
+        ).map((entry) => [entry.planItemId, entry.executionStatus])
+      );
+      return {
+        ...plan,
+        items: plan.items.map((item) => ({
+          ...item,
+          executionStatus: itemStatuses.get(item.planItemId) ?? item.executionStatus
+        }))
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private getLatestBatchAnalysisReviewFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchPlanReview | null {
+    const row = db.get<{ payloadJson: string }>(
+      `SELECT json_object(
+          'id', id,
+          'workspaceId', workspace_id,
+          'batchId', batch_id,
+          'iterationId', iteration_id,
+          'iteration', iteration,
+          'stage', stage,
+          'role', role,
+          'verdict', verdict,
+          'summary', summary,
+          'didAccountForEveryPbi', did_account_for_every_pbi,
+          'hasMissingCreates', has_missing_creates,
+          'hasMissingEdits', has_missing_edits,
+          'hasTargetIssues', has_target_issues,
+          'hasOverlapOrConflict', has_overlap_or_conflict,
+          'foundAdditionalArticleWork', found_additional_article_work,
+          'underScopedKbImpact', under_scoped_kb_impact,
+          'delta', json(delta_json),
+          'createdAtUtc', created_at,
+          'planId', plan_id,
+          'agentModelId', agent_model_id,
+          'sessionId', session_id
+        ) as payloadJson
+         FROM batch_analysis_reviews
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      { workspaceId, batchId }
+    );
+    if (!row?.payloadJson) {
+      return null;
+    }
+    try {
+      return JSON.parse(row.payloadJson) as BatchPlanReview;
+    } catch {
+      return null;
+    }
+  }
+
+  private getLatestBatchAnalysisWorkerReportFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchWorkerExecutionReport | null {
+    const row = db.get<{ payloadJson: string }>(
+      `SELECT payload_json as payloadJson
+         FROM batch_analysis_worker_reports
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      { workspaceId, batchId }
+    );
+    if (!row?.payloadJson) {
+      return null;
+    }
+    try {
+      return JSON.parse(row.payloadJson) as BatchWorkerExecutionReport;
+    } catch {
+      return null;
+    }
+  }
+
+  private getLatestBatchAnalysisWorkerReportForIterationFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    iterationId: string
+  ): BatchWorkerExecutionReport | null {
+    const row = db.get<{ payloadJson: string }>(
+      `SELECT payload_json as payloadJson
+         FROM batch_analysis_worker_reports
+        WHERE iteration_id = @iterationId
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      { iterationId }
+    );
+    if (!row?.payloadJson) {
+      return null;
+    }
+    try {
+      return JSON.parse(row.payloadJson) as BatchWorkerExecutionReport;
+    } catch {
+      return null;
+    }
+  }
+
+  private getLatestBatchAnalysisFinalReviewFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchFinalReview | null {
+    const row = db.get<{ payloadJson: string }>(
+      `SELECT json_object(
+          'id', id,
+          'workspaceId', workspace_id,
+          'batchId', batch_id,
+          'iterationId', iteration_id,
+          'iteration', iteration,
+          'stage', stage,
+          'role', role,
+          'verdict', verdict,
+          'summary', summary,
+          'allPbisMapped', all_pbis_mapped,
+          'planExecutionComplete', plan_execution_complete,
+          'hasMissingArticleChanges', has_missing_article_changes,
+          'hasUnresolvedDiscoveredWork', has_unresolved_discovered_work,
+          'delta', json(delta_json),
+          'createdAtUtc', created_at,
+          'planId', plan_id,
+          'workerReportId', worker_report_id,
+          'agentModelId', agent_model_id,
+          'sessionId', session_id
+        ) as payloadJson
+         FROM batch_analysis_final_reviews
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      { workspaceId, batchId }
+    );
+    if (!row?.payloadJson) {
+      return null;
+    }
+    try {
+      return JSON.parse(row.payloadJson) as BatchFinalReview;
+    } catch {
+      return null;
+    }
+  }
+
+  private mapBatchAnalysisStageEventRow(row: {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iterationId: string;
+    iteration: number;
+    stage: BatchAnalysisStageStatus;
+    role: BatchAnalysisIterationRecord['role'];
+    eventType: BatchAnalysisStageEventRecord['eventType'];
+    status: BatchAnalysisIterationStatus | null;
+    summary: string | null;
+    sessionId: string | null;
+    agentModelId: string | null;
+    approvedPlanId: string | null;
+    lastReviewVerdict: BatchAnalysisArtifactVerdict | null;
+    outstandingDiscoveredWorkCount: number;
+    executionCountsJson: string | null;
+    detailsJson: string | null;
+    createdAtUtc: string;
+  }): BatchAnalysisStageEventRecord {
+    let details: BatchAnalysisStageEventDetails | undefined;
+    if (row.detailsJson) {
+      try {
+        const parsed = JSON.parse(row.detailsJson) as BatchAnalysisStageEventDetails;
+        if (parsed && typeof parsed === 'object') {
+          details = parsed;
+        }
+      } catch {
+        details = undefined;
+      }
+    }
+    return {
+      id: row.id,
+      workspaceId: row.workspaceId,
+      batchId: row.batchId,
+      iterationId: row.iterationId,
+      iteration: row.iteration,
+      stage: row.stage,
+      role: row.role,
+      eventType: row.eventType,
+      status: row.status ?? undefined,
+      summary: row.summary ?? undefined,
+      sessionId: row.sessionId ?? undefined,
+      agentModelId: row.agentModelId ?? undefined,
+      approvedPlanId: row.approvedPlanId ?? undefined,
+      lastReviewVerdict: row.lastReviewVerdict ?? undefined,
+      outstandingDiscoveredWorkCount: row.outstandingDiscoveredWorkCount,
+      executionCounts: this.parseBatchAnalysisExecutionCounts(row.executionCountsJson),
+      details,
+      createdAtUtc: row.createdAtUtc
+    };
+  }
+
+  private getLatestBatchAnalysisStageEventFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchAnalysisStageEventRecord | null {
+    const row = db.get<Parameters<WorkspaceRepository['mapBatchAnalysisStageEventRow']>[0]>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration_id as iterationId,
+              iteration,
+              stage,
+              role,
+              event_type as eventType,
+              status,
+              summary,
+              session_id as sessionId,
+              agent_model_id as agentModelId,
+              approved_plan_id as approvedPlanId,
+              last_review_verdict as lastReviewVerdict,
+              outstanding_discovered_work_count as outstandingDiscoveredWorkCount,
+              execution_counts_json as executionCountsJson,
+              details_json as detailsJson,
+              created_at as createdAtUtc
+         FROM batch_analysis_stage_events
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      { workspaceId, batchId }
+    );
+    return row ? this.mapBatchAnalysisStageEventRow(row) : null;
+  }
+
+  private hydrateBatchAnalysisPlan(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    row: { id: string; payloadJson: string }
+  ): BatchAnalysisPlan | null {
+    if (!row.payloadJson) {
+      return null;
+    }
+    try {
+      const plan = JSON.parse(row.payloadJson) as BatchAnalysisPlan;
+      const itemStatuses = new Map(
+        db.all<{ planItemId: string; executionStatus: BatchPlanItem['executionStatus'] }>(
+          `SELECT plan_item_id as planItemId, execution_status as executionStatus
+             FROM batch_analysis_plan_items
+            WHERE workspace_id = @workspaceId AND plan_id = @planId`,
+          { workspaceId, planId: row.id }
+        ).map((entry) => [entry.planItemId, entry.executionStatus])
+      );
+      return {
+        ...plan,
+        items: plan.items.map((item) => ({
+          ...item,
+          executionStatus: itemStatuses.get(item.planItemId) ?? item.executionStatus
+        }))
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private listBatchAnalysisIterationsFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchAnalysisIterationRecord[] {
+    const rows = db.all<ReturnType<WorkspaceRepository['getBatchAnalysisIterationRow']>>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration,
+              status,
+              stage,
+              role,
+              summary,
+              agent_model_id as agentModelId,
+              session_id as sessionId,
+              approved_plan_id as approvedPlanId,
+              last_review_verdict as lastReviewVerdict,
+              outstanding_discovered_work_count as outstandingDiscoveredWorkCount,
+              execution_counts_json as executionCountsJson,
+              started_at as startedAtUtc,
+              ended_at as endedAtUtc,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+         FROM batch_analysis_iterations
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY iteration DESC, updated_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.flatMap((row) => row ? [this.mapBatchAnalysisIterationRow(row)] : []);
+  }
+
+  private listBatchAnalysisPlansFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchAnalysisPlan[] {
+    const rows = db.all<{ id: string; payloadJson: string }>(
+      `SELECT id, payload_json as payloadJson
+         FROM batch_analysis_plans
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.flatMap((row) => {
+      const plan = this.hydrateBatchAnalysisPlan(db, workspaceId, row);
+      return plan ? [plan] : [];
+    });
+  }
+
+  private listBatchAnalysisReviewsFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchPlanReview[] {
+    const rows = db.all<{ payloadJson: string }>(
+      `SELECT json_object(
+          'id', id,
+          'workspaceId', workspace_id,
+          'batchId', batch_id,
+          'iterationId', iteration_id,
+          'iteration', iteration,
+          'stage', stage,
+          'role', role,
+          'verdict', verdict,
+          'summary', summary,
+          'didAccountForEveryPbi', did_account_for_every_pbi,
+          'hasMissingCreates', has_missing_creates,
+          'hasMissingEdits', has_missing_edits,
+          'hasTargetIssues', has_target_issues,
+          'hasOverlapOrConflict', has_overlap_or_conflict,
+          'foundAdditionalArticleWork', found_additional_article_work,
+          'underScopedKbImpact', under_scoped_kb_impact,
+          'delta', json(delta_json),
+          'createdAtUtc', created_at,
+          'planId', plan_id,
+          'agentModelId', agent_model_id,
+          'sessionId', session_id
+        ) as payloadJson
+         FROM batch_analysis_reviews
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.flatMap((row) => {
+      try {
+        return row.payloadJson ? [JSON.parse(row.payloadJson) as BatchPlanReview] : [];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  private listBatchAnalysisWorkerReportsFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchWorkerExecutionReport[] {
+    const rows = db.all<{ payloadJson: string }>(
+      `SELECT payload_json as payloadJson
+         FROM batch_analysis_worker_reports
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.flatMap((row) => {
+      try {
+        return row.payloadJson ? [JSON.parse(row.payloadJson) as BatchWorkerExecutionReport] : [];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  private listBatchAnalysisDiscoveredWorkFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchDiscoveredWorkItem[] {
+    const rows = db.all<{ payloadJson: string }>(
+      `SELECT payload_json as payloadJson
+         FROM batch_analysis_discovered_work
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.flatMap((row) => {
+      try {
+        return row.payloadJson ? [JSON.parse(row.payloadJson) as BatchDiscoveredWorkItem] : [];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  private listBatchAnalysisAmendmentsFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchPlanAmendment[] {
+    const rows = db.all<{ payloadJson: string }>(
+      `SELECT json_object(
+          'id', id,
+          'workspaceId', workspace_id,
+          'batchId', batch_id,
+          'iterationId', iteration_id,
+          'approvedPlanId', approved_plan_id,
+          'sourceWorkerReportId', source_worker_report_id,
+          'sourceDiscoveryIds', json(source_discovery_ids_json),
+          'proposedPlanId', proposed_plan_id,
+          'reviewId', review_id,
+          'status', status,
+          'summary', summary,
+          'createdAtUtc', created_at,
+          'updatedAtUtc', updated_at
+        ) as payloadJson
+         FROM batch_analysis_amendments
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.flatMap((row) => {
+      try {
+        return row.payloadJson ? [JSON.parse(row.payloadJson) as BatchPlanAmendment] : [];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  private listBatchAnalysisFinalReviewsFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): BatchFinalReview[] {
+    const rows = db.all<{ payloadJson: string }>(
+      `SELECT json_object(
+          'id', id,
+          'workspaceId', workspace_id,
+          'batchId', batch_id,
+          'iterationId', iteration_id,
+          'iteration', iteration,
+          'stage', stage,
+          'role', role,
+          'verdict', verdict,
+          'summary', summary,
+          'allPbisMapped', all_pbis_mapped,
+          'planExecutionComplete', plan_execution_complete,
+          'hasMissingArticleChanges', has_missing_article_changes,
+          'hasUnresolvedDiscoveredWork', has_unresolved_discovered_work,
+          'delta', json(delta_json),
+          'createdAtUtc', created_at,
+          'planId', plan_id,
+          'workerReportId', worker_report_id,
+          'agentModelId', agent_model_id,
+          'sessionId', session_id
+        ) as payloadJson
+         FROM batch_analysis_final_reviews
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.flatMap((row) => {
+      try {
+        return row.payloadJson ? [JSON.parse(row.payloadJson) as BatchFinalReview] : [];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  private listBatchAnalysisRunsFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string
+  ): PersistedAgentAnalysisRun[] {
+    const rows = db.all<{
+      id: string;
+      workspaceId: string;
+      batchId: string;
+      sessionId: string | null;
+      kbAccessMode: KbAccessMode | null;
+      agentModelId: string | null;
+      status: PersistedAgentAnalysisRun['status'];
+      startedAtUtc: string;
+      endedAtUtc: string | null;
+      promptTemplate: string | null;
+      transcriptPath: string | null;
+      toolCallsJson: string | null;
+      rawOutputJson: string | null;
+      message: string | null;
+    }>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              session_id as sessionId,
+              kb_access_mode as kbAccessMode,
+              agent_model_id as agentModelId,
+              status,
+              started_at as startedAtUtc,
+              ended_at as endedAtUtc,
+              prompt_template as promptTemplate,
+              transcript_path as transcriptPath,
+              tool_calls_json as toolCallsJson,
+              raw_output_json as rawOutputJson,
+              message
+         FROM ai_runs
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY started_at DESC`,
+      { workspaceId, batchId }
+    );
+    return rows.map((row) => {
+      let toolCalls: AgentToolCallAudit[] = [];
+      if (row.toolCallsJson) {
+        try {
+          const parsed = JSON.parse(row.toolCallsJson) as unknown;
+          if (Array.isArray(parsed)) {
+            toolCalls = parsed as AgentToolCallAudit[];
+          }
+        } catch {
+          toolCalls = [];
+        }
+      }
+      let rawOutput: string[] = [];
+      if (row.rawOutputJson) {
+        try {
+          const parsed = JSON.parse(row.rawOutputJson) as unknown;
+          if (Array.isArray(parsed)) {
+            rawOutput = parsed as string[];
+          }
+        } catch {
+          rawOutput = [];
+        }
+      }
+      return {
+        id: row.id,
+        workspaceId: row.workspaceId,
+        batchId: row.batchId,
+        sessionId: row.sessionId ?? undefined,
+        kbAccessMode: row.kbAccessMode ?? 'mcp',
+        agentModelId: row.agentModelId?.trim() ? row.agentModelId.trim() : undefined,
+        status: row.status,
+        startedAtUtc: row.startedAtUtc,
+        endedAtUtc: row.endedAtUtc ?? undefined,
+        promptTemplate: row.promptTemplate ?? undefined,
+        transcriptPath: row.transcriptPath ?? undefined,
+        toolCalls,
+        rawOutput,
+        message: row.message ?? undefined
+      };
+    });
+  }
+
+  private listBatchAnalysisStageEventsFromDb(
+    db: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    batchId: string,
+    limit = 100
+  ): BatchAnalysisStageEventRecord[] {
+    const rows = db.all<Parameters<WorkspaceRepository['mapBatchAnalysisStageEventRow']>[0]>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration_id as iterationId,
+              iteration,
+              stage,
+              role,
+              event_type as eventType,
+              status,
+              summary,
+              session_id as sessionId,
+              agent_model_id as agentModelId,
+              approved_plan_id as approvedPlanId,
+              last_review_verdict as lastReviewVerdict,
+              outstanding_discovered_work_count as outstandingDiscoveredWorkCount,
+              execution_counts_json as executionCountsJson,
+              details_json as detailsJson,
+              created_at as createdAtUtc
+         FROM batch_analysis_stage_events
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY created_at DESC
+        LIMIT @limit`,
+      { workspaceId, batchId, limit }
+    );
+    return rows.map((row) => this.mapBatchAnalysisStageEventRow(row));
+  }
+
+  private backfillLegacyBatchAnalysisIterations(db: ReturnType<typeof openWorkspaceDatabase>): number {
+    const batches = db.all<{
+      workspaceId: string;
+      batchId: string;
+      totalRuns: number;
+    }>(
+      `SELECT ai_runs.workspace_id as workspaceId,
+              ai_runs.batch_id as batchId,
+              COUNT(*) as totalRuns
+         FROM ai_runs
+        WHERE ai_runs.batch_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+              FROM batch_analysis_iterations iterations
+             WHERE iterations.workspace_id = ai_runs.workspace_id
+               AND iterations.batch_id = ai_runs.batch_id
+          )
+        GROUP BY ai_runs.workspace_id, ai_runs.batch_id`
+    );
+    let inserted = 0;
+    for (const batch of batches) {
+      const runs = db.all<{
+        id: string;
+        workspaceId: string;
+        batchId: string;
+        sessionId: string | null;
+        agentModelId: string | null;
+        status: PersistedAgentAnalysisRun['status'];
+        startedAtUtc: string;
+        endedAtUtc: string | null;
+        message: string | null;
+      }>(
+        `SELECT id,
+                workspace_id as workspaceId,
+                batch_id as batchId,
+                session_id as sessionId,
+                agent_model_id as agentModelId,
+                status,
+                started_at as startedAtUtc,
+                ended_at as endedAtUtc,
+                message
+           FROM ai_runs
+          WHERE workspace_id = @workspaceId AND batch_id = @batchId
+          ORDER BY started_at ASC, id ASC`,
+        batch
+      );
+      runs.forEach((run, index) => {
+        const stage =
+          run.status === 'complete'
+            ? 'approved'
+            : run.status === 'canceled'
+              ? 'canceled'
+              : 'failed';
+        const role = run.status === 'complete' ? 'final-reviewer' : 'worker';
+        const status =
+          run.status === 'complete'
+            ? 'completed'
+            : run.status === 'canceled'
+              ? 'canceled'
+              : 'failed';
+        const summary = run.message?.trim() || 'Legacy single-run analysis imported into orchestration history.';
+        db.run(
+          `INSERT INTO batch_analysis_iterations (
+            id, workspace_id, batch_id, iteration, status, stage, role, summary, agent_model_id, session_id,
+            approved_plan_id, last_review_verdict, outstanding_discovered_work_count, execution_counts_json,
+            started_at, ended_at, created_at, updated_at
+          ) VALUES (
+            @id, @workspaceId, @batchId, @iteration, @status, @stage, @role, @summary, @agentModelId, @sessionId,
+            NULL, NULL, 0, @executionCountsJson, @startedAtUtc, @endedAtUtc, @createdAtUtc, @updatedAtUtc
+          )`,
+          {
+            id: randomUUID(),
+            workspaceId: run.workspaceId,
+            batchId: run.batchId,
+            iteration: index + 1,
+            status,
+            stage,
+            role,
+            summary,
+            agentModelId: run.agentModelId ?? null,
+            sessionId: run.sessionId ?? null,
+            executionCountsJson: JSON.stringify(this.normalizeBatchAnalysisExecutionCounts()),
+            startedAtUtc: run.startedAtUtc,
+            endedAtUtc: run.endedAtUtc ?? run.startedAtUtc,
+            createdAtUtc: run.startedAtUtc,
+            updatedAtUtc: run.endedAtUtc ?? run.startedAtUtc
+          }
+        );
+        inserted += 1;
+      });
+    }
+    return inserted;
+  }
+
+  private backfillLegacyBatchAnalysisWorkerReports(db: ReturnType<typeof openWorkspaceDatabase>): number {
+    const iterations = db.all<{
+      id: string;
+      workspaceId: string;
+      batchId: string;
+      iteration: number;
+      sessionId: string | null;
+      agentModelId: string | null;
+      summary: string | null;
+      endedAtUtc: string | null;
+      status: BatchAnalysisIterationStatus;
+    }>(
+      `SELECT iterations.id,
+              iterations.workspace_id as workspaceId,
+              iterations.batch_id as batchId,
+              iterations.iteration,
+              iterations.session_id as sessionId,
+              iterations.agent_model_id as agentModelId,
+              iterations.summary,
+              iterations.ended_at as endedAtUtc,
+              iterations.status
+         FROM batch_analysis_iterations iterations
+        WHERE NOT EXISTS (
+          SELECT 1
+            FROM batch_analysis_worker_reports reports
+           WHERE reports.iteration_id = iterations.id
+        )
+          AND EXISTS (
+            SELECT 1
+              FROM ai_runs runs
+             WHERE runs.workspace_id = iterations.workspace_id
+               AND runs.batch_id = iterations.batch_id
+               AND ((runs.session_id IS NULL AND iterations.session_id IS NULL) OR runs.session_id = iterations.session_id)
+          )`
+    );
+    let inserted = 0;
+    for (const iteration of iterations) {
+      db.run(
+        `INSERT INTO batch_analysis_worker_reports (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, summary, status, plan_id,
+          executed_items_json, blocker_notes_json, payload_json, agent_model_id, session_id, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, 'worker', @summary, @status, NULL,
+          '[]', @blockerNotesJson, @payloadJson, @agentModelId, @sessionId, @createdAtUtc
+        )`,
+        {
+          id: randomUUID(),
+          workspaceId: iteration.workspaceId,
+          batchId: iteration.batchId,
+          iterationId: iteration.id,
+          iteration: iteration.iteration,
+          stage: 'building',
+          summary: iteration.summary ?? 'Legacy single-run analysis imported into worker history.',
+          status: iteration.status === 'completed' ? 'completed' : iteration.status === 'canceled' ? 'blocked' : 'failed',
+          blockerNotesJson: JSON.stringify(
+            iteration.status === 'completed' ? [] : [iteration.summary ?? 'Legacy run did not complete successfully.']
+          ),
+          payloadJson: JSON.stringify({
+            id: `legacy-worker-report:${iteration.id}`,
+            workspaceId: iteration.workspaceId,
+            batchId: iteration.batchId,
+            iterationId: iteration.id,
+            iteration: iteration.iteration,
+            stage: 'building',
+            role: 'worker',
+            summary: iteration.summary ?? 'Legacy single-run analysis imported into worker history.',
+            status: iteration.status === 'completed' ? 'completed' : iteration.status === 'canceled' ? 'blocked' : 'failed',
+            executedItems: [],
+            discoveredWork: [],
+            blockerNotes: iteration.status === 'completed' ? [] : [iteration.summary ?? 'Legacy run did not complete successfully.'],
+            createdAtUtc: iteration.endedAtUtc ?? new Date().toISOString(),
+            agentModelId: iteration.agentModelId ?? undefined,
+            sessionId: iteration.sessionId ?? undefined
+          }),
+          agentModelId: iteration.agentModelId ?? null,
+          sessionId: iteration.sessionId ?? null,
+          createdAtUtc: iteration.endedAtUtc ?? new Date().toISOString()
+        }
+      );
+      inserted += 1;
+    }
+    return inserted;
+  }
+
+  private normalizeBatchAnalysisIterations(db: ReturnType<typeof openWorkspaceDatabase>): number {
+    const iterations = db.all<{
+      id: string;
+      workspaceId: string;
+      batchId: string;
+      executionCountsJson: string | null;
+      approvedPlanId: string | null;
+      lastReviewVerdict: BatchAnalysisArtifactVerdict | null;
+      outstandingDiscoveredWorkCount: number;
+      endedAtUtc: string | null;
+      status: BatchAnalysisIterationStatus;
+      updatedAtUtc: string;
+    }>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              execution_counts_json as executionCountsJson,
+              approved_plan_id as approvedPlanId,
+              last_review_verdict as lastReviewVerdict,
+              outstanding_discovered_work_count as outstandingDiscoveredWorkCount,
+              ended_at as endedAtUtc,
+              status,
+              updated_at as updatedAtUtc
+         FROM batch_analysis_iterations`
+    );
+    let updated = 0;
+    for (const iteration of iterations) {
+      const nextApprovedPlanId = iteration.approvedPlanId ?? db.get<{ id: string }>(
+        `SELECT id
+           FROM batch_analysis_plans
+          WHERE iteration_id = @iterationId AND verdict = 'approved'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        { iterationId: iteration.id }
+      )?.id ?? null;
+      const nextLastReviewVerdict = iteration.lastReviewVerdict ?? db.get<{ verdict: BatchAnalysisArtifactVerdict }>(
+        `SELECT verdict
+           FROM batch_analysis_final_reviews
+          WHERE iteration_id = @iterationId
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        { iterationId: iteration.id }
+      )?.verdict ?? db.get<{ verdict: BatchAnalysisArtifactVerdict }>(
+        `SELECT verdict
+           FROM batch_analysis_reviews
+          WHERE iteration_id = @iterationId
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        { iterationId: iteration.id }
+      )?.verdict ?? null;
+      const unresolvedDiscoveries = db.get<{ total: number }>(
+        `SELECT COUNT(*) as total
+           FROM batch_analysis_discovered_work
+          WHERE iteration_id = @iterationId
+            AND COALESCE(status, 'pending_review') NOT IN ('approved', 'rejected')`,
+        { iterationId: iteration.id }
+      )?.total ?? 0;
+      const currentCounts = this.parseBatchAnalysisExecutionCounts(iteration.executionCountsJson);
+      const hasZeroCounts = currentCounts.total === 0 && currentCounts.executed === 0 && currentCounts.blocked === 0;
+      let nextCounts = currentCounts;
+      if (hasZeroCounts) {
+        const workerReport = this.getLatestBatchAnalysisWorkerReportForIterationFromDb(db, iteration.id);
+        if (workerReport) {
+          nextCounts = this.buildExecutionCountsFromWorkerReport(workerReport);
+        }
+      }
+      const nextEndedAtUtc = iteration.endedAtUtc ?? (
+        iteration.status === 'completed' || iteration.status === 'failed' || iteration.status === 'canceled' || iteration.status === 'needs_human_review'
+          ? iteration.updatedAtUtc
+          : null
+      );
+      const needsUpdate =
+        nextApprovedPlanId !== iteration.approvedPlanId
+        || nextLastReviewVerdict !== iteration.lastReviewVerdict
+        || unresolvedDiscoveries !== iteration.outstandingDiscoveredWorkCount
+        || nextEndedAtUtc !== iteration.endedAtUtc
+        || JSON.stringify(nextCounts) !== JSON.stringify(currentCounts);
+      if (!needsUpdate) {
+        continue;
+      }
+      db.run(
+        `UPDATE batch_analysis_iterations
+            SET approved_plan_id = COALESCE(@approvedPlanId, approved_plan_id),
+                last_review_verdict = COALESCE(@lastReviewVerdict, last_review_verdict),
+                outstanding_discovered_work_count = @outstandingDiscoveredWorkCount,
+                execution_counts_json = @executionCountsJson,
+                ended_at = COALESCE(@endedAtUtc, ended_at),
+                updated_at = @updatedAtUtc
+          WHERE id = @iterationId`,
+        {
+          iterationId: iteration.id,
+          approvedPlanId: nextApprovedPlanId,
+          lastReviewVerdict: nextLastReviewVerdict,
+          outstandingDiscoveredWorkCount: unresolvedDiscoveries,
+          executionCountsJson: JSON.stringify(nextCounts),
+          endedAtUtc: nextEndedAtUtc,
+          updatedAtUtc: new Date().toISOString()
+        }
+      );
+      updated += 1;
+    }
+    return updated;
+  }
+
+  private backfillBatchAnalysisStageEvents(db: ReturnType<typeof openWorkspaceDatabase>): number {
+    const iterations = db.all<{
+      id: string;
+      workspaceId: string;
+      batchId: string;
+      iteration: number;
+      stage: BatchAnalysisStageStatus;
+      role: BatchAnalysisIterationRecord['role'];
+      status: BatchAnalysisIterationStatus;
+      summary: string | null;
+      sessionId: string | null;
+      agentModelId: string | null;
+      approvedPlanId: string | null;
+      lastReviewVerdict: BatchAnalysisArtifactVerdict | null;
+      outstandingDiscoveredWorkCount: number;
+      executionCountsJson: string | null;
+      startedAtUtc: string;
+      endedAtUtc: string | null;
+      updatedAtUtc: string;
+    }>(
+      `SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration,
+              stage,
+              role,
+              status,
+              summary,
+              session_id as sessionId,
+              agent_model_id as agentModelId,
+              approved_plan_id as approvedPlanId,
+              last_review_verdict as lastReviewVerdict,
+              outstanding_discovered_work_count as outstandingDiscoveredWorkCount,
+              execution_counts_json as executionCountsJson,
+              started_at as startedAtUtc,
+              ended_at as endedAtUtc,
+              updated_at as updatedAtUtc
+         FROM batch_analysis_iterations`
+    );
+    let inserted = 0;
+    for (const iteration of iterations) {
+      const existingCount = db.get<{ total: number }>(
+        `SELECT COUNT(*) as total
+           FROM batch_analysis_stage_events
+          WHERE iteration_id = @iterationId`,
+        { iterationId: iteration.id }
+      )?.total ?? 0;
+      if (existingCount > 0) {
+        continue;
+      }
+      const executionCounts = this.parseBatchAnalysisExecutionCounts(iteration.executionCountsJson);
+      db.run(
+        `INSERT INTO batch_analysis_stage_events (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, event_type, status, summary,
+          session_id, agent_model_id, approved_plan_id, last_review_verdict, outstanding_discovered_work_count,
+          execution_counts_json, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, @role, 'iteration_started', @status, @summary,
+          @sessionId, @agentModelId, @approvedPlanId, @lastReviewVerdict, @outstandingDiscoveredWorkCount,
+          @executionCountsJson, @createdAtUtc
+        )`,
+        {
+          id: randomUUID(),
+          workspaceId: iteration.workspaceId,
+          batchId: iteration.batchId,
+          iterationId: iteration.id,
+          iteration: iteration.iteration,
+          stage: 'planning',
+          role: 'planner',
+          status: 'running',
+          summary: 'Backfilled iteration start event.',
+          sessionId: iteration.sessionId ?? null,
+          agentModelId: iteration.agentModelId ?? null,
+          approvedPlanId: iteration.approvedPlanId ?? null,
+          lastReviewVerdict: iteration.lastReviewVerdict ?? null,
+          outstandingDiscoveredWorkCount: 0,
+          executionCountsJson: JSON.stringify(this.normalizeBatchAnalysisExecutionCounts()),
+          createdAtUtc: iteration.startedAtUtc
+        }
+      );
+      inserted += 1;
+      db.run(
+        `INSERT INTO batch_analysis_stage_events (
+          id, workspace_id, batch_id, iteration_id, iteration, stage, role, event_type, status, summary,
+          session_id, agent_model_id, approved_plan_id, last_review_verdict, outstanding_discovered_work_count,
+          execution_counts_json, created_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @iteration, @stage, @role, @eventType, @status, @summary,
+          @sessionId, @agentModelId, @approvedPlanId, @lastReviewVerdict, @outstandingDiscoveredWorkCount,
+          @executionCountsJson, @createdAtUtc
+        )`,
+        {
+          id: randomUUID(),
+          workspaceId: iteration.workspaceId,
+          batchId: iteration.batchId,
+          iterationId: iteration.id,
+          iteration: iteration.iteration,
+          stage: iteration.stage,
+          role: iteration.role,
+          eventType:
+            iteration.status === 'running'
+              ? 'stage_transition'
+              : 'iteration_completed',
+          status: iteration.status,
+          summary: iteration.summary ?? 'Backfilled iteration state event.',
+          sessionId: iteration.sessionId ?? null,
+          agentModelId: iteration.agentModelId ?? null,
+          approvedPlanId: iteration.approvedPlanId ?? null,
+          lastReviewVerdict: iteration.lastReviewVerdict ?? null,
+          outstandingDiscoveredWorkCount: iteration.outstandingDiscoveredWorkCount,
+          executionCountsJson: JSON.stringify(executionCounts),
+          createdAtUtc: iteration.endedAtUtc ?? iteration.updatedAtUtc
+        }
+      );
+      inserted += 1;
+    }
+    return inserted;
+  }
+
+  private buildExecutionCountsFromWorkerReport(report: BatchWorkerExecutionReport): BatchAnalysisExecutionCounts {
+    const counts = this.normalizeBatchAnalysisExecutionCounts({
+      total: report.executedItems.length
+    });
+    for (const item of report.executedItems) {
+      if (item.action === 'create') counts.create += 1;
+      else if (item.action === 'edit') counts.edit += 1;
+      else if (item.action === 'retire') counts.retire += 1;
+      else counts.noImpact += 1;
+
+      if (item.status === 'executed' || item.status === 'skipped') {
+        counts.executed += 1;
+      } else if (item.status === 'blocked') {
+        counts.blocked += 1;
+      }
+    }
+    return counts;
   }
 
   private async prepareWorkspaceFilesystem(workspacePath: string) {
@@ -6852,6 +9105,49 @@ export class WorkspaceRepository {
       normalizedTitle,
       normalizedLocale
     }) ?? null;
+  }
+
+  private findOpenProposalByIdempotencyKey(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    payload: {
+      workspaceId: string;
+      batchId: string;
+      idempotencyKey: string;
+    }
+  ): { id: string; queueOrder: number } | null {
+    const rows = workspaceDb.all<{ id: string; queueOrder: number; metadataJson: string | null }>(`
+      SELECT id,
+             queue_order as queueOrder,
+             metadata_json as metadataJson
+      FROM proposals
+      WHERE workspace_id = @workspaceId
+        AND batch_id = @batchId
+        AND review_status IN ('pending_review', 'deferred')
+      ORDER BY updated_at DESC, generated_at DESC
+      LIMIT 50
+    `, {
+      workspaceId: payload.workspaceId,
+      batchId: payload.batchId
+    });
+
+    for (const row of rows) {
+      if (!row.metadataJson) {
+        continue;
+      }
+      try {
+        const metadata = JSON.parse(row.metadataJson) as Record<string, unknown>;
+        if (extractString(metadata._agentCommandKey) === payload.idempotencyKey) {
+          return {
+            id: row.id,
+            queueOrder: row.queueOrder
+          };
+        }
+      } catch {
+        // ignore malformed stored metadata
+      }
+    }
+
+    return null;
   }
 
   private buildFallbackProposalHtml(
@@ -8268,6 +10564,16 @@ function safeParseJson<T = unknown>(value: string | null | undefined): T | null 
 
 function variantToDraftCount(map: Map<string, number>, localeVariantId: string): number {
   return map.get(localeVariantId) ?? 0;
+}
+
+function normalizeSearchIdList(values?: string[]): string[] {
+  return Array.from(
+    new Set(
+      (values ?? [])
+        .map((value) => value.trim())
+        .filter(Boolean)
+    )
+  );
 }
 
 function passSearchScope(

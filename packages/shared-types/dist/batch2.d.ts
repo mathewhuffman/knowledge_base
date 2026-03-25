@@ -126,6 +126,7 @@ export interface WorkspaceSettingsRecord {
     enabledLocales: string[];
     kbAccessMode: KbAccessMode;
     agentModelId?: string;
+    acpModelId?: string;
 }
 export interface WorkspaceSettingsUpdateRequest {
     workspaceId: EntityId;
@@ -135,6 +136,7 @@ export interface WorkspaceSettingsUpdateRequest {
     enabledLocales?: string[];
     kbAccessMode?: KbAccessMode;
     agentModelId?: string;
+    acpModelId?: string;
 }
 export interface WorkspaceListItem extends WorkspaceRecord {
     isDefaultWorkspace: boolean;
@@ -500,13 +502,16 @@ export interface SearchResult {
 }
 export interface SearchPayload {
     workspaceId: EntityId;
-    query: string;
+    query?: string;
     locales?: string[];
     includeArchived?: boolean;
     scope?: SearchScope;
     changedWithinHours?: number;
     hasDrafts?: boolean;
     includeConflicts?: boolean;
+    localeVariantIds?: EntityId[];
+    familyIds?: EntityId[];
+    revisionIds?: EntityId[];
 }
 export interface SearchResponse {
     workspaceId: EntityId;
@@ -687,9 +692,16 @@ export interface WorkspaceMigrationHealth {
     workspaceDbVersion: number;
     repaired: boolean;
     exists: boolean;
+    batchAnalysisRepair?: WorkspaceBatchAnalysisRepairSummary;
 }
 export interface WorkspaceMigrationHealthReport {
     catalogVersion: number;
     workspaceId: EntityId | null;
     workspaces: WorkspaceMigrationHealth[];
+}
+export interface WorkspaceBatchAnalysisRepairSummary {
+    backfilledLegacyIterations: number;
+    backfilledLegacyWorkerReports: number;
+    backfilledStageEvents: number;
+    normalizedIterations: number;
 }

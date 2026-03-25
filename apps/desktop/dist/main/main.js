@@ -70,7 +70,7 @@ async function bootstrapApp() {
                 featureFlags: config.featureFlags,
                 defaultWorkspaceRoot: workspace_root_1.DEFAULT_WORKSPACE_ROOT,
                 uiPreferences: {
-                    sidebarCollapsed: (0, app_preferences_1.getSidebarCollapsedPreference)()
+                    sidebarCollapsed: (0, app_preferences_1.getStoredSidebarCollapsedPreference)() ?? undefined
                 }
             }
         };

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import {
   AppErrorCode,
   createErrorResult,
@@ -65,6 +66,11 @@ import {
   type MCPRecordAgentNotesInput,
   type MCPFindRelatedArticlesInput,
   type AgentStreamingPayload,
+  type BatchAnalysisStageEventDetails,
+  type BatchAnalysisIterationRecord,
+  type BatchAnalysisPlan,
+  type BatchAnalysisStageStatus,
+  type BatchPlanReview,
   type ProposalIngestRequest,
   type ProposalReviewDecisionRequest,
   type ProposalReviewDeleteRequest,
@@ -72,6 +78,7 @@ import {
   type ProposalReviewSaveWorkingCopyRequest,
   ProposalReviewDecision,
   type ProposalReviewGetRequest,
+  type ProposalReviewQueueItem,
   type ProposalReviewListRequest,
   DraftBranchStatus,
   type DraftBranchCreateRequest,
@@ -118,6 +125,7 @@ import { KbCliLoopbackService } from './kb-cli-loopback-service';
 import { KbCliRuntimeService } from './kb-cli-runtime-service';
 import { AiAssistantService } from './ai-assistant-service';
 import { AppWorkingStateService } from './app-working-state-service';
+import { BatchAnalysisOrchestrator } from './batch-analysis-orchestrator';
 
 interface RuntimeModelCatalogEntry {
   provider: string;
@@ -323,6 +331,640 @@ const readTranscriptLines = async (transcriptPath?: string, limit?: number): Pro
   }
 };
 
+type PlannerPrefetchCluster = {
+  clusterId: string;
+  label: string;
+  pbiIds: string[];
+  sampleTitles: string[];
+  queries: string[];
+};
+
+type PlannerPrefetchSummary = {
+  priorAnalysis: {
+    latestPlanSummary?: string;
+    latestApprovedPlanSummary?: string;
+    latestReviewVerdict?: string;
+    latestFinalVerdict?: string;
+  } | null;
+  topicClusters: PlannerPrefetchCluster[];
+  articleMatches: Array<{
+    clusterId: string;
+    query: string;
+    total: number;
+    topResults: Array<{
+      title: string;
+      familyId: string;
+      localeVariantId: string;
+      score: number;
+      matchContext?: string;
+      snippet: string;
+    }>;
+  }>;
+  relationMatches: Array<{
+    title: string;
+    familyId: string;
+    strengthScore: number;
+    relationType: string;
+    evidence: string[];
+  }>;
+};
+
+const PLANNER_CLUSTER_STOPWORDS = new Set([
+  'a', 'an', 'and', 'the', 'for', 'of', 'to', 'in', 'on', 'with', 'from', 'by',
+  'tab', 'page', 'view', 'workflow', 'behavior', 'state', 'visibility', 'navigation',
+  'related', 'scenarios', 'management', 'details', 'table', 'modal'
+]);
+
+const normalizePlannerPhrase = (value: string): string =>
+  value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+const tokenizePlannerPhrase = (value: string): string[] =>
+  normalizePlannerPhrase(value)
+    .split(' ')
+    .filter((token) => token.length >= 3 && !PLANNER_CLUSTER_STOPWORDS.has(token));
+
+const dedupeStrings = (values: Array<string | undefined | null>): string[] =>
+  Array.from(new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))));
+
+const extractPlannerPbiRows = (uploadedPbis: unknown): Array<{
+  pbiId: string;
+  title: string;
+  titlePath: string[];
+}> => {
+  const rows = Array.isArray(uploadedPbis)
+    ? uploadedPbis
+    : uploadedPbis && typeof uploadedPbis === 'object' && Array.isArray((uploadedPbis as { rows?: unknown[] }).rows)
+      ? (uploadedPbis as { rows: unknown[] }).rows
+      : [];
+
+  return rows
+    .map((row) => {
+      if (!row || typeof row !== 'object') {
+        return null;
+      }
+      const record = row as Record<string, unknown>;
+      const title = typeof record.title === 'string' ? record.title.trim() : '';
+      const pbiId = typeof record.id === 'string' ? record.id : '';
+      const titlePath = [record.title1, record.title2, record.title3]
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .map((value) => value.trim());
+      if (!pbiId || !title) {
+        return null;
+      }
+      return { pbiId, title, titlePath };
+    })
+    .filter((row): row is { pbiId: string; title: string; titlePath: string[] } => Boolean(row));
+};
+
+const computePlannerTokenSimilarity = (left: string[], right: string[]): number => {
+  if (left.length === 0 || right.length === 0) {
+    return 0;
+  }
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  let overlap = 0;
+  for (const token of leftSet) {
+    if (rightSet.has(token)) {
+      overlap += 1;
+    }
+  }
+  return overlap / Math.max(leftSet.size, rightSet.size);
+};
+
+const buildPlannerTopicClusters = (uploadedPbis: unknown): PlannerPrefetchCluster[] => {
+  const rows = extractPlannerPbiRows(uploadedPbis);
+  const clusters: Array<PlannerPrefetchCluster & { tokenSets: string[][] }> = [];
+
+  for (const row of rows) {
+    const phrases = dedupeStrings([row.title, ...row.titlePath]);
+    const tokenSets = phrases.map((phrase) => tokenizePlannerPhrase(phrase)).filter((tokens) => tokens.length > 0);
+    const existing = clusters.find((cluster) =>
+      tokenSets.some((tokens) => cluster.tokenSets.some((candidate) => computePlannerTokenSimilarity(tokens, candidate) >= 0.55))
+    );
+
+    if (existing) {
+      if (!existing.pbiIds.includes(row.pbiId)) {
+        existing.pbiIds.push(row.pbiId);
+      }
+      existing.sampleTitles = dedupeStrings([...existing.sampleTitles, row.title]).slice(0, 4);
+      existing.queries = dedupeStrings([...existing.queries, ...phrases]).slice(0, 4);
+      existing.tokenSets.push(...tokenSets);
+      continue;
+    }
+
+    clusters.push({
+      clusterId: `cluster-${clusters.length + 1}`,
+      label: row.titlePath[row.titlePath.length - 1] ?? row.title,
+      pbiIds: [row.pbiId],
+      sampleTitles: [row.title],
+      queries: phrases.slice(0, 4),
+      tokenSets
+    });
+  }
+
+  return clusters
+    .map(({ tokenSets: _tokenSets, ...cluster }) => cluster)
+    .sort((left, right) => right.pbiIds.length - left.pbiIds.length || left.label.localeCompare(right.label));
+};
+
+const summarizeRelationEvidence = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return '';
+      }
+      const record = item as { snippet?: unknown; sourceRef?: unknown };
+      if (typeof record.snippet === 'string' && record.snippet.trim()) {
+        return record.snippet.trim();
+      }
+      if (typeof record.sourceRef === 'string' && record.sourceRef.trim()) {
+        return record.sourceRef.trim();
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .slice(0, 3);
+};
+
+const buildPlannerPrefetch = async (
+  workspaceRepository: WorkspaceRepository,
+  workspaceId: string,
+  batchId: string,
+  uploadedPbis: unknown
+): Promise<PlannerPrefetchSummary> => {
+  const topicClusters = buildPlannerTopicClusters(uploadedPbis);
+  const [inspection, relationResponse, articleMatches] = await Promise.all([
+    workspaceRepository.getBatchAnalysisInspection(workspaceId, batchId).catch(() => null),
+    workspaceRepository.listArticleRelations(workspaceId, {
+      workspaceId,
+      batchId,
+      limit: 12,
+      minScore: 0.15,
+      includeEvidence: true
+    }).catch(() => ({ relations: [] })),
+    Promise.all(
+      topicClusters.slice(0, 12).flatMap((cluster) =>
+        cluster.queries.slice(0, 2).map(async (query) => {
+          const search = await workspaceRepository.searchArticles(workspaceId, {
+            workspaceId,
+            query,
+            scope: 'all',
+            includeArchived: true
+          }).catch(() => ({ total: 0, results: [] as Array<Record<string, unknown>> }));
+          return {
+            clusterId: cluster.clusterId,
+            query,
+            total: typeof search.total === 'number' ? search.total : 0,
+            topResults: Array.isArray(search.results)
+              ? search.results.slice(0, 3).map((result) => ({
+                  title: typeof result.title === 'string' ? result.title : 'Untitled article',
+                  familyId: typeof result.familyId === 'string' ? result.familyId : '',
+                  localeVariantId: typeof result.localeVariantId === 'string' ? result.localeVariantId : '',
+                  score: typeof result.score === 'number' ? result.score : 0,
+                  matchContext: typeof result.matchContext === 'string' ? result.matchContext : undefined,
+                  snippet: typeof result.snippet === 'string' ? result.snippet.trim() : ''
+                }))
+              : []
+          };
+        })
+      )
+    )
+  ]);
+
+  return {
+    priorAnalysis: inspection
+      ? {
+          latestPlanSummary: inspection.plans[0]?.summary,
+          latestApprovedPlanSummary: inspection.snapshot.latestApprovedPlan?.summary,
+          latestReviewVerdict: inspection.reviews[0]?.verdict,
+          latestFinalVerdict: inspection.finalReviews[0]?.verdict
+        }
+      : null,
+    topicClusters,
+    articleMatches,
+    relationMatches: Array.isArray((relationResponse as { relations?: unknown[] }).relations)
+      ? ((relationResponse as { relations: Array<Record<string, unknown>> }).relations).slice(0, 12).map((relation) => ({
+          title: typeof relation.targetFamily === 'object' && relation.targetFamily && typeof (relation.targetFamily as { title?: unknown }).title === 'string'
+            ? (relation.targetFamily as { title: string }).title
+            : 'Untitled family',
+          familyId: typeof relation.targetFamily === 'object' && relation.targetFamily && typeof (relation.targetFamily as { id?: unknown }).id === 'string'
+            ? (relation.targetFamily as { id: string }).id
+            : '',
+          strengthScore: typeof relation.strengthScore === 'number' ? relation.strengthScore : 0,
+          relationType: typeof relation.relationType === 'string' ? relation.relationType : 'related',
+          evidence: summarizeRelationEvidence(relation.evidence)
+        }))
+      : []
+  };
+};
+
+const extractResultTextCandidates = (payload: unknown): string[] => {
+  if (!payload || typeof payload !== 'object') {
+    return [];
+  }
+  const record = payload as {
+    text?: unknown;
+    streamedText?: unknown;
+    content?: Array<{ type?: string; text?: string }>;
+  };
+  const candidates = [
+    typeof record.text === 'string' ? record.text : '',
+    Array.isArray(record.content)
+      ? record.content
+          .filter((item) => item?.type === 'text' && typeof item.text === 'string')
+          .map((item) => item.text)
+          .join('\n')
+          .trim()
+      : '',
+    typeof record.streamedText === 'string' ? record.streamedText : ''
+  ].map((value) => collapseRepeatedTranscriptText(value)).filter(Boolean);
+
+  return Array.from(new Set(candidates));
+};
+
+const scoreResultTextCandidate = (candidate: string): number => {
+  const trimmed = candidate.trim();
+  if (!trimmed) {
+    return -1;
+  }
+  if (extractJsonObject(trimmed)) {
+    return 10_000 + trimmed.length;
+  }
+
+  let score = trimmed.length;
+  if (trimmed.startsWith('{')) {
+    score += 500;
+  }
+  if (trimmed.includes('"summary"')) {
+    score += 300;
+  }
+  if (trimmed.includes('"coverage"')) {
+    score += 300;
+  }
+  if (trimmed.includes('"items"')) {
+    score += 300;
+  }
+  if (trimmed.includes('"verdict"')) {
+    score += 300;
+  }
+  score += (trimmed.match(/\{/g) ?? []).length * 25;
+  return score;
+};
+
+const selectBestResultText = (candidates: string[]): string => {
+  if (candidates.length === 0) {
+    return '';
+  }
+  return [...candidates]
+    .sort((left, right) => scoreResultTextCandidate(right) - scoreResultTextCandidate(left))[0] ?? '';
+};
+
+const collapseRepeatedTranscriptText = (value: string): string => {
+  let current = value.trim();
+  while (current.length >= 64 && current.length % 2 === 0) {
+    const midpoint = current.length / 2;
+    const left = current.slice(0, midpoint).trim();
+    const right = current.slice(midpoint).trim();
+    if (!left || left !== right) {
+      break;
+    }
+    current = left;
+  }
+  return current;
+};
+
+const findTranscriptChunkOverlap = (left: string, right: string): number => {
+  const maxOverlap = Math.min(left.length, right.length);
+  for (let overlap = maxOverlap; overlap >= 24; overlap -= 1) {
+    if (left.slice(-overlap) === right.slice(0, overlap)) {
+      return overlap;
+    }
+  }
+  return 0;
+};
+
+const appendTranscriptChunk = (chunks: string[], chunk: string): void => {
+  const normalized = collapseRepeatedTranscriptText(chunk);
+  if (!normalized) {
+    return;
+  }
+
+  const assembled = chunks.join('');
+  if (!assembled) {
+    chunks.push(normalized);
+    return;
+  }
+
+  if (assembled.endsWith(normalized)) {
+    return;
+  }
+
+  const overlap = findTranscriptChunkOverlap(assembled, normalized);
+  const suffix = overlap > 0 ? normalized.slice(overlap) : normalized;
+  if (suffix) {
+    chunks.push(suffix);
+  }
+};
+
+const normalizeRecoveredJsonText = (text: string): string | null => {
+  const extracted = extractJsonObject(text);
+  return extracted ? JSON.stringify(extracted) : null;
+};
+
+const extractJsonStringField = (text: string, fieldName: string): string | null => {
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`"${escapedField}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, 's').exec(text);
+  if (!match) {
+    return null;
+  }
+  try {
+    return JSON.parse(`"${match[1]}"`) as string;
+  } catch {
+    return match[1];
+  }
+};
+
+const findJsonArrayStart = (text: string, fieldName: string): number => {
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`"${escapedField}"\\s*:\\s*\\[`, 's').exec(text);
+  return match ? match.index + match[0].length - 1 : -1;
+};
+
+const extractCompleteJsonObjectsFromArray = (text: string, fieldName: string): Record<string, unknown>[] => {
+  const arrayStart = findJsonArrayStart(text, fieldName);
+  if (arrayStart < 0) {
+    return [];
+  }
+
+  const results: Record<string, unknown>[] = [];
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let objectStart = -1;
+
+  for (let index = arrayStart + 1; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      if (depth === 0) {
+        objectStart = index;
+      }
+      depth += 1;
+      continue;
+    }
+
+    if (char === '}' && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && objectStart >= 0) {
+        try {
+          const parsed = JSON.parse(text.slice(objectStart, index + 1)) as unknown;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            results.push(parsed as Record<string, unknown>);
+          }
+        } catch {
+          // ignore incomplete object candidates
+        }
+        objectStart = -1;
+      }
+      continue;
+    }
+
+    if (char === ']' && depth === 0) {
+      break;
+    }
+  }
+
+  return results;
+};
+
+const extractCompleteJsonStringsFromArray = (text: string, fieldName: string): string[] => {
+  const arrayStart = findJsonArrayStart(text, fieldName);
+  if (arrayStart < 0) {
+    return [];
+  }
+
+  const results: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let stringStart = -1;
+
+  for (let index = arrayStart + 1; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        try {
+          results.push(JSON.parse(text.slice(stringStart, index + 1)) as string);
+        } catch {
+          // ignore malformed string fragments
+        }
+        inString = false;
+        stringStart = -1;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      stringStart = index;
+      continue;
+    }
+
+    if (char === ']') {
+      break;
+    }
+  }
+
+  return results;
+};
+
+const salvagePlannerJsonText = (text: string): string | null => {
+  const summary = extractJsonStringField(text, 'summary');
+  const rawCoverage = extractCompleteJsonObjectsFromArray(text, 'coverage');
+  const rawItems = extractCompleteJsonObjectsFromArray(text, 'items');
+  const openQuestions = extractCompleteJsonStringsFromArray(text, 'openQuestions');
+
+  const items: Array<Record<string, unknown> & { planItemId: string }> = rawItems
+    .filter((item) =>
+      typeof item.planItemId === 'string'
+      && Array.isArray(item.pbiIds)
+      && typeof item.action === 'string'
+      && typeof item.targetType === 'string'
+      && typeof item.targetTitle === 'string'
+      && typeof item.reason === 'string'
+    )
+    .map((item) => ({
+      ...item,
+      planItemId: item.planItemId as string,
+      pbiIds: (item.pbiIds as unknown[]).filter((value): value is string => typeof value === 'string'),
+      evidence: Array.isArray(item.evidence)
+        ? (item.evidence as Array<Record<string, unknown>>).filter((evidence) =>
+            evidence
+            && typeof evidence === 'object'
+            && typeof evidence.kind === 'string'
+            && typeof evidence.ref === 'string'
+            && typeof evidence.summary === 'string'
+          )
+        : [],
+      confidence: typeof item.confidence === 'number' ? item.confidence : 0.5,
+      executionStatus: typeof item.executionStatus === 'string' ? item.executionStatus : 'pending'
+    }) as Record<string, unknown> & { planItemId: string });
+
+  if (items.length === 0) {
+    return null;
+  }
+
+  const itemIds = new Set(items.map((item) => item.planItemId));
+  const coverage = rawCoverage
+    .filter((entry) => typeof entry.pbiId === 'string' && typeof entry.outcome === 'string')
+    .map((entry) => ({
+      ...entry,
+      planItemIds: Array.isArray(entry.planItemIds)
+        ? (entry.planItemIds as unknown[]).filter((value): value is string => typeof value === 'string' && itemIds.has(value))
+        : []
+    }))
+    .filter((entry) => entry.planItemIds.length > 0);
+
+  if (coverage.length === 0) {
+    return null;
+  }
+
+  return JSON.stringify({
+    summary: summary ?? 'Recovered planner draft from truncated output.',
+    coverage,
+    items,
+    openQuestions
+  });
+};
+
+const buildMalformedPlanReviewFallback = (summary: string, verdict: 'needs_revision' | 'needs_human_review' = 'needs_human_review'): string =>
+  JSON.stringify({
+    summary,
+    verdict,
+    didAccountForEveryPbi: false,
+    hasMissingCreates: false,
+    hasMissingEdits: false,
+    hasTargetIssues: false,
+    hasOverlapOrConflict: false,
+    foundAdditionalArticleWork: false,
+    underScopedKbImpact: false,
+    delta: {
+      summary,
+      requestedChanges: [],
+      missingPbiIds: [],
+      missingCreates: [],
+      missingEdits: [],
+      additionalArticleWork: [],
+      targetCorrections: [],
+      overlapConflicts: []
+    }
+  });
+
+const buildMalformedFinalReviewFallback = (summary: string): string =>
+  JSON.stringify({
+    summary,
+    verdict: 'needs_human_review',
+    allPbisMapped: false,
+    planExecutionComplete: false,
+    hasMissingArticleChanges: false,
+    hasUnresolvedDiscoveredWork: false,
+    delta: {
+      summary,
+      requestedRework: [],
+      uncoveredPbiIds: [],
+      missingArticleChanges: [],
+      duplicateRiskTitles: [],
+      unnecessaryChanges: [],
+      unresolvedAmbiguities: []
+    }
+  });
+
+const STAGE_EVENT_TEXT_PREVIEW_LIMIT = 1_200;
+
+const buildStageEventTextPreview = (value: string | undefined, limit = STAGE_EVENT_TEXT_PREVIEW_LIMIT): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  return normalized.length > limit ? `${normalized.slice(0, limit)}...` : normalized;
+};
+
+const extractTranscriptResultTextCandidates = (lines: AgentTranscriptLine[]): string[] => {
+  const chunkParts: string[] = [];
+  const candidates: string[] = [];
+
+  for (const line of lines) {
+    if (line.direction !== 'from_agent') {
+      continue;
+    }
+
+    if (line.event === 'response') {
+      try {
+        const parsed = JSON.parse(line.payload) as { result?: unknown };
+        candidates.push(...extractResultTextCandidates(parsed.result));
+      } catch {
+        // ignore malformed transcript response lines
+      }
+      continue;
+    }
+
+    if (line.event === 'session_update') {
+      try {
+        const parsed = JSON.parse(line.payload) as {
+          update?: {
+            sessionUpdate?: string;
+            content?: { text?: string };
+          };
+        };
+        if (parsed.update?.sessionUpdate === 'agent_message_chunk' && typeof parsed.update.content?.text === 'string') {
+          appendTranscriptChunk(chunkParts, parsed.update.content.text);
+        }
+      } catch {
+        // ignore malformed transcript update lines
+      }
+    }
+  }
+
+  if (chunkParts.length > 0) {
+    candidates.push(collapseRepeatedTranscriptText(chunkParts.join('')));
+  }
+
+  return Array.from(new Set(candidates.map((value) => value.trim()).filter(Boolean)));
+};
+
+const extractResultText = (payload: unknown): string =>
+  selectBestResultText(extractResultTextCandidates(payload));
+
 const ARTICLE_AI_PRESET_PROMPTS: Record<ArticleAiPresetAction, string> = {
   [ArticleAiPresetAction.REWRITE_TONE]: 'Rewrite the article for clearer tone and readability while preserving factual meaning.',
   [ArticleAiPresetAction.SHORTEN]: 'Shorten the article by removing repetition and tightening wording without losing key steps.',
@@ -340,35 +982,192 @@ function extractJsonObject(text: string): Record<string, unknown> | null {
   if (!trimmed) {
     return null;
   }
-  const directCandidates = [
+  const normalizedCandidates = [
     trimmed,
     trimmed.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '')
   ];
-  for (const candidate of directCandidates) {
-    try {
-      const parsed = JSON.parse(candidate) as unknown;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
+  const parsedCandidates: Array<{ score: number; value: Record<string, unknown> }> = [];
+
+  const scoreCandidate = (value: Record<string, unknown>): number => {
+    let score = 0;
+    if (typeof value.summary === 'string') {
+      score += 3;
+    }
+    if (Array.isArray(value.coverage)) {
+      score += 4;
+    }
+    if (Array.isArray(value.items)) {
+      score += 4;
+    }
+    if (typeof value.verdict === 'string') {
+      score += 3;
+    }
+    if (value.delta && typeof value.delta === 'object') {
+      score += 2;
+    }
+    if (Array.isArray(value.discoveredWork)) {
+      score += 3;
+    }
+    if (typeof value.updatedHtml === 'string') {
+      score += 3;
+    }
+    return score;
+  };
+
+  const balancedCandidates = (value: string): string[] => {
+    const candidates: string[] = [];
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = 0; index < value.length; index += 1) {
+      const char = value[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (char === '\\') {
+          escaped = true;
+          continue;
+        }
+        if (char === '"') {
+          inString = false;
+        }
+        continue;
       }
-    } catch {
-      // try next candidate
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (char === '{') {
+        if (depth === 0) {
+          start = index;
+        }
+        depth += 1;
+        continue;
+      }
+
+      if (char === '}' && depth > 0) {
+        depth -= 1;
+        if (depth === 0 && start >= 0) {
+          candidates.push(value.slice(start, index + 1));
+          start = -1;
+          if (candidates.length >= 24) {
+            break;
+          }
+        }
+      }
+    }
+
+    return candidates;
+  };
+
+  for (const candidate of normalizedCandidates) {
+    for (const jsonCandidate of [candidate, ...balancedCandidates(candidate)]) {
+      try {
+        const parsed = JSON.parse(jsonCandidate) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          parsedCandidates.push({
+            score: scoreCandidate(parsed as Record<string, unknown>),
+            value: parsed as Record<string, unknown>
+          });
+        }
+      } catch {
+        // try next candidate
+      }
     }
   }
 
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start >= 0 && end > start) {
-    try {
-      const parsed = JSON.parse(trimmed.slice(start, end + 1)) as unknown;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {
-      return null;
-    }
+  if (parsedCandidates.length === 0) {
+    return null;
   }
-  return null;
+
+  parsedCandidates.sort((left, right) => right.score - left.score);
+  return parsedCandidates[0]?.value ?? null;
 }
+
+const resolveBatchAnalysisResultText = async (
+  agentRuntime: CursorAcpRuntime,
+  workspaceId: string,
+  sessionId: string | undefined,
+  payload: unknown
+): Promise<{
+  text: string;
+  usedTranscript: boolean;
+  initialCandidateCount: number;
+  transcriptCandidateCount: number;
+  parseable: boolean;
+}> => {
+  const initialCandidates = extractResultTextCandidates(payload);
+  const initialBest = selectBestResultText(initialCandidates);
+  if (extractJsonObject(initialBest)) {
+    return {
+      text: initialBest,
+      usedTranscript: false,
+      initialCandidateCount: initialCandidates.length,
+      transcriptCandidateCount: 0,
+      parseable: true
+    };
+  }
+
+  if (!sessionId) {
+    return {
+      text: initialBest,
+      usedTranscript: false,
+      initialCandidateCount: initialCandidates.length,
+      transcriptCandidateCount: 0,
+      parseable: false
+    };
+  }
+
+  const transcript = await agentRuntime.getTranscripts({
+    workspaceId,
+    sessionId,
+    limit: 0
+  });
+  const transcriptCandidates = extractTranscriptResultTextCandidates(transcript.lines);
+  const resolved = selectBestResultText([...initialCandidates, ...transcriptCandidates]);
+  return {
+    text: resolved,
+    usedTranscript: transcriptCandidates.length > 0 && transcriptCandidates.includes(resolved),
+    initialCandidateCount: initialCandidates.length,
+    transcriptCandidateCount: transcriptCandidates.length,
+    parseable: Boolean(extractJsonObject(resolved))
+  };
+};
+
+const summarizeWorkerExecutionFallback = (
+  fallbackSummary: string,
+  proposalQueue: ProposalReviewQueueItem[]
+): string => {
+  if (proposalQueue.length === 0) {
+    return fallbackSummary;
+  }
+
+  const actionCounts = proposalQueue.reduce<Record<string, number>>((counts, proposal) => {
+    counts[proposal.action] = (counts[proposal.action] ?? 0) + 1;
+    return counts;
+  }, {});
+  const actionSummary = ['create', 'edit', 'retire']
+    .filter((action) => (actionCounts[action] ?? 0) > 0)
+    .map((action) => `${actionCounts[action]} ${action}`)
+    .join(', ');
+  const previewTitles = proposalQueue
+    .slice(0, 3)
+    .map((proposal) => proposal.articleLabel.trim())
+    .filter(Boolean);
+  const titleSummary = previewTitles.length > 0
+    ? ` for ${previewTitles.map((title) => `\`${title}\``).join(', ')}`
+    : '';
+  const remainingCount = proposalQueue.length - previewTitles.length;
+  const remainingSummary = remainingCount > 0 ? ` and ${remainingCount} more` : '';
+
+  return `Worker execution completed with ${proposalQueue.length} persisted proposal${proposalQueue.length === 1 ? '' : 's'} (${actionSummary})${titleSummary}${remainingSummary}.`;
+};
 
 function parseArticleAiResult(resultPayload: unknown): { updatedHtml: string; summary: string; rationale?: string } | null {
   const candidates: string[] = [];
@@ -433,6 +1232,7 @@ export function registerCoreCommands(
   emitAppWorkingStateEvent?: (event: AppWorkingStatePatchAppliedEvent) => void
 ) {
   const workspaceRepository = new WorkspaceRepository(workspaceRoot);
+  const batchAnalysisOrchestrator = new BatchAnalysisOrchestrator(workspaceRepository);
   const zendeskSyncService = new ZendeskSyncService(workspaceRepository);
   const pbiBatchImportService = new PBIBatchImportService(workspaceRepository);
   const defaultKbAccessMode: KbAccessMode = 'mcp';
@@ -638,15 +1438,42 @@ export function registerCoreCommands(
   const appWorkingStateService = new AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
   const kbCliLoopback = new KbCliLoopbackService(workspaceRepository, appWorkingStateService);
   const kbCliRuntime = new KbCliRuntimeService(kbCliLoopback, workspaceRepository);
+  const noisyAgentRuntimeLogs = new Set([
+    'agent.runtime.ensure_initialized_start',
+    'agent.runtime.ensure_initialized_success',
+    'agent.runtime.health_check_start',
+    'agent.runtime.health_check_result',
+    'agent.runtime.session_finalize_wait_begin',
+    'agent.runtime.session_finalize_wait_complete',
+    'agent.runtime.retry_cycle_begin',
+    'agent.runtime.retry_attempt',
+    'agent.runtime.retry_wait',
+    'agent.runtime.session_new_start',
+    'agent.runtime.session_new_success',
+    'agent.runtime.session_set_model_success'
+  ]);
   const agentRuntime = new CursorAcpRuntime(workspaceRoot, runtimeToolContext, {
     prepareCliEnvironment: async (workspaceId) => kbCliRuntime.ensureReady(),
     getCliHealth: (workspaceId) => kbCliRuntime.checkHealth(workspaceId),
     buildCliPromptSuffix: () => kbCliRuntime.buildPromptSuffix(),
     getWorkspaceAgentModel: async (workspaceId) => {
       const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
-      return settings.agentModelId;
+      return settings.acpModelId;
     }
   }, (message, details) => {
+    if (noisyAgentRuntimeLogs.has(message)) {
+      return;
+    }
+    if (
+      message.includes('failed')
+      || message.includes('unreachable')
+      || message.includes('timeout')
+      || message.includes('violation')
+      || message.includes('abort')
+    ) {
+      logger.warn(`[agent-runtime] ${message}`, details);
+      return;
+    }
     logger.info(`[agent-runtime] ${message}`, details);
   });
   const resolveWorkspaceKbAccessMode = async (workspaceId: string): Promise<KbAccessMode> => {
@@ -854,14 +1681,76 @@ export function registerCoreCommands(
       }
 
       const run = await workspaceRepository.getLatestBatchAnalysisRun(input.workspaceId, input.batchId);
+      const orchestration = await workspaceRepository.getBatchAnalysisSnapshot(input.workspaceId, input.batchId);
       const lines = await readTranscriptLines(run?.transcriptPath, input.limit);
       const response: PersistedAgentAnalysisRunResponse = {
         workspaceId: input.workspaceId,
         batchId: input.batchId,
         run,
-        lines
+        lines,
+        orchestration
       };
       return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('batch.analysis.snapshot.get', async (payload: unknown) => {
+    const input = payload as { workspaceId?: string; batchId?: string };
+    try {
+      if (!input?.workspaceId || !input.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'batch.analysis.snapshot.get requires workspaceId and batchId');
+      }
+      return {
+        ok: true,
+        data: await workspaceRepository.getBatchAnalysisSnapshot(input.workspaceId, input.batchId)
+      };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('batch.analysis.inspection.get', async (payload: unknown) => {
+    const input = payload as { workspaceId?: string; batchId?: string };
+    try {
+      if (!input?.workspaceId || !input.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'batch.analysis.inspection.get requires workspaceId and batchId');
+      }
+      return {
+        ok: true,
+        data: await workspaceRepository.getBatchAnalysisInspection(input.workspaceId, input.batchId)
+      };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('batch.analysis.runtime.get', async (payload: unknown) => {
+    const input = payload as { workspaceId?: string; batchId?: string };
+    try {
+      if (!input?.workspaceId || !input.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'batch.analysis.runtime.get requires workspaceId and batchId');
+      }
+      return {
+        ok: true,
+        data: await workspaceRepository.getBatchAnalysisRuntimeStatus(input.workspaceId, input.batchId)
+      };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  bus.register('batch.analysis.events.get', async (payload: unknown) => {
+    const input = payload as { workspaceId?: string; batchId?: string; limit?: number };
+    try {
+      if (!input?.workspaceId || !input.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'batch.analysis.events.get requires workspaceId and batchId');
+      }
+      return {
+        ok: true,
+        data: await workspaceRepository.getBatchAnalysisEventStream(input.workspaceId, input.batchId, input.limit)
+      };
     } catch (error) {
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
     }
@@ -983,7 +1872,8 @@ export function registerCoreCommands(
         input.defaultLocale === undefined &&
         input.enabledLocales === undefined &&
         input.kbAccessMode === undefined &&
-        input.agentModelId === undefined
+        input.agentModelId === undefined &&
+        input.acpModelId === undefined
       ) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'workspace.settings.update requires at least one setting field');
       }
@@ -1005,9 +1895,12 @@ export function registerCoreCommands(
       if (typeof input.agentModelId === 'string' && !input.agentModelId.trim()) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agentModelId cannot be empty');
       }
+      if (typeof input.acpModelId === 'string' && !input.acpModelId.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'acpModelId cannot be empty');
+      }
 
       const updated = await workspaceRepository.updateWorkspaceSettings(input);
-      await agentRuntime.setWorkspaceAgentModel(updated.workspaceId, updated.agentModelId);
+      await agentRuntime.setWorkspaceAgentModel(updated.workspaceId, updated.acpModelId);
       return { ok: true, data: updated };
     } catch (error) {
       if ((error as Error).message === 'Workspace not found') {
@@ -1033,13 +1926,21 @@ export function registerCoreCommands(
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.runtime.options.get requires workspaceId');
       }
       await workspaceRepository.getWorkspace(workspaceId);
+      const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
       const options = await agentRuntime.getRuntimeOptions(workspaceId);
+      const currentModelId = settings.agentModelId ?? options.currentModelId;
+      const availableModels = Array.from(new Set([
+        ...(options.availableModels ?? []),
+        ...(currentModelId ? [currentModelId] : [])
+      ]));
       return {
         ok: true,
         data: {
           ...options,
           workspaceId,
-          modelCatalog: buildRuntimeModelCatalog(options.availableModels, options.currentModelId)
+          currentModelId,
+          availableModels,
+          modelCatalog: buildRuntimeModelCatalog(availableModels, currentModelId)
         } satisfies AgentRuntimeOptionsResponse
       };
     } catch (error) {
@@ -1597,8 +2498,17 @@ export function registerCoreCommands(
   bus.register('workspace.search', async (payload) => {
     try {
       const input = payload as SearchPayload | undefined;
-      if (!input?.workspaceId || !input.query) {
-        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'workspace.search requires workspaceId and query');
+      const hasQuery = Boolean(input?.query?.trim());
+      const hasIdFilters = Boolean(
+        input?.localeVariantIds?.length
+        || input?.familyIds?.length
+        || input?.revisionIds?.length
+      );
+      if (!input?.workspaceId || (!hasQuery && !hasIdFilters)) {
+        return createErrorResult(
+          AppErrorCode.INVALID_REQUEST,
+          'workspace.search requires workspaceId plus query or article ids'
+        );
       }
 
       const result = await workspaceRepository.searchArticles(input.workspaceId, input);
@@ -2588,7 +3498,8 @@ export function registerCoreCommands(
     }
     const workspaceMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
     const workspaceSettings = await workspaceRepository.getWorkspaceSettings(input.workspaceId);
-    const agentModelId = workspaceSettings.agentModelId;
+    const agentModelId = workspaceSettings.acpModelId;
+    await agentRuntime.setWorkspaceAgentModel(input.workspaceId, agentModelId);
     let kbAccessMode = input.kbAccessMode ?? workspaceMode;
     const providerHealth = await agentRuntime.checkHealth(input.workspaceId, kbAccessMode, workspaceMode);
     const selectedProvider = providerHealth.providers[kbAccessMode];
@@ -2619,11 +3530,37 @@ export function registerCoreCommands(
       batchId: input.batchId,
       workspaceId: input.workspaceId
     });
+    const batchContext = await workspaceRepository.getBatchContext(input.workspaceId, input.batchId);
+    if (!batchContext) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'Batch context not found'
+      });
+      return;
+    }
+    const uploadedPbis = await workspaceRepository.getPBISubset(input.workspaceId, input.batchId).catch(() => ({ rows: [] }));
+    const plannerPrefetch = await buildPlannerPrefetch(
+      workspaceRepository,
+      input.workspaceId,
+      input.batchId,
+      uploadedPbis
+    ).catch(() => ({
+      priorAnalysis: null,
+      topicClusters: [],
+      articleMatches: [],
+      relationMatches: []
+    }));
     const streamMetadata: {
       batchId: string;
       kbAccessMode: KbAccessMode;
       workspaceId: string;
       agentModelId?: string;
+      iterationId?: string;
+      stage?: string;
+      role?: string;
       status?: 'ok' | 'error' | 'timeout' | 'canceled';
       sessionId?: string;
     } = {
@@ -2632,10 +3569,662 @@ export function registerCoreCommands(
       workspaceId: input.workspaceId,
       agentModelId
     };
-    const runAnalysis = async (mode: KbAccessMode) => {
+    const orchestrationIteration = await batchAnalysisOrchestrator.startIteration({
+      workspaceId: input.workspaceId,
+      batchId: input.batchId,
+      agentModelId,
+      startedAtUtc: new Date().toISOString()
+    });
+    let liveIteration = orchestrationIteration;
+    let liveExecutionCounts = orchestrationIteration.executionCounts;
+    let liveOutstandingDiscoveredWorkCount = orchestrationIteration.outstandingDiscoveredWorkCount;
+    let liveApprovedPlanId = orchestrationIteration.approvedPlanId;
+    let liveLastReviewVerdict = orchestrationIteration.lastReviewVerdict;
+    let liveSessionId = orchestrationIteration.sessionId;
+    let liveStageStartedAtUtc = orchestrationIteration.startedAtUtc;
+    const buildStreamMetadata = (
+      overrides?: Partial<typeof streamMetadata> & {
+        sessionId?: string;
+        stageEndedAtUtc?: string;
+      }
+    ) => ({
+      ...streamMetadata,
+      ...overrides,
+      sessionId: overrides?.sessionId ?? liveSessionId ?? streamMetadata.sessionId,
+      orchestration: {
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iterationId: liveIteration.id,
+        iteration: liveIteration.iteration,
+        iterationStatus: liveIteration.status,
+        stage: overrides?.stage ?? streamMetadata.stage ?? liveIteration.stage,
+        role: overrides?.role ?? streamMetadata.role ?? liveIteration.role,
+        agentModelId: overrides?.agentModelId ?? streamMetadata.agentModelId ?? liveIteration.agentModelId,
+        sessionId: overrides?.sessionId ?? liveSessionId ?? streamMetadata.sessionId ?? liveIteration.sessionId,
+        approvedPlanId: liveApprovedPlanId,
+        lastReviewVerdict: liveLastReviewVerdict,
+        outstandingDiscoveredWorkCount: liveOutstandingDiscoveredWorkCount,
+        executionCounts: liveExecutionCounts,
+        stageStartedAtUtc: liveStageStartedAtUtc,
+        stageEndedAtUtc: overrides?.stageEndedAtUtc,
+        updatedAtUtc: new Date().toISOString()
+      }
+    });
+    const logAnalysisProgress = async (
+      summary: string,
+      overrides?: Partial<{
+        stage: string;
+        role: string;
+        sessionId: string;
+        eventType: 'iteration_started' | 'stage_transition' | 'stage_progress' | 'iteration_completed';
+      }>,
+      details?: BatchAnalysisStageEventDetails
+    ) => {
+      const stage = (overrides?.stage ?? streamMetadata.stage ?? liveIteration.stage) as BatchAnalysisStageStatus;
+      const role = (overrides?.role ?? streamMetadata.role ?? liveIteration.role) as BatchAnalysisIterationRecord['role'];
+      const sessionId = overrides?.sessionId ?? liveSessionId ?? streamMetadata.sessionId ?? liveIteration.sessionId;
+      const eventDetails: BatchAnalysisStageEventDetails = {
+        previousStage: liveIteration.stage,
+        previousRole: liveIteration.role,
+        ...(details ?? {})
+      };
+      logger.info('[agent.analysis.trace] ' + summary, {
+        jobId: payload.jobId,
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iterationId: liveIteration.id,
+        iteration: liveIteration.iteration,
+        stage,
+        role,
+        sessionId,
+        ...eventDetails
+      });
+      await workspaceRepository.recordBatchAnalysisStageEvent({
+        id: randomUUID(),
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iterationId: liveIteration.id,
+        iteration: liveIteration.iteration,
+        stage,
+        role,
+        eventType: overrides?.eventType ?? 'stage_progress',
+        status: liveIteration.status,
+        summary,
+        sessionId,
+        agentModelId,
+        approvedPlanId: liveApprovedPlanId,
+        lastReviewVerdict: liveLastReviewVerdict,
+        outstandingDiscoveredWorkCount: liveOutstandingDiscoveredWorkCount,
+        executionCounts: liveExecutionCounts,
+        details: eventDetails,
+        createdAtUtc: new Date().toISOString()
+      });
+    };
+    try {
+      streamMetadata.iterationId = orchestrationIteration.id;
+      streamMetadata.stage = orchestrationIteration.stage;
+      streamMetadata.role = orchestrationIteration.role;
+      await logAnalysisProgress('Batch analysis iteration started.', { eventType: 'stage_progress' }, {
+      kbAccessMode,
+      agentModelId,
+      uploadedPbiCount: Array.isArray((uploadedPbis as { rows?: unknown[] })?.rows) ? ((uploadedPbis as { rows?: unknown[] }).rows?.length ?? 0) : 0,
+      prefetchedClusterCount: plannerPrefetch.topicClusters.length,
+      prefetchedArticleMatchCount: plannerPrefetch.articleMatches.length,
+      prefetchedRelationCount: plannerPrefetch.relationMatches.length
+      });
+      let approvedPlanId: string | undefined;
+      const runPlanningPass = async (attempt: number, priorPlanJson?: string, reviewDeltaJson?: string) => {
+      const planningStage = attempt === 1 ? 'planning' : 'plan_revision';
+      await logAnalysisProgress(
+        attempt === 1 ? 'Planner attempt 1 started.' : `Planner revision attempt ${attempt} started.`,
+        { stage: planningStage, role: 'planner' },
+        {
+          attempt,
+          hasPriorPlan: Boolean(priorPlanJson),
+          hasReviewDelta: Boolean(reviewDeltaJson)
+        }
+      );
+      liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: planningStage,
+        role: 'planner',
+        summary: attempt === 1 ? 'Generating initial batch plan.' : `Revising plan after review feedback (attempt ${attempt}).`,
+        agentModelId
+      });
+      streamMetadata.stage = planningStage;
+      streamMetadata.role = 'planner';
+      liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.RUNNING,
+        progress: 20,
+        message: attempt === 1 ? 'Generating structured batch plan...' : `Revising plan (attempt ${attempt})...`,
+        metadata: buildStreamMetadata()
+      });
+
+      const plannerPrompt = batchAnalysisOrchestrator.buildPlannerPrompt({
+        batchContext,
+        uploadedPbis,
+        plannerPrefetch,
+        priorPlan: priorPlanJson ? JSON.parse(priorPlanJson) : undefined,
+        reviewDelta: reviewDeltaJson ? JSON.parse(reviewDeltaJson) : undefined
+      });
+
+      let plannerResult: Awaited<ReturnType<typeof agentRuntime.runBatchAnalysis>>;
+      try {
+        plannerResult = await agentRuntime.runBatchAnalysis(
+          {
+            ...input,
+            sessionId: liveSessionId,
+            kbAccessMode,
+            agentRole: 'planner',
+            sessionMode: 'plan',
+            prompt: plannerPrompt
+          },
+          (stream: AgentStreamingPayload) => {
+            emit({
+              id: payload.jobId,
+              command: payload.command,
+              state: JobState.RUNNING,
+              progress: 28,
+              message: JSON.stringify(stream),
+              metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+            });
+          },
+          isCancelled
+        );
+      } catch (error) {
+        const plannerError = error instanceof Error ? error.message : String(error);
+        await logAnalysisProgress('Planner attempt failed before producing a usable response.', {
+          stage: planningStage,
+          role: 'planner',
+          sessionId: liveSessionId
+        }, {
+          attempt,
+          plannerError
+        });
+        throw error;
+      }
+      liveSessionId = plannerResult.sessionId;
+      const parseDraftPlan = (resultText: string, sessionId?: string) =>
+        batchAnalysisOrchestrator.parsePlannerResult({
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iteration: orchestrationIteration,
+          resultText,
+          agentModelId,
+          sessionId,
+          planVersion: attempt,
+          supersedesPlanId: priorPlanJson ? (JSON.parse(priorPlanJson) as { id?: string }).id : undefined
+        });
+
+      const plannerResolution = await resolveBatchAnalysisResultText(
+        agentRuntime,
+        input.workspaceId,
+        plannerResult.sessionId,
+        plannerResult.resultPayload
+      );
+      const plannerText = plannerResolution.text;
+      await logAnalysisProgress('Planner response received.', { stage: planningStage, role: 'planner', sessionId: plannerResult.sessionId }, {
+        attempt,
+        rawOutputCount: plannerResult.rawOutput.length,
+        transcriptPath: plannerResult.transcriptPath,
+        textLength: plannerText.length,
+        parseable: plannerResolution.parseable,
+        usedTranscriptRecovery: plannerResolution.usedTranscript,
+        payloadCandidateCount: plannerResolution.initialCandidateCount,
+        transcriptCandidateCount: plannerResolution.transcriptCandidateCount,
+        resultTextPreview: buildStageEventTextPreview(plannerText)
+      });
+      let draftPlan: BatchAnalysisPlan | null = null;
+      try {
+        draftPlan = parseDraftPlan(plannerText, plannerResult.sessionId);
+      } catch (error) {
+        const parseError = error instanceof Error ? error.message : 'Planner output could not be parsed';
+        const locallySalvagedPlan =
+          normalizeRecoveredJsonText(plannerText)
+          ?? salvagePlannerJsonText(plannerText);
+        let salvageSucceeded = false;
+        if (locallySalvagedPlan) {
+          try {
+            draftPlan = parseDraftPlan(locallySalvagedPlan, plannerResult.sessionId);
+            await logAnalysisProgress('Planner output was salvaged locally without a repair prompt.', {
+              stage: planningStage,
+              role: 'planner',
+              sessionId: plannerResult.sessionId
+            }, {
+              attempt,
+              parseError
+            });
+            salvageSucceeded = true;
+          } catch {
+            // fall through to repair prompt
+          }
+        }
+        if (salvageSucceeded) {
+          // Continue through the normal reviewer flow below using the locally salvaged plan.
+        } else {
+          await logAnalysisProgress('Planner output could not be parsed; starting repair prompt.', {
+            stage: planningStage,
+            role: 'planner',
+            sessionId: plannerResult.sessionId
+          }, {
+            attempt,
+            parseError,
+            resultTextPreview: buildStageEventTextPreview(plannerText, 500)
+          });
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 30,
+            message: 'Planner returned non-JSON or incomplete output. Requesting a strict JSON repair pass...',
+            metadata: buildStreamMetadata({ sessionId: plannerResult.sessionId })
+          });
+
+          const repairedPlannerResult = await agentRuntime.runBatchAnalysis(
+            {
+              ...input,
+              sessionId: liveSessionId,
+              kbAccessMode,
+              agentRole: 'planner',
+              sessionMode: 'plan',
+              prompt: batchAnalysisOrchestrator.buildPlannerRepairPrompt({
+                originalPrompt: plannerPrompt,
+                priorOutput: plannerText.slice(0, 6_000),
+                parseError
+              })
+            },
+            (stream: AgentStreamingPayload) => {
+              emit({
+                id: payload.jobId,
+                command: payload.command,
+                state: JobState.RUNNING,
+                progress: 32,
+                message: JSON.stringify(stream),
+                metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+              });
+            },
+            isCancelled
+          );
+          liveSessionId = repairedPlannerResult.sessionId;
+          const repairedPlannerResolution = await resolveBatchAnalysisResultText(
+            agentRuntime,
+            input.workspaceId,
+            repairedPlannerResult.sessionId,
+            repairedPlannerResult.resultPayload
+          );
+          await logAnalysisProgress('Planner repair response received.', {
+            stage: planningStage,
+            role: 'planner',
+            sessionId: repairedPlannerResult.sessionId
+          }, {
+            attempt,
+            rawOutputCount: repairedPlannerResult.rawOutput.length,
+            transcriptPath: repairedPlannerResult.transcriptPath,
+            textLength: repairedPlannerResolution.text.length,
+            parseable: repairedPlannerResolution.parseable,
+            usedTranscriptRecovery: repairedPlannerResolution.usedTranscript,
+            payloadCandidateCount: repairedPlannerResolution.initialCandidateCount,
+            transcriptCandidateCount: repairedPlannerResolution.transcriptCandidateCount,
+            resultTextPreview: buildStageEventTextPreview(repairedPlannerResolution.text)
+          });
+          const normalizedRepairedPlannerText = normalizeRecoveredJsonText(repairedPlannerResolution.text);
+          const salvagedRepairedPlannerText =
+            normalizedRepairedPlannerText
+            ?? salvagePlannerJsonText(repairedPlannerResolution.text)
+            ?? salvagePlannerJsonText(plannerText);
+          try {
+            draftPlan = parseDraftPlan(
+              salvagedRepairedPlannerText ?? repairedPlannerResolution.text,
+              repairedPlannerResult.sessionId
+            );
+            if (salvagedRepairedPlannerText && !repairedPlannerResolution.parseable) {
+              await logAnalysisProgress('Planner repair output was salvaged locally.', {
+                stage: planningStage,
+                role: 'planner',
+                sessionId: repairedPlannerResult.sessionId
+              }, {
+                attempt,
+                textLength: repairedPlannerResolution.text.length
+              });
+            }
+          } catch (repairError) {
+            const fallbackMessage = 'Planner repair output remained malformed after recovery attempts.';
+            await logAnalysisProgress('Planner repair output was malformed; escalating safely.', {
+              stage: 'needs_human_review',
+              role: 'planner',
+              sessionId: repairedPlannerResult.sessionId
+            }, {
+              attempt,
+              error: repairError instanceof Error ? repairError.message : String(repairError),
+              textLength: repairedPlannerResolution.text.length,
+              transitionReason: 'planner_repair_output_malformed',
+              triggerBranch: 'planner repair parse failed after recovery attempts',
+              resultTextPreview: buildStageEventTextPreview(repairedPlannerResolution.text)
+            });
+            await workspaceRepository.updateBatchAnalysisIteration({
+              workspaceId: input.workspaceId,
+              iterationId: orchestrationIteration.id,
+              stage: 'needs_human_review',
+              role: 'planner',
+              status: 'needs_human_review',
+              summary: fallbackMessage,
+              agentModelId,
+              sessionId: repairedPlannerResult.sessionId
+            });
+            emit({
+              id: payload.jobId,
+              command: payload.command,
+              state: JobState.FAILED,
+              progress: 100,
+              message: fallbackMessage,
+              metadata: buildStreamMetadata({
+                stage: 'needs_human_review',
+                role: 'planner',
+                sessionId: repairedPlannerResult.sessionId,
+                status: 'error'
+              })
+            });
+            throw new Error(fallbackMessage);
+          }
+        }
+      }
+      if (!draftPlan) {
+        throw new Error('Planner did not produce a draft plan');
+      }
+      await batchAnalysisOrchestrator.recordPlan(draftPlan);
+      await logAnalysisProgress('Planner draft plan recorded.', { stage: planningStage, role: 'planner', sessionId: draftPlan.sessionId }, {
+        attempt,
+        planId: draftPlan.id,
+        planVersion: draftPlan.planVersion,
+        coverageCount: draftPlan.coverage.length,
+        itemCount: draftPlan.items.length,
+        openQuestionCount: draftPlan.openQuestions.length
+      });
+
+      liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'plan_reviewing',
+        role: 'plan-reviewer',
+        summary: 'Reviewing planner output for completeness and missed KB impact.',
+        agentModelId
+      });
+      streamMetadata.stage = 'plan_reviewing';
+      streamMetadata.role = 'plan-reviewer';
+      liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.RUNNING,
+        progress: 36,
+        message: 'Reviewing plan for missed creates, edits, and target issues...',
+        metadata: buildStreamMetadata()
+      });
+      const reviewResult = await agentRuntime.runBatchAnalysis(
+        {
+          ...input,
+          sessionId: liveSessionId,
+          kbAccessMode,
+          agentRole: 'plan-reviewer',
+          sessionMode: 'plan',
+          prompt: batchAnalysisOrchestrator.buildPlanReviewerPrompt({
+            batchContext,
+            uploadedPbis,
+            plan: draftPlan
+          })
+        },
+        (stream: AgentStreamingPayload) => {
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 44,
+            message: JSON.stringify(stream),
+            metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+          });
+        },
+        isCancelled
+      );
+      liveSessionId = reviewResult.sessionId;
+      const reviewResolution = await resolveBatchAnalysisResultText(
+        agentRuntime,
+        input.workspaceId,
+        reviewResult.sessionId,
+        reviewResult.resultPayload
+      );
+      const reviewText = reviewResolution.text;
+      await logAnalysisProgress('Plan reviewer response received.', {
+        stage: 'plan_reviewing',
+        role: 'plan-reviewer',
+        sessionId: reviewResult.sessionId
+      }, {
+        attempt,
+        rawOutputCount: reviewResult.rawOutput.length,
+        transcriptPath: reviewResult.transcriptPath,
+        textLength: reviewText.length,
+        parseable: reviewResolution.parseable,
+        usedTranscriptRecovery: reviewResolution.usedTranscript,
+        payloadCandidateCount: reviewResolution.initialCandidateCount,
+        transcriptCandidateCount: reviewResolution.transcriptCandidateCount,
+        resultTextPreview: buildStageEventTextPreview(reviewText)
+      });
+      const normalizedReviewText = normalizeRecoveredJsonText(reviewText);
+      let review: BatchPlanReview;
+      try {
+        review = batchAnalysisOrchestrator.parsePlanReviewResult({
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iteration: orchestrationIteration,
+          plan: draftPlan,
+          resultText: normalizedReviewText ?? reviewText,
+          agentModelId,
+          sessionId: reviewResult.sessionId
+        });
+        if (normalizedReviewText && !reviewResolution.parseable) {
+          await logAnalysisProgress('Plan review output salvaged locally.', {
+            stage: 'plan_reviewing',
+            role: 'plan-reviewer',
+            sessionId: reviewResult.sessionId
+          }, {
+            attempt,
+            textLength: reviewText.length
+          });
+        }
+      } catch (error) {
+        const fallbackSummary = 'Plan review output was malformed and could not be parsed safely.';
+        review = batchAnalysisOrchestrator.parsePlanReviewResult({
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iteration: orchestrationIteration,
+          plan: draftPlan,
+          resultText: buildMalformedPlanReviewFallback(fallbackSummary),
+          agentModelId,
+          sessionId: reviewResult.sessionId
+        });
+        await logAnalysisProgress('Plan review output was malformed; escalating safely.', {
+          stage: 'plan_reviewing',
+          role: 'plan-reviewer',
+          sessionId: reviewResult.sessionId
+        }, {
+          attempt,
+          error: error instanceof Error ? error.message : String(error),
+          textLength: reviewText.length,
+          transitionReason: 'plan_review_output_malformed',
+          triggerBranch: 'plan review parse failed and malformed fallback was used',
+          resultTextPreview: buildStageEventTextPreview(reviewText)
+        });
+      }
+      await batchAnalysisOrchestrator.recordReview(review);
+      await logAnalysisProgress('Plan review recorded.', {
+        stage: 'plan_reviewing',
+        role: 'plan-reviewer',
+        sessionId: review.sessionId
+      }, {
+        attempt,
+        reviewId: review.id,
+        verdict: review.verdict,
+        didAccountForEveryPbi: review.didAccountForEveryPbi,
+        hasMissingCreates: review.hasMissingCreates,
+        hasMissingEdits: review.hasMissingEdits,
+        hasTargetIssues: review.hasTargetIssues,
+        hasOverlapOrConflict: review.hasOverlapOrConflict,
+        foundAdditionalArticleWork: review.foundAdditionalArticleWork,
+        underScopedKbImpact: review.underScopedKbImpact,
+        triggerSummary: review.summary
+      });
+
+      if (review.verdict === 'approved') {
+        const approvedPlan = {
+          ...draftPlan,
+          id: randomUUID(),
+          verdict: 'approved' as const,
+          createdAtUtc: new Date().toISOString(),
+          supersedesPlanId: draftPlan.id
+        };
+        await batchAnalysisOrchestrator.recordPlan(approvedPlan);
+        approvedPlanId = approvedPlan.id;
+        liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+          workspaceId: input.workspaceId,
+          iterationId: orchestrationIteration.id,
+          stage: 'building',
+          role: 'worker',
+          summary: 'Plan approved. Executing worker stage.',
+          agentModelId,
+          approvedPlanId: approvedPlan.id,
+          lastReviewVerdict: review.verdict
+        });
+        liveApprovedPlanId = approvedPlan.id;
+        liveLastReviewVerdict = review.verdict;
+        liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+        streamMetadata.stage = 'building';
+        streamMetadata.role = 'worker';
+        await logAnalysisProgress('Plan approved; advancing to worker stage.', {
+          stage: 'building',
+          role: 'worker'
+        }, {
+          attempt,
+          approvedPlanId: approvedPlan.id,
+          supersededPlanId: draftPlan.id,
+          previousStage: 'plan_reviewing',
+          previousRole: 'plan-reviewer',
+          transitionReason: 'plan_review_approved',
+          triggerBranch: 'review.verdict === approved',
+          triggerArtifactType: 'review',
+          triggerArtifactId: review.id,
+          triggerSessionId: review.sessionId,
+          triggerVerdict: review.verdict,
+          triggerSummary: review.summary
+        });
+        return { approvedPlan, review };
+      }
+
+      if (review.verdict === 'needs_human_review') {
+        await logAnalysisProgress('Plan review escalated to human review.', {
+          stage: 'needs_human_review',
+          role: 'plan-reviewer'
+        }, {
+          attempt,
+          reviewId: review.id,
+          summary: review.summary,
+          transitionReason: 'plan_review_needs_human_review',
+          triggerBranch: 'review.verdict === needs_human_review',
+          triggerArtifactType: 'review',
+          triggerArtifactId: review.id,
+          triggerSessionId: review.sessionId,
+          triggerVerdict: review.verdict,
+          triggerSummary: review.summary
+        });
+        await workspaceRepository.updateBatchAnalysisIteration({
+          workspaceId: input.workspaceId,
+          iterationId: orchestrationIteration.id,
+          stage: 'needs_human_review',
+          role: 'plan-reviewer',
+          status: 'needs_human_review',
+          summary: review.summary,
+          agentModelId,
+          lastReviewVerdict: review.verdict
+        });
+        throw new Error(`Plan review escalated to human review: ${review.summary}`);
+      }
+
+      await logAnalysisProgress('Plan review requested another revision.', {
+        stage: 'plan_reviewing',
+        role: 'plan-reviewer',
+        sessionId: review.sessionId
+      }, {
+        attempt,
+        reviewId: review.id,
+        summary: review.summary,
+        transitionReason: 'plan_review_needs_revision',
+        triggerBranch: 'review.verdict === needs_revision',
+        triggerArtifactType: 'review',
+        triggerArtifactId: review.id,
+        triggerSessionId: review.sessionId,
+        triggerVerdict: review.verdict,
+        triggerSummary: review.summary
+      });
+      return { draftPlan, review };
+    };
+
+    let planningOutcome: { approvedPlan: BatchAnalysisPlan; review: BatchPlanReview } | null = null;
+    let priorPlanJson: string | undefined;
+    let reviewDeltaJson: string | undefined;
+    const maxPlannerAttempts = 3;
+    for (let attempt = 1; attempt <= maxPlannerAttempts; attempt += 1) {
+      const outcome = await runPlanningPass(attempt, priorPlanJson, reviewDeltaJson);
+      if ('approvedPlan' in outcome) {
+        planningOutcome = outcome as { approvedPlan: BatchAnalysisPlan; review: BatchPlanReview };
+        break;
+      }
+      priorPlanJson = JSON.stringify(outcome.draftPlan);
+      reviewDeltaJson = outcome.review.delta ? JSON.stringify(outcome.review.delta) : undefined;
+    }
+    if (!planningOutcome?.approvedPlan || !approvedPlanId) {
+      await logAnalysisProgress('Planner/reviewer loop exhausted without an approved plan.', {
+        stage: 'needs_human_review',
+        role: 'plan-reviewer'
+      }, {
+        maxPlannerAttempts,
+        transitionReason: 'planner_revision_limit_exhausted',
+        triggerBranch: 'planning loop ended without approvedPlan',
+        triggerVerdict: liveLastReviewVerdict,
+        triggerSummary: 'Planner/reviewer loop did not reach an approved plan within the revision limit.'
+      });
+      await workspaceRepository.updateBatchAnalysisIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'needs_human_review',
+        role: 'plan-reviewer',
+        status: 'needs_human_review',
+        summary: 'Planner/reviewer loop did not reach an approved plan within the revision limit.',
+        agentModelId
+      });
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'Batch analysis requires human review before execution.',
+        metadata: buildStreamMetadata()
+      });
+      return;
+    }
+
+    const runAnalysis = async (mode: KbAccessMode, plan: BatchAnalysisPlan, extraInstructions?: string) => {
       streamMetadata.kbAccessMode = mode;
       return agentRuntime.runBatchAnalysis(
-        { ...input, kbAccessMode: mode },
+        {
+          ...input,
+          sessionId: liveSessionId,
+          kbAccessMode: mode,
+          agentRole: 'worker',
+          sessionMode: 'agent',
+          prompt: batchAnalysisOrchestrator.buildWorkerPrompt(plan, extraInstructions ?? input.prompt)
+        },
         (stream: AgentStreamingPayload) => {
           emit({
             id: payload.jobId,
@@ -2643,44 +4232,474 @@ export function registerCoreCommands(
             state: JobState.RUNNING,
             progress: stream.kind === 'result' ? 100 : 35,
             message: JSON.stringify(stream),
-            metadata: streamMetadata
+            metadata: buildStreamMetadata({ sessionId: stream.sessionId })
           });
         },
         isCancelled
       );
     };
 
-    let result = await runAnalysis(kbAccessMode);
+    const executeWorkerPass = async (
+      approvedPlan: BatchAnalysisPlan,
+      extraInstructions?: string
+    ): Promise<{
+      result: Awaited<ReturnType<typeof runAnalysis>>;
+      workerSummary: string;
+      discoveredWork: ReturnType<typeof batchAnalysisOrchestrator.parseWorkerResult>['discoveredWork'];
+    }> => {
+      let workerResult = await runAnalysis(kbAccessMode, approvedPlan, extraInstructions);
 
-    if (result.status === 'ok' && kbAccessMode === 'cli') {
-      const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
-      const cliPolicyViolations = result.toolCalls.filter((toolCall) =>
-        toolCall.allowed === false
-        && typeof toolCall.reason === 'string'
-        && toolCall.reason.includes('CLI mode forbids')
+      if (workerResult.status === 'ok' && kbAccessMode === 'cli') {
+        const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
+        const cliPolicyViolations = workerResult.toolCalls.filter((toolCall) =>
+          toolCall.allowed === false
+          && typeof toolCall.reason === 'string'
+          && toolCall.reason.includes('CLI mode forbids')
+        );
+
+        if (proposalQueue.queue.length === 0 && cliPolicyViolations.length > 0 && providerHealth.providers.mcp.ok) {
+          logger.warn('[agent.analysis.run] cli analysis created no proposals after policy violations; retrying in mcp', {
+            jobId: payload.jobId,
+            batchId: input.batchId,
+            workspaceId: input.workspaceId,
+            violationCount: cliPolicyViolations.length
+          });
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 55,
+            message: 'CLI analysis hit blocked tool usage and created no proposals. Retrying in MCP mode.',
+            metadata: buildStreamMetadata({ kbAccessMode: 'mcp' })
+          });
+          kbAccessMode = 'mcp';
+          workerResult = await runAnalysis('mcp', approvedPlan, extraInstructions);
+        }
+      }
+
+      const workerResolution = await resolveBatchAnalysisResultText(
+        agentRuntime,
+        input.workspaceId,
+        workerResult.sessionId,
+        workerResult.resultPayload
+      );
+      await logAnalysisProgress('Worker response received.', {
+        stage: 'building',
+        role: 'worker',
+        sessionId: workerResult.sessionId
+      }, {
+        rawOutputCount: workerResult.rawOutput.length,
+        transcriptPath: workerResult.transcriptPath,
+        textLength: workerResolution.text.length,
+        parseable: workerResolution.parseable,
+        usedTranscriptRecovery: workerResolution.usedTranscript,
+        payloadCandidateCount: workerResolution.initialCandidateCount,
+        transcriptCandidateCount: workerResolution.transcriptCandidateCount,
+        kbAccessMode: workerResult.kbAccessMode,
+        status: workerResult.status
+      });
+      const workerFallbackSummary = workerResult.message ?? 'Worker pass completed.';
+      const locallySalvagedWorker = extractJsonObject(workerResolution.text);
+      let workerParsed: ReturnType<typeof batchAnalysisOrchestrator.parseWorkerResult>;
+      try {
+        workerParsed = batchAnalysisOrchestrator.parseWorkerResult(
+          locallySalvagedWorker ? JSON.stringify(locallySalvagedWorker) : workerResolution.text,
+          workerFallbackSummary,
+          workerResult.sessionId
+        );
+        if (locallySalvagedWorker && !workerResolution.parseable) {
+          await logAnalysisProgress('Worker output salvaged locally.', {
+            stage: 'building',
+            role: 'worker',
+            sessionId: workerResult.sessionId
+          }, {
+            textLength: workerResolution.text.length,
+            kbAccessMode: workerResult.kbAccessMode
+          });
+        }
+      } catch (error) {
+        const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
+        workerParsed = {
+          summary: summarizeWorkerExecutionFallback(workerFallbackSummary, proposalQueue.queue),
+          discoveredWork: []
+        };
+        await logAnalysisProgress('Worker output was malformed; using execution fallback summary.', {
+          stage: 'building',
+          role: 'worker',
+          sessionId: workerResult.sessionId
+        }, {
+          error: error instanceof Error ? error.message : String(error),
+          textLength: workerResolution.text.length,
+          proposalCount: proposalQueue.queue.length,
+          kbAccessMode: workerResult.kbAccessMode
+        });
+      }
+      liveSessionId = workerResult.sessionId;
+      return {
+        result: workerResult,
+        workerSummary: workerParsed.summary,
+        discoveredWork: workerParsed.discoveredWork
+      };
+    };
+
+    let workerPass = await executeWorkerPass(planningOutcome.approvedPlan);
+
+    const maxAmendmentLoops = 2;
+    let amendmentLoops = 0;
+    let activeApprovedPlan = planningOutcome.approvedPlan;
+    while (workerPass.result.status === 'ok' && workerPass.discoveredWork.some((item) => item.requiresPlanAmendment)) {
+      amendmentLoops += 1;
+      const discoveredForAmendment = workerPass.discoveredWork.filter((item) => item.requiresPlanAmendment);
+      await logAnalysisProgress('Worker discovered additional scope requiring plan amendment.', {
+        stage: 'worker_discovery_review',
+        role: 'planner',
+        sessionId: workerPass.result.sessionId
+      }, {
+        discoveredCount: discoveredForAmendment.length,
+        totalDiscoveredCount: workerPass.discoveredWork.length,
+        amendmentLoop: amendmentLoops
+      });
+      const workerPassRecord = await batchAnalysisOrchestrator.recordWorkerPass({
+        iteration: orchestrationIteration,
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        agentModelId,
+        approvedPlan: activeApprovedPlan,
+        result: workerPass.result,
+        summary: workerPass.workerSummary,
+        discoveredWork: workerPass.discoveredWork
+      });
+      liveExecutionCounts = workerPassRecord.executionCounts;
+      liveOutstandingDiscoveredWorkCount = workerPassRecord.workerReport.discoveredWork.length;
+
+      liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'worker_discovery_review',
+        role: 'planner',
+        summary: 'Worker discovered additional scope. Reviewing amendment.',
+        agentModelId
+      });
+      streamMetadata.stage = 'worker_discovery_review';
+      streamMetadata.role = 'planner';
+      liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+
+      const amendmentId = randomUUID();
+      await batchAnalysisOrchestrator.recordAmendment({
+        id: amendmentId,
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iterationId: orchestrationIteration.id,
+        approvedPlanId: activeApprovedPlan.id,
+        sourceWorkerReportId: workerPassRecord.workerReport.id,
+        sourceDiscoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
+        status: 'pending',
+        summary: 'Worker discoveries routed into amendment review.',
+        createdAtUtc: new Date().toISOString(),
+        updatedAtUtc: new Date().toISOString()
+      });
+
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.RUNNING,
+        progress: 68,
+        message: `Reviewing ${discoveredForAmendment.length} discovered work item(s) before continuing execution...`,
+        metadata: buildStreamMetadata()
+      });
+
+      const amendmentPlannerResult = await agentRuntime.runBatchAnalysis(
+        {
+          ...input,
+          sessionId: liveSessionId,
+          kbAccessMode,
+          agentRole: 'planner',
+          sessionMode: 'plan',
+          prompt: batchAnalysisOrchestrator.buildAmendmentPlannerPrompt({
+            batchContext,
+            uploadedPbis,
+            approvedPlan: activeApprovedPlan,
+            discoveredWork: discoveredForAmendment,
+            plannerPrefetch
+          })
+        },
+        (stream: AgentStreamingPayload) => {
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 72,
+            message: JSON.stringify(stream),
+            metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+          });
+        },
+        isCancelled
+      );
+      liveSessionId = amendmentPlannerResult.sessionId;
+      const amendmentPlannerResolution = await resolveBatchAnalysisResultText(
+        agentRuntime,
+        input.workspaceId,
+        amendmentPlannerResult.sessionId,
+        amendmentPlannerResult.resultPayload
+      );
+      await logAnalysisProgress('Amendment planner response received.', {
+        stage: 'worker_discovery_review',
+        role: 'planner',
+        sessionId: amendmentPlannerResult.sessionId
+      }, {
+        amendmentLoop: amendmentLoops,
+        textLength: amendmentPlannerResolution.text.length,
+        parseable: amendmentPlannerResolution.parseable,
+        usedTranscriptRecovery: amendmentPlannerResolution.usedTranscript,
+        payloadCandidateCount: amendmentPlannerResolution.initialCandidateCount,
+        transcriptCandidateCount: amendmentPlannerResolution.transcriptCandidateCount
+      });
+      const amendmentDraftPlan = batchAnalysisOrchestrator.parsePlannerResult({
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iteration: orchestrationIteration,
+        resultText: amendmentPlannerResolution.text,
+        agentModelId,
+        sessionId: amendmentPlannerResult.sessionId,
+        planVersion: activeApprovedPlan.planVersion + 1,
+        supersedesPlanId: activeApprovedPlan.id
+      });
+      await batchAnalysisOrchestrator.recordPlan(amendmentDraftPlan);
+
+      streamMetadata.role = 'plan-reviewer';
+      liveSessionId = amendmentPlannerResult.sessionId;
+      const amendmentReviewResult = await agentRuntime.runBatchAnalysis(
+        {
+          ...input,
+          sessionId: liveSessionId,
+          kbAccessMode,
+          agentRole: 'plan-reviewer',
+          sessionMode: 'plan',
+          prompt: batchAnalysisOrchestrator.buildPlanReviewerPrompt({
+            batchContext,
+            uploadedPbis,
+            plan: amendmentDraftPlan
+          })
+        },
+        (stream: AgentStreamingPayload) => {
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 76,
+            message: JSON.stringify(stream),
+            metadata: buildStreamMetadata({ role: 'plan-reviewer', sessionId: stream.sessionId })
+          });
+        },
+        isCancelled
+      );
+      liveSessionId = amendmentReviewResult.sessionId;
+      const amendmentReviewResolution = await resolveBatchAnalysisResultText(
+        agentRuntime,
+        input.workspaceId,
+        amendmentReviewResult.sessionId,
+        amendmentReviewResult.resultPayload
+      );
+      await logAnalysisProgress('Amendment reviewer response received.', {
+        stage: 'worker_discovery_review',
+        role: 'plan-reviewer',
+        sessionId: amendmentReviewResult.sessionId
+      }, {
+        amendmentLoop: amendmentLoops,
+        textLength: amendmentReviewResolution.text.length,
+        parseable: amendmentReviewResolution.parseable,
+        usedTranscriptRecovery: amendmentReviewResolution.usedTranscript,
+        payloadCandidateCount: amendmentReviewResolution.initialCandidateCount,
+        transcriptCandidateCount: amendmentReviewResolution.transcriptCandidateCount,
+        resultTextPreview: buildStageEventTextPreview(amendmentReviewResolution.text)
+      });
+      const normalizedAmendmentReviewText = normalizeRecoveredJsonText(amendmentReviewResolution.text);
+      let amendmentReview: BatchPlanReview;
+      try {
+        amendmentReview = batchAnalysisOrchestrator.parsePlanReviewResult({
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iteration: orchestrationIteration,
+          plan: amendmentDraftPlan,
+          resultText: normalizedAmendmentReviewText ?? amendmentReviewResolution.text,
+          agentModelId,
+          sessionId: amendmentReviewResult.sessionId
+        });
+        if (normalizedAmendmentReviewText && !amendmentReviewResolution.parseable) {
+          await logAnalysisProgress('Amendment review output salvaged locally.', {
+            stage: 'worker_discovery_review',
+            role: 'plan-reviewer',
+            sessionId: amendmentReviewResult.sessionId
+          }, {
+            amendmentLoop: amendmentLoops,
+            textLength: amendmentReviewResolution.text.length
+          });
+        }
+      } catch (error) {
+        const fallbackSummary = 'Amendment review output was malformed and could not be parsed safely.';
+        amendmentReview = batchAnalysisOrchestrator.parsePlanReviewResult({
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iteration: orchestrationIteration,
+          plan: amendmentDraftPlan,
+          resultText: buildMalformedPlanReviewFallback(fallbackSummary),
+          agentModelId,
+          sessionId: amendmentReviewResult.sessionId
+        });
+        await logAnalysisProgress('Amendment review output was malformed; escalating safely.', {
+          stage: 'worker_discovery_review',
+          role: 'plan-reviewer',
+          sessionId: amendmentReviewResult.sessionId
+        }, {
+          amendmentLoop: amendmentLoops,
+          error: error instanceof Error ? error.message : String(error),
+          textLength: amendmentReviewResolution.text.length,
+          transitionReason: 'amendment_review_output_malformed',
+          triggerBranch: 'amendment review parse failed and malformed fallback was used',
+          resultTextPreview: buildStageEventTextPreview(amendmentReviewResolution.text)
+        });
+      }
+      await batchAnalysisOrchestrator.recordReview(amendmentReview);
+
+      if (amendmentReview.verdict !== 'approved') {
+        const amendmentStatus = amendmentReview.verdict === 'needs_human_review' ? 'needs_human_review' : 'rejected';
+        await batchAnalysisOrchestrator.recordAmendment({
+          id: randomUUID(),
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iterationId: orchestrationIteration.id,
+          approvedPlanId: activeApprovedPlan.id,
+          sourceWorkerReportId: workerPassRecord.workerReport.id,
+          sourceDiscoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
+          proposedPlanId: amendmentDraftPlan.id,
+          reviewId: amendmentReview.id,
+          status: amendmentStatus,
+          summary: amendmentReview.summary,
+          createdAtUtc: new Date().toISOString(),
+          updatedAtUtc: new Date().toISOString()
+        });
+        if (amendmentStatus === 'rejected') {
+          await workspaceRepository.updateBatchAnalysisDiscoveredWorkStatuses({
+            workspaceId: input.workspaceId,
+            discoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
+            status: 'rejected'
+          });
+          liveOutstandingDiscoveredWorkCount = Math.max(
+            0,
+            liveOutstandingDiscoveredWorkCount - discoveredForAmendment.length
+          );
+        }
+        if (amendmentReview.verdict === 'needs_human_review' || amendmentLoops >= maxAmendmentLoops) {
+          await logAnalysisProgress('Amendment review halted execution and requires human review.', {
+            stage: 'needs_human_review',
+            role: 'plan-reviewer',
+            sessionId: amendmentReview.sessionId
+          }, {
+            amendmentLoop: amendmentLoops,
+            transitionReason: amendmentReview.verdict === 'needs_human_review'
+              ? 'amendment_review_needs_human_review'
+              : 'amendment_revision_limit_exhausted',
+            triggerBranch: amendmentReview.verdict === 'needs_human_review'
+              ? 'amendmentReview.verdict === needs_human_review'
+              : 'amendmentLoops >= maxAmendmentLoops',
+            triggerArtifactType: 'review',
+            triggerArtifactId: amendmentReview.id,
+            triggerSessionId: amendmentReview.sessionId,
+            triggerVerdict: amendmentReview.verdict,
+            triggerSummary: amendmentReview.summary
+          });
+          await workspaceRepository.updateBatchAnalysisIteration({
+            workspaceId: input.workspaceId,
+            iterationId: orchestrationIteration.id,
+            stage: 'needs_human_review',
+            role: 'plan-reviewer',
+            status: 'needs_human_review',
+            summary: amendmentReview.summary,
+            agentModelId
+          });
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.FAILED,
+            progress: 100,
+            message: 'Worker discoveries require human review before execution can continue.',
+            metadata: buildStreamMetadata()
+          });
+          return;
+        }
+        break;
+      }
+
+      const approvedAmendmentPlan: BatchAnalysisPlan = {
+        ...amendmentDraftPlan,
+        id: randomUUID(),
+        verdict: 'approved',
+        createdAtUtc: new Date().toISOString(),
+        supersedesPlanId: amendmentDraftPlan.id
+      };
+      await batchAnalysisOrchestrator.recordPlan(approvedAmendmentPlan);
+      await batchAnalysisOrchestrator.recordAmendment({
+        id: randomUUID(),
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iterationId: orchestrationIteration.id,
+        approvedPlanId: activeApprovedPlan.id,
+        sourceWorkerReportId: workerPassRecord.workerReport.id,
+        sourceDiscoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
+        proposedPlanId: approvedAmendmentPlan.id,
+        reviewId: amendmentReview.id,
+        status: 'approved',
+        summary: amendmentReview.summary,
+        createdAtUtc: new Date().toISOString(),
+        updatedAtUtc: new Date().toISOString()
+      });
+      await workspaceRepository.updateBatchAnalysisDiscoveredWorkStatuses({
+        workspaceId: input.workspaceId,
+        discoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
+        status: 'approved'
+      });
+      liveOutstandingDiscoveredWorkCount = Math.max(
+        0,
+        liveOutstandingDiscoveredWorkCount - discoveredForAmendment.length
       );
 
-      if (proposalQueue.queue.length === 0 && cliPolicyViolations.length > 0 && providerHealth.providers.mcp.ok) {
-        logger.warn('[agent.analysis.run] cli analysis created no proposals after policy violations; retrying in mcp', {
-          jobId: payload.jobId,
-          batchId: input.batchId,
-          workspaceId: input.workspaceId,
-          violationCount: cliPolicyViolations.length
-        });
-        emit({
-          id: payload.jobId,
-          command: payload.command,
-          state: JobState.RUNNING,
-          progress: 55,
-          message: 'CLI analysis hit blocked tool usage and created no proposals. Retrying in MCP mode.',
-          metadata: {
-            ...streamMetadata,
-            kbAccessMode: 'mcp'
-          }
-        });
-        kbAccessMode = 'mcp';
-        result = await runAnalysis('mcp');
-      }
+      activeApprovedPlan = approvedAmendmentPlan;
+      approvedPlanId = approvedAmendmentPlan.id;
+      liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'building',
+        role: 'worker',
+        summary: 'Plan amendment approved. Resuming worker execution.',
+        agentModelId,
+        approvedPlanId
+      });
+      streamMetadata.stage = 'building';
+      streamMetadata.role = 'worker';
+      liveApprovedPlanId = approvedPlanId;
+      liveLastReviewVerdict = amendmentReview.verdict;
+      liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+      await logAnalysisProgress('Amendment approved; resuming worker execution.', {
+        stage: 'building',
+        role: 'worker',
+        sessionId: amendmentReview.sessionId
+      }, {
+        amendmentLoop: amendmentLoops,
+        approvedPlanId,
+        previousStage: 'worker_discovery_review',
+        previousRole: 'plan-reviewer',
+        transitionReason: 'amendment_review_approved',
+        triggerBranch: 'amendmentReview.verdict === approved',
+        triggerArtifactType: 'review',
+        triggerArtifactId: amendmentReview.id,
+        triggerSessionId: amendmentReview.sessionId,
+        triggerVerdict: amendmentReview.verdict,
+        triggerSummary: amendmentReview.summary
+      });
+      workerPass = await executeWorkerPass(
+        activeApprovedPlan,
+        'Resume execution against the approved amended plan. Only execute work that remains pending or newly added.'
+      );
     }
 
     emit({
@@ -2689,67 +4708,434 @@ export function registerCoreCommands(
       state: JobState.RUNNING,
       progress: 92,
       message: 'Finalizing analysis run...',
-      metadata: {
-        ...streamMetadata,
-        status: result.status,
-        sessionId: result.sessionId
-      }
+      metadata: buildStreamMetadata({
+        status: workerPass.result.status,
+        sessionId: workerPass.result.sessionId
+      })
     });
 
     logger.info('[agent.analysis.run] runtime finished', {
       jobId: payload.jobId,
       batchId: input.batchId,
-      status: result.status,
+      status: workerPass.result.status,
       kbAccessMode,
-      toolCalls: result.toolCalls.length,
-      transcriptPath: result.transcriptPath
+      toolCalls: workerPass.result.toolCalls.length,
+      transcriptPath: workerPass.result.transcriptPath
+    });
+    await logAnalysisProgress('Primary worker runtime finished.', {
+      stage: streamMetadata.stage,
+      role: streamMetadata.role,
+      sessionId: workerPass.result.sessionId
+    }, {
+      status: workerPass.result.status,
+      kbAccessMode,
+      toolCallCount: workerPass.result.toolCalls.length,
+      transcriptPath: workerPass.result.transcriptPath
     });
     const persistedStatus =
-      result.status === 'ok'
+      workerPass.result.status === 'ok'
         ? 'complete'
-        : result.status === 'canceled'
+        : workerPass.result.status === 'canceled'
           ? 'canceled'
           : 'failed';
     await workspaceRepository.recordBatchAnalysisRun({
       workspaceId: input.workspaceId,
       batchId: input.batchId,
-      sessionId: result.sessionId,
+      sessionId: workerPass.result.sessionId,
       kbAccessMode,
       agentModelId,
       status: persistedStatus,
-      startedAtUtc: result.startedAtUtc,
-      endedAtUtc: result.endedAtUtc,
+      startedAtUtc: workerPass.result.startedAtUtc,
+      endedAtUtc: workerPass.result.endedAtUtc,
       promptTemplate: input.prompt,
-      transcriptPath: result.transcriptPath,
-      toolCalls: result.toolCalls,
-      rawOutput: result.rawOutput,
-      message: result.message
+      transcriptPath: workerPass.result.transcriptPath,
+      toolCalls: workerPass.result.toolCalls,
+      rawOutput: workerPass.result.rawOutput,
+      message: workerPass.result.message
     });
-    if (result.status === 'ok') {
+    const workerRecordResult = await batchAnalysisOrchestrator.recordWorkerPass({
+      iteration: orchestrationIteration,
+      workspaceId: input.workspaceId,
+      batchId: input.batchId,
+      agentModelId,
+      approvedPlan: activeApprovedPlan,
+      summary: workerPass.workerSummary,
+      discoveredWork: workerPass.discoveredWork,
+      result: workerPass.result
+    });
+    let latestWorkerReport = workerRecordResult.workerReport;
+    let latestExecutionCounts = workerRecordResult.executionCounts;
+    liveExecutionCounts = latestExecutionCounts;
+    liveOutstandingDiscoveredWorkCount = latestWorkerReport.discoveredWork.length;
+    liveSessionId = workerPass.result.sessionId;
+
+    const runFinalReview = async () => {
+      liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'final_reviewing',
+        role: 'final-reviewer',
+        summary: 'Running final review against worker outputs.',
+        agentModelId,
+        approvedPlanId: activeApprovedPlan.id
+      });
+      streamMetadata.stage = 'final_reviewing';
+      streamMetadata.role = 'final-reviewer';
+      liveApprovedPlanId = activeApprovedPlan.id;
+      liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+
+      const finalReviewResult = await agentRuntime.runBatchAnalysis(
+        {
+          ...input,
+          sessionId: liveSessionId,
+          kbAccessMode,
+          agentRole: 'final-reviewer',
+          sessionMode: 'plan',
+          prompt: batchAnalysisOrchestrator.buildFinalReviewerPrompt({
+            batchContext,
+            uploadedPbis,
+            approvedPlan: activeApprovedPlan,
+            workerReport: latestWorkerReport,
+            discoveredWork: latestWorkerReport.discoveredWork
+          })
+        },
+        (stream: AgentStreamingPayload) => {
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 95,
+            message: JSON.stringify(stream),
+            metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+          });
+        },
+        isCancelled
+      );
+      liveSessionId = finalReviewResult.sessionId;
+      const finalReviewResolution = await resolveBatchAnalysisResultText(
+        agentRuntime,
+        input.workspaceId,
+        finalReviewResult.sessionId,
+        finalReviewResult.resultPayload
+      );
+      await logAnalysisProgress('Final reviewer response received.', {
+        stage: 'final_reviewing',
+        role: 'final-reviewer',
+        sessionId: finalReviewResult.sessionId
+      }, {
+        textLength: finalReviewResolution.text.length,
+        parseable: finalReviewResolution.parseable,
+        usedTranscriptRecovery: finalReviewResolution.usedTranscript,
+        payloadCandidateCount: finalReviewResolution.initialCandidateCount,
+        transcriptCandidateCount: finalReviewResolution.transcriptCandidateCount,
+        rawOutputCount: finalReviewResult.rawOutput.length,
+        transcriptPath: finalReviewResult.transcriptPath,
+        resultTextPreview: buildStageEventTextPreview(finalReviewResolution.text)
+      });
+      const normalizedFinalReviewText = normalizeRecoveredJsonText(finalReviewResolution.text);
+      let finalReview;
+      try {
+        finalReview = batchAnalysisOrchestrator.parseFinalReviewResult({
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iteration: orchestrationIteration,
+          planId: activeApprovedPlan.id,
+          workerReportId: latestWorkerReport.id,
+          resultText: normalizedFinalReviewText ?? finalReviewResolution.text,
+          agentModelId,
+          sessionId: finalReviewResult.sessionId
+        });
+        if (normalizedFinalReviewText && !finalReviewResolution.parseable) {
+          await logAnalysisProgress('Final review output salvaged locally.', {
+            stage: 'final_reviewing',
+            role: 'final-reviewer',
+            sessionId: finalReviewResult.sessionId
+          }, {
+            textLength: finalReviewResolution.text.length
+          });
+        }
+      } catch (error) {
+        const fallbackSummary = 'Final review output was malformed and could not be parsed safely.';
+        finalReview = batchAnalysisOrchestrator.parseFinalReviewResult({
+          workspaceId: input.workspaceId,
+          batchId: input.batchId,
+          iteration: orchestrationIteration,
+          planId: activeApprovedPlan.id,
+          workerReportId: latestWorkerReport.id,
+          resultText: buildMalformedFinalReviewFallback(fallbackSummary),
+          agentModelId,
+          sessionId: finalReviewResult.sessionId
+        });
+        await logAnalysisProgress('Final review output was malformed; escalating safely.', {
+          stage: 'final_reviewing',
+          role: 'final-reviewer',
+          sessionId: finalReviewResult.sessionId
+        }, {
+          error: error instanceof Error ? error.message : String(error),
+          textLength: finalReviewResolution.text.length,
+          transitionReason: 'final_review_output_malformed',
+          triggerBranch: 'final review parse failed and malformed fallback was used',
+          resultTextPreview: buildStageEventTextPreview(finalReviewResolution.text)
+        });
+      }
+      await batchAnalysisOrchestrator.recordFinalReview(finalReview);
+      await logAnalysisProgress('Final review recorded.', {
+        stage: 'final_reviewing',
+        role: 'final-reviewer',
+        sessionId: finalReview.sessionId
+      }, {
+        verdict: finalReview.verdict,
+        finalReviewId: finalReview.id,
+        hasMissingArticleChanges: finalReview.hasMissingArticleChanges,
+        hasUnresolvedDiscoveredWork: finalReview.hasUnresolvedDiscoveredWork,
+        planExecutionComplete: finalReview.planExecutionComplete,
+        allPbisMapped: finalReview.allPbisMapped
+      });
+      return { finalReview, finalReviewResult };
+    };
+
+    const maxFinalReworkLoops = 2;
+    let finalReviewOutcome = await runFinalReview();
+    let reworkLoops = 0;
+    while (finalReviewOutcome.finalReview.verdict === 'needs_rework' && reworkLoops < maxFinalReworkLoops) {
+      reworkLoops += 1;
+      liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'reworking',
+        role: 'worker',
+        summary: 'Final review requested rework. Executing rework pass.',
+        agentModelId,
+        approvedPlanId: activeApprovedPlan.id
+      });
+      streamMetadata.stage = 'reworking';
+      streamMetadata.role = 'worker';
+      liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+      const reworkInstructions = [
+        'Apply the final-review rework requests below.',
+        JSON.stringify(finalReviewOutcome.finalReview.delta ?? {}, null, 2)
+      ].join('\n\n');
+      workerPass = await executeWorkerPass(activeApprovedPlan, reworkInstructions);
+      const reworkRecord = await batchAnalysisOrchestrator.recordWorkerPass({
+        iteration: orchestrationIteration,
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        agentModelId,
+        approvedPlan: activeApprovedPlan,
+        summary: workerPass.workerSummary,
+        discoveredWork: workerPass.discoveredWork,
+        result: workerPass.result
+      });
+      latestWorkerReport = reworkRecord.workerReport;
+      latestExecutionCounts = reworkRecord.executionCounts;
+      liveExecutionCounts = latestExecutionCounts;
+      liveOutstandingDiscoveredWorkCount = latestWorkerReport.discoveredWork.length;
+      liveSessionId = workerPass.result.sessionId;
+      finalReviewOutcome = await runFinalReview();
+    }
+
+    let completedIteration;
+    const hardGateValidation = batchAnalysisOrchestrator.validateFinalApproval({
+      plan: activeApprovedPlan,
+      workerReport: latestWorkerReport,
+      finalReview: finalReviewOutcome.finalReview
+    });
+
+    if (finalReviewOutcome.finalReview.verdict === 'approved' && workerPass.result.status === 'ok' && hardGateValidation.ok) {
+      await logAnalysisProgress('Final review approved the batch for completion.', {
+        stage: 'approved',
+        role: 'final-reviewer',
+        sessionId: finalReviewOutcome.finalReview.sessionId
+      }, {
+        transitionReason: 'final_review_approved',
+        triggerBranch: 'finalReview.verdict === approved && worker status ok && hard gates passed',
+        triggerArtifactType: 'final_review',
+        triggerArtifactId: finalReviewOutcome.finalReview.id,
+        triggerSessionId: finalReviewOutcome.finalReview.sessionId,
+        triggerVerdict: finalReviewOutcome.finalReview.verdict,
+        triggerSummary: finalReviewOutcome.finalReview.summary
+      });
       await workspaceRepository.setPBIBatchStatus(
         input.workspaceId,
         input.batchId,
         PBIBatchStatus.ANALYZED,
         true
       );
+      completedIteration = await batchAnalysisOrchestrator.completeIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'approved',
+        role: 'final-reviewer',
+        status: 'completed',
+        summary: finalReviewOutcome.finalReview.summary,
+        agentModelId,
+        sessionId: finalReviewOutcome.finalReviewResult.sessionId,
+        approvedPlanId: activeApprovedPlan.id,
+        lastReviewVerdict: finalReviewOutcome.finalReview.verdict,
+        outstandingDiscoveredWorkCount: latestWorkerReport.discoveredWork.length,
+        executionCounts: latestExecutionCounts,
+        endedAtUtc: workerPass.result.endedAtUtc
+      });
+      liveIteration = completedIteration;
+      liveLastReviewVerdict = finalReviewOutcome.finalReview.verdict;
+    } else if (
+      finalReviewOutcome.finalReview.verdict === 'needs_human_review'
+      || reworkLoops >= maxFinalReworkLoops
+      || (finalReviewOutcome.finalReview.verdict === 'approved' && !hardGateValidation.ok)
+    ) {
+      const escalationSummary = finalReviewOutcome.finalReview.verdict === 'approved' && !hardGateValidation.ok
+        ? `Hard approval gates failed: ${hardGateValidation.reasons.join(' ')}`
+        : finalReviewOutcome.finalReview.summary;
+      await logAnalysisProgress('Final review requires human review before approval.', {
+        stage: 'needs_human_review',
+        role: 'final-reviewer',
+        sessionId: finalReviewOutcome.finalReview.sessionId
+      }, {
+        transitionReason: finalReviewOutcome.finalReview.verdict === 'approved' && !hardGateValidation.ok
+          ? 'final_review_hard_gate_failed'
+          : finalReviewOutcome.finalReview.verdict === 'needs_human_review'
+            ? 'final_review_needs_human_review'
+            : 'final_review_rework_limit_exhausted',
+        triggerBranch: finalReviewOutcome.finalReview.verdict === 'approved' && !hardGateValidation.ok
+          ? 'finalReview.verdict === approved && hardGateValidation.ok === false'
+          : finalReviewOutcome.finalReview.verdict === 'needs_human_review'
+            ? 'finalReview.verdict === needs_human_review'
+            : 'reworkLoops >= maxFinalReworkLoops',
+        triggerArtifactType: 'final_review',
+        triggerArtifactId: finalReviewOutcome.finalReview.id,
+        triggerSessionId: finalReviewOutcome.finalReview.sessionId,
+        triggerVerdict: finalReviewOutcome.finalReview.verdict,
+        triggerSummary: escalationSummary,
+        hardGateReasons: hardGateValidation.ok ? [] : hardGateValidation.reasons
+      });
+      completedIteration = await batchAnalysisOrchestrator.completeIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: 'needs_human_review',
+        role: 'final-reviewer',
+        status: 'needs_human_review',
+        summary: escalationSummary,
+        agentModelId,
+        sessionId: finalReviewOutcome.finalReviewResult.sessionId,
+        approvedPlanId: activeApprovedPlan.id,
+        lastReviewVerdict: finalReviewOutcome.finalReview.verdict,
+        outstandingDiscoveredWorkCount: latestWorkerReport.discoveredWork.length,
+        executionCounts: latestExecutionCounts,
+        endedAtUtc: workerPass.result.endedAtUtc
+      });
+      liveIteration = completedIteration;
+      liveLastReviewVerdict = finalReviewOutcome.finalReview.verdict;
+    } else {
+      await logAnalysisProgress('Worker run ended without final approval.', {
+        stage: workerPass.result.status === 'canceled' ? 'canceled' : 'failed',
+        role: 'worker',
+        sessionId: workerPass.result.sessionId
+      }, {
+        transitionReason: workerPass.result.status === 'canceled'
+          ? 'worker_canceled_before_final_approval'
+          : 'worker_failed_before_final_approval',
+        triggerBranch: 'worker result was not ok or final review did not approve',
+        triggerArtifactType: 'run',
+        triggerSessionId: workerPass.result.sessionId,
+        triggerSummary: workerPass.result.message ?? 'Worker failed before final approval.'
+      });
+      completedIteration = await batchAnalysisOrchestrator.completeIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: workerPass.result.status === 'canceled' ? 'canceled' : 'failed',
+        role: 'worker',
+        status: workerPass.result.status === 'canceled' ? 'canceled' : 'failed',
+        summary: workerPass.result.message ?? 'Worker failed before final approval.',
+        agentModelId,
+        sessionId: workerPass.result.sessionId,
+        approvedPlanId: activeApprovedPlan.id,
+        outstandingDiscoveredWorkCount: latestWorkerReport.discoveredWork.length,
+        executionCounts: latestExecutionCounts,
+        endedAtUtc: workerPass.result.endedAtUtc
+      });
+      liveIteration = completedIteration;
     }
-    emit({
-      id: payload.jobId,
-      command: payload.command,
-      state:
-        result.status === 'error'
-          ? JobState.FAILED
-          : result.status === 'canceled'
-            ? JobState.CANCELED
-            : JobState.SUCCEEDED,
-      progress: 100,
-      message: result.message ?? 'analysis command complete',
-      metadata: {
-        ...streamMetadata,
-        status: result.status,
-        sessionId: result.sessionId
-      }
-    });
+    streamMetadata.iterationId = completedIteration.id;
+    streamMetadata.stage = completedIteration.stage;
+    streamMetadata.role = completedIteration.role;
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state:
+          completedIteration.status === 'failed'
+            ? JobState.FAILED
+            : completedIteration.status === 'canceled'
+              ? JobState.CANCELED
+              : completedIteration.status === 'needs_human_review'
+                ? JobState.FAILED
+              : JobState.SUCCEEDED,
+        progress: 100,
+        message:
+          completedIteration.status === 'needs_human_review'
+            ? (hardGateValidation.ok ? 'Batch analysis requires human review before approval.' : `Batch approval blocked by hard correctness gates. ${hardGateValidation.reasons.join(' ')}`)
+            : finalReviewOutcome.finalReview.summary ?? workerPass.result.message ?? 'analysis command complete',
+        metadata: buildStreamMetadata({
+          stage: completedIteration.stage,
+          role: completedIteration.role,
+          status: workerPass.result.status,
+          sessionId: workerPass.result.sessionId,
+          stageEndedAtUtc: completedIteration.endedAtUtc
+        })
+      });
+    } catch (error) {
+      const failureMessage = error instanceof Error ? error.message : String(error);
+      const terminalStage: BatchAnalysisIterationRecord['stage'] =
+        liveIteration.stage === 'planning' || liveIteration.stage === 'plan_revision' || liveIteration.stage === 'plan_reviewing'
+          ? 'needs_human_review'
+          : liveIteration.stage === 'approved'
+            ? 'failed'
+            : liveIteration.stage;
+      const terminalStatus: BatchAnalysisIterationRecord['status'] =
+        terminalStage === 'needs_human_review' ? 'needs_human_review' : 'failed';
+      logger.error('[agent.analysis.run] orchestration failed', {
+        jobId: payload.jobId,
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iterationId: liveIteration.id,
+        stage: liveIteration.stage,
+        role: liveIteration.role,
+        sessionId: liveSessionId,
+        failureMessage
+      });
+      await logAnalysisProgress('Batch analysis orchestration failed.', {
+        stage: terminalStage,
+        role: liveIteration.role,
+        sessionId: liveSessionId
+      }, {
+        transitionReason: 'orchestration_exception',
+        triggerBranch: 'top-level orchestration catch block',
+        triggerSummary: failureMessage,
+        error: failureMessage
+      });
+      await workspaceRepository.updateBatchAnalysisIteration({
+        workspaceId: input.workspaceId,
+        iterationId: orchestrationIteration.id,
+        stage: terminalStage,
+        role: liveIteration.role,
+        status: terminalStatus,
+        summary: failureMessage,
+        agentModelId,
+        sessionId: liveSessionId
+      });
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: failureMessage,
+        metadata: buildStreamMetadata({
+          stage: terminalStage,
+          role: liveIteration.role,
+          status: 'error',
+          sessionId: liveSessionId
+        })
+      });
+    }
   });
 
   jobs.registerRunner('agent.article_edit.run', async (payload: JobRunContext, emit, isCancelled) => {

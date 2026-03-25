@@ -14,6 +14,7 @@
     "test": "echo '\"agent-runtime\" tests are not implemented in batch 1'"
   },
   "devDependencies": {
-    "@types/node": "^20.19.37"
+    "@types/node": "^20.19.37",
+    "typescript": "^5.9.3"
   }
 }

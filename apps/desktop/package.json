@@ -5,7 +5,7 @@
   "main": "dist/main/main.js",
   "type": "commonjs",
   "scripts": {
-    "dev": "node -e \"console.log('Run from renderer with npm run dev:renderer and main with npm run dev:main')\"",
+    "dev": "node ./scripts/dev.mjs",
     "dev:renderer": "vite",
     "dev:main": "pnpm run rebuild:native && pnpm run build:main && electron dist/main/main.js",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3",

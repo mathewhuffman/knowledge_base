@@ -84,6 +84,224 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createStreamingOnlyAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-streaming-only');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-streaming';
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    const payload = {
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: '{"summary":"streamed-only"}'
+          }
+        }
+      }
+    };
+    process.stdout.write(JSON.stringify(payload) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createEarlyResponseThenStreamAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-early-response-then-stream');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-early-response';
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: 'Gathering KB evidence via the CLI and then returning only the structured JSON plan.'
+      }
+    }) + '\\n');
+
+    const payload = {
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: '{"summary":"late-streamed-json"}'
+          }
+        }
+      }
+    };
+    append({ emitted: 'late-session-update', payload });
+    process.stdout.write(JSON.stringify(payload) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createValidResponseWithCorruptStreamAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-valid-response-corrupt-stream');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-valid-response-corrupt-stream';
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: '{"summary":"final-json-from-response"}'
+      }
+    }) + '\\n');
+
+    const payload = {
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: '{"summary":"final-json-from-response"}{"summary":"garbled-duplicate'
+          }
+        }
+      }
+    };
+    append({ emitted: 'corrupt-session-update', payload });
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify(payload) + '\\n');
+    }, 20);
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
 async function readLoggedRequests(logPath: string): Promise<LoggedRequest[]> {
   const contents = await readFile(logPath, 'utf8');
   return contents
@@ -188,12 +406,14 @@ test.describe('agent runtime provider modes', () => {
       expect(initializeRequest?.params?.clientCapabilities).toMatchObject({
         terminal: true
       });
-      expect(sessionNewRequest?.params).not.toHaveProperty('mcpServers');
+      expect(sessionNewRequest?.params).toMatchObject({
+        mcpServers: []
+      });
 
       const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
       expect(promptText).toContain('Use only the `kb` CLI');
       expect(promptText).not.toContain('MCP');
-      expect(promptText).toContain('Run exactly one `kb` command per response.');
+      expect(promptText).toContain('Use as many `kb` commands as needed to complete the task.');
       expect(promptText).not.toContain('KB Vault MCP guidance');
       expect(promptText).not.toContain('get_batch_context');
       expect(promptText).not.toContain('list_mcp_resources');
@@ -305,6 +525,145 @@ test.describe('agent runtime provider modes', () => {
       expect(promptText).toContain('get_batch_context');
       expect(promptText).toContain('get_pbi_subset');
       expect(promptText).not.toContain('`kb` CLI and data returned by its JSON output');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('batch planner sessions request ACP plan mode', async () => {
+    const logPath = path.join(tempRoot, 'plan-log.jsonl');
+    const binaryPath = await createFakeAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'mcp',
+          agentRole: 'planner',
+          sessionMode: 'plan'
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const sessionNewRequest = requests.find((entry) => entry.method === 'session/new');
+      expect(sessionNewRequest?.params).toMatchObject({
+        config: {
+          mode: 'plan'
+        }
+      });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('streamed prompt output can complete a run even when ACP never returns a prompt response', async () => {
+    const logPath = path.join(tempRoot, 'streaming-log.jsonl');
+    const binaryPath = await createStreamingOnlyAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'cli',
+          timeoutMs: 5_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.resultPayload).toMatchObject({
+        text: '{"summary":"streamed-only"}'
+      });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('late streamed output wins when session/prompt responds before the real answer is finished', async () => {
+    const logPath = path.join(tempRoot, 'early-response-stream-log.jsonl');
+    const binaryPath = await createEarlyResponseThenStreamAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'cli',
+          timeoutMs: 5_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.resultPayload).toMatchObject({
+        text: '{"summary":"late-streamed-json"}'
+      });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('explicit ACP result beats corrupt streamed chunk assembly when the response already contains valid JSON', async () => {
+    const logPath = path.join(tempRoot, 'valid-response-corrupt-stream-log.jsonl');
+    const binaryPath = await createValidResponseWithCorruptStreamAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'cli',
+          timeoutMs: 5_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.resultPayload).toMatchObject({
+        text: '{"summary":"final-json-from-response"}',
+        streamedText: '{"summary":"final-json-from-response"}{"summary":"garbled-duplicate'
+      });
     } finally {
       await runtime.stop();
     }

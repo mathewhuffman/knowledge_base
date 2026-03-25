@@ -658,6 +658,249 @@ export const migrations: Migration[] = [
     sql: `
       SELECT 1;
     `
+  },
+  {
+    version: 16,
+    name: '0016_batch_analysis_orchestration',
+    description: 'Persist multi-stage batch analysis orchestration artifacts and iteration state.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS batch_analysis_iterations (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        role TEXT NOT NULL,
+        summary TEXT,
+        agent_model_id TEXT,
+        session_id TEXT,
+        approved_plan_id TEXT,
+        last_review_verdict TEXT,
+        outstanding_discovered_work_count INTEGER NOT NULL DEFAULT 0,
+        execution_counts_json TEXT NOT NULL DEFAULT '{"total":0,"create":0,"edit":0,"retire":0,"noImpact":0,"executed":0,"blocked":0,"rejected":0}',
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_analysis_iterations_batch_iteration
+        ON batch_analysis_iterations(workspace_id, batch_id, iteration);
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_iterations_stage
+        ON batch_analysis_iterations(workspace_id, batch_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS batch_analysis_plans (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        iteration INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        role TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        plan_version INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        coverage_json TEXT NOT NULL,
+        open_questions_json TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        supersedes_plan_id TEXT,
+        source_discovery_ids_json TEXT,
+        agent_model_id TEXT,
+        session_id TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_plans_iteration
+        ON batch_analysis_plans(iteration_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS batch_analysis_plan_items (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        plan_item_id TEXT NOT NULL,
+        pbi_ids_json TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_article_id TEXT,
+        target_family_id TEXT,
+        target_title TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        depends_on_json TEXT,
+        execution_status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_plan_items_plan
+        ON batch_analysis_plan_items(plan_id, created_at ASC);
+
+      CREATE TABLE IF NOT EXISTS batch_analysis_reviews (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        iteration INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        role TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        did_account_for_every_pbi INTEGER NOT NULL DEFAULT 0,
+        has_missing_creates INTEGER NOT NULL DEFAULT 0,
+        has_missing_edits INTEGER NOT NULL DEFAULT 0,
+        has_target_issues INTEGER NOT NULL DEFAULT 0,
+        has_overlap_or_conflict INTEGER NOT NULL DEFAULT 0,
+        found_additional_article_work INTEGER NOT NULL DEFAULT 0,
+        under_scoped_kb_impact INTEGER NOT NULL DEFAULT 0,
+        delta_json TEXT,
+        plan_id TEXT,
+        agent_model_id TEXT,
+        session_id TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_reviews_iteration
+        ON batch_analysis_reviews(iteration_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS batch_analysis_worker_reports (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        iteration INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        role TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        status TEXT NOT NULL,
+        plan_id TEXT,
+        executed_items_json TEXT NOT NULL,
+        blocker_notes_json TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        agent_model_id TEXT,
+        session_id TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_worker_reports_iteration
+        ON batch_analysis_worker_reports(iteration_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS batch_analysis_discovered_work (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        worker_report_id TEXT NOT NULL,
+        discovery_id TEXT NOT NULL,
+        discovered_action TEXT NOT NULL,
+        suspected_target TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        linked_pbi_ids_json TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        requires_plan_amendment INTEGER NOT NULL DEFAULT 1,
+        status TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_discovered_work_iteration
+        ON batch_analysis_discovered_work(iteration_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS batch_analysis_final_reviews (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        iteration INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        role TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        all_pbis_mapped INTEGER NOT NULL DEFAULT 0,
+        plan_execution_complete INTEGER NOT NULL DEFAULT 0,
+        has_missing_article_changes INTEGER NOT NULL DEFAULT 0,
+        has_unresolved_discovered_work INTEGER NOT NULL DEFAULT 0,
+        delta_json TEXT,
+        plan_id TEXT,
+        worker_report_id TEXT,
+        agent_model_id TEXT,
+        session_id TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_final_reviews_iteration
+        ON batch_analysis_final_reviews(iteration_id, created_at DESC);
+    `
+  },
+  {
+    version: 17,
+    name: '0017_batch_analysis_amendments',
+    description: 'Persist worker-discovery amendment records and approval state.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS batch_analysis_amendments (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        approved_plan_id TEXT,
+        source_worker_report_id TEXT NOT NULL,
+        source_discovery_ids_json TEXT NOT NULL,
+        proposed_plan_id TEXT,
+        review_id TEXT,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_amendments_iteration
+        ON batch_analysis_amendments(iteration_id, updated_at DESC);
+    `
+  },
+  {
+    version: 18,
+    name: '0018_batch_analysis_stage_events',
+    description: 'Persist batch analysis runtime stage transitions and status events.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS batch_analysis_stage_events (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        iteration INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        role TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        status TEXT,
+        summary TEXT,
+        session_id TEXT,
+        agent_model_id TEXT,
+        approved_plan_id TEXT,
+        last_review_verdict TEXT,
+        outstanding_discovered_work_count INTEGER NOT NULL DEFAULT 0,
+        execution_counts_json TEXT NOT NULL DEFAULT '{"total":0,"create":0,"edit":0,"retire":0,"noImpact":0,"executed":0,"blocked":0,"rejected":0}',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_stage_events_batch
+        ON batch_analysis_stage_events(workspace_id, batch_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_stage_events_iteration
+        ON batch_analysis_stage_events(iteration_id, created_at ASC);
+    `
+  },
+  {
+    version: 19,
+    name: '0019_batch_analysis_stage_event_details',
+    description: 'Store structured trigger details for batch analysis stage events.',
+    sql: `
+      ALTER TABLE batch_analysis_stage_events
+        ADD COLUMN details_json TEXT;
+    `
   }
 ];
 

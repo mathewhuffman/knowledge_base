@@ -54,6 +54,13 @@ export function getSidebarCollapsedPreference(): boolean {
   return collapsed;
 }
 
+export function getStoredSidebarCollapsedPreference(): boolean | null {
+  const value = readPreferences().ui?.sidebarCollapsed;
+  const collapsed = typeof value === 'boolean' ? value : null;
+  logger.info('app-preferences.getStoredSidebarCollapsedPreference', { collapsed });
+  return collapsed;
+}
+
 export function setSidebarCollapsedPreference(collapsed: boolean): void {
   logger.info('app-preferences.setSidebarCollapsedPreference.begin', { collapsed });
   const preferences = readPreferences();

@@ -1,5 +1,13 @@
 import type { KbAccessMode } from './batch2';
 export type AgentSessionType = 'batch_analysis' | 'article_edit' | 'assistant_chat';
+export type AgentSessionMode = 'plan' | 'agent' | 'ask';
+export type BatchAnalysisAgentRole = 'planner' | 'plan-reviewer' | 'worker' | 'final-reviewer';
+export type BatchAnalysisStageStatus = 'queued' | 'planning' | 'plan_reviewing' | 'plan_revision' | 'building' | 'worker_discovery_review' | 'final_reviewing' | 'reworking' | 'approved' | 'needs_human_review' | 'failed' | 'canceled';
+export type BatchAnalysisArtifactVerdict = 'approved' | 'needs_revision' | 'needs_rework' | 'rejected' | 'blocked' | 'needs_human_review';
+export type BatchPlanItemAction = 'create' | 'edit' | 'retire' | 'no_impact';
+export type BatchPlanTargetType = 'article' | 'article_family' | 'article_set' | 'new_article' | 'unknown';
+export type BatchPlanExecutionStatus = 'pending' | 'approved' | 'executed' | 'blocked' | 'rejected';
+export type BatchAnalysisIterationStatus = 'running' | 'completed' | 'failed' | 'needs_human_review' | 'canceled';
 export type AgentSessionStatus = 'starting' | 'running' | 'idle' | 'closed' | 'error';
 export declare enum AgentCommand {
     ANALYSIS_RUN = "agent.analysis.run",
@@ -10,6 +18,8 @@ export interface AgentSessionRecord {
     workspaceId: string;
     kbAccessMode: KbAccessMode;
     type: AgentSessionType;
+    mode?: AgentSessionMode;
+    role?: BatchAnalysisAgentRole;
     status: AgentSessionStatus;
     batchId?: string;
     locale?: string;
@@ -25,6 +35,8 @@ export interface AgentSessionCreateRequest {
     workspaceId: string;
     kbAccessMode?: KbAccessMode;
     type: AgentSessionType;
+    mode?: AgentSessionMode;
+    role?: BatchAnalysisAgentRole;
     batchId?: string;
     locale?: string;
     templatePackId?: string;
@@ -77,6 +89,8 @@ export interface AgentAnalysisRunRequest {
     locale?: string;
     sessionId?: string;
     sessionType?: AgentSessionType;
+    sessionMode?: AgentSessionMode;
+    agentRole?: BatchAnalysisAgentRole;
     prompt?: string;
     systemPrompt?: string;
     templatePackId?: string;
@@ -90,6 +104,8 @@ export interface AgentArticleEditRunRequest {
     locale?: string;
     sessionId?: string;
     sessionType?: AgentSessionType;
+    sessionMode?: AgentSessionMode;
+    agentRole?: BatchAnalysisAgentRole;
     prompt?: string;
     timeoutMs?: number;
 }
@@ -100,6 +116,8 @@ export interface AgentAssistantChatRunRequest {
     locale?: string;
     sessionId?: string;
     sessionType?: AgentSessionType;
+    sessionMode?: AgentSessionMode;
+    agentRole?: BatchAnalysisAgentRole;
     prompt?: string;
     timeoutMs?: number;
 }
@@ -204,6 +222,338 @@ export interface PersistedAgentAnalysisRunResponse {
     batchId: string;
     run: PersistedAgentAnalysisRun | null;
     lines: AgentTranscriptLine[];
+    orchestration?: BatchAnalysisSnapshotResponse | null;
+}
+export interface BatchPlanEvidenceItem {
+    kind: 'pbi' | 'article' | 'search' | 'review' | 'transcript' | 'other';
+    ref: string;
+    summary: string;
+}
+export interface BatchPlanCoverage {
+    pbiId: string;
+    outcome: 'covered' | 'gap' | 'no_impact' | 'blocked';
+    planItemIds: string[];
+    notes?: string;
+}
+export interface BatchPlanItem {
+    planItemId: string;
+    pbiIds: string[];
+    action: BatchPlanItemAction;
+    targetType: BatchPlanTargetType;
+    targetArticleId?: string;
+    targetFamilyId?: string;
+    targetTitle: string;
+    reason: string;
+    evidence: BatchPlanEvidenceItem[];
+    confidence: number;
+    dependsOn?: string[];
+    executionStatus: BatchPlanExecutionStatus;
+}
+export interface BatchAnalysisPlan {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iterationId: string;
+    iteration: number;
+    stage: Extract<BatchAnalysisStageStatus, 'planning' | 'plan_revision' | 'worker_discovery_review'>;
+    role: 'planner';
+    verdict: BatchAnalysisArtifactVerdict | 'draft';
+    planVersion: number;
+    summary: string;
+    coverage: BatchPlanCoverage[];
+    items: BatchPlanItem[];
+    openQuestions: string[];
+    createdAtUtc: string;
+    supersedesPlanId?: string;
+    sourceDiscoveryIds?: string[];
+    agentModelId?: string;
+    sessionId?: string;
+}
+export interface BatchPlanReviewDelta {
+    summary: string;
+    requestedChanges: string[];
+    missingPbiIds: string[];
+    missingCreates: string[];
+    missingEdits: string[];
+    additionalArticleWork: string[];
+    targetCorrections: string[];
+    overlapConflicts: string[];
+}
+export interface BatchPlanReview {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iterationId: string;
+    iteration: number;
+    stage: Extract<BatchAnalysisStageStatus, 'plan_reviewing' | 'worker_discovery_review'>;
+    role: 'plan-reviewer';
+    verdict: BatchAnalysisArtifactVerdict;
+    summary: string;
+    didAccountForEveryPbi: boolean;
+    hasMissingCreates: boolean;
+    hasMissingEdits: boolean;
+    hasTargetIssues: boolean;
+    hasOverlapOrConflict: boolean;
+    foundAdditionalArticleWork: boolean;
+    underScopedKbImpact: boolean;
+    delta?: BatchPlanReviewDelta;
+    createdAtUtc: string;
+    planId?: string;
+    agentModelId?: string;
+    sessionId?: string;
+}
+export interface BatchDiscoveredWorkItem {
+    discoveryId: string;
+    sourceWorkerRunId: string;
+    discoveredAction: Exclude<BatchPlanItemAction, 'no_impact'>;
+    suspectedTarget: string;
+    reason: string;
+    evidence: BatchPlanEvidenceItem[];
+    linkedPbiIds: string[];
+    confidence: number;
+    requiresPlanAmendment: boolean;
+    status?: 'pending_review' | 'approved' | 'rejected' | 'escalated';
+}
+export interface BatchWorkerExecutionItemResult {
+    planItemId: string;
+    action: BatchPlanItemAction;
+    targetTitle?: string;
+    status: 'executed' | 'blocked' | 'skipped';
+    proposalId?: string;
+    artifactIds?: string[];
+    note?: string;
+}
+export interface BatchWorkerExecutionReport {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iterationId: string;
+    iteration: number;
+    stage: Extract<BatchAnalysisStageStatus, 'building' | 'reworking'>;
+    role: 'worker';
+    summary: string;
+    status: 'completed' | 'blocked' | 'needs_amendment' | 'failed';
+    planId?: string;
+    executedItems: BatchWorkerExecutionItemResult[];
+    discoveredWork: BatchDiscoveredWorkItem[];
+    blockerNotes: string[];
+    createdAtUtc: string;
+    agentModelId?: string;
+    sessionId?: string;
+}
+export interface BatchPlanAmendment {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iterationId: string;
+    approvedPlanId?: string;
+    sourceWorkerReportId: string;
+    sourceDiscoveryIds: string[];
+    proposedPlanId?: string;
+    reviewId?: string;
+    status: 'pending' | 'approved' | 'rejected' | 'needs_human_review';
+    summary: string;
+    createdAtUtc: string;
+    updatedAtUtc: string;
+}
+export interface BatchFinalReviewDelta {
+    summary: string;
+    requestedRework: string[];
+    uncoveredPbiIds: string[];
+    missingArticleChanges: string[];
+    duplicateRiskTitles: string[];
+    unnecessaryChanges: string[];
+    unresolvedAmbiguities: string[];
+}
+export interface BatchFinalReview {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iterationId: string;
+    iteration: number;
+    stage: 'final_reviewing';
+    role: 'final-reviewer';
+    verdict: BatchAnalysisArtifactVerdict;
+    summary: string;
+    allPbisMapped: boolean;
+    planExecutionComplete: boolean;
+    hasMissingArticleChanges: boolean;
+    hasUnresolvedDiscoveredWork: boolean;
+    delta?: BatchFinalReviewDelta;
+    createdAtUtc: string;
+    planId?: string;
+    workerReportId?: string;
+    agentModelId?: string;
+    sessionId?: string;
+}
+export interface BatchAnalysisExecutionCounts {
+    total: number;
+    create: number;
+    edit: number;
+    retire: number;
+    noImpact: number;
+    executed: number;
+    blocked: number;
+    rejected: number;
+}
+export interface BatchAnalysisIterationRecord {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iteration: number;
+    status: BatchAnalysisIterationStatus;
+    stage: BatchAnalysisStageStatus;
+    role: BatchAnalysisAgentRole;
+    summary?: string;
+    agentModelId?: string;
+    sessionId?: string;
+    approvedPlanId?: string;
+    lastReviewVerdict?: BatchAnalysisArtifactVerdict;
+    outstandingDiscoveredWorkCount: number;
+    executionCounts: BatchAnalysisExecutionCounts;
+    startedAtUtc: string;
+    endedAtUtc?: string;
+    createdAtUtc: string;
+    updatedAtUtc: string;
+}
+export interface BatchAnalysisSnapshotResponse {
+    workspaceId: string;
+    batchId: string;
+    latestIteration: BatchAnalysisIterationRecord | null;
+    latestApprovedPlan: BatchAnalysisPlan | null;
+    latestPlanReview: BatchPlanReview | null;
+    latestWorkerReport: BatchWorkerExecutionReport | null;
+    latestFinalReview: BatchFinalReview | null;
+    discoveredWork: BatchDiscoveredWorkItem[];
+}
+export interface BatchAnalysisReviewDeltaRecord {
+    reviewId: string;
+    iterationId: string;
+    iteration: number;
+    stage: BatchPlanReview['stage'];
+    verdict: BatchAnalysisArtifactVerdict;
+    summary: string;
+    createdAtUtc: string;
+    planId?: string;
+    delta: BatchPlanReviewDelta;
+}
+export interface BatchAnalysisFinalReviewDeltaRecord {
+    finalReviewId: string;
+    iterationId: string;
+    iteration: number;
+    verdict: BatchAnalysisArtifactVerdict;
+    summary: string;
+    createdAtUtc: string;
+    planId?: string;
+    workerReportId?: string;
+    delta: BatchFinalReviewDelta;
+}
+export interface BatchAnalysisTranscriptLink {
+    artifactType: 'iteration' | 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'run';
+    artifactId: string;
+    iterationId?: string;
+    iteration?: number;
+    stage: BatchAnalysisStageStatus;
+    role: BatchAnalysisAgentRole;
+    sessionId?: string;
+    transcriptPath?: string;
+    agentModelId?: string;
+    createdAtUtc: string;
+}
+export interface BatchAnalysisTimelineEntry {
+    artifactType: 'iteration' | 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'run';
+    artifactId: string;
+    iterationId?: string;
+    iteration?: number;
+    stage: BatchAnalysisStageStatus;
+    role: BatchAnalysisAgentRole;
+    status?: string;
+    verdict?: BatchAnalysisArtifactVerdict | 'draft';
+    summary?: string;
+    relatedPlanId?: string;
+    relatedReviewId?: string;
+    relatedWorkerReportId?: string;
+    sessionId?: string;
+    agentModelId?: string;
+    createdAtUtc: string;
+}
+export interface BatchAnalysisInspectionResponse {
+    workspaceId: string;
+    batchId: string;
+    snapshot: BatchAnalysisSnapshotResponse;
+    iterations: BatchAnalysisIterationRecord[];
+    plans: BatchAnalysisPlan[];
+    supersededPlans: BatchAnalysisPlan[];
+    reviews: BatchPlanReview[];
+    reviewDeltas: BatchAnalysisReviewDeltaRecord[];
+    workerReports: BatchWorkerExecutionReport[];
+    discoveredWork: BatchDiscoveredWorkItem[];
+    amendments: BatchPlanAmendment[];
+    finalReviews: BatchFinalReview[];
+    finalReviewReworkPlans: BatchAnalysisFinalReviewDeltaRecord[];
+    timeline: BatchAnalysisTimelineEntry[];
+    transcriptLinks: BatchAnalysisTranscriptLink[];
+}
+export interface BatchAnalysisRuntimeStatus {
+    workspaceId: string;
+    batchId: string;
+    iterationId?: string;
+    iteration?: number;
+    iterationStatus?: BatchAnalysisIterationStatus;
+    stage?: BatchAnalysisStageStatus;
+    role?: BatchAnalysisAgentRole;
+    agentModelId?: string;
+    sessionId?: string;
+    approvedPlanId?: string;
+    lastReviewVerdict?: BatchAnalysisArtifactVerdict;
+    outstandingDiscoveredWorkCount: number;
+    executionCounts: BatchAnalysisExecutionCounts;
+    stageStartedAtUtc?: string;
+    stageEndedAtUtc?: string;
+    updatedAtUtc?: string;
+    latestEventId?: string;
+    latestEventType?: BatchAnalysisStageEventRecord['eventType'];
+}
+export interface BatchAnalysisStageEventDetails {
+    previousStage?: BatchAnalysisStageStatus;
+    previousRole?: BatchAnalysisAgentRole;
+    transitionReason?: string;
+    triggerBranch?: string;
+    triggerArtifactType?: 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'run' | 'session' | 'system';
+    triggerArtifactId?: string;
+    triggerSessionId?: string;
+    triggerVerdict?: BatchAnalysisArtifactVerdict | 'draft';
+    triggerSummary?: string;
+    parseable?: boolean;
+    usedTranscriptRecovery?: boolean;
+    textLength?: number;
+    resultTextPreview?: string;
+    [key: string]: unknown;
+}
+export interface BatchAnalysisStageEventRecord {
+    id: string;
+    workspaceId: string;
+    batchId: string;
+    iterationId: string;
+    iteration: number;
+    stage: BatchAnalysisStageStatus;
+    role: BatchAnalysisAgentRole;
+    eventType: 'iteration_started' | 'stage_transition' | 'stage_progress' | 'iteration_completed';
+    status?: BatchAnalysisIterationStatus;
+    summary?: string;
+    sessionId?: string;
+    agentModelId?: string;
+    approvedPlanId?: string;
+    lastReviewVerdict?: BatchAnalysisArtifactVerdict;
+    outstandingDiscoveredWorkCount: number;
+    executionCounts: BatchAnalysisExecutionCounts;
+    details?: BatchAnalysisStageEventDetails;
+    createdAtUtc: string;
+}
+export interface BatchAnalysisEventStreamResponse {
+    workspaceId: string;
+    batchId: string;
+    events: BatchAnalysisStageEventRecord[];
 }
 export interface AgentStreamingPayload {
     sessionId: string;

@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -83,6 +83,612 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createFakeBatchAnalysisAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-agent');
+  const source = `#!/usr/bin/env node
+const readline = require('node:readline');
+const sessionId = 'fake-batch-analysis-session';
+let reviewCount = 0;
+let workerCount = 0;
+let finalReviewCount = 0;
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      const revised = promptText.includes('Reviewer delta');
+      const discoveredAmendment = promptText.includes('Worker discovered additional scope requiring amendment review.');
+      payload = {
+        summary: discoveredAmendment ? 'Amended plan.' : (revised ? 'Revised plan.' : 'Initial draft plan.'),
+        coverage: [
+          { pbiId: 'pbi-1', outcome: 'covered', planItemIds: discoveredAmendment ? ['item-1', 'item-2'] : ['item-1'] }
+        ],
+        items: discoveredAmendment ? [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'no_impact',
+            targetType: 'article',
+            targetTitle: 'Primary article',
+            reason: 'Tracked for test coverage.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+            confidence: 0.9,
+            executionStatus: 'pending'
+          },
+          {
+            planItemId: 'item-2',
+            pbiIds: ['pbi-1'],
+            action: 'no_impact',
+            targetType: 'article',
+            targetTitle: 'Discovered article',
+            reason: 'Amendment added discovered scope for loop testing.',
+            evidence: [{ kind: 'review', ref: 'discovery-1', summary: 'Worker discovered related article work.' }],
+            confidence: 0.74,
+            executionStatus: 'pending'
+          }
+        ] : [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'no_impact',
+            targetType: 'article',
+            targetTitle: 'Primary article',
+            reason: revised ? 'Reviewer-approved test plan item.' : 'Initial test plan item.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+            confidence: 0.9,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      };
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      reviewCount += 1;
+      if (reviewCount === 1) {
+        const fence = String.fromCharCode(96).repeat(3);
+        payload = fence + "json\\n" + JSON.stringify({
+          summary: 'Missing one related article.',
+          verdict: 'needs_revision',
+          didAccountForEveryPbi: true,
+          hasMissingCreates: false,
+          hasMissingEdits: true,
+          hasTargetIssues: false,
+          hasOverlapOrConflict: false,
+          foundAdditionalArticleWork: true,
+          underScopedKbImpact: true,
+          delta: {
+            summary: 'Add the related article coverage.',
+            requestedChanges: ['Cover the related article.'],
+            missingPbiIds: [],
+            missingCreates: [],
+            missingEdits: ['Related article'],
+            additionalArticleWork: ['Related article'],
+            targetCorrections: [],
+            overlapConflicts: []
+          }
+        }, null, 2) + "\\n" + fence + "\\nSummary repeated after the fence.";
+      } else {
+        payload = {
+          summary: 'Plan is approved.',
+          verdict: 'approved',
+          didAccountForEveryPbi: true,
+          hasMissingCreates: false,
+          hasMissingEdits: false,
+          hasTargetIssues: false,
+          hasOverlapOrConflict: false,
+          foundAdditionalArticleWork: false,
+          underScopedKbImpact: false,
+          delta: {
+            summary: 'No changes requested.',
+            requestedChanges: [],
+            missingPbiIds: [],
+            missingCreates: [],
+            missingEdits: [],
+            additionalArticleWork: [],
+            targetCorrections: [],
+            overlapConflicts: []
+          }
+        };
+      }
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      workerCount += 1;
+      if (workerCount === 1) {
+        payload = {
+          summary: 'Executed approved items and found one discovered item.',
+          discoveredWork: [
+            {
+              discoveryId: 'discovery-1',
+              discoveredAction: 'edit',
+              suspectedTarget: 'Discovered article',
+              reason: 'Worker found adjacent scope.',
+              evidence: [{ kind: 'article', ref: 'article-2', summary: 'Adjacent article references the same workflow.' }],
+              linkedPbiIds: ['pbi-1'],
+              confidence: 0.68,
+              requiresPlanAmendment: true
+            }
+          ]
+        };
+      } else {
+        payload = {
+          summary: workerCount === 2 ? 'Resumed worker execution after amendment.' : 'Completed final-review rework pass.',
+          discoveredWork: []
+        };
+      }
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      finalReviewCount += 1;
+      if (finalReviewCount === 1) {
+        payload = {
+          summary: 'One final rework pass is still needed.',
+          verdict: 'needs_rework',
+          allPbisMapped: true,
+          planExecutionComplete: true,
+          hasMissingArticleChanges: false,
+          hasUnresolvedDiscoveredWork: false,
+          delta: {
+            summary: 'Run one cleanup recheck.',
+            requestedRework: ['Perform the final rework pass.'],
+            uncoveredPbiIds: [],
+            missingArticleChanges: [],
+            duplicateRiskTitles: [],
+            unnecessaryChanges: [],
+            unresolvedAmbiguities: []
+          }
+        };
+      } else {
+        payload = {
+          summary: 'Final review approved.',
+          verdict: 'approved',
+          allPbisMapped: true,
+          planExecutionComplete: true,
+          hasMissingArticleChanges: false,
+          hasUnresolvedDiscoveredWork: false,
+          delta: {
+            summary: 'No further work required.',
+            requestedRework: [],
+            uncoveredPbiIds: [],
+            missingArticleChanges: [],
+            duplicateRiskTitles: [],
+            unnecessaryChanges: [],
+            unresolvedAmbiguities: []
+          }
+        };
+      }
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createPlannerRepairAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-planner-repair-agent');
+  const source = `#!/usr/bin/env node
+const readline = require('node:readline');
+const sessionId = 'fake-batch-analysis-repair-session';
+let reviewCount = 0;
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Your previous planner response was not valid planner JSON')) {
+      payload = {
+        summary: 'Recovered draft plan after repair prompt.',
+        coverage: [
+          { pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['item-1'] }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'no_impact',
+            targetType: 'article',
+            targetTitle: 'Recovered planner article',
+            reason: 'Repair prompt converted the batch into valid plan JSON.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+            confidence: 0.88,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      };
+    } else if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      payload = 'Gathering KB evidence via the kb CLI: batch context, related articles, and targeted searches for food-list coverage.';
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      reviewCount += 1;
+      payload = {
+        summary: 'Recovered plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      payload = {
+        summary: 'Executed recovered plan.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review approved.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createTruncatedPlannerRepairAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-truncated-planner-agent');
+  const source = `#!/usr/bin/env node
+const readline = require('node:readline');
+const sessionId = 'fake-batch-analysis-truncated-session';
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let text = '';
+
+    if (promptText.includes('Your previous planner response was not valid planner JSON')) {
+      text = '{"summary":"OnecandidatePBIwasfullyassessed.","coverage":[{"pbiId":"pbi-1","outcome":"covered","planItemIds":["item-1","item-2"],"notes":"Recoveredcoverage."}],"items":[{"planItemId":"item-1","pbiIds":["pbi-1"],"action":"edit","targetType":"article","targetArticleId":"locale-1","targetFamilyId":"family-1","targetTitle":"EditaFoodItem","reason":"Recoverededititem.","evidence":[{"kind":"pbi","ref":"pbi-1","summary":"Recoveredevidence."}],"confidence":0.88,"executionStatus":"pending"},{"planItemId":"item-2","pbiIds":["pbi-1"],"action":"no_impact","targetType":"article","targetArticleId":"locale-2","targetFamilyId":"family-2","targetTitle":"CreateaFoodItem","reason":"Recoveredlegacyarticledecision.","evidence":[{"kind":"article","ref":"locale-2","summary":"Legacyarticle."}],"confidence":0.7,"executionStatus":"pending"},{"planItemId":"item-3"';
+    } else if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      text = '{"summary":"Initialplanneroutputwastruncated.","coverage":[{"pbiId":"pbi-1","outcome":"covered","planItemIds":["item-1"],"notes":"Initialcoverage."}],"items":[{"planItemId":"item-1","pbiIds":["pbi-1"],"action":"edit","targetType":"article","targetTitle":"EditaFoodItem","reason":"Initialedititem.","evidence":[{"kind":"pbi","ref":"pbi-1","summary":"Initialevidence."}],"confidence":0.8,"executionStatus":"pending"';
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      text = JSON.stringify({
+        summary: 'Recovered plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      });
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      text = JSON.stringify({
+        summary: 'Executed recovered truncated plan.',
+        discoveredWork: []
+      });
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      text = JSON.stringify({
+        summary: 'Final review approved.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      });
+    } else {
+      text = JSON.stringify({ text: 'noop' });
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createLoggedBatchAnalysisAcpBinary(root: string, logPath: string, releasePath: string): Promise<string> {
+  const binaryPath = path.join(root, 'agent');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const releasePath = process.env.KBV_TEST_ACP_RELEASE_PATH;
+const sessionId = 'fake-batch-analysis-logged-session';
+let plannerPromptBlocked = false;
+
+const startupArgs = process.argv.slice(2);
+if (startupArgs.includes('--list-models') || startupArgs.includes('models')) {
+  process.stdout.write(JSON.stringify([
+    'gpt-5.4-high',
+    'gpt-5.4[reasoning=medium,context=272k,fast=false]'
+  ]) + '\\n');
+  process.exit(0);
+}
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+function respond(message, payload) {
+  const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text } }) + '\\n');
+}
+
+function releasePlannerPrompt(message, payload) {
+  const timer = setInterval(() => {
+    if (!fs.existsSync(releasePath)) {
+      return;
+    }
+    clearInterval(timer);
+    respond(message, payload);
+  }, 25);
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        sessionId,
+        models: {
+          currentModelId: 'default[]',
+          availableModels: [
+            { modelId: 'default[]', name: 'Auto' },
+            { modelId: 'gpt-5.4[reasoning=medium,context=272k,fast=false]', name: 'GPT-5.4' }
+          ]
+        }
+      }
+    }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/set_model') {
+    const modelId = message.params && typeof message.params === 'object' ? message.params.modelId : undefined;
+    if (modelId === 'gpt-5.4[reasoning=medium,context=272k,fast=false]') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+      return;
+    }
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      error: {
+        code: -32602,
+        message: 'Invalid params',
+        data: {
+          message: 'Invalid model value: ' + String(modelId)
+        }
+      }
+    }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      const payload = {
+        summary: 'Initial draft plan.',
+        coverage: [
+          { pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['item-1'] }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'no_impact',
+            targetType: 'article',
+            targetTitle: 'Logged article',
+            reason: 'Tracked for cache-isolation coverage.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+            confidence: 0.92,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      };
+
+      if (!plannerPromptBlocked) {
+        plannerPromptBlocked = true;
+        releasePlannerPrompt(message, payload);
+        return;
+      }
+
+      respond(message, payload);
+      return;
+    }
+
+    if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      respond(message, {
+        summary: 'Plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      });
+      return;
+    }
+
+    if (promptText.includes('Execute only the approved plan items below.')) {
+      respond(message, {
+        summary: 'Executed approved items.',
+        discoveredWork: []
+      });
+      return;
+    }
+
+    if (promptText.includes('You are the final reviewer for the batch.')) {
+      respond(message, {
+        summary: 'Final review approved.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      });
+      return;
+    }
+
+    respond(message, { text: 'noop' });
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function readLoggedRequests(logPath: string): Promise<Array<{ method?: string; params?: Record<string, unknown> }>> {
+  try {
+    const contents = await readFile(logPath, 'utf8');
+    return contents
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+  } catch {
+    return [];
+  }
+}
+
+async function waitForLoggedMethod(logPath: string, method: string, timeoutMs = 5_000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const entries = await readLoggedRequests(logPath);
+    if (entries.some((entry) => entry.method === method)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${method}`);
+}
+
 async function createTestHarness() {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch2-commands-'));
   await mkdir(workspaceRoot, { recursive: true });
@@ -110,6 +716,7 @@ async function createTestHarness() {
 
 test.describe('command registry content model transitions', () => {
   let bus: CommandBus;
+  let jobs: JobRegistry;
   let cleanup: () => Promise<void>;
   let createWorkspace: () => Promise<{ id: string }>;
   let previousCursorBinary: string | undefined;
@@ -118,6 +725,7 @@ test.describe('command registry content model transitions', () => {
     previousCursorBinary = process.env.KBV_CURSOR_BINARY;
     const harness = await createTestHarness();
     bus = harness.bus;
+    jobs = harness.jobs;
     createWorkspace = harness.createWorkspace;
     cleanup = harness.cleanup;
   });
@@ -514,6 +1122,275 @@ test.describe('command registry content model transitions', () => {
       expect(deleted.ok).toBe(true);
     } finally {
       await harness.cleanup();
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('runs batch analysis through revision, amendment, and final rework loops', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-commands-'));
+    process.env.KBV_CURSOR_BINARY = await createFakeBatchAnalysisAcpBinary(isolatedRoot);
+
+    try {
+      const workspace = await createWorkspace();
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'batch-analysis.csv',
+          sourceContent: 'Id,Title,Description\n1,Loop Coverage,Verify orchestration loop coverage'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const jobEvents: Array<{ state: string; progress: number; message?: string; metadata?: Record<string, unknown> }> = [];
+      jobs.setEmitter((event) => {
+        if (event.command === 'agent.analysis.run') {
+          jobEvents.push(event);
+        }
+      });
+
+      const job = await jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('SUCCEEDED');
+
+      const latestResp = await bus.execute({
+        method: 'agent.analysis.latest',
+        payload: { workspaceId: workspace.id, batchId, limit: 0 }
+      });
+      expect(latestResp.ok).toBe(true);
+      const latestData = latestResp.data as {
+        orchestration?: {
+          latestIteration?: { stage: string; role: string };
+          latestApprovedPlan?: { items: Array<{ executionStatus: string }> };
+          latestFinalReview?: { verdict: string };
+        } | null;
+      };
+      expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
+      expect(latestData.orchestration?.latestIteration?.role).toBe('final-reviewer');
+      expect(latestData.orchestration?.latestApprovedPlan?.items.every((item) => item.executionStatus === 'executed')).toBeTruthy();
+      expect(latestData.orchestration?.latestFinalReview?.verdict).toBe('approved');
+
+      const inspectionResp = await bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        plans: Array<{ verdict: string }>;
+        reviews: Array<{ verdict: string }>;
+        amendments: Array<{ status: string }>;
+        finalReviewReworkPlans: Array<{ summary: string }>;
+      };
+      expect(inspection.plans.length).toBeGreaterThanOrEqual(4);
+      expect(inspection.reviews.some((review) => review.verdict === 'needs_revision')).toBeTruthy();
+      expect(inspection.amendments.some((amendment) => amendment.status === 'approved')).toBeTruthy();
+      expect(inspection.finalReviewReworkPlans).toHaveLength(1);
+
+      const runtimeResp = await bus.execute({
+        method: 'batch.analysis.runtime.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(runtimeResp.ok).toBe(true);
+      const runtime = runtimeResp.data as {
+        stage: string;
+        role: string;
+        latestEventType: string;
+        executionCounts: { total: number; executed: number };
+      } | null;
+      expect(runtime?.stage).toBe('approved');
+      expect(runtime?.role).toBe('final-reviewer');
+      expect(runtime?.latestEventType).toBe('iteration_completed');
+      expect(runtime?.executionCounts.executed).toBe(runtime?.executionCounts.total);
+
+      const eventsResp = await bus.execute({
+        method: 'batch.analysis.events.get',
+        payload: { workspaceId: workspace.id, batchId, limit: 100 }
+      });
+      expect(eventsResp.ok).toBe(true);
+      const eventStream = eventsResp.data as {
+        events: Array<{ eventType: string; stage: string; role: string }>;
+      };
+      expect(eventStream.events.some((event) => event.eventType === 'iteration_started')).toBeTruthy();
+      expect(eventStream.events.some((event) => event.stage === 'worker_discovery_review')).toBeTruthy();
+      expect(eventStream.events.some((event) => event.stage === 'reworking')).toBeTruthy();
+      expect(eventStream.events.some((event) => event.eventType === 'iteration_completed')).toBeTruthy();
+
+      expect(jobEvents.some((event) => {
+        const orchestration = event.metadata?.orchestration as { stage?: string } | undefined;
+        return orchestration?.stage === 'worker_discovery_review';
+      })).toBeTruthy();
+      expect(jobEvents.some((event) => {
+        const orchestration = event.metadata?.orchestration as { stage?: string } | undefined;
+        return orchestration?.stage === 'final_reviewing';
+      })).toBeTruthy();
+    } finally {
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('repairs planner output when the first planning response is not valid JSON', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-planner-repair-'));
+    process.env.KBV_CURSOR_BINARY = await createPlannerRepairAcpBinary(isolatedRoot);
+
+    try {
+      const workspace = await createWorkspace();
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'planner-repair.csv',
+          sourceContent: 'Id,Title,Description\n1,Planner Repair,Verify planner JSON repair flow'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const jobEvents: Array<{ state: string; progress: number; message?: string; metadata?: Record<string, unknown> }> = [];
+      jobs.setEmitter((event) => {
+        if (event.command === 'agent.analysis.run') {
+          jobEvents.push(event);
+        }
+      });
+
+      const job = await jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('SUCCEEDED');
+      expect(jobEvents.some((event) => event.message?.includes('Planner returned non-JSON or incomplete output'))).toBeTruthy();
+
+      const latestResp = await bus.execute({
+        method: 'agent.analysis.latest',
+        payload: { workspaceId: workspace.id, batchId, limit: 0 }
+      });
+      expect(latestResp.ok).toBe(true);
+      const latestData = latestResp.data as {
+        orchestration?: {
+          latestIteration?: { stage: string; role: string };
+          latestApprovedPlan?: { summary?: string; items: Array<{ targetTitle: string; executionStatus: string }> };
+          latestFinalReview?: { verdict: string };
+        } | null;
+      };
+      expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
+      expect(latestData.orchestration?.latestApprovedPlan?.summary).toBe('Recovered draft plan after repair prompt.');
+      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.targetTitle).toBe('Recovered planner article');
+      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.executionStatus).toBe('executed');
+      expect(latestData.orchestration?.latestFinalReview?.verdict).toBe('approved');
+    } finally {
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('salvages truncated planner repair output into a registered plan instead of escalating', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-truncated-planner-'));
+    process.env.KBV_CURSOR_BINARY = await createTruncatedPlannerRepairAcpBinary(isolatedRoot);
+
+    try {
+      const workspace = await createWorkspace();
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'truncated-planner.csv',
+          sourceContent: 'Id,Title,Description\n1,Truncated Planner,Verify truncated planner recovery'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const job = await jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('SUCCEEDED');
+
+      const latestResp = await bus.execute({
+        method: 'agent.analysis.latest',
+        payload: { workspaceId: workspace.id, batchId, limit: 0 }
+      });
+      expect(latestResp.ok).toBe(true);
+      const latestData = latestResp.data as {
+        orchestration?: {
+          latestIteration?: { stage: string; role: string };
+          latestApprovedPlan?: { summary?: string; items: Array<{ targetTitle: string; executionStatus: string }> };
+          latestFinalReview?: { verdict: string };
+        } | null;
+      };
+
+      expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
+      expect(latestData.orchestration?.latestApprovedPlan?.summary).toContain('One candidate PBI');
+      expect(latestData.orchestration?.latestApprovedPlan?.items.length).toBeGreaterThanOrEqual(2);
+      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.targetTitle).toBe('Edit a Food Item');
+      expect(latestData.orchestration?.latestFinalReview?.verdict).toBe('approved');
+    } finally {
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('runtime options lookup does not start a second ACP session during batch analysis', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-runtime-options-'));
+    const logPath = path.join(isolatedRoot, 'acp-log.jsonl');
+    const releasePath = path.join(isolatedRoot, 'release-planner.txt');
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_TEST_ACP_RELEASE_PATH = releasePath;
+    process.env.KBV_CURSOR_BINARY = await createLoggedBatchAnalysisAcpBinary(isolatedRoot, logPath, releasePath);
+
+    try {
+      const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          agentModelId: 'gpt-5.4-high',
+          acpModelId: 'gpt-5.4[reasoning=medium,context=272k,fast=false]'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'runtime-options-isolation.csv',
+          sourceContent: 'Id,Title,Description\n1,Runtime Options Isolation,Verify runtime options reads do not restart ACP analysis sessions'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const jobPromise = jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+
+      await waitForLoggedMethod(logPath, 'session/prompt');
+
+      const runtimeOptionsResp = await bus.execute({
+        method: 'agent.runtime.options.get',
+        payload: { workspaceId: workspace.id }
+      });
+      expect(runtimeOptionsResp.ok).toBe(true);
+
+      await writeFile(releasePath, 'release', 'utf8');
+
+      const job = await jobPromise;
+      expect(job.state).toBe('SUCCEEDED');
+
+      const requests = await readLoggedRequests(logPath);
+      const sessionNewRequests = requests.filter((entry) => entry.method === 'session/new');
+      const setModelRequests = requests.filter((entry) => entry.method === 'session/set_model');
+
+      expect(sessionNewRequests).toHaveLength(1);
+      expect(setModelRequests).toHaveLength(1);
+      expect(setModelRequests[0]?.params).toMatchObject({
+        modelId: 'gpt-5.4[reasoning=medium,context=272k,fast=false]'
+      });
+    } finally {
+      delete process.env.KBV_TEST_ACP_LOG_PATH;
+      delete process.env.KBV_TEST_ACP_RELEASE_PATH;
       await rm(isolatedRoot, { recursive: true, force: true });
     }
   });

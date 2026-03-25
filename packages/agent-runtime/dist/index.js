@@ -56,16 +56,11 @@ function resolveCursorArgs(binary) {
     }
     return DEFAULT_CURSOR_ARGS;
 }
-function buildCursorAcpArgs(binary, modelId) {
-    const normalizedModelId = modelId?.trim();
-    const basename = node_path_1.default.basename(binary).toLowerCase().replace(/\.exe$/, '');
-    if (!normalizedModelId) {
-        return resolveCursorArgs(binary);
-    }
-    if (basename === 'agent') {
-        return ['--model', normalizedModelId, 'acp'];
-    }
-    return ['agent', '--model', normalizedModelId, 'acp'];
+function buildCursorAcpArgs(binary, _modelId) {
+    // Launch ACP without a model override and select the model through
+    // `session/set_model` after `session/new`. Cursor's startup `--model` flag
+    // accepts a different token format than ACP session model ids.
+    return resolveCursorArgs(binary);
 }
 function normalizeAgentModelId(modelId) {
     const next = modelId?.trim();
@@ -77,6 +72,26 @@ function normalizeAgentModelId(modelId) {
     const normalized = withoutMarkers.split(/\s+-\s+/, 1)[0]?.trim() ?? withoutMarkers;
     return normalized || undefined;
 }
+function resolveProviderSessionMode(mode, sessionMode) {
+    const normalizedMode = sessionMode ?? 'agent';
+    if (mode === 'cli' && normalizedMode === 'plan') {
+        // Cursor ACP plan sessions currently stall in CLI runtime mode, so keep the
+        // planner/reviewer prompts but bootstrap the ACP session as a normal agent run.
+        return 'agent';
+    }
+    return normalizedMode;
+}
+function isMissingAcpSessionError(error) {
+    if (!error) {
+        return false;
+    }
+    const message = typeof error.message === 'string' ? error.message : '';
+    const details = error.data && typeof error.data === 'object' && typeof error.data.details === 'string'
+        ? String(error.data.details)
+        : '';
+    const combined = `${message}\n${details}`.toLowerCase();
+    return combined.includes('session') && combined.includes('not found');
+}
 function getSessionUpdateType(params) {
     if (!params || typeof params !== 'object') {
         return null;
@@ -86,6 +101,45 @@ function getSessionUpdateType(params) {
 }
 function isHiddenAgentThoughtUpdate(params) {
     return getSessionUpdateType(params) === 'agent_thought_chunk';
+}
+class NonRetriableRuntimeError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'NonRetriableRuntimeError';
+    }
+}
+function parseSessionModelState(value) {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+    const candidate = value;
+    const currentModelId = typeof candidate.currentModelId === 'string'
+        ? candidate.currentModelId.trim()
+        : undefined;
+    const availableModels = Array.isArray(candidate.availableModels)
+        ? candidate.availableModels
+            .map((entry) => {
+            if (!entry || typeof entry !== 'object') {
+                return null;
+            }
+            const modelIdValue = entry.modelId;
+            const nameValue = entry.name;
+            const modelId = typeof modelIdValue === 'string' ? modelIdValue.trim() : undefined;
+            const name = typeof nameValue === 'string' ? nameValue.trim() : undefined;
+            if (!modelId && !name) {
+                return null;
+            }
+            return { modelId, name };
+        })
+            .filter((entry) => entry !== null)
+        : undefined;
+    if (!currentModelId && !availableModels?.length) {
+        return null;
+    }
+    return {
+        currentModelId,
+        availableModels
+    };
 }
 function buildBatchAnalysisPhaseGuidance(providerLabel) {
     return [
@@ -119,6 +173,7 @@ function buildMcpTaskPrompt(session, taskPayload, extras) {
     const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
     const locale = typeof taskPayload.locale === 'string' ? taskPayload.locale : session.locale ?? 'default';
     const explicitPrompt = typeof taskPayload.prompt === 'string' ? taskPayload.prompt.trim() : '';
+    const role = session.role ?? 'worker';
     const mcpGuidance = [
         'KB Vault MCP guidance:',
         '- Use only these exact KB Vault MCP tool names when needed: get_batch_context, get_pbi_subset, get_pbi, get_article, get_article_family, get_locale_variant, get_article_history, find_related_articles, search_kb, list_article_templates, get_template, propose_create_kb, propose_edit_kb, propose_retire_kb, record_agent_notes.',
@@ -147,6 +202,45 @@ function buildMcpTaskPrompt(session, taskPayload, extras) {
         .filter(Boolean)
         .join('\n\n');
     if (taskPayload.task === 'analyze_batch') {
+        if (role === 'planner') {
+            return [
+                'You are running inside KB Vault as the batch planner.',
+                `Workspace ID: ${session.workspaceId}`,
+                `Batch ID: ${batchId}`,
+                `Locale: ${locale}`,
+                '',
+                'Your job:',
+                '1. Account for every candidate PBI in a structured plan.',
+                '2. Propose KB create, edit, retire, or no-impact outcomes.',
+                '3. Identify likely existing article targets when possible.',
+                '4. Return only JSON and do not execute proposal creation in this stage.',
+                '',
+                mcpGuidance,
+                '',
+                explicitPrompt ? `Planner instructions:\n${explicitPrompt}` : '',
+                '',
+                extraSections
+            ].filter(Boolean).join('\n');
+        }
+        if (role === 'plan-reviewer' || role === 'final-reviewer') {
+            return [
+                `You are running inside KB Vault as the ${role}.`,
+                `Workspace ID: ${session.workspaceId}`,
+                `Batch ID: ${batchId}`,
+                `Locale: ${locale}`,
+                '',
+                'Your job:',
+                '1. Review the supplied batch plan or outputs for completeness and correctness.',
+                '2. Actively look for missing article work beyond the submitted artifact.',
+                '3. Return only JSON and do not execute proposal creation in this stage.',
+                '',
+                mcpGuidance,
+                '',
+                explicitPrompt ? `Reviewer instructions:\n${explicitPrompt}` : '',
+                '',
+                extraSections
+            ].filter(Boolean).join('\n');
+        }
         return [
             'You are running inside KB Vault to analyze one imported PBI batch.',
             `Workspace ID: ${session.workspaceId}`,
@@ -237,6 +331,7 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
     const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
     const locale = typeof taskPayload.locale === 'string' ? taskPayload.locale : session.locale ?? 'default';
     const explicitPrompt = typeof taskPayload.prompt === 'string' ? taskPayload.prompt.trim() : '';
+    const role = session.role ?? 'worker';
     const cliGuidance = [
         'KB Vault CLI guidance:',
         '- Use only the `kb` CLI and data returned by its JSON output.',
@@ -275,6 +370,45 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
         .filter(Boolean)
         .join('\n\n');
     if (taskPayload.task === 'analyze_batch') {
+        if (role === 'planner') {
+            return [
+                'You are running inside KB Vault as the batch planner.',
+                `Workspace ID: ${session.workspaceId}`,
+                `Batch ID: ${batchId}`,
+                `Locale: ${locale}`,
+                '',
+                'Your job:',
+                '1. Account for every candidate PBI in a structured plan.',
+                '2. Propose KB create, edit, retire, or no-impact outcomes.',
+                '3. Identify likely existing article targets when possible.',
+                '4. Return only JSON and do not execute proposal creation in this stage.',
+                '',
+                cliGuidance,
+                '',
+                explicitPrompt ? `Planner instructions:\n${explicitPrompt}` : '',
+                '',
+                extraSections
+            ].filter(Boolean).join('\n');
+        }
+        if (role === 'plan-reviewer' || role === 'final-reviewer') {
+            return [
+                `You are running inside KB Vault as the ${role}.`,
+                `Workspace ID: ${session.workspaceId}`,
+                `Batch ID: ${batchId}`,
+                `Locale: ${locale}`,
+                '',
+                'Your job:',
+                '1. Review the supplied batch plan or outputs for completeness and correctness.',
+                '2. Actively look for missing article work beyond the submitted artifact.',
+                '3. Return only JSON and do not execute proposal creation in this stage.',
+                '',
+                cliGuidance,
+                '',
+                explicitPrompt ? `Reviewer instructions:\n${explicitPrompt}` : '',
+                '',
+                extraSections
+            ].filter(Boolean).join('\n');
+        }
         return [
             'You are running inside KB Vault to analyze one imported PBI batch.',
             `Workspace ID: ${session.workspaceId}`,
@@ -340,19 +474,12 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
             `Workspace ID: ${session.workspaceId}`,
             `Locale: ${locale}`,
             '',
-            'Tool rules:',
-            '- Use kb commands and structured article/template data only when they help answer the user.',
-            '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
-            '- The preloaded prompt context is for orientation; use CLI output directly when you need to confirm or inspect source records.',
-            '- Return only valid JSON in your final answer.',
+            'Assistant chat rules:',
+            '- Use kb commands and structured article/template data only when they materially help answer the user or complete an explicit edit/proposal request.',
+            '- If the user is asking a normal question or wants an explanation, answer directly instead of doing unnecessary research.',
+            '- Use terminal access only for kb commands or the minimal work needed to complete an explicit assistant action.',
             '- Do not include preamble, commentary about your reasoning, or markdown fences.',
-            '- For live form edits, use `kb app get-form-schema` first when you need editable fields/current values/version token, then use `kb app patch-form` to mutate the app.',
-            '- Never claim a field changed unless `kb app patch-form` succeeded.',
-            '- After a successful live form edit, return `artifactType=informational_response` with a truthful summary of what the command applied.',
-            '- For informational chat, return only `artifactType` and `response`. Omit `summary`, `html`, `formPatch`, and `payload` unless they are needed.',
-            '- Only return `proposal_candidate` when the user explicitly asks you to make or propose changes.',
-            '',
-            cliGuidance,
+            '- Follow the output contract in the additional instructions below exactly.',
             '',
             explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
             '',
@@ -365,6 +492,7 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
     return JSON.stringify({ session, task: taskPayload });
 }
 const DEFAULT_TRANSCRIPT_DIR = '.meta/agent-transcripts';
+const CLI_PLANNER_ZERO_RESULT_SEARCH_LIMIT = 6;
 function loadConfiguredMcpServers() {
     const raw = node_process_1.default.env.KBV_MCP_TOOLS?.trim();
     if (!raw) {
@@ -419,6 +547,7 @@ class CursorTransport {
     nextRequestId = 0;
     pending = new Map();
     buffer = '';
+    stderrBuffer = '';
     constructor(binary, args, cwd, terminalEnabled, logger, notificationHandler) {
         this.binary = binary;
         this.args = args;
@@ -444,7 +573,9 @@ class CursorTransport {
                 this.flushBuffer();
             });
             proc.stderr?.on('data', (chunk) => {
-                this.logger('system', { direction: 'from_agent', event: 'stderr', payload: chunk.toString('utf8') });
+                const text = chunk.toString('utf8');
+                this.stderrBuffer += text;
+                this.logger('system', { direction: 'from_agent', event: 'stderr', payload: text });
             });
             proc.on('error', (error) => {
                 this.logger('system', { direction: 'system', event: 'transport_error', payload: String(error?.message ?? error) });
@@ -452,10 +583,17 @@ class CursorTransport {
                 this.connected = false;
                 reject(error);
             });
-            proc.on('close', () => {
+            proc.on('close', (code, signal) => {
                 this.logger('system', { direction: 'system', event: 'transport_closed', payload: 'cursor process closed' });
+                const stderr = this.stderrBuffer.trim();
+                const closeMessage = stderr
+                    ? `Cursor process closed (code ${code ?? 'unknown'}${signal ? `, signal ${signal}` : ''}): ${stderr}`
+                    : `Cursor process closed (code ${code ?? 'unknown'}${signal ? `, signal ${signal}` : ''})`;
+                this.rejectAllPending(new Error(closeMessage));
                 this.connected = false;
                 this.initialized = false;
+                this.proc = null;
+                this.stderrBuffer = '';
             });
             this.connected = true;
             proc.stdin?.write(`\n`);
@@ -470,6 +608,7 @@ class CursorTransport {
         this.proc = null;
         this.connected = false;
         this.initialized = false;
+        this.stderrBuffer = '';
     }
     async request(method, params, timeoutMs, sessionId) {
         const logSessionId = sessionId?.trim() || 'system';
@@ -523,6 +662,24 @@ class CursorTransport {
             this.pending.delete(requestId);
             pending.reject(new Error(reason));
         }
+    }
+    resolvePromptSession(sessionId, result) {
+        if (!sessionId) {
+            return false;
+        }
+        for (const [requestId, pending] of this.pending.entries()) {
+            if (pending.method !== 'session/prompt' || pending.watchedSessionId !== sessionId) {
+                continue;
+            }
+            this.pending.delete(requestId);
+            pending.resolve({
+                jsonrpc: '2.0',
+                id: requestId,
+                result
+            });
+            return true;
+        }
+        return false;
     }
     async ensureInitialized(timeoutMs) {
         if (this.initialized) {
@@ -700,8 +857,11 @@ class CursorAcpRuntime {
     cursorSessionLookup = new Map();
     activeStreamEmitters = new Map();
     promptMessageChunks = new Map();
+    promptCompletionTimers = new Map();
+    pendingPromptFallbacks = new Map();
     pendingSessionOperations = new Map();
     sessionActivityAt = new Map();
+    cliPlannerLoopState = new Map();
     workspaceAgentModels = new Map();
     debugLogger;
     configuredMcpServers;
@@ -860,11 +1020,9 @@ class CursorAcpRuntime {
         return [workspaceId ?? 'global', mode, this.getWorkspaceAgentModel(workspaceId) ?? 'default'].join('::');
     }
     async restartWorkspaceAcpConnections(workspaceId) {
-        for (const session of this.sessions.values()) {
-            if (session.workspaceId === workspaceId) {
-                this.resetCursorSession(session.id);
-            }
-        }
+        await Promise.all(Array.from(this.sessions.values())
+            .filter((session) => session.workspaceId === workspaceId)
+            .map((session) => this.resetCursorSession(session.id)));
         const prefix = `${workspaceId}::`;
         const matchingEntries = Array.from(this.transports.entries()).filter(([key]) => key.startsWith(prefix));
         await Promise.all(matchingEntries.map(async ([key, transport]) => {
@@ -893,10 +1051,10 @@ class CursorAcpRuntime {
         });
         return operation;
     }
-    async waitForSessionToSettle(sessionId, idleMs = 350, maxWaitMs = 5000) {
+    async waitForSessionToSettle(sessionId, idleMs = 350, maxWaitMs = 5000, minWaitMs = 0) {
         const startedAt = Date.now();
         this.markSessionActivity(sessionId);
-        this.log('agent.runtime.session_finalize_wait_begin', { sessionId, idleMs, maxWaitMs });
+        this.log('agent.runtime.session_finalize_wait_begin', { sessionId, idleMs, maxWaitMs, minWaitMs });
         while (Date.now() - startedAt < maxWaitMs) {
             const pending = this.pendingSessionOperations.get(sessionId);
             if (pending && pending.size > 0) {
@@ -905,13 +1063,16 @@ class CursorAcpRuntime {
             }
             const lastActivityAt = this.sessionActivityAt.get(sessionId) ?? startedAt;
             const idleForMs = Date.now() - lastActivityAt;
-            if (idleForMs >= idleMs) {
-                this.log('agent.runtime.session_finalize_wait_complete', { sessionId, idleForMs });
+            const waitedForMs = Date.now() - startedAt;
+            if (idleForMs >= idleMs && waitedForMs >= minWaitMs) {
+                this.log('agent.runtime.session_finalize_wait_complete', { sessionId, idleForMs, waitedForMs });
                 return;
             }
-            await new Promise((resolve) => setTimeout(resolve, Math.min(100, idleMs - idleForMs)));
+            const minWaitRemainingMs = Math.max(0, minWaitMs - waitedForMs);
+            const nextDelayMs = Math.max(10, Math.min(100, idleMs - idleForMs, minWaitRemainingMs || 100));
+            await new Promise((resolve) => setTimeout(resolve, nextDelayMs));
         }
-        this.log('agent.runtime.session_finalize_wait_timeout', { sessionId, maxWaitMs });
+        this.log('agent.runtime.session_finalize_wait_timeout', { sessionId, maxWaitMs, minWaitMs });
     }
     getSession(sessionId) {
         return this.sessions.get(sessionId) ?? null;
@@ -935,6 +1096,8 @@ class CursorAcpRuntime {
             workspaceId: input.workspaceId,
             kbAccessMode: input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
             type: input.type,
+            mode: input.mode ?? (input.type === 'assistant_chat' ? 'ask' : 'agent'),
+            role: input.role,
             status: 'idle',
             batchId: input.batchId,
             locale: input.locale,
@@ -953,6 +1116,7 @@ class CursorAcpRuntime {
         }
         session.status = 'closed';
         session.updatedAtUtc = new Date().toISOString();
+        void this.resetCursorSession(session.id);
         return session;
     }
     async checkHealth(workspaceId, selectedMode = DEFAULT_AGENT_ACCESS_MODE, workspaceKbAccessMode) {
@@ -1013,6 +1177,7 @@ class CursorAcpRuntime {
     }
     async ensureAcpSession(session) {
         const mode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
+        const providerSessionMode = resolveProviderSessionMode(mode, session.mode);
         if (mode === 'cli') {
             await this.runtimeOptions.prepareCliEnvironment?.(session.workspaceId);
         }
@@ -1020,11 +1185,14 @@ class CursorAcpRuntime {
         const agentModelId = this.getWorkspaceAgentModel(session.workspaceId);
         const transportKey = this.buildTransportKey(mode, session.workspaceId);
         const existing = this.cursorSessionIds.get(session.id);
-        if (existing?.mode === mode && existing.transportKey === transportKey) {
+        if (existing?.mode === mode
+            && existing.transportKey === transportKey
+            && existing.sessionMode === providerSessionMode) {
             return existing.acpSessionId;
         }
-        if (existing && (existing.mode !== mode || existing.transportKey !== transportKey)) {
-            this.resetCursorSession(session.id);
+        if (existing
+            && (existing.mode !== mode || existing.transportKey !== transportKey || existing.sessionMode !== providerSessionMode)) {
+            await this.resetCursorSession(session.id);
         }
         const provider = this.getProvider(mode);
         const transport = this.getTransport(mode, session.workspaceId);
@@ -1033,7 +1201,7 @@ class CursorAcpRuntime {
             mode,
             agentModelId: agentModelId ?? 'default'
         });
-        const response = await transport.request('session/new', provider.buildSessionCreateParams(session.type), this.config.requestTimeoutMs, session.id);
+        const response = await transport.request('session/new', provider.buildSessionCreateParams(session.mode), this.config.requestTimeoutMs, session.id);
         if (response.error) {
             this.log('agent.runtime.session_new_failed', {
                 sessionId: session.id,
@@ -1046,13 +1214,50 @@ class CursorAcpRuntime {
         if (!result?.sessionId) {
             throw new Error('Cursor ACP did not return a sessionId');
         }
+        const reportedModelState = parseSessionModelState(result.models);
+        const normalizedRequestedModelId = normalizeAgentModelId(agentModelId);
+        const normalizedCurrentModelId = normalizeAgentModelId(reportedModelState?.currentModelId);
+        if (normalizedRequestedModelId && reportedModelState && normalizedRequestedModelId !== normalizedCurrentModelId) {
+            const setModelResponse = await transport.request('session/set_model', {
+                sessionId: result.sessionId,
+                modelId: normalizedRequestedModelId
+            }, this.config.requestTimeoutMs, session.id);
+            if (setModelResponse.error) {
+                this.log('agent.runtime.session_set_model_failed', {
+                    sessionId: session.id,
+                    acpSessionId: result.sessionId,
+                    requestedModelId: normalizedRequestedModelId,
+                    currentModelId: normalizedCurrentModelId ?? 'default',
+                    availableModels: reportedModelState.availableModels?.map((model) => model.modelId).filter(Boolean) ?? [],
+                    error: setModelResponse.error
+                });
+                try {
+                    await transport.request('session/close', { sessionId: result.sessionId }, this.config.requestTimeoutMs, session.id);
+                }
+                catch {
+                    // Best effort close for a session that failed model selection.
+                }
+                throw new NonRetriableRuntimeError(`Cursor ACP rejected selected model "${normalizedRequestedModelId}": ${setModelResponse.error.message}`);
+            }
+            this.log('agent.runtime.session_set_model_success', {
+                sessionId: session.id,
+                acpSessionId: result.sessionId,
+                requestedModelId: normalizedRequestedModelId,
+                previousModelId: normalizedCurrentModelId ?? 'default'
+            });
+        }
         this.log('agent.runtime.session_new_success', {
             sessionId: session.id,
             acpSessionId: result.sessionId,
             mode,
             agentModelId: agentModelId ?? 'default'
         });
-        this.cursorSessionIds.set(session.id, { mode, acpSessionId: result.sessionId, transportKey });
+        this.cursorSessionIds.set(session.id, {
+            mode,
+            sessionMode: providerSessionMode,
+            acpSessionId: result.sessionId,
+            transportKey
+        });
         this.cursorSessionLookup.set(result.sessionId, { localSessionId: session.id, mode });
         return result.sessionId;
     }
@@ -1061,7 +1266,8 @@ class CursorAcpRuntime {
     }
     async runBatchAnalysis(request, emit, isCancelled) {
         const session = await this.resolveSession(request);
-        const startedAt = new Date().toISOString();
+        const startedAtMs = Date.now();
+        const startedAt = new Date(startedAtMs).toISOString();
         const runId = (0, node_crypto_1.randomUUID)();
         const transcriptPath = await this.ensureTranscriptPath(session.id, runId);
         const toolCalls = [];
@@ -1075,7 +1281,7 @@ class CursorAcpRuntime {
             timeoutMs
         });
         try {
-            const resultPayload = await this.transit(session, {
+            const initialResultPayload = await this.transit(session, {
                 task: 'analyze_batch',
                 batchId: request.batchId,
                 prompt: request.prompt,
@@ -1085,7 +1291,10 @@ class CursorAcpRuntime {
                 rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
                 emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
             }, toolCalls, isCancelled, timeoutMs);
-            await this.waitForSessionToSettle(session.id);
+            const settleWindow = getPromptSettleWindow(initialResultPayload, assemblePromptMessageText(this.promptMessageChunks.get(session.id) ?? []));
+            const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
+            await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
+            const resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
             const endedAt = new Date().toISOString();
             session.updatedAtUtc = endedAt;
             session.status = 'idle';
@@ -1099,7 +1308,7 @@ class CursorAcpRuntime {
                 toolCalls,
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
-                durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+                durationMs: Date.parse(endedAt) - startedAtMs,
                 message: isCancelled() ? 'Run cancelled' : 'Completed'
             };
         }
@@ -1109,7 +1318,7 @@ class CursorAcpRuntime {
                 batchId: request.batchId,
                 error: error instanceof Error ? error.message : String(error)
             });
-            await this.waitForSessionToSettle(session.id);
+            await this.waitForSessionToSettle(session.id, 350, timeoutMs);
             const endedAt = new Date().toISOString();
             session.updatedAtUtc = endedAt;
             session.status = 'idle';
@@ -1128,6 +1337,7 @@ class CursorAcpRuntime {
             };
         }
         finally {
+            this.cleanupPromptState(session.id);
             this.log('agent.runtime.batch_analysis_complete', {
                 workspaceId: request.workspaceId,
                 batchId: request.batchId,
@@ -1205,26 +1415,54 @@ class CursorAcpRuntime {
     }
     async runAssistantChat(request, emit, isCancelled) {
         const session = await this.resolveSession({ ...request, sessionType: 'assistant_chat' });
+        const startedAtMs = Date.now();
         const startedAt = new Date().toISOString();
         const runId = (0, node_crypto_1.randomUUID)();
         const transcriptPath = await this.ensureTranscriptPath(session.id, runId);
         const toolCalls = [];
         const rawOutput = [];
+        const timeoutMs = request.timeoutMs ?? this.config.requestTimeoutMs;
         this.log('agent.runtime.assistant_chat_begin', {
             workspaceId: request.workspaceId,
             localeVariantId: request.localeVariantId,
-            timeoutMs: request.timeoutMs ?? this.config.requestTimeoutMs
+            timeoutMs
         });
         try {
-            const resultPayload = await this.transit(session, {
-                task: 'assistant_chat',
-                localeVariantId: request.localeVariantId,
-                prompt: request.prompt,
-                locale: request.locale
-            }, (event) => {
-                rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
-                emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
-            }, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs);
+            let resultPayload = undefined;
+            let attempt = 0;
+            let nextPrompt = request.prompt;
+            while (true) {
+                const initialResultPayload = await this.transit(session, {
+                    task: 'assistant_chat',
+                    localeVariantId: request.localeVariantId,
+                    prompt: nextPrompt,
+                    locale: request.locale
+                }, (event) => {
+                    rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                    emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+                }, toolCalls, isCancelled, timeoutMs);
+                const settleWindow = ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW;
+                const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
+                await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
+                resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
+                const resultText = extractPromptResultText(resultPayload);
+                const canAutoContinue = !isCancelled()
+                    && attempt < ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT
+                    && Math.max(0, timeoutMs - (Date.now() - startedAtMs)) >= 5_000
+                    && looksLikeAssistantProgressText(resultText);
+                if (!canAutoContinue) {
+                    break;
+                }
+                attempt += 1;
+                nextPrompt = ASSISTANT_CHAT_CONTINUE_PROMPT;
+                rawOutput.push(`[assistant-chat auto-continue ${attempt}] ${String(resultText ?? '')}`);
+                this.log('agent.runtime.assistant_chat_auto_continue', {
+                    workspaceId: request.workspaceId,
+                    sessionId: session.id,
+                    attempt,
+                    preview: (resultText ?? '').slice(0, 160)
+                });
+            }
             const endedAt = new Date().toISOString();
             return {
                 sessionId: session.id,
@@ -1236,7 +1474,7 @@ class CursorAcpRuntime {
                 toolCalls,
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
-                durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+                durationMs: Date.parse(endedAt) - startedAtMs,
                 message: isCancelled() ? 'Run cancelled' : 'Completed'
             };
         }
@@ -1246,6 +1484,7 @@ class CursorAcpRuntime {
                 localeVariantId: request.localeVariantId,
                 error: error instanceof Error ? error.message : String(error)
             });
+            await this.waitForSessionToSettle(session.id, 350, timeoutMs);
             const endedAt = new Date().toISOString();
             return {
                 sessionId: session.id,
@@ -1257,7 +1496,7 @@ class CursorAcpRuntime {
                 toolCalls,
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
-                durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+                durationMs: Date.parse(endedAt) - startedAtMs,
                 message: error instanceof Error ? error.message : String(error)
             };
         }
@@ -1321,8 +1560,20 @@ class CursorAcpRuntime {
     async stop() {
         await Promise.all(Array.from(this.transports.values()).map((transport) => transport.stop()));
     }
+    findReusableBatchAnalysisSession(input) {
+        return Array.from(this.sessions.values())
+            .filter((session) => session.workspaceId === input.workspaceId
+            && session.type === 'batch_analysis'
+            && session.batchId === input.batchId
+            && session.status !== 'closed')
+            .sort((left, right) => right.updatedAtUtc.localeCompare(left.updatedAtUtc))[0] ?? null;
+    }
     async resolveSession(input) {
-        const existing = input.sessionId ? this.getSession(input.sessionId) : null;
+        const sessionType = input.sessionType ?? ('localeVariantId' in input ? 'article_edit' : 'batch_analysis');
+        const requestedMode = input.sessionMode ?? (input.sessionType === 'assistant_chat' ? 'ask' : 'agent');
+        const existing = input.sessionId
+            ? this.getSession(input.sessionId)
+            : ('batchId' in input && sessionType === 'batch_analysis' ? this.findReusableBatchAnalysisSession(input) : null);
         let session = existing;
         if (!session) {
             if (!input.workspaceId) {
@@ -1331,7 +1582,9 @@ class CursorAcpRuntime {
             const createRequest = {
                 workspaceId: input.workspaceId,
                 kbAccessMode: input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
-                type: input.sessionType ?? ('localeVariantId' in input ? 'article_edit' : 'batch_analysis'),
+                type: sessionType,
+                mode: requestedMode,
+                role: input.agentRole,
                 batchId: 'batchId' in input ? input.batchId : undefined,
                 locale: input.locale,
                 templatePackId: 'templatePackId' in input ? input.templatePackId : undefined,
@@ -1339,9 +1592,32 @@ class CursorAcpRuntime {
             };
             session = this.createSession(createRequest);
         }
-        else if (input.kbAccessMode && input.kbAccessMode !== session.kbAccessMode) {
-            this.resetCursorSession(session.id);
-            session.kbAccessMode = input.kbAccessMode;
+        else {
+            let needsReset = false;
+            if (input.kbAccessMode && input.kbAccessMode !== session.kbAccessMode) {
+                session.kbAccessMode = input.kbAccessMode;
+                needsReset = true;
+            }
+            if (requestedMode !== session.mode) {
+                session.mode = requestedMode;
+                needsReset = true;
+            }
+            session.role = input.agentRole;
+            if ('batchId' in input) {
+                session.batchId = input.batchId;
+            }
+            if (input.locale) {
+                session.locale = input.locale;
+            }
+            if ('templatePackId' in input && input.templatePackId) {
+                session.templatePackId = input.templatePackId;
+            }
+            if ('localeVariantScope' in input && input.localeVariantScope?.length) {
+                session.scope = { ...(session.scope ?? {}), localeVariantIds: input.localeVariantScope };
+            }
+            if (needsReset) {
+                await this.resetCursorSession(session.id);
+            }
         }
         if (session.status === 'closed') {
             throw new Error('Cannot run request against closed session');
@@ -1407,6 +1683,8 @@ class CursorAcpRuntime {
                     }
                 ]
             };
+            this.pendingPromptFallbacks.set(session.id, { transport, acpSessionId });
+            this.startPromptCompletionWatcher(session.id);
             this.log('agent.runtime.prompt_send', {
                 workspaceId: session.workspaceId,
                 sessionId: session.id,
@@ -1416,7 +1694,30 @@ class CursorAcpRuntime {
                 agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default',
                 promptLength: promptText.length
             });
-            const response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
+            let response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
+            if (isMissingAcpSessionError(response.error)) {
+                this.log('agent.runtime.prompt_missing_session_retry', {
+                    workspaceId: session.workspaceId,
+                    sessionId: session.id,
+                    acpSessionId,
+                    task: taskPayload.task
+                });
+                await this.resetCursorSession(session.id);
+                const retryAcpSessionId = await this.ensureAcpSession(session);
+                requestPayload.sessionId = retryAcpSessionId;
+                this.pendingPromptFallbacks.set(session.id, { transport, acpSessionId: retryAcpSessionId });
+                this.startPromptCompletionWatcher(session.id);
+                this.log('agent.runtime.prompt_send_retry', {
+                    workspaceId: session.workspaceId,
+                    sessionId: session.id,
+                    acpSessionId: retryAcpSessionId,
+                    task: taskPayload.task,
+                    kbAccessMode: provider.mode,
+                    agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default',
+                    promptLength: promptText.length
+                });
+                response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
+            }
             this.log('agent.runtime.prompt_response', {
                 workspaceId: session.workspaceId,
                 sessionId: session.id,
@@ -1428,20 +1729,13 @@ class CursorAcpRuntime {
             const result = response.result && typeof response.result === 'object'
                 ? { ...response.result }
                 : {};
-            const assembledText = this.consumePromptMessageText(session.id);
-            if (assembledText) {
-                result.text = assembledText;
-                if (!Array.isArray(result.content)) {
-                    result.content = [{ type: 'text', text: assembledText }];
-                }
-            }
             await this.trackSessionOperation(session.id, Promise.resolve(emit({ kind: 'result', data: response, message: 'Run complete' })));
             await this.trackSessionOperation(session.id, (0, promises_1.appendFile)(transcriptPath, `${JSON.stringify({ atUtc: new Date().toISOString(), direction: 'to_agent', event: requestEnvelopeString, payload: requestEnvelopeString })}\n`, 'utf8'));
             return result;
         }
         finally {
-            this.activeStreamEmitters.delete(session.id);
-            this.promptMessageChunks.delete(session.id);
+            this.clearPromptCompletionTimer(session.id);
+            this.pendingPromptFallbacks.delete(session.id);
         }
     }
     async buildPromptText(session, taskPayload) {
@@ -1449,43 +1743,7 @@ class CursorAcpRuntime {
         if (taskPayload.task !== 'analyze_batch') {
             return provider.getPromptTaskBuilder(session, taskPayload);
         }
-        const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
-        if (!batchId) {
-            return provider.getPromptTaskBuilder(session, taskPayload);
-        }
-        let batchContext;
-        let uploadedPbis;
-        let articleDirectory = '';
-        try {
-            batchContext = await this.toolContext.getBatchContext({
-                workspaceId: session.workspaceId,
-                batchId
-            });
-        }
-        catch {
-            batchContext = undefined;
-        }
-        try {
-            uploadedPbis = await this.toolContext.getPBISubset({
-                workspaceId: session.workspaceId,
-                batchId
-            });
-        }
-        catch {
-            uploadedPbis = undefined;
-        }
-        try {
-            const tree = await this.toolContext.getExplorerTree(session.workspaceId);
-            articleDirectory = summarizeExplorerTree(tree);
-        }
-        catch {
-            articleDirectory = '';
-        }
-        return provider.getPromptTaskBuilder(session, taskPayload, {
-            batchContext,
-            uploadedPbis,
-            articleDirectory
-        });
+        return provider.getPromptTaskBuilder(session, taskPayload);
     }
     async executeWithRetry(fn, maxAttempts, isCancelled) {
         this.log('agent.runtime.retry_cycle_begin', { maxAttempts });
@@ -1500,6 +1758,14 @@ class CursorAcpRuntime {
                 return await fn();
             }
             catch (error) {
+                if (error instanceof NonRetriableRuntimeError) {
+                    this.log('agent.runtime.retry_abort_non_retriable', {
+                        attempt: attempt + 1,
+                        maxAttempts,
+                        error: error.message
+                    });
+                    throw error;
+                }
                 attempt += 1;
                 this.log('agent.runtime.retry_attempt_failed', {
                     attempt,
@@ -1532,9 +1798,9 @@ class CursorAcpRuntime {
         if (updateRecord?.sessionUpdate === 'agent_message_chunk') {
             const text = extractAgentMessageChunkText(updateRecord.content);
             if (text) {
-                const chunks = this.promptMessageChunks.get(localSessionId) ?? [];
-                chunks.push(text);
+                const chunks = appendPromptMessageChunk(this.promptMessageChunks.get(localSessionId) ?? [], text);
                 this.promptMessageChunks.set(localSessionId, chunks);
+                this.schedulePromptCompletionFallback(localSessionId, params.sessionId);
             }
         }
         this.markSessionActivity(localSessionId);
@@ -1574,6 +1840,7 @@ class CursorAcpRuntime {
                 }
             }
         }
+        await this.maybeAbortCliPlannerLoop(localSessionId, params.sessionId, updateRecord);
         const emit = this.activeStreamEmitters.get(localSessionId);
         if (!emit) {
             return;
@@ -1587,7 +1854,80 @@ class CursorAcpRuntime {
     consumePromptMessageText(sessionId) {
         const chunks = this.promptMessageChunks.get(sessionId) ?? [];
         this.promptMessageChunks.delete(sessionId);
-        return chunks.join('');
+        return assemblePromptMessageText(chunks);
+    }
+    finalizePromptResult(sessionId, result) {
+        const finalized = result && typeof result === 'object'
+            ? { ...result }
+            : {};
+        const assembledText = this.consumePromptMessageText(sessionId).trim();
+        if (assembledText) {
+            const explicitText = extractPromptResultText(finalized)?.trim();
+            if (!explicitText || (!looksLikeJsonObjectText(explicitText) && looksLikeJsonObjectText(assembledText))) {
+                finalized.text = assembledText;
+                finalized.content = [{ type: 'text', text: assembledText }];
+            }
+            else {
+                finalized.streamedText = assembledText;
+            }
+        }
+        return finalized;
+    }
+    cleanupPromptState(sessionId) {
+        this.clearPromptCompletionTimer(sessionId);
+        this.pendingPromptFallbacks.delete(sessionId);
+        this.activeStreamEmitters.delete(sessionId);
+        this.promptMessageChunks.delete(sessionId);
+        this.cliPlannerLoopState.delete(sessionId);
+    }
+    clearPromptCompletionTimer(sessionId) {
+        const timer = this.promptCompletionTimers.get(sessionId);
+        if (timer) {
+            clearTimeout(timer);
+            this.promptCompletionTimers.delete(sessionId);
+        }
+    }
+    startPromptCompletionWatcher(localSessionId) {
+        this.clearPromptCompletionTimer(localSessionId);
+        const timer = setInterval(() => {
+            const pending = this.pendingPromptFallbacks.get(localSessionId);
+            if (!pending) {
+                this.clearPromptCompletionTimer(localSessionId);
+                return;
+            }
+            const normalizedAssembledText = assemblePromptMessageText(this.promptMessageChunks.get(localSessionId) ?? []).trim();
+            if (!normalizedAssembledText) {
+                return;
+            }
+            const lastActivityAt = this.sessionActivityAt.get(localSessionId) ?? Date.now();
+            if (Date.now() - lastActivityAt < 900) {
+                return;
+            }
+            const resolved = pending.transport.resolvePromptSession(pending.acpSessionId, {
+                text: normalizedAssembledText,
+                content: [{ type: 'text', text: normalizedAssembledText }]
+            });
+            if (resolved) {
+                this.log('agent.runtime.prompt_stream_fallback_resolved', {
+                    sessionId: localSessionId,
+                    acpSessionId: pending.acpSessionId
+                });
+                this.clearPromptCompletionTimer(localSessionId);
+            }
+        }, 200);
+        this.promptCompletionTimers.set(localSessionId, timer);
+    }
+    schedulePromptCompletionFallback(localSessionId, acpSessionId) {
+        const pending = this.pendingPromptFallbacks.get(localSessionId);
+        if (!pending) {
+            return;
+        }
+        if (acpSessionId && pending.acpSessionId !== acpSessionId) {
+            return;
+        }
+        if (!this.promptCompletionTimers.has(localSessionId)) {
+            this.startPromptCompletionWatcher(localSessionId);
+        }
     }
     async ensureTranscriptPath(sessionId, runId) {
         const transcriptDir = node_path_1.default.resolve(this.config.workspaceRoot, DEFAULT_TRANSCRIPT_DIR, sessionId);
@@ -1692,6 +2032,80 @@ class CursorAcpRuntime {
             reason: `CLI mode ACP tool call allowed: ${toolName} (${normalizedKind})`
         };
     }
+    parseCliLoopbackToolResult(updateRecord) {
+        if (updateRecord.sessionUpdate !== 'tool_call_update' || updateRecord.status !== 'completed') {
+            return null;
+        }
+        const rawOutput = updateRecord.rawOutput;
+        if (!rawOutput || typeof rawOutput !== 'object') {
+            return null;
+        }
+        const stdout = typeof rawOutput.stdout === 'string'
+            ? (rawOutput.stdout).trim()
+            : '';
+        if (!stdout) {
+            return null;
+        }
+        try {
+            const parsed = JSON.parse(stdout);
+            const command = typeof parsed.command === 'string' ? parsed.command : '';
+            if (!command) {
+                return null;
+            }
+            const total = typeof parsed.data?.total === 'number'
+                ? parsed.data.total
+                : Array.isArray(parsed.data?.results)
+                    ? parsed.data.results.length
+                    : undefined;
+            return { command, total };
+        }
+        catch {
+            return null;
+        }
+    }
+    async maybeAbortCliPlannerLoop(localSessionId, acpSessionId, updateRecord) {
+        if (!acpSessionId || !updateRecord) {
+            return;
+        }
+        const session = this.sessions.get(localSessionId);
+        if (!session || session.kbAccessMode !== 'cli' || session.role !== 'planner' || session.mode !== 'plan') {
+            return;
+        }
+        const parsed = this.parseCliLoopbackToolResult(updateRecord);
+        if (!parsed || parsed.command !== 'search-kb') {
+            return;
+        }
+        const state = this.cliPlannerLoopState.get(localSessionId) ?? {
+            searchKbCalls: 0,
+            consecutiveZeroResultSearches: 0,
+            aborted: false
+        };
+        state.searchKbCalls += 1;
+        if ((parsed.total ?? 0) === 0) {
+            state.consecutiveZeroResultSearches += 1;
+        }
+        else {
+            state.consecutiveZeroResultSearches = 0;
+        }
+        this.cliPlannerLoopState.set(localSessionId, state);
+        if (state.aborted || state.consecutiveZeroResultSearches < CLI_PLANNER_ZERO_RESULT_SEARCH_LIMIT) {
+            return;
+        }
+        state.aborted = true;
+        const reason = `Planner loop breaker triggered after ${state.searchKbCalls} search-kb calls and ${state.consecutiveZeroResultSearches} consecutive zero-result searches`;
+        this.log('agent.runtime.cli_planner_loop_breaker', {
+            sessionId: localSessionId,
+            acpSessionId,
+            searchKbCalls: state.searchKbCalls,
+            consecutiveZeroResultSearches: state.consecutiveZeroResultSearches
+        });
+        await this.trackSessionOperation(localSessionId, this.appendTranscriptLine(localSessionId, 'system', 'planner_loop_breaker', JSON.stringify({
+            reason,
+            searchKbCalls: state.searchKbCalls,
+            consecutiveZeroResultSearches: state.consecutiveZeroResultSearches
+        })));
+        this.getTransport('cli', session.workspaceId).abortPromptSession(acpSessionId, reason);
+    }
     resolveMcpServerConfigs() {
         if (this.runtimeMcpServers.length > 0) {
             return this.runtimeMcpServers;
@@ -1706,11 +2120,11 @@ class CursorAcpRuntime {
             return {
                 mode: 'cli',
                 provider: 'cli',
-                terminalEnabled: false,
-                buildSessionCreateParams: (sessionType) => ({
+                terminalEnabled: true,
+                buildSessionCreateParams: (sessionMode) => ({
                     cwd: this.config.acpCwd,
                     mcpServers: [],
-                    config: { mode: sessionType === 'assistant_chat' ? 'ask' : 'agent' }
+                    config: { mode: resolveProviderSessionMode('cli', sessionMode) }
                 }),
                 getPromptTaskBuilder: (session, taskPayload, extras) => {
                     const prompt = buildCliTaskPrompt(session, taskPayload, extras);
@@ -1725,12 +2139,12 @@ class CursorAcpRuntime {
             mode: 'mcp',
             provider: 'mcp',
             terminalEnabled: false,
-            buildSessionCreateParams: (sessionType) => {
+            buildSessionCreateParams: (sessionMode) => {
                 const mcpServers = this.resolveMcpServerConfigs();
                 return {
                     cwd: this.config.acpCwd,
                     ...(mcpServers.length > 0 ? { mcpServers } : {}),
-                    config: { mode: sessionType === 'assistant_chat' ? 'ask' : 'agent' }
+                    config: { mode: resolveProviderSessionMode('mcp', sessionMode) }
                 };
             },
             getPromptTaskBuilder: (session, taskPayload, extras) => buildMcpTaskPrompt(session, taskPayload, extras),
@@ -1840,13 +2254,30 @@ class CursorAcpRuntime {
             return result;
         }
     }
-    resetCursorSession(sessionId) {
+    async resetCursorSession(sessionId) {
         const existing = this.cursorSessionIds.get(sessionId);
         if (!existing) {
             return;
         }
+        this.clearPromptCompletionTimer(sessionId);
+        this.pendingPromptFallbacks.delete(sessionId);
         this.cursorSessionIds.delete(sessionId);
         this.cursorSessionLookup.delete(existing.acpSessionId);
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return;
+        }
+        const transportKey = this.buildTransportKey(existing.mode, session.workspaceId);
+        const transport = this.transports.get(transportKey);
+        if (!transport) {
+            return;
+        }
+        try {
+            await transport.request('session/close', { sessionId: existing.acpSessionId }, Math.min(this.config.requestTimeoutMs, 10_000), sessionId);
+        }
+        catch {
+            // Best effort close for an ACP session that may already be gone.
+        }
     }
     async appendTranscriptLine(sessionId, direction, event, payload) {
         const path = this.transcripts.get(sessionId);
@@ -2135,6 +2566,153 @@ function extractAgentMessageChunkText(value) {
     return typeof content.text === 'string' && content.text.length > 0
         ? content.text
         : undefined;
+}
+function collapseRepeatedChunkText(value) {
+    let current = value;
+    while (current.trim().length >= 64 && current.length % 2 === 0) {
+        const midpoint = current.length / 2;
+        const left = current.slice(0, midpoint);
+        const right = current.slice(midpoint);
+        if (!left.trim() || left !== right) {
+            break;
+        }
+        current = left;
+    }
+    return current.trim();
+}
+function findChunkOverlap(left, right) {
+    const maxOverlap = Math.min(left.length, right.length);
+    for (let overlap = maxOverlap; overlap >= 24; overlap -= 1) {
+        if (left.slice(-overlap) === right.slice(0, overlap)) {
+            return overlap;
+        }
+    }
+    return 0;
+}
+function appendPromptMessageChunk(chunks, text) {
+    if (!text.trim()) {
+        return chunks;
+    }
+    const assembled = chunks.join('');
+    if (!assembled) {
+        chunks.push(text);
+        return chunks;
+    }
+    if (assembled.endsWith(text)) {
+        return chunks;
+    }
+    const overlap = findChunkOverlap(assembled, text);
+    const suffix = overlap > 0 ? text.slice(overlap) : text;
+    if (suffix) {
+        chunks.push(suffix);
+    }
+    return chunks;
+}
+function assemblePromptMessageText(chunks) {
+    return collapseRepeatedChunkText(chunks.join(''));
+}
+const DEFAULT_PROMPT_SETTLE_WINDOW = {
+    idleMs: 350,
+    minWaitMs: 0,
+    maxWaitMs: 5_000
+};
+const NON_JSON_PROMPT_SETTLE_WINDOW = {
+    idleMs: 2_500,
+    minWaitMs: 60_000,
+    maxWaitMs: 90_000
+};
+const ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW = {
+    idleMs: 1_000,
+    minWaitMs: 0,
+    maxWaitMs: 8_000
+};
+const ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT = 2;
+const ASSISTANT_CHAT_CONTINUE_PROMPT = [
+    'Continue the same user request using the existing session context.',
+    'If research is needed, do it now and then provide the final user-facing answer in this same turn.',
+    'Do not send another progress update, status note, or "I am going to..." message.',
+    'Return the final answer only.'
+].join(' ');
+function extractPromptResultText(value) {
+    if (!value || typeof value !== 'object') {
+        return undefined;
+    }
+    const record = value;
+    if (typeof record.text === 'string' && record.text.trim()) {
+        return record.text;
+    }
+    if (Array.isArray(record.content)) {
+        const joined = record.content
+            .filter((item) => item?.type === 'text' && typeof item.text === 'string')
+            .map((item) => item.text)
+            .join('\n')
+            .trim();
+        if (joined) {
+            return joined;
+        }
+    }
+    return undefined;
+}
+function looksLikeAssistantProgressText(value) {
+    const normalized = value?.trim().toLowerCase();
+    if (!normalized) {
+        return false;
+    }
+    if (looksLikeJsonObjectText(normalized)) {
+        return false;
+    }
+    const progressPhrases = [
+        "i'm going to",
+        'i am going to',
+        "i’ll look",
+        'i will look',
+        'let me look',
+        "i'm looking up",
+        'i am looking up',
+        "i'm opening",
+        'i am opening',
+        'opening those now',
+        'opening that now',
+        'so i can answer',
+        'so i can explain',
+        'instead of guessing',
+        'rather than guess',
+        'i found the likely source',
+        'i found the likely source articles',
+        "i'm going to look up",
+        'continue the same task',
+        'i can try to pull'
+    ];
+    return progressPhrases.some((phrase) => normalized.includes(phrase));
+}
+function looksLikeJsonObjectText(value) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return false;
+    }
+    const candidates = [
+        trimmed,
+        trimmed.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '')
+    ];
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return true;
+            }
+        }
+        catch {
+            // fall through
+        }
+    }
+    return false;
+}
+function getPromptSettleWindow(result, streamedText) {
+    const explicitText = extractPromptResultText(result);
+    if ((explicitText && looksLikeJsonObjectText(explicitText)) || (streamedText && looksLikeJsonObjectText(streamedText))) {
+        return DEFAULT_PROMPT_SETTLE_WINDOW;
+    }
+    return NON_JSON_PROMPT_SETTLE_WINDOW;
 }
 class AgentRuntimeService {
     runtime;
