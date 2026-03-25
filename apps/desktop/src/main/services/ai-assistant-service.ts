@@ -595,6 +595,8 @@ export class AiAssistantService {
       '- Any mutating result must include an explicit command and valid JSON. Without a valid command, the result will be treated as informational_response.',
       '- If the user is asking a question, greeting you, asking for explanation, or chatting back and forth, prefer a plain-text answer instead of JSON.',
       '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
+      '- When research or data lookup is needed, use only kb commands. Never use terminal commands like grep, Read File, codebase search, or filesystem exploration.',
+      '- Preferred kb commands for research are: `kb batch-context --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb find-related-articles --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json`, `kb get-article-family --workspace-id <workspace-id> --family-id <family-id> --json`, `kb app get-form-schema --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --json`, `kb app patch-form --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --version-token <version-token> --patch \'<json object>\' --json`, and `kb help --json`.',
       '- If you choose JSON for informational_response, return only the user-facing response text. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
       '- On the first meaningful reply in a new chat, include a short human-readable title in "title" based on the user request.',
       '- For informational_response, omit summary unless it is genuinely needed for internal bookkeeping.',
@@ -901,7 +903,7 @@ export class AiAssistantService {
               };
             };
             const chunkText = payload.update?.sessionUpdate === 'agent_message_chunk'
-              ? extractString(payload.update.content?.text)
+              ? extractChunkString(payload.update.content?.text)
               : undefined;
             if (chunkText) {
               appendAssistantTranscriptChunk(chunkParts, chunkText);
@@ -1675,6 +1677,10 @@ function extractString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function extractChunkString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 function extractAssistantText(value: unknown): string | undefined {
   const candidates: string[] = [];
 
@@ -1752,7 +1758,10 @@ function findAssistantTranscriptChunkOverlap(left: string, right: string): numbe
 }
 
 function appendAssistantTranscriptChunk(chunks: string[], text: string): void {
-  if (!text.trim()) {
+  if (!text && text !== '') {
+    return;
+  }
+  if (!text.trim() && !/[\r\n]/.test(text)) {
     return;
   }
 

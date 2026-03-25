@@ -92,6 +92,21 @@ function isMissingAcpSessionError(error) {
     const combined = `${message}\n${details}`.toLowerCase();
     return combined.includes('session') && combined.includes('not found');
 }
+function isRetriablePromptError(error) {
+    if (!error) {
+        return false;
+    }
+    if (isMissingAcpSessionError(error)) {
+        return true;
+    }
+    const message = typeof error.message === 'string' ? error.message.trim().toLowerCase() : '';
+    return message === 'internal error';
+}
+function isCliToolPolicyViolationError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.trim().toLowerCase();
+    return normalized.includes('cli mode forbids');
+}
 function getSessionUpdateType(params) {
     if (!params || typeof params !== 'object') {
         return null;
@@ -469,6 +484,13 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
         ].filter(Boolean).join('\n');
     }
     if (taskPayload.task === 'assistant_chat') {
+        const chatCliGuidance = [
+            'KB command rules for chat:',
+            '- When research or data lookup is needed, use only `kb` commands.',
+            '- Never use terminal commands like grep, Read File, codebase search, or general filesystem exploration.',
+            '- Prefer these commands when relevant: `kb batch-context --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb find-related-articles --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json`, `kb get-article-family --workspace-id <workspace-id> --family-id <family-id> --json`, `kb app get-form-schema --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --json`, `kb app patch-form --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --version-token <version-token> --patch \'<json object>\' --json`, and `kb help --json`.',
+            '- Use the KB command output as the source of truth when answering.'
+        ].join('\n');
         return [
             'You are running inside KB Vault as a route-aware assistant for conversational help and proposal drafting.',
             `Workspace ID: ${session.workspaceId}`,
@@ -477,9 +499,12 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
             'Assistant chat rules:',
             '- Use kb commands and structured article/template data only when they materially help answer the user or complete an explicit edit/proposal request.',
             '- If the user is asking a normal question or wants an explanation, answer directly instead of doing unnecessary research.',
-            '- Use terminal access only for kb commands or the minimal work needed to complete an explicit assistant action.',
+            '- If the user explicitly asks you to research, investigate, look something up, or answer from workspace data, do that research now and return the final findings in the same turn.',
+            '- Never use generic terminal commands. Only use kb commands when tool use is needed.',
             '- Do not include preamble, commentary about your reasoning, or markdown fences.',
             '- Follow the output contract in the additional instructions below exactly.',
+            '',
+            chatCliGuidance,
             '',
             explicitPrompt ? `Additional instructions: ${explicitPrompt}` : '',
             '',
@@ -1432,15 +1457,38 @@ class CursorAcpRuntime {
             let attempt = 0;
             let nextPrompt = request.prompt;
             while (true) {
-                const initialResultPayload = await this.transit(session, {
-                    task: 'assistant_chat',
-                    localeVariantId: request.localeVariantId,
-                    prompt: nextPrompt,
-                    locale: request.locale
-                }, (event) => {
-                    rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
-                    emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
-                }, toolCalls, isCancelled, timeoutMs);
+                let initialResultPayload;
+                try {
+                    initialResultPayload = await this.transit(session, {
+                        task: 'assistant_chat',
+                        localeVariantId: request.localeVariantId,
+                        prompt: nextPrompt,
+                        locale: request.locale
+                    }, (event) => {
+                        rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                        emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+                    }, toolCalls, isCancelled, timeoutMs);
+                }
+                catch (error) {
+                    const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
+                    const canRecoverFromToolPolicy = !isCancelled()
+                        && attempt < ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT
+                        && remainingWaitMs >= 5_000
+                        && isCliToolPolicyViolationError(error);
+                    if (!canRecoverFromToolPolicy) {
+                        throw error;
+                    }
+                    attempt += 1;
+                    nextPrompt = ASSISTANT_CHAT_KB_ONLY_RECOVERY_PROMPT;
+                    rawOutput.push(`[assistant-chat kb-only recovery ${attempt}] ${error instanceof Error ? error.message : String(error)}`);
+                    this.log('agent.runtime.assistant_chat_kb_only_retry', {
+                        workspaceId: request.workspaceId,
+                        sessionId: session.id,
+                        attempt,
+                        reason: error instanceof Error ? error.message : String(error)
+                    });
+                    continue;
+                }
                 const settleWindow = ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW;
                 const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
                 await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
@@ -1694,28 +1742,27 @@ class CursorAcpRuntime {
                 agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default',
                 promptLength: promptText.length
             });
+            let currentAcpSessionId = acpSessionId;
+            let retryCount = 0;
             let response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
-            if (isMissingAcpSessionError(response.error)) {
-                this.log('agent.runtime.prompt_missing_session_retry', {
-                    workspaceId: session.workspaceId,
-                    sessionId: session.id,
-                    acpSessionId,
-                    task: taskPayload.task
-                });
-                await this.resetCursorSession(session.id);
-                const retryAcpSessionId = await this.ensureAcpSession(session);
-                requestPayload.sessionId = retryAcpSessionId;
-                this.pendingPromptFallbacks.set(session.id, { transport, acpSessionId: retryAcpSessionId });
-                this.startPromptCompletionWatcher(session.id);
+            while (response.error && retryCount < 2 && isRetriablePromptError(response.error)) {
+                retryCount += 1;
                 this.log('agent.runtime.prompt_send_retry', {
                     workspaceId: session.workspaceId,
                     sessionId: session.id,
-                    acpSessionId: retryAcpSessionId,
+                    acpSessionId: currentAcpSessionId,
                     task: taskPayload.task,
                     kbAccessMode: provider.mode,
                     agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default',
-                    promptLength: promptText.length
+                    promptLength: promptText.length,
+                    retryCount,
+                    reason: response.error.message
                 });
+                await this.resetCursorSession(session.id);
+                currentAcpSessionId = await this.ensureAcpSession(session);
+                requestPayload.sessionId = currentAcpSessionId;
+                this.pendingPromptFallbacks.set(session.id, { transport, acpSessionId: currentAcpSessionId });
+                this.startPromptCompletionWatcher(session.id);
                 response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
             }
             this.log('agent.runtime.prompt_response', {
@@ -2590,7 +2637,10 @@ function findChunkOverlap(left, right) {
     return 0;
 }
 function appendPromptMessageChunk(chunks, text) {
-    if (!text.trim()) {
+    if (!text && text !== '') {
+        return chunks;
+    }
+    if (!text.trim() && !/[\r\n]/.test(text)) {
         return chunks;
     }
     const assembled = chunks.join('');
@@ -2632,6 +2682,13 @@ const ASSISTANT_CHAT_CONTINUE_PROMPT = [
     'If research is needed, do it now and then provide the final user-facing answer in this same turn.',
     'Do not send another progress update, status note, or "I am going to..." message.',
     'Return the final answer only.'
+].join(' ');
+const ASSISTANT_CHAT_KB_ONLY_RECOVERY_PROMPT = [
+    'Continue the same user request using the existing session context.',
+    'Use only kb commands for research. Do not use terminal utilities, grep, Read File, codebase search, or filesystem exploration.',
+    'Allowed kb commands include: kb batch-context --json, kb find-related-articles --json, kb search-kb --json, kb get-article --json, kb get-article-family --json, kb app get-form-schema --json, kb app patch-form --json, and kb help --json.',
+    'Do the research now and return the final user-facing answer in this same turn.',
+    'Do not send a progress update.'
 ].join(' ');
 function extractPromptResultText(value) {
     if (!value || typeof value !== 'object') {
