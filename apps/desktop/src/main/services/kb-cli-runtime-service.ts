@@ -579,6 +579,11 @@ export class KbCliRuntimeService {
     private readonly workspaceRepository?: WorkspaceRepository
   ) {}
 
+  async ensureReady(): Promise<void> {
+    await this.loopbackService.start();
+    this.applyProcessEnv();
+  }
+
   private ensureShimBinary(): string {
     fs.mkdirSync(KB_CLI_SHIM_DIR, { recursive: true });
     const source = buildKbCliShimSource();
@@ -671,6 +676,7 @@ export class KbCliRuntimeService {
   }
 
   async checkHealth(workspaceId?: string): Promise<KbAccessHealth> {
+    await this.ensureReady();
     const issues: string[] = [];
     let failureCode: CliHealthFailure | undefined;
     const binaryName = this.getBinaryName();

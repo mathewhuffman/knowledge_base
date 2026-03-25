@@ -125,6 +125,7 @@ export interface WorkspaceSettingsRecord {
     defaultLocale: string;
     enabledLocales: string[];
     kbAccessMode: KbAccessMode;
+    agentModelId?: string;
 }
 export interface WorkspaceSettingsUpdateRequest {
     workspaceId: EntityId;
@@ -133,6 +134,7 @@ export interface WorkspaceSettingsUpdateRequest {
     defaultLocale?: string;
     enabledLocales?: string[];
     kbAccessMode?: KbAccessMode;
+    agentModelId?: string;
 }
 export interface WorkspaceListItem extends WorkspaceRecord {
     isDefaultWorkspace: boolean;

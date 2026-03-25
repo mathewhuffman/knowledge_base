@@ -18,6 +18,81 @@ const kb_cli_loopback_service_1 = require("./kb-cli-loopback-service");
 const kb_cli_runtime_service_1 = require("./kb-cli-runtime-service");
 const ai_assistant_service_1 = require("./ai-assistant-service");
 const app_working_state_service_1 = require("./app-working-state-service");
+const RUNTIME_MODEL_CATALOG = [
+    { provider: 'Anthropic', name: 'Claude 4 Sonnet', aliases: ['claude 4 sonnet', 'claude-sonnet-4', 'claude-4-sonnet'], costs: { inputUsdPerMillion: 3, cacheWriteUsdPerMillion: 3.75, cacheReadUsdPerMillion: 0.3, outputUsdPerMillion: 15 } },
+    { provider: 'Anthropic', name: 'Claude 4 Sonnet 1M', aliases: ['claude 4 sonnet 1m', 'claude-sonnet-4-1m', 'claude-4-sonnet-1m'], costs: { inputUsdPerMillion: 6, cacheWriteUsdPerMillion: 7.5, cacheReadUsdPerMillion: 0.6, outputUsdPerMillion: 22.5 } },
+    { provider: 'Anthropic', name: 'Claude 4.5 Haiku', aliases: ['claude 4.5 haiku', 'claude-4-5-haiku', 'claude-haiku-4-5'], costs: { inputUsdPerMillion: 1, cacheWriteUsdPerMillion: 1.25, cacheReadUsdPerMillion: 0.1, outputUsdPerMillion: 5 } },
+    { provider: 'Anthropic', name: 'Claude 4.5 Opus', aliases: ['claude 4.5 opus', 'claude-4-5-opus', 'claude-opus-4-5'], costs: { inputUsdPerMillion: 5, cacheWriteUsdPerMillion: 6.25, cacheReadUsdPerMillion: 0.5, outputUsdPerMillion: 25 } },
+    { provider: 'Anthropic', name: 'Claude 4.5 Sonnet', aliases: ['claude 4.5 sonnet', 'claude-4-5-sonnet', 'claude-sonnet-4-5'], costs: { inputUsdPerMillion: 3, cacheWriteUsdPerMillion: 3.75, cacheReadUsdPerMillion: 0.3, outputUsdPerMillion: 15 } },
+    { provider: 'Anthropic', name: 'Claude 4.6 Opus', aliases: ['claude 4.6 opus', 'claude-4-6-opus', 'claude-opus-4-6'], costs: { inputUsdPerMillion: 5, cacheWriteUsdPerMillion: 6.25, cacheReadUsdPerMillion: 0.5, outputUsdPerMillion: 25 } },
+    { provider: 'Anthropic', name: 'Claude 4.6 Opus (Fast mode)', aliases: ['claude 4.6 opus fast mode', 'claude-4-6-opus-fast', 'claude-opus-4-6-fast'], costs: { inputUsdPerMillion: 30, cacheWriteUsdPerMillion: 37.5, cacheReadUsdPerMillion: 3, outputUsdPerMillion: 150 } },
+    { provider: 'Anthropic', name: 'Claude 4.6 Sonnet', aliases: ['claude 4.6 sonnet', 'claude-4-6-sonnet', 'claude-sonnet-4-6'], costs: { inputUsdPerMillion: 3, cacheWriteUsdPerMillion: 3.75, cacheReadUsdPerMillion: 0.3, outputUsdPerMillion: 15 } },
+    { provider: 'Cursor', name: 'Composer 1', aliases: ['composer 1', 'cursor composer 1'], costs: { inputUsdPerMillion: 1.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.125, outputUsdPerMillion: 10 } },
+    { provider: 'Cursor', name: 'Composer 1.5', aliases: ['composer 1.5', 'composer 15', 'cursor composer 1.5'], costs: { inputUsdPerMillion: 3.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.35, outputUsdPerMillion: 17.5 } },
+    { provider: 'Cursor', name: 'Composer 2', aliases: ['composer 2', 'cursor composer 2'], costs: { inputUsdPerMillion: 0.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.2, outputUsdPerMillion: 2.5 } },
+    { provider: 'Google', name: 'Gemini 2.5 Flash', aliases: ['gemini 2.5 flash', 'gemini-2-5-flash'], costs: { inputUsdPerMillion: 0.3, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.03, outputUsdPerMillion: 2.5 } },
+    { provider: 'Google', name: 'Gemini 3 Flash', aliases: ['gemini 3 flash', 'gemini-3-flash'], costs: { inputUsdPerMillion: 0.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.05, outputUsdPerMillion: 3 } },
+    { provider: 'Google', name: 'Gemini 3 Pro', aliases: ['gemini 3 pro', 'gemini-3-pro'], costs: { inputUsdPerMillion: 2, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.2, outputUsdPerMillion: 12 } },
+    { provider: 'Google', name: 'Gemini 3 Pro Image Preview', aliases: ['gemini 3 pro image preview', 'gemini-3-pro-image-preview'], costs: { inputUsdPerMillion: 2, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.2, outputUsdPerMillion: 12 } },
+    { provider: 'Google', name: 'Gemini 3.1 Pro', aliases: ['gemini 3.1 pro', 'gemini-3-1-pro'], costs: { inputUsdPerMillion: 2, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.2, outputUsdPerMillion: 12 } },
+    { provider: 'OpenAI', name: 'GPT-5', aliases: ['gpt-5'], costs: { inputUsdPerMillion: 1.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.125, outputUsdPerMillion: 10 } },
+    { provider: 'OpenAI', name: 'GPT-5 Fast', aliases: ['gpt-5 fast', 'gpt-5-fast'], costs: { inputUsdPerMillion: 2.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.25, outputUsdPerMillion: 20 } },
+    { provider: 'OpenAI', name: 'GPT-5 Mini', aliases: ['gpt-5 mini', 'gpt-5-mini'], costs: { inputUsdPerMillion: 0.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.025, outputUsdPerMillion: 2 } },
+    { provider: 'OpenAI', name: 'GPT-5-Codex', aliases: ['gpt-5-codex', 'gpt 5 codex'], costs: { inputUsdPerMillion: 1.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.125, outputUsdPerMillion: 10 } },
+    { provider: 'OpenAI', name: 'GPT-5.1 Codex', aliases: ['gpt-5.1 codex', 'gpt-5-1-codex'], costs: { inputUsdPerMillion: 1.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.125, outputUsdPerMillion: 10 } },
+    { provider: 'OpenAI', name: 'GPT-5.1 Codex Max', aliases: ['gpt-5.1 codex max', 'gpt-5-1-codex-max'], costs: { inputUsdPerMillion: 1.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.125, outputUsdPerMillion: 10 } },
+    { provider: 'OpenAI', name: 'GPT-5.1 Codex Mini', aliases: ['gpt-5.1 codex mini', 'gpt-5-1-codex-mini'], costs: { inputUsdPerMillion: 0.25, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.025, outputUsdPerMillion: 2 } },
+    { provider: 'OpenAI', name: 'GPT-5.2', aliases: ['gpt-5.2', 'gpt-5-2'], costs: { inputUsdPerMillion: 1.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.175, outputUsdPerMillion: 14 } },
+    { provider: 'OpenAI', name: 'GPT-5.2 Codex', aliases: ['gpt-5.2 codex', 'gpt-5-2-codex'], costs: { inputUsdPerMillion: 1.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.175, outputUsdPerMillion: 14 } },
+    { provider: 'OpenAI', name: 'GPT-5.3 Codex', aliases: ['gpt-5.3 codex', 'gpt-5-3-codex'], costs: { inputUsdPerMillion: 1.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.175, outputUsdPerMillion: 14 } },
+    { provider: 'OpenAI', name: 'GPT-5.4', aliases: ['gpt-5.4', 'gpt-5-4'], costs: { inputUsdPerMillion: 2.5, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.25, outputUsdPerMillion: 15 } },
+    { provider: 'OpenAI', name: 'GPT-5.4 Mini', aliases: ['gpt-5.4 mini', 'gpt-5-4-mini'], costs: { inputUsdPerMillion: 0.75, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.075, outputUsdPerMillion: 4.5 } },
+    { provider: 'OpenAI', name: 'GPT-5.4 Nano', aliases: ['gpt-5.4 nano', 'gpt-5-4-nano'], costs: { inputUsdPerMillion: 0.2, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.02, outputUsdPerMillion: 1.25 } },
+    { provider: 'xAI', name: 'Grok 4.20', aliases: ['grok 4.20', 'grok-4-20'], costs: { inputUsdPerMillion: 2, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.2, outputUsdPerMillion: 6 } },
+    { provider: 'Moonshot', name: 'Kimi K2.5', aliases: ['kimi k2.5', 'kimi-k2-5'], costs: { inputUsdPerMillion: 0.6, cacheWriteUsdPerMillion: null, cacheReadUsdPerMillion: 0.1, outputUsdPerMillion: 3 } }
+];
+const normalizeModelCatalogToken = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const resolveRuntimeModelOption = (modelId) => {
+    const normalizedId = normalizeModelCatalogToken(modelId);
+    const match = [...RUNTIME_MODEL_CATALOG]
+        .sort((a, b) => Math.max(...b.aliases.map((alias) => normalizeModelCatalogToken(alias).length)) - Math.max(...a.aliases.map((alias) => normalizeModelCatalogToken(alias).length)))
+        .find((entry) => entry.aliases.some((alias) => {
+        const normalizedAlias = normalizeModelCatalogToken(alias);
+        return normalizedId === normalizedAlias || normalizedId.includes(normalizedAlias);
+    }));
+    return {
+        id: modelId,
+        provider: match?.provider ?? 'Unknown',
+        name: match?.name ?? modelId,
+        costs: match?.costs ?? {
+            inputUsdPerMillion: null,
+            cacheWriteUsdPerMillion: null,
+            cacheReadUsdPerMillion: null,
+            outputUsdPerMillion: null
+        }
+    };
+};
+const buildRuntimeModelCatalog = (availableModels, currentModelId) => {
+    const orderedModelIds = [];
+    for (const modelId of availableModels ?? []) {
+        const normalized = modelId?.trim();
+        if (normalized) {
+            orderedModelIds.push(normalized);
+        }
+    }
+    if (currentModelId?.trim()) {
+        orderedModelIds.unshift(currentModelId.trim());
+    }
+    const deduped = new Map();
+    for (const modelId of orderedModelIds) {
+        const option = resolveRuntimeModelOption(modelId);
+        const key = `${normalizeModelCatalogToken(option.provider)}::${normalizeModelCatalogToken(option.name)}`;
+        if (!deduped.has(key)) {
+            deduped.set(key, option);
+        }
+    }
+    return Array.from(deduped.values());
+};
 const ZENDESK_PREVIEW_STYLE_TOKENS = {
     base_font_size: '16px',
     bg_color: '#ffffff',
@@ -427,8 +502,13 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
     const kbCliLoopback = new kb_cli_loopback_service_1.KbCliLoopbackService(workspaceRepository, appWorkingStateService);
     const kbCliRuntime = new kb_cli_runtime_service_1.KbCliRuntimeService(kbCliLoopback, workspaceRepository);
     const agentRuntime = new agent_runtime_1.CursorAcpRuntime(workspaceRoot, runtimeToolContext, {
+        prepareCliEnvironment: async (workspaceId) => kbCliRuntime.ensureReady(),
         getCliHealth: (workspaceId) => kbCliRuntime.checkHealth(workspaceId),
-        buildCliPromptSuffix: () => kbCliRuntime.buildPromptSuffix()
+        buildCliPromptSuffix: () => kbCliRuntime.buildPromptSuffix(),
+        getWorkspaceAgentModel: async (workspaceId) => {
+            const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
+            return settings.agentModelId;
+        }
     }, (message, details) => {
         logger_1.logger.info(`[agent-runtime] ${message}`, details);
     });
@@ -747,7 +827,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 input.zendeskBrandId === undefined &&
                 input.defaultLocale === undefined &&
                 input.enabledLocales === undefined &&
-                input.kbAccessMode === undefined) {
+                input.kbAccessMode === undefined &&
+                input.agentModelId === undefined) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'workspace.settings.update requires at least one setting field');
             }
             if (typeof input.defaultLocale === 'string' && !input.defaultLocale.trim()) {
@@ -765,7 +846,11 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (input.kbAccessMode !== undefined && input.kbAccessMode !== 'mcp' && input.kbAccessMode !== 'cli') {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'kbAccessMode must be mcp or cli');
             }
+            if (typeof input.agentModelId === 'string' && !input.agentModelId.trim()) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agentModelId cannot be empty');
+            }
             const updated = await workspaceRepository.updateWorkspaceSettings(input);
+            await agentRuntime.setWorkspaceAgentModel(updated.workspaceId, updated.agentModelId);
             return { ok: true, data: updated };
         }
         catch (error) {
@@ -780,6 +865,30 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, error.message);
             }
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('agent.runtime.options.get', async (payload) => {
+        try {
+            const workspaceId = payload?.workspaceId;
+            if (!workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agent.runtime.options.get requires workspaceId');
+            }
+            await workspaceRepository.getWorkspace(workspaceId);
+            const options = await agentRuntime.getRuntimeOptions(workspaceId);
+            return {
+                ok: true,
+                data: {
+                    ...options,
+                    workspaceId,
+                    modelCatalog: buildRuntimeModelCatalog(options.availableModels, options.currentModelId)
+                }
+            };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, 'Workspace not found');
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
         }
     });
     bus.register('workspace.open', async (payload) => {
@@ -2267,6 +2376,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             return;
         }
         const workspaceMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
+        const workspaceSettings = await workspaceRepository.getWorkspaceSettings(input.workspaceId);
+        const agentModelId = workspaceSettings.agentModelId;
         let kbAccessMode = input.kbAccessMode ?? workspaceMode;
         const providerHealth = await agentRuntime.checkHealth(input.workspaceId, kbAccessMode, workspaceMode);
         const selectedProvider = providerHealth.providers[kbAccessMode];
@@ -2288,7 +2399,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             message: `Starting analysis session for batch ${input.batchId}`,
             metadata: {
                 batchId: input.batchId,
-                kbAccessMode
+                kbAccessMode,
+                agentModelId
             }
         });
         logger_1.logger.info('[agent.analysis.run] starting runtime', {
@@ -2299,7 +2411,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         const streamMetadata = {
             batchId: input.batchId,
             kbAccessMode,
-            workspaceId: input.workspaceId
+            workspaceId: input.workspaceId,
+            agentModelId
         };
         const runAnalysis = async (mode) => {
             streamMetadata.kbAccessMode = mode;
@@ -2372,6 +2485,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             batchId: input.batchId,
             sessionId: result.sessionId,
             kbAccessMode,
+            agentModelId,
             status: persistedStatus,
             startedAtUtc: result.startedAtUtc,
             endedAtUtc: result.endedAtUtc,

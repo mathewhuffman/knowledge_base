@@ -1339,6 +1339,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   const [sessionListData, setSessionListData] = useState<AgentSessionRecord[]>([]);
   const [resolvedSessionId, setResolvedSessionId] = useState<string | null>(null);
   const [currentRunMode, setCurrentRunMode] = useState<KbAccessMode | null>(null);
+  const [currentRunModel, setCurrentRunModel] = useState<string | null>(null);
   const [stickyHistorySessionId, setStickyHistorySessionId] = useState<string | null>(null);
   const [persistedRun, setPersistedRun] = useState<PersistedAgentAnalysisRun | null>(null);
   const [persistedTranscriptLines, setPersistedTranscriptLines] = useState<AgentTranscriptLine[]>([]);
@@ -1456,6 +1457,10 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       if (eventMode) {
         setCurrentRunMode(eventMode);
       }
+      const eventModel = (event as { metadata?: { agentModelId?: unknown } })?.metadata?.agentModelId;
+      if (typeof eventModel === 'string' && eventModel.trim()) {
+        setCurrentRunModel(eventModel.trim());
+      }
 
       setJobState(event.state);
       setProgress(event.progress);
@@ -1550,6 +1555,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
   );
   const displaySessionId = (shouldUseLiveHistory ? activeLiveSessionId : null) ?? persistedRun?.sessionId ?? persistedRun?.id ?? activeLiveSessionId ?? null;
   const runtimeMode = (shouldUseLiveHistory ? activeSession?.kbAccessMode : null) ?? currentRunMode ?? persistedRun?.kbAccessMode ?? activeSession?.kbAccessMode ?? null;
+  const runtimeModel = currentRunModel ?? persistedRun?.agentModelId ?? null;
   const transcriptLines = shouldUseLiveHistory
     ? liveTranscriptLines
     : (persistedTranscriptLines.length > 0 ? persistedTranscriptLines : liveTranscriptLines);
@@ -1594,6 +1600,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     setError(null);
     setEvents([]);
     setCurrentRunMode(null);
+    setCurrentRunModel(null);
     setStickyHistorySessionId(null);
     terminalStateHandledRef.current = false;
     setJobState('QUEUED');
@@ -1675,6 +1682,9 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       if (activeSession.updatedAtUtc) {
         chunks.push(`Updated: ${formatTimestamp(activeSession.updatedAtUtc)}`);
       }
+      if (runtimeModel) {
+        chunks.push(`Model: ${runtimeModel}`);
+      }
     } else if (persistedRun) {
       chunks.push(`Saved run: ${persistedRun.id}`);
       if (persistedRun.sessionId) {
@@ -1689,6 +1699,9 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
       }
       if (persistedRun.endedAtUtc) {
         chunks.push(`Ended: ${formatTimestamp(persistedRun.endedAtUtc)}`);
+      }
+      if (persistedRun.agentModelId) {
+        chunks.push(`Model: ${persistedRun.agentModelId}`);
       }
     }
     if (jobState) {
@@ -1833,6 +1846,12 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
               <div className="agent-meta-pair">
                 <span className="agent-meta-label">Updated</span>
                 <span className="agent-meta-value">{formatTimestamp(latestBatchSession.updatedAtUtc)}</span>
+              </div>
+            )}
+            {runtimeModel && (
+              <div className="agent-meta-pair">
+                <span className="agent-meta-label">Model</span>
+                <span className="agent-meta-value" style={{ fontFamily: 'var(--font-mono)' }}>{runtimeModel}</span>
               </div>
             )}
             {!activeSession && persistedRun?.endedAtUtc && (

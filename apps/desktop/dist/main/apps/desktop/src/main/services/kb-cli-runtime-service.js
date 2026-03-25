@@ -563,6 +563,10 @@ class KbCliRuntimeService {
         this.loopbackService = loopbackService;
         this.workspaceRepository = workspaceRepository;
     }
+    async ensureReady() {
+        await this.loopbackService.start();
+        this.applyProcessEnv();
+    }
     ensureShimBinary() {
         node_fs_1.default.mkdirSync(KB_CLI_SHIM_DIR, { recursive: true });
         const source = buildKbCliShimSource();
@@ -647,6 +651,7 @@ class KbCliRuntimeService {
         ].join('\n');
     }
     async checkHealth(workspaceId) {
+        await this.ensureReady();
         const issues = [];
         let failureCode;
         const binaryName = this.getBinaryName();

@@ -1,4 +1,4 @@
-import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentAssistantChatRunRequest, AgentHealthCheckResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRunResult, KbAccessMode, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode, KbAccessHealth } from '@kb-vault/shared-types';
+import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentAssistantChatRunRequest, AgentHealthCheckResponse, AgentRuntimeOptionsResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRunResult, KbAccessMode, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode, KbAccessHealth } from '@kb-vault/shared-types';
 interface ScopedToolContext {
     workspaceId: string;
     allowedLocaleVariantIds?: string[];
@@ -10,6 +10,8 @@ type RuntimeDebugLogger = (message: string, details?: unknown) => void;
 interface KbRuntimeOptions {
     getCliHealth?: (workspaceId?: string) => Promise<KbAccessHealth>;
     buildCliPromptSuffix?: () => string;
+    getWorkspaceAgentModel?: (workspaceId: string) => Promise<string | undefined>;
+    prepareCliEnvironment?: (workspaceId?: string) => Promise<void>;
 }
 export interface AgentRuntimeToolContext {
     searchKb: (input: MCPFindRelatedArticlesInput & {
@@ -48,6 +50,7 @@ export declare class CursorAcpRuntime {
     private readonly promptMessageChunks;
     private readonly pendingSessionOperations;
     private readonly sessionActivityAt;
+    private readonly workspaceAgentModels;
     private readonly debugLogger;
     private readonly configuredMcpServers;
     private runtimeMcpServers;
@@ -55,6 +58,14 @@ export declare class CursorAcpRuntime {
     private readonly runtimeOptions;
     constructor(workspaceRoot: string, toolContext: AgentRuntimeToolContext, runtimeOptions?: KbRuntimeOptions, debugLogger?: RuntimeDebugLogger);
     private log;
+    private ensureWorkspaceAgentModelLoaded;
+    private getWorkspaceAgentModel;
+    setWorkspaceAgentModel(workspaceId: string, agentModelId?: string): Promise<void>;
+    getRuntimeOptions(workspaceId: string): Promise<AgentRuntimeOptionsResponse>;
+    private probeRuntimeOptionsThroughAcp;
+    private parseAvailableModels;
+    private buildTransportKey;
+    private restartWorkspaceAcpConnections;
     private markSessionActivity;
     private trackSessionOperation;
     private waitForSessionToSettle;

@@ -642,6 +642,22 @@ export const migrations: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_ai_sessions_last_message
         ON ai_sessions(workspace_id, last_message_at DESC, updated_at DESC);
     `
+  },
+  {
+    version: 14,
+    name: '0014_workspace_agent_model_preference',
+    description: 'Persist workspace-scoped ACP model preferences.',
+    sql: `
+      SELECT 1;
+    `
+  },
+  {
+    version: 15,
+    name: '0015_ai_runs_agent_model',
+    description: 'Persist the model used for batch analysis runs.',
+    sql: `
+      SELECT 1;
+    `
   }
 ];
 

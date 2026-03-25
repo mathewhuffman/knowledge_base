@@ -7,6 +7,8 @@ import type {
   ZendeskCategoryRecord,
   ZendeskSectionRecord,
   ZendeskSearchArticleRecord,
+  AgentRuntimeOptionsResponse,
+  AgentRuntimeModelOption,
 } from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
@@ -701,6 +703,12 @@ function ZendeskTaxonomyBrowser({ workspaceId }: { workspaceId: string }) {
   );
 }
 
+function formatModelCost(model: AgentRuntimeModelOption): string {
+  const fmt = (value: number | null) => (value == null ? '-' : `$${value.toFixed(3).replace(/\.?0+$/, '')}`);
+  const costs = model.costs;
+  return `In ${fmt(costs.inputUsdPerMillion)} · CW ${fmt(costs.cacheWriteUsdPerMillion)} · CR ${fmt(costs.cacheReadUsdPerMillion)} · Out ${fmt(costs.outputUsdPerMillion)} /M tok`;
+}
+
 /* ================================================================== */
 /* Main Settings page                                                  */
 /* ================================================================== */
@@ -710,6 +718,7 @@ export const Settings = () => {
   const repoQuery = useIpc<RepositoryStructurePayload>('workspace.repository.info');
   const settingsMutation = useIpcMutation<WorkspaceSettingsRecord>('workspace.settings.update');
   const credentialsQuery = useIpc<ZendeskCredentialRecord | null>('zendesk.credentials.get');
+  const runtimeOptionsQuery = useIpc<AgentRuntimeOptionsResponse>('agent.runtime.options.get');
 
   const [activeSection, setActiveSection] = useState('zendesk');
   const [selectedSession, setSelectedSession] = useState<AgentSessionRecord | null>(null);
@@ -717,13 +726,17 @@ export const Settings = () => {
   // Form state for locale settings
   const [defaultLocale, setDefaultLocale] = useState('');
   const [enabledLocales, setEnabledLocales] = useState<string[]>([]);
+  const [agentModelId, setAgentModelId] = useState('');
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [runtimeSaveSuccess, setRuntimeSaveSuccess] = useState(false);
+  const [runtimeValidationError, setRuntimeValidationError] = useState('');
 
   useEffect(() => {
     if (activeWorkspace) {
       settingsQuery.execute({ workspaceId: activeWorkspace.id });
       repoQuery.execute({ workspaceId: activeWorkspace.id });
       credentialsQuery.execute({ workspaceId: activeWorkspace.id });
+      runtimeOptionsQuery.execute({ workspaceId: activeWorkspace.id });
     }
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -731,8 +744,20 @@ export const Settings = () => {
     if (settingsQuery.data) {
       setDefaultLocale(settingsQuery.data.defaultLocale);
       setEnabledLocales(settingsQuery.data.enabledLocales);
+      setAgentModelId(settingsQuery.data.agentModelId ?? '');
     }
   }, [settingsQuery.data]);
+
+  useEffect(() => {
+    const options = runtimeOptionsQuery.data;
+    if (!options || settingsQuery.data?.agentModelId) {
+      return;
+    }
+    const fallbackModelId = options.currentModelId ?? options.modelCatalog?.[0]?.id ?? '';
+    if (fallbackModelId) {
+      setAgentModelId(fallbackModelId);
+    }
+  }, [runtimeOptionsQuery.data, settingsQuery.data?.agentModelId]);
 
   const handleToggleLocale = (locale: string) => {
     if (locale === defaultLocale) return;
@@ -761,6 +786,43 @@ export const Settings = () => {
     }
   };
 
+  const handleRefreshRuntimeOptions = () => {
+    if (activeWorkspace) {
+      runtimeOptionsQuery.execute({ workspaceId: activeWorkspace.id });
+    }
+  };
+
+  const handleSaveAgentRuntime = async () => {
+    if (!activeWorkspace) {
+      return;
+    }
+
+    setRuntimeValidationError('');
+    setRuntimeSaveSuccess(false);
+    if (!agentModelId.trim()) {
+      setRuntimeValidationError('Select a model before saving.');
+      return;
+    }
+
+    const savedModelId = settingsQuery.data?.agentModelId ?? '';
+    if (agentModelId === savedModelId) {
+      setRuntimeSaveSuccess(true);
+      setTimeout(() => setRuntimeSaveSuccess(false), 2000);
+      return;
+    }
+
+    const result = await settingsMutation.mutate({
+      workspaceId: activeWorkspace.id,
+      agentModelId
+    });
+    if (result) {
+      settingsQuery.execute({ workspaceId: activeWorkspace.id });
+      runtimeOptionsQuery.execute({ workspaceId: activeWorkspace.id });
+      setRuntimeSaveSuccess(true);
+      setTimeout(() => setRuntimeSaveSuccess(false), 2000);
+    }
+  };
+
   const sections = [
     { id: 'zendesk', label: 'Zendesk Connection' },
     { id: 'locales', label: 'Locales' },
@@ -784,6 +846,9 @@ export const Settings = () => {
       </>
     );
   }
+
+  const selectedModel = runtimeOptionsQuery.data?.modelCatalog?.find((model) => model.id === agentModelId);
+  const modelOptions = runtimeOptionsQuery.data?.modelCatalog ?? [];
 
   return (
     <>
@@ -893,6 +958,73 @@ export const Settings = () => {
           {activeSection === 'ai' && (
             <div>
               <h3 className="settings-heading">AI Runtime</h3>
+              <div className="card card-padded" style={{ marginBottom: 'var(--space-4)' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-1)' }}>
+                      <label className="settings-label" style={{ marginBottom: 0 }}>Preferred model</label>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={handleRefreshRuntimeOptions}
+                        disabled={runtimeOptionsQuery.loading}
+                        title="Refresh available models"
+                      >
+                        <IconRefreshCw size={12} />
+                      </button>
+                    </div>
+                    {runtimeOptionsQuery.loading ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', padding: 'var(--space-2) 0' }}>
+                        <span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                        <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>Loading models...</span>
+                      </div>
+                    ) : modelOptions.length > 0 ? (
+                      <>
+                        <select
+                          className="select"
+                          value={agentModelId}
+                          onChange={(e) => setAgentModelId(e.target.value)}
+                        >
+                          {modelOptions.map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.provider !== 'Unknown' ? `${model.provider} - ${model.name}` : model.name}
+                            </option>
+                          ))}
+                        </select>
+                        {selectedModel && (
+                          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', marginTop: 'var(--space-1)', fontFamily: 'var(--font-mono)' }}>
+                            {formatModelCost(selectedModel)}
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="settings-hint">
+                        No agent models were discovered. KB Vault will try <code>agent --list-models</code>, <code>agent models</code>, and an ACP runtime probe. Check that your local agent runtime is installed and reachable.
+                      </div>
+                    )}
+                    {!runtimeOptionsQuery.loading && runtimeOptionsQuery.error && (
+                      <div className="settings-inline-error" style={{ marginTop: 'var(--space-2)' }}>
+                        {runtimeOptionsQuery.error}
+                      </div>
+                    )}
+                  </div>
+
+                  {runtimeValidationError && (
+                    <span className="settings-inline-error">{runtimeValidationError}</span>
+                  )}
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                    <button className="btn btn-primary" onClick={handleSaveAgentRuntime} disabled={settingsMutation.loading || runtimeOptionsQuery.loading || modelOptions.length === 0}>
+                      {settingsMutation.loading ? 'Saving...' : 'Save AI Model'}
+                    </button>
+                    {runtimeSaveSuccess && (
+                      <span className="settings-inline-success">
+                        <IconCheckCircle size={14} /> Saved
+                      </span>
+                    )}
+                    {settingsMutation.error && <span className="settings-inline-error">{settingsMutation.error}</span>}
+                  </div>
+                </div>
+              </div>
               <HealthStatusPanel workspaceId={activeWorkspace.id} />
               {selectedSession ? (
                 <SessionDetailPanel

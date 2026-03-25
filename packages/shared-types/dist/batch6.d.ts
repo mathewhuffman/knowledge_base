@@ -49,6 +49,27 @@ export interface AgentSessionGetRequest {
     workspaceId: string;
     sessionId: string;
 }
+export interface AgentRuntimeOptionsRequest {
+    workspaceId: string;
+}
+export interface AgentRuntimeModelCost {
+    inputUsdPerMillion: number | null;
+    cacheWriteUsdPerMillion: number | null;
+    cacheReadUsdPerMillion: number | null;
+    outputUsdPerMillion: number | null;
+}
+export interface AgentRuntimeModelOption {
+    id: string;
+    provider: string;
+    name: string;
+    costs: AgentRuntimeModelCost;
+}
+export interface AgentRuntimeOptionsResponse {
+    workspaceId: string;
+    currentModelId?: string;
+    availableModels?: string[];
+    modelCatalog?: AgentRuntimeModelOption[];
+}
 export interface AgentAnalysisRunRequest {
     workspaceId: string;
     batchId: string;
@@ -167,6 +188,7 @@ export interface PersistedAgentAnalysisRun {
     batchId: string;
     sessionId?: string;
     kbAccessMode?: KbAccessMode;
+    agentModelId?: string;
     status: 'running' | 'complete' | 'failed' | 'canceled';
     startedAtUtc: string;
     endedAtUtc?: string;

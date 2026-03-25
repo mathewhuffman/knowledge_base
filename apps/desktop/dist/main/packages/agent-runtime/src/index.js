@@ -15,12 +15,16 @@ const shared_types_1 = require("@kb-vault/shared-types");
 const DEFAULT_AGENT_ACCESS_MODE = 'mcp';
 const KB_CLI_BINARY_ENV = 'KBV_KB_CLI_BINARY';
 const KBV_CURSOR_BINARY_ENV = 'KBV_CURSOR_BINARY';
+const DEFAULT_AGENT_BINARY = 'agent';
 const DEFAULT_CURSOR_BINARY = 'cursor';
 const DEFAULT_CURSOR_ARGS = ['agent', 'acp'];
 const DEFAULT_CLI_BINARY = 'kb';
 const ACP_HEALTH_INIT_TIMEOUT_MS = 15_000;
 const ACP_HEALTH_INIT_ATTEMPTS = 2;
 function resolveDefaultCursorBinary() {
+    if (hasBinaryOnPath(DEFAULT_AGENT_BINARY)) {
+        return DEFAULT_AGENT_BINARY;
+    }
     const candidates = node_process_1.default.platform === 'darwin'
         ? [
             '/Applications/Cursor.app/Contents/Resources/app/bin/cursor',
@@ -34,12 +38,44 @@ function resolveDefaultCursorBinary() {
     }
     return DEFAULT_CURSOR_BINARY;
 }
+function hasBinaryOnPath(binary) {
+    const searchPath = node_process_1.default.env.PATH ?? '';
+    return searchPath.split(node_path_1.default.delimiter).some((dir) => {
+        if (!dir) {
+            return false;
+        }
+        const exe = node_path_1.default.join(dir, binary);
+        const exeWithExt = node_path_1.default.extname(exe).length > 0 ? exe : `${exe}.exe`;
+        return node_fs_1.default.existsSync(exe) || node_fs_1.default.existsSync(exeWithExt);
+    });
+}
 function resolveCursorArgs(binary) {
     const basename = node_path_1.default.basename(binary).toLowerCase().replace(/\.exe$/, '');
     if (basename === 'agent') {
         return ['acp'];
     }
     return DEFAULT_CURSOR_ARGS;
+}
+function buildCursorAcpArgs(binary, modelId) {
+    const normalizedModelId = modelId?.trim();
+    const basename = node_path_1.default.basename(binary).toLowerCase().replace(/\.exe$/, '');
+    if (!normalizedModelId) {
+        return resolveCursorArgs(binary);
+    }
+    if (basename === 'agent') {
+        return ['--model', normalizedModelId, 'acp'];
+    }
+    return ['agent', '--model', normalizedModelId, 'acp'];
+}
+function normalizeAgentModelId(modelId) {
+    const next = modelId?.trim();
+    if (!next) {
+        return undefined;
+    }
+    const withoutAnsi = next.replace(/\u001B\[[0-9;]*m/g, '').trim();
+    const withoutMarkers = withoutAnsi.replace(/\s+\((?:current|default)[^)]+\)\s*$/i, '').trim();
+    const normalized = withoutMarkers.split(/\s+-\s+/, 1)[0]?.trim() ?? withoutMarkers;
+    return normalized || undefined;
 }
 function getSessionUpdateType(params) {
     if (!params || typeof params !== 'object') {
@@ -509,12 +545,23 @@ class CursorTransport {
         if (init.error) {
             return false;
         }
-        const auth = await this.request('authenticate', { methodId: 'cursor_login' }, timeoutMs);
-        if (auth.error) {
+        try {
+            const auth = await this.request('authenticate', { methodId: 'cursor_login' }, timeoutMs);
+            if (auth.error) {
+                this.logger('system', {
+                    direction: 'system',
+                    event: 'auth_optional_skipped',
+                    payload: JSON.stringify(auth.error)
+                });
+            }
+        }
+        catch (error) {
             this.logger('system', {
                 direction: 'system',
                 event: 'auth_optional_skipped',
-                payload: JSON.stringify(auth.error)
+                payload: JSON.stringify({
+                    message: error instanceof Error ? error.message : String(error)
+                })
             });
         }
         this.initialized = true;
@@ -598,6 +645,50 @@ class CursorTransport {
         this.pending.clear();
     }
 }
+async function captureCommandOutput(binary, args, cwd, timeoutMs) {
+    return await new Promise((resolve, reject) => {
+        const child = (0, node_child_process_1.spawn)(binary, args, {
+            cwd,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: node_process_1.default.env
+        });
+        let stdout = '';
+        let stderr = '';
+        let settled = false;
+        const finish = (fn) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            if (timer) {
+                clearTimeout(timer);
+            }
+            fn();
+        };
+        const timer = setTimeout(() => {
+            child.kill();
+            finish(() => reject(new Error(`Command timed out: ${binary} ${args.join(' ')}`)));
+        }, timeoutMs);
+        child.stdout?.on('data', (chunk) => {
+            stdout += chunk.toString('utf8');
+        });
+        child.stderr?.on('data', (chunk) => {
+            stderr += chunk.toString('utf8');
+        });
+        child.on('error', (error) => {
+            finish(() => reject(error));
+        });
+        child.on('close', (code) => {
+            finish(() => {
+                resolve({
+                    stdout,
+                    stderr,
+                    exitCode: code ?? 0
+                });
+            });
+        });
+    });
+}
 class CursorAcpRuntime {
     config;
     sessions = new Map();
@@ -611,6 +702,7 @@ class CursorAcpRuntime {
     promptMessageChunks = new Map();
     pendingSessionOperations = new Map();
     sessionActivityAt = new Map();
+    workspaceAgentModels = new Map();
     debugLogger;
     configuredMcpServers;
     runtimeMcpServers = [];
@@ -636,6 +728,149 @@ class CursorAcpRuntime {
     }
     log(message, details) {
         this.debugLogger(message, details);
+    }
+    async ensureWorkspaceAgentModelLoaded(workspaceId) {
+        if (!workspaceId) {
+            return undefined;
+        }
+        if (this.workspaceAgentModels.has(workspaceId)) {
+            return this.workspaceAgentModels.get(workspaceId);
+        }
+        const modelId = normalizeAgentModelId(await this.runtimeOptions.getWorkspaceAgentModel?.(workspaceId));
+        this.workspaceAgentModels.set(workspaceId, modelId);
+        return modelId;
+    }
+    getWorkspaceAgentModel(workspaceId) {
+        if (!workspaceId) {
+            return undefined;
+        }
+        return normalizeAgentModelId(this.workspaceAgentModels.get(workspaceId));
+    }
+    async setWorkspaceAgentModel(workspaceId, agentModelId) {
+        const normalized = normalizeAgentModelId(agentModelId);
+        const current = this.getWorkspaceAgentModel(workspaceId);
+        this.workspaceAgentModels.set(workspaceId, normalized);
+        if (current !== normalized) {
+            await this.restartWorkspaceAcpConnections(workspaceId);
+        }
+    }
+    async getRuntimeOptions(workspaceId) {
+        const currentModelId = await this.ensureWorkspaceAgentModelLoaded(workspaceId);
+        const binary = this.resolveBinary('mcp');
+        const commandSets = node_path_1.default.basename(binary).toLowerCase().replace(/\.exe$/, '') === 'agent'
+            ? [['--list-models'], ['models']]
+            : [
+                [DEFAULT_AGENT_BINARY, '--list-models'],
+                [DEFAULT_AGENT_BINARY, 'models'],
+                ['agent', '--list-models'],
+                ['agent', 'models']
+            ];
+        let lastError;
+        for (const args of commandSets) {
+            try {
+                const commandBinary = args[0] === DEFAULT_AGENT_BINARY || args[0] === 'agent' ? args[0] : binary;
+                const commandArgs = commandBinary === binary ? args : args.slice(1);
+                const result = await captureCommandOutput(commandBinary, commandArgs, this.config.acpCwd, 15_000);
+                if (result.exitCode !== 0) {
+                    throw new Error(result.stderr.trim() || `Command exited with code ${result.exitCode}`);
+                }
+                const availableModels = this.parseAvailableModels(result.stdout);
+                if (availableModels.length > 0 || currentModelId) {
+                    return {
+                        workspaceId,
+                        currentModelId,
+                        availableModels
+                    };
+                }
+            }
+            catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+            }
+        }
+        const acpFallback = await this.probeRuntimeOptionsThroughAcp(workspaceId).catch((error) => {
+            lastError = error instanceof Error ? error : new Error(String(error));
+            return null;
+        });
+        if (acpFallback && ((acpFallback.availableModels?.length ?? 0) > 0 || acpFallback.currentModelId)) {
+            return acpFallback;
+        }
+        throw lastError ?? new Error('Unable to load available agent models');
+    }
+    async probeRuntimeOptionsThroughAcp(workspaceId) {
+        await this.ensureWorkspaceAgentModelLoaded(workspaceId);
+        const provider = this.getProvider('mcp');
+        const transport = this.getTransport('mcp', workspaceId);
+        const initialized = await transport.ensureInitialized(this.config.requestTimeoutMs);
+        if (!initialized) {
+            throw new Error('Cursor ACP initialize failed');
+        }
+        const response = await transport.request('session/new', provider.buildSessionCreateParams(), this.config.requestTimeoutMs, `runtime-options:${workspaceId}`);
+        if (response.error) {
+            throw new Error(response.error.message);
+        }
+        const result = response.result;
+        if (result?.sessionId) {
+            try {
+                await transport.request('session/close', { sessionId: result.sessionId }, this.config.requestTimeoutMs, `runtime-options:${workspaceId}`);
+            }
+            catch {
+                // best effort
+            }
+        }
+        return {
+            workspaceId,
+            currentModelId: normalizeAgentModelId(result?.currentModelId),
+            availableModels: Array.isArray(result?.availableModels)
+                ? result.availableModels.map((value) => value.trim()).filter(Boolean)
+                : undefined
+        };
+    }
+    parseAvailableModels(output) {
+        const trimmed = output.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '').trim();
+        if (!trimmed) {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (Array.isArray(parsed)) {
+                return parsed.filter((value) => typeof value === 'string').map((value) => value.trim()).filter(Boolean);
+            }
+            if (parsed && typeof parsed === 'object') {
+                const models = parsed.models;
+                if (Array.isArray(models)) {
+                    return models
+                        .map((value) => (typeof value === 'string' ? value : (value && typeof value === 'object' && 'id' in value ? String(value.id ?? '') : '')))
+                        .map((value) => value.trim())
+                        .filter(Boolean);
+                }
+            }
+        }
+        catch {
+            // fall through to plain text parsing
+        }
+        return Array.from(new Set(trimmed
+            .split('\n')
+            .map((line) => line.trim())
+            .map((line) => line.replace(/\s+\((?:current|default)[^)]+\)\s*$/i, '').trim())
+            .map((line) => line.replace(/^[*\-]\s*/, '').replace(/^\d+\.\s*/, ''))
+            .map((line) => line.split(/\s+-\s+/, 1)[0]?.trim() ?? '')
+            .filter((line) => line && !/^(available models|loading models…|loading models\.{3}|tip:)/i.test(line))));
+    }
+    buildTransportKey(mode, workspaceId) {
+        return [workspaceId ?? 'global', mode, this.getWorkspaceAgentModel(workspaceId) ?? 'default'].join('::');
+    }
+    async restartWorkspaceAcpConnections(workspaceId) {
+        for (const session of this.sessions.values()) {
+            if (session.workspaceId === workspaceId) {
+                this.resetCursorSession(session.id);
+            }
+        }
+        const prefix = `${workspaceId}::`;
+        const matchingEntries = Array.from(this.transports.entries()).filter(([key]) => key.startsWith(prefix));
+        await Promise.all(matchingEntries.map(async ([key, transport]) => {
+            await transport.stop();
+            this.transports.delete(key);
+        }));
     }
     markSessionActivity(sessionId) {
         this.sessionActivityAt.set(sessionId, Date.now());
@@ -778,17 +1013,27 @@ class CursorAcpRuntime {
     }
     async ensureAcpSession(session) {
         const mode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
+        if (mode === 'cli') {
+            await this.runtimeOptions.prepareCliEnvironment?.(session.workspaceId);
+        }
+        await this.ensureWorkspaceAgentModelLoaded(session.workspaceId);
+        const agentModelId = this.getWorkspaceAgentModel(session.workspaceId);
+        const transportKey = this.buildTransportKey(mode, session.workspaceId);
         const existing = this.cursorSessionIds.get(session.id);
-        if (existing?.mode === mode) {
+        if (existing?.mode === mode && existing.transportKey === transportKey) {
             return existing.acpSessionId;
         }
-        if (existing && existing.mode !== mode) {
+        if (existing && (existing.mode !== mode || existing.transportKey !== transportKey)) {
             this.resetCursorSession(session.id);
         }
         const provider = this.getProvider(mode);
-        const transport = this.getTransport(mode);
-        this.log('agent.runtime.session_new_start', { sessionId: session.id, mode });
-        const response = await transport.request('session/new', provider.buildSessionCreateParams(), this.config.requestTimeoutMs, session.id);
+        const transport = this.getTransport(mode, session.workspaceId);
+        this.log('agent.runtime.session_new_start', {
+            sessionId: session.id,
+            mode,
+            agentModelId: agentModelId ?? 'default'
+        });
+        const response = await transport.request('session/new', provider.buildSessionCreateParams(session.type), this.config.requestTimeoutMs, session.id);
         if (response.error) {
             this.log('agent.runtime.session_new_failed', {
                 sessionId: session.id,
@@ -801,8 +1046,13 @@ class CursorAcpRuntime {
         if (!result?.sessionId) {
             throw new Error('Cursor ACP did not return a sessionId');
         }
-        this.log('agent.runtime.session_new_success', { sessionId: session.id, acpSessionId: result.sessionId, mode });
-        this.cursorSessionIds.set(session.id, { mode, acpSessionId: result.sessionId });
+        this.log('agent.runtime.session_new_success', {
+            sessionId: session.id,
+            acpSessionId: result.sessionId,
+            mode,
+            agentModelId: agentModelId ?? 'default'
+        });
+        this.cursorSessionIds.set(session.id, { mode, acpSessionId: result.sessionId, transportKey });
         this.cursorSessionLookup.set(result.sessionId, { localSessionId: session.id, mode });
         return result.sessionId;
     }
@@ -1114,7 +1364,12 @@ class CursorAcpRuntime {
         this.promptMessageChunks.set(session.id, []);
         try {
             // Log runtime mode in transcript so CLI-mode runs are identifiable in history
-            await this.trackSessionOperation(session.id, this.appendTranscriptLine(session.id, 'system', 'runtime_mode', JSON.stringify({ kbAccessMode: mode, provider: provider.provider, terminalEnabled: provider.terminalEnabled })));
+            await this.trackSessionOperation(session.id, this.appendTranscriptLine(session.id, 'system', 'runtime_mode', JSON.stringify({
+                kbAccessMode: mode,
+                provider: provider.provider,
+                terminalEnabled: provider.terminalEnabled,
+                agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default'
+            })));
             await this.trackSessionOperation(session.id, Promise.resolve(emit({ kind: 'session_started', data: { ...requestEnvelope, kbAccessMode: mode }, message: 'Session started' })));
             const requestEnvelopeString = JSON.stringify(requestEnvelope);
             const promptText = await this.buildPromptText(session, taskPayload);
@@ -1125,7 +1380,7 @@ class CursorAcpRuntime {
             };
             const transcriptPath = this.transcripts.get(session.id) ?? '';
             const { transport, acpSessionId } = await this.executeWithRetry(async () => {
-                const transport = this.getTransport(provider.mode);
+                const transport = this.getTransport(provider.mode, session.workspaceId);
                 this.log('agent.runtime.ensure_initialized_start', {
                     workspaceId: session.workspaceId,
                     sessionId: session.id,
@@ -1158,6 +1413,7 @@ class CursorAcpRuntime {
                 acpSessionId,
                 task: taskPayload.task,
                 kbAccessMode: provider.mode,
+                agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default',
                 promptLength: promptText.length
             });
             const response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
@@ -1313,7 +1569,8 @@ class CursorAcpRuntime {
                         kind: params.update.kind,
                         reason: policy.reason
                     })));
-                    this.getTransport('cli').abortPromptSession(params.sessionId, policy.reason);
+                    const workspaceId = this.sessions.get(localSessionId)?.workspaceId;
+                    this.getTransport('cli', workspaceId).abortPromptSession(params.sessionId, policy.reason);
                 }
             }
         }
@@ -1364,10 +1621,17 @@ class CursorAcpRuntime {
             });
         });
     }
-    async canReachCursor(mode) {
+    async canReachCursor(mode, workspaceId) {
+        if (mode === 'cli') {
+            await this.runtimeOptions.prepareCliEnvironment?.(workspaceId);
+        }
+        if (workspaceId) {
+            await this.ensureWorkspaceAgentModelLoaded(workspaceId);
+        }
         let lastError;
+        const transportKey = this.buildTransportKey(mode, workspaceId);
         for (let attempt = 1; attempt <= ACP_HEALTH_INIT_ATTEMPTS; attempt += 1) {
-            const transport = this.getTransport(mode);
+            const transport = this.getTransport(mode, workspaceId);
             try {
                 const response = await transport.ensureInitialized(ACP_HEALTH_INIT_TIMEOUT_MS);
                 if (response) {
@@ -1386,25 +1650,26 @@ class CursorAcpRuntime {
             });
             if (attempt < ACP_HEALTH_INIT_ATTEMPTS) {
                 await transport.stop();
-                this.transports.delete(mode);
+                this.transports.delete(transportKey);
             }
         }
         return false;
     }
-    getTransport(mode) {
-        const existing = this.transports.get(mode);
+    getTransport(mode, workspaceId) {
+        const transportKey = this.buildTransportKey(mode, workspaceId);
+        const existing = this.transports.get(transportKey);
         if (existing) {
             return existing;
         }
         const provider = this.getProvider(mode);
         const transportBinary = this.resolveBinary(mode);
-        const transport = new CursorTransport(transportBinary, this.config.cursorArgs, this.config.acpCwd, provider.terminalEnabled, (sessionId, line) => {
+        const transport = new CursorTransport(transportBinary, buildCursorAcpArgs(transportBinary, this.getWorkspaceAgentModel(workspaceId)), this.config.acpCwd, provider.terminalEnabled, (sessionId, line) => {
             const targetSessionId = sessionId?.trim() || 'system';
             void this.appendTranscriptLine(targetSessionId, line.direction, line.event, line.payload);
         }, (message) => {
             void this.handleTransportNotification(message);
         });
-        this.transports.set(mode, transport);
+        this.transports.set(transportKey, transport);
         return transport;
     }
     evaluateCliToolPolicy(toolName, kind) {
@@ -1441,11 +1706,11 @@ class CursorAcpRuntime {
             return {
                 mode: 'cli',
                 provider: 'cli',
-                terminalEnabled: true,
-                buildSessionCreateParams: () => ({
+                terminalEnabled: false,
+                buildSessionCreateParams: (sessionType) => ({
                     cwd: this.config.acpCwd,
                     mcpServers: [],
-                    config: { mode: 'agent' }
+                    config: { mode: sessionType === 'assistant_chat' ? 'ask' : 'agent' }
                 }),
                 getPromptTaskBuilder: (session, taskPayload, extras) => {
                     const prompt = buildCliTaskPrompt(session, taskPayload, extras);
@@ -1460,28 +1725,28 @@ class CursorAcpRuntime {
             mode: 'mcp',
             provider: 'mcp',
             terminalEnabled: false,
-            buildSessionCreateParams: () => {
+            buildSessionCreateParams: (sessionType) => {
                 const mcpServers = this.resolveMcpServerConfigs();
                 return {
                     cwd: this.config.acpCwd,
                     ...(mcpServers.length > 0 ? { mcpServers } : {}),
-                    config: { mode: 'agent' }
+                    config: { mode: sessionType === 'assistant_chat' ? 'ask' : 'agent' }
                 };
             },
             getPromptTaskBuilder: (session, taskPayload, extras) => buildMcpTaskPrompt(session, taskPayload, extras),
-            getHealth: (_workspaceId) => this.getMcpHealth()
+            getHealth: (workspaceId) => this.getMcpHealth(workspaceId)
         };
     }
     async getProviderHealth(mode, workspaceId) {
         return this.getProvider(mode).getHealth(workspaceId);
     }
-    async getMcpHealth() {
+    async getMcpHealth(workspaceId) {
         const issues = [];
         const cursorInstalled = this.isCursorAvailable('mcp');
         if (!cursorInstalled) {
             issues.push('Cursor binary not found');
         }
-        const acpReachable = cursorInstalled ? await this.canReachCursor('mcp') : false;
+        const acpReachable = cursorInstalled ? await this.canReachCursor('mcp', workspaceId) : false;
         if (cursorInstalled && !acpReachable) {
             issues.push('Cursor ACP command did not initialize');
         }
@@ -1525,7 +1790,7 @@ class CursorAcpRuntime {
         try {
             const health = await this.runtimeOptions.getCliHealth(workspaceId);
             const issues = [...(health.issues ?? [])];
-            const acpReachable = await this.canReachCursor('cli');
+            const acpReachable = await this.canReachCursor('cli', workspaceId);
             if (!acpReachable) {
                 issues.push('Cursor ACP transport is not reachable');
             }

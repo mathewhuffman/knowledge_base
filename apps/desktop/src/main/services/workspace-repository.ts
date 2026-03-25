@@ -327,6 +327,17 @@ export class WorkspaceRepository {
     this.catalogDbPath = path.join(this.workspaceRoot, CATALOG_DB_PATH);
   }
 
+  private normalizeAgentModelId(modelId?: string | null): string | undefined {
+    const next = modelId?.trim();
+    if (!next) {
+      return undefined;
+    }
+    const withoutAnsi = next.replace(/\u001B\[[0-9;]*m/g, '').trim();
+    const withoutMarkers = withoutAnsi.replace(/\s+\((?:current|default)[^)]+\)\s*$/i, '').trim();
+    const normalized = withoutMarkers.split(/\s+-\s+/, 1)[0]?.trim() ?? withoutMarkers;
+    return normalized || undefined;
+  }
+
   async listWorkspaces(): Promise<WorkspaceRecord[]> {
     const catalog = await this.openCatalogWithRecovery();
     try {
@@ -377,9 +388,10 @@ export class WorkspaceRepository {
           default_locale: string;
           enabled_locales: string;
           kb_access_mode: string | null;
+          agent_model_id: string | null;
         }>(
           `SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
-            , kb_access_mode
+            , kb_access_mode, agent_model_id
            FROM workspace_settings WHERE workspace_id = @workspaceId`,
           { workspaceId: id }
         );
@@ -391,16 +403,17 @@ export class WorkspaceRepository {
             zendeskBrandId: settings.zendesk_brand_id ?? undefined,
             defaultLocale: settings.default_locale,
             enabledLocales: safeParseLocales(settings.enabled_locales),
-            kbAccessMode: normalizeKbAccessMode(settings.kb_access_mode)
+            kbAccessMode: normalizeKbAccessMode(settings.kb_access_mode),
+            agentModelId: this.normalizeAgentModelId(settings.agent_model_id)
           };
         }
 
         const enabledLocales = safeParseLocales(row.enabled_locales);
         workspaceDb.run(
           `INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @updatedAt
           )`,
           {
             workspaceId: id,
@@ -409,6 +422,7 @@ export class WorkspaceRepository {
             defaultLocale: row.default_locale,
             enabledLocales: JSON.stringify(enabledLocales),
             kbAccessMode: DEFAULT_KB_ACCESS_MODE,
+            agentModelId: null,
             updatedAt: new Date().toISOString()
           }
         );
@@ -419,7 +433,8 @@ export class WorkspaceRepository {
           zendeskBrandId: row.zendesk_brand_id ?? undefined,
           defaultLocale: row.default_locale,
           enabledLocales,
-          kbAccessMode: DEFAULT_KB_ACCESS_MODE
+          kbAccessMode: DEFAULT_KB_ACCESS_MODE,
+          agentModelId: undefined
         };
       } finally {
         workspaceDb.close();
@@ -452,9 +467,10 @@ export class WorkspaceRepository {
           default_locale: string;
           enabled_locales: string;
           kb_access_mode: string | null;
+          agent_model_id: string | null;
         }>(
           `SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
-            , kb_access_mode
+            , kb_access_mode, agent_model_id
            FROM workspace_settings WHERE workspace_id = @workspaceId`,
           { workspaceId: payload.workspaceId }
         );
@@ -469,7 +485,8 @@ export class WorkspaceRepository {
           payload.zendeskBrandId === undefined &&
           payload.defaultLocale === undefined &&
           payload.enabledLocales === undefined &&
-          payload.kbAccessMode === undefined
+          payload.kbAccessMode === undefined &&
+          payload.agentModelId === undefined
         ) {
           throw new Error('No settings provided');
         }
@@ -489,6 +506,9 @@ export class WorkspaceRepository {
         if (payload.enabledLocales?.length === 0) {
           throw new Error('enabledLocales cannot be empty');
         }
+        if (typeof payload.agentModelId === 'string' && !payload.agentModelId.trim()) {
+          throw new Error('agentModelId cannot be empty');
+        }
 
         const enabledLocales = payload.enabledLocales?.length
           ? normalizeLocales(payload.enabledLocales)
@@ -497,6 +517,9 @@ export class WorkspaceRepository {
         const nextSubdomain = payload.zendeskSubdomain ?? fallbackSubdomain;
         const nextBrand = payload.zendeskBrandId !== undefined ? payload.zendeskBrandId : fallbackBrand;
         const nextKbAccessMode = normalizeKbAccessMode(payload.kbAccessMode ?? existing?.kb_access_mode);
+        const nextAgentModelId = payload.agentModelId !== undefined
+          ? this.normalizeAgentModelId(payload.agentModelId)
+          : this.normalizeAgentModelId(existing?.agent_model_id);
 
         if (!nextSubdomain) {
           throw new Error('zendeskSubdomain cannot be empty');
@@ -516,9 +539,9 @@ export class WorkspaceRepository {
 
         workspaceDb.run(
           `INSERT OR REPLACE INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @updatedAt
           )`,
           {
             workspaceId: payload.workspaceId,
@@ -527,6 +550,7 @@ export class WorkspaceRepository {
             defaultLocale: nextDefaultLocale,
             enabledLocales: JSON.stringify(normalizedEnabledLocales),
             kbAccessMode: nextKbAccessMode,
+            agentModelId: nextAgentModelId ?? null,
             updatedAt: now
           }
         );
@@ -555,7 +579,8 @@ export class WorkspaceRepository {
           zendeskBrandId: nextBrand ?? undefined,
           defaultLocale: nextDefaultLocale,
           enabledLocales: normalizedEnabledLocales,
-          kbAccessMode: nextKbAccessMode
+          kbAccessMode: nextKbAccessMode,
+          agentModelId: nextAgentModelId
         };
       } finally {
         workspaceDb.close();
@@ -635,9 +660,9 @@ export class WorkspaceRepository {
       try {
         workspaceDb.run(
           `INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @updatedAt
           )`,
           {
             workspaceId: id,
@@ -646,6 +671,7 @@ export class WorkspaceRepository {
             defaultLocale: payload.defaultLocale,
             enabledLocales: JSON.stringify(enabledLocales),
             kbAccessMode: DEFAULT_KB_ACCESS_MODE,
+            agentModelId: null,
             updatedAt: now
           }
         );
@@ -3389,6 +3415,7 @@ export class WorkspaceRepository {
     batchId: string;
     sessionId?: string;
     kbAccessMode?: KbAccessMode;
+    agentModelId?: string;
     status: PersistedAgentAnalysisRun['status'];
     startedAtUtc: string;
     endedAtUtc?: string;
@@ -3406,10 +3433,10 @@ export class WorkspaceRepository {
       workspaceDb.run(
         `INSERT INTO ai_runs (
           id, workspace_id, batch_id, status, started_at, ended_at, prompt_template, transcript_path,
-          session_id, kb_access_mode, tool_calls_json, raw_output_json, message
+          session_id, kb_access_mode, agent_model_id, tool_calls_json, raw_output_json, message
         ) VALUES (
           @id, @workspaceId, @batchId, @status, @startedAt, @endedAt, @promptTemplate, @transcriptPath,
-          @sessionId, @kbAccessMode, @toolCallsJson, @rawOutputJson, @message
+          @sessionId, @kbAccessMode, @agentModelId, @toolCallsJson, @rawOutputJson, @message
         )`,
         {
           id,
@@ -3422,6 +3449,7 @@ export class WorkspaceRepository {
           transcriptPath: params.transcriptPath ?? null,
           sessionId: params.sessionId ?? null,
           kbAccessMode: params.kbAccessMode ?? 'mcp',
+          agentModelId: params.agentModelId ?? null,
           toolCallsJson: JSON.stringify(params.toolCalls ?? []),
           rawOutputJson: params.rawOutput ? JSON.stringify(params.rawOutput) : null,
           message: params.message ?? null
@@ -3434,6 +3462,7 @@ export class WorkspaceRepository {
         batchId: params.batchId,
         sessionId: params.sessionId,
         kbAccessMode: params.kbAccessMode ?? 'mcp',
+        agentModelId: params.agentModelId,
         status: params.status,
         startedAtUtc: params.startedAtUtc,
         endedAtUtc: params.endedAtUtc,
@@ -3459,6 +3488,7 @@ export class WorkspaceRepository {
         batchId: string;
         sessionId: string | null;
         kbAccessMode: KbAccessMode | null;
+        agentModelId: string | null;
         status: PersistedAgentAnalysisRun['status'];
         startedAtUtc: string;
         endedAtUtc: string | null;
@@ -3473,6 +3503,7 @@ export class WorkspaceRepository {
                 batch_id as batchId,
                 session_id as sessionId,
                 kb_access_mode as kbAccessMode,
+                agent_model_id as agentModelId,
                 status,
                 started_at as startedAtUtc,
                 ended_at as endedAtUtc,
@@ -3521,6 +3552,7 @@ export class WorkspaceRepository {
         batchId: row.batchId,
         sessionId: row.sessionId ?? undefined,
         kbAccessMode: row.kbAccessMode ?? 'mcp',
+        agentModelId: row.agentModelId?.trim() ? row.agentModelId.trim() : undefined,
         status: row.status,
         startedAtUtc: row.startedAtUtc,
         endedAtUtc: row.endedAtUtc ?? undefined,
@@ -5915,6 +5947,8 @@ export class WorkspaceRepository {
     await fs.mkdir(path.dirname(dbPath), { recursive: true });
     this.repairWorkspaceDb(dbPath);
     this.ensureKbAccessModeColumn(dbPath);
+    this.ensureAgentModelIdColumn(dbPath);
+    this.ensureAiRunsAgentModelIdColumn(dbPath);
     return dbPath;
   }
 
@@ -5974,6 +6008,30 @@ export class WorkspaceRepository {
       const columns = db.all<{ name: string }>(`PRAGMA table_info(workspace_settings)`).map((c) => c.name);
       if (!columns.includes('kb_access_mode')) {
         db.exec(`ALTER TABLE workspace_settings ADD COLUMN kb_access_mode TEXT NOT NULL DEFAULT 'mcp'`);
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  private ensureAgentModelIdColumn(dbPath: string) {
+    const db = openWorkspaceDatabase(dbPath);
+    try {
+      const columns = db.all<{ name: string }>(`PRAGMA table_info(workspace_settings)`).map((c) => c.name);
+      if (!columns.includes('agent_model_id')) {
+        db.exec(`ALTER TABLE workspace_settings ADD COLUMN agent_model_id TEXT`);
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  private ensureAiRunsAgentModelIdColumn(dbPath: string) {
+    const db = openWorkspaceDatabase(dbPath);
+    try {
+      const columns = db.all<{ name: string }>(`PRAGMA table_info(ai_runs)`).map((c) => c.name);
+      if (!columns.includes('agent_model_id')) {
+        db.exec(`ALTER TABLE ai_runs ADD COLUMN agent_model_id TEXT`);
       }
     } finally {
       db.close();
