@@ -107,7 +107,12 @@ async function bootstrapApp() {
             win.webContents.send(shared_types_1.IPC_CHANNELS.APP_WORKING_STATE_EVENT, event);
         });
     };
-    const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = (0, command_registry_1.registerCoreCommands)(commandBus, jobs, workspaceRoot, emitAppWorkingStateEvent);
+    const emitAiAssistantEvent = (event) => {
+        electron_1.BrowserWindow.getAllWindows().forEach((win) => {
+            win.webContents.send(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_EVENT, event);
+        });
+    };
+    const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = (0, command_registry_1.registerCoreCommands)(commandBus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent);
     kbCliLoopback = cliLoopback;
     mcpBridge = new mcp_bridge_service_1.McpBridgeService(agentRuntime);
     await mcpBridge.start();

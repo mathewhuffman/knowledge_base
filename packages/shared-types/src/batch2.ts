@@ -784,6 +784,7 @@ export interface WorkspaceMigrationHealthReport {
 
 export interface WorkspaceBatchAnalysisRepairSummary {
   backfilledLegacyIterations: number;
+  backfilledLegacyStageRuns: number;
   backfilledLegacyWorkerReports: number;
   backfilledStageEvents: number;
   normalizedIterations: number;

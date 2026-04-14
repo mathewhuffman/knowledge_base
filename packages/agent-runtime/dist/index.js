@@ -21,6 +21,9 @@ const DEFAULT_CURSOR_ARGS = ['agent', 'acp'];
 const DEFAULT_CLI_BINARY = 'kb';
 const ACP_HEALTH_INIT_TIMEOUT_MS = 15_000;
 const ACP_HEALTH_INIT_ATTEMPTS = 2;
+const ACP_SESSION_READY_WAIT_MS = 1_200;
+const ACP_SESSION_NOT_FOUND_RETRY_LIMIT = 4;
+const ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT = 2;
 function resolveDefaultCursorBinary() {
     if (hasBinaryOnPath(DEFAULT_AGENT_BINARY)) {
         return DEFAULT_AGENT_BINARY;
@@ -62,6 +65,93 @@ function buildCursorAcpArgs(binary, _modelId) {
     // accepts a different token format than ACP session model ids.
     return resolveCursorArgs(binary);
 }
+function extractKbCliCommandName(value) {
+    const normalized = value?.replace(/["']/g, ' ').trim() ?? '';
+    if (!normalized) {
+        return undefined;
+    }
+    const kbMatch = normalized.match(/(?:^|\s)(?:kb|kb\.exe)\s+([a-z0-9_]+(?:-[a-z0-9_]+)*(?:\s+[a-z0-9_]+(?:-[a-z0-9_]+)*)?)/i);
+    if (kbMatch?.[1]) {
+        return kbMatch[1].trim().toLowerCase();
+    }
+    const shimMatch = normalized.match(/kb-vault-cli-shim\/kb(?:\s+|["']\s+)([a-z0-9_]+(?:-[a-z0-9_]+)*(?:\s+[a-z0-9_]+(?:-[a-z0-9_]+)*)?)/i);
+    if (shimMatch?.[1]) {
+        return shimMatch[1].trim().toLowerCase();
+    }
+    return undefined;
+}
+function looksLikeKbCliShellInvocation(value) {
+    const normalized = value?.replace(/["']/g, ' ').trim() ?? '';
+    if (!normalized) {
+        return false;
+    }
+    return (/(?:^|\s)(?:kb|kb\.exe)\s+[a-z0-9_-]+/i.test(normalized)
+        || /kb-vault-cli-shim\/kb(?:\s+|["']\s+)[a-z0-9_-]+/i.test(normalized)
+        || /\/kb(?:\s+|["']\s+)[a-z0-9_-]+/i.test(normalized));
+}
+function extractCliToolCommand(rawInput) {
+    if (!rawInput || typeof rawInput !== 'object') {
+        return undefined;
+    }
+    const record = rawInput;
+    if (typeof record.command === 'string' && record.command.trim()) {
+        return record.command.trim();
+    }
+    if (Array.isArray(record.args)) {
+        const joined = record.args
+            .filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+            .join(' ')
+            .trim();
+        if (joined) {
+            return joined;
+        }
+    }
+    return undefined;
+}
+function extractSearchKbQueryFromCliCommand(command) {
+    const normalized = command?.trim();
+    if (!normalized || !/\bsearch-kb\b/i.test(normalized)) {
+        return undefined;
+    }
+    const match = normalized.match(/--query\s+("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)/i);
+    if (!match?.[1]) {
+        return undefined;
+    }
+    const token = match[1].trim();
+    const unwrapped = (token.startsWith('"') && token.endsWith('"'))
+        || (token.startsWith('\'') && token.endsWith('\''))
+        ? token.slice(1, -1)
+        : token;
+    return unwrapped.trim() || undefined;
+}
+function normalizePlannerSearchQuery(query) {
+    const normalized = query?.trim().toLowerCase().replace(/\s+/g, ' ');
+    return normalized || undefined;
+}
+function isCliTerminalToolName(value) {
+    const normalized = value?.trim().toLowerCase();
+    return normalized === 'terminal' || normalized === 'shell';
+}
+function shouldDeferCliToolPolicyCheck(update) {
+    if (!update) {
+        return false;
+    }
+    const command = extractCliToolCommand(update.rawInput);
+    if (command) {
+        return false;
+    }
+    const normalizedKind = update.kind?.trim().toLowerCase() ?? '';
+    const normalizedStatus = update.status?.trim().toLowerCase() ?? '';
+    const isPlaceholderTerminal = isCliTerminalToolName(update.title)
+        || normalizedKind === 'terminal'
+        || normalizedKind === 'execute'
+        || normalizedKind === 'shell';
+    if (!isPlaceholderTerminal) {
+        return false;
+    }
+    return (update.sessionUpdate === 'tool_call'
+        && (!normalizedStatus || normalizedStatus === 'pending'));
+}
 function normalizeAgentModelId(modelId) {
     const next = modelId?.trim();
     if (!next) {
@@ -75,12 +165,14 @@ function normalizeAgentModelId(modelId) {
 function resolveProviderSessionMode(mode, sessionMode) {
     const normalizedMode = sessionMode ?? 'agent';
     if (mode === 'cli' && normalizedMode === 'plan') {
-        // Cursor ACP plan sessions currently stall in CLI runtime mode, so keep the
-        // planner/reviewer prompts but bootstrap the ACP session as a normal agent run.
         return 'agent';
     }
     return normalizedMode;
 }
+const NON_CHAT_IDLE_SESSION_TTL_MS = 15 * 60 * 1_000;
+const BATCH_PLANNER_MAX_TOOL_CALLS = 8;
+const BATCH_PLANNER_JSON_STREAM_GRACE_MS = 1_500;
+const BATCH_PLANNER_MALFORMED_JSON_ABORT_MS = 6_000;
 function isMissingAcpSessionError(error) {
     if (!error) {
         return false;
@@ -106,6 +198,132 @@ function isCliToolPolicyViolationError(error) {
     const message = error instanceof Error ? error.message : String(error);
     const normalized = message.trim().toLowerCase();
     return normalized.includes('cli mode forbids');
+}
+function looksLikeAssistantProgressText(value) {
+    const normalized = value?.replace(/\s+/g, ' ').trim().toLowerCase() ?? '';
+    if (!normalized) {
+        return false;
+    }
+    return (/^(gathering|checking|looking|researching|reviewing|investigating|loading|searching|finding)\b/.test(normalized)
+        || /^i(?:'m| am) (gathering|checking|looking|researching|reviewing|investigating|finding)\b/.test(normalized)
+        || normalized.includes('returning only the structured json')
+        || normalized.includes('return the final answer')
+        || normalized.includes('using the cli and then returning')
+        || normalized.includes('do not send a progress update')
+        || normalized.includes('pulling the core'));
+}
+function looksLikeBatchProgressText(value) {
+    return looksLikeAssistantProgressText(value);
+}
+function normalizeAssistantCompletionState(value) {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+    switch (value.trim().toLowerCase()) {
+        case 'completed':
+            return 'completed';
+        case 'researching':
+            return 'researching';
+        case 'needs_user_input':
+        case 'needs-user-input':
+            return 'needs_user_input';
+        case 'blocked':
+            return 'blocked';
+        case 'errored':
+        case 'error':
+            return 'errored';
+        case 'unknown':
+            return 'unknown';
+        default:
+            return undefined;
+    }
+}
+function looksLikeAssistantEnvelope(value) {
+    return (typeof value.response === 'string'
+        || typeof value.command === 'string'
+        || typeof value.artifactType === 'string'
+        || typeof value.completionState === 'string'
+        || typeof value.isFinal === 'boolean');
+}
+function extractLastJsonObjectFromText(value) {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+        return null;
+    }
+    try {
+        const direct = JSON.parse(trimmed);
+        if (direct && typeof direct === 'object' && !Array.isArray(direct)) {
+            return direct;
+        }
+    }
+    catch {
+        // Fall through to substring extraction.
+    }
+    let best = null;
+    for (let start = 0; start < trimmed.length; start += 1) {
+        if (trimmed[start] !== '{') {
+            continue;
+        }
+        for (let end = trimmed.lastIndexOf('}'); end > start; end = trimmed.lastIndexOf('}', end - 1)) {
+            try {
+                const candidate = JSON.parse(trimmed.slice(start, end + 1));
+                if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+                    best = candidate;
+                    break;
+                }
+            }
+            catch {
+                // continue searching
+            }
+        }
+    }
+    return best;
+}
+function extractPreferredAssistantEnvelope(value) {
+    const directObject = value && typeof value === 'object' && !Array.isArray(value)
+        ? value
+        : null;
+    if (directObject && looksLikeAssistantEnvelope(directObject)) {
+        return directObject;
+    }
+    const candidates = [];
+    if (directObject) {
+        if (typeof directObject.streamedText === 'string') {
+            candidates.push(directObject.streamedText);
+        }
+        const explicitText = extractPromptResultText(directObject);
+        if (explicitText) {
+            candidates.push(explicitText);
+        }
+    }
+    else if (typeof value === 'string') {
+        candidates.push(value);
+    }
+    for (const candidate of candidates) {
+        const parsed = extractLastJsonObjectFromText(candidate);
+        if (parsed) {
+            return parsed;
+        }
+    }
+    return null;
+}
+function extractAssistantCompletionContract(value) {
+    const candidates = [];
+    const preferred = extractPreferredAssistantEnvelope(value);
+    if (preferred) {
+        candidates.push(preferred);
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+        candidates.push(value);
+    }
+    for (const candidate of candidates) {
+        const completionState = normalizeAssistantCompletionState(candidate.completionState);
+        const isFinal = typeof candidate.isFinal === 'boolean' ? candidate.isFinal : undefined;
+        if (completionState || isFinal !== undefined) {
+            return { completionState, isFinal };
+        }
+    }
+    return {};
 }
 function getSessionUpdateType(params) {
     if (!params || typeof params !== 'object') {
@@ -321,14 +539,24 @@ function buildMcpTaskPrompt(session, taskPayload, extras) {
             `Workspace ID: ${session.workspaceId}`,
             `Locale: ${locale}`,
             '',
+            'Your job:',
+            '- Answer the user\'s actual request.',
+            '- When workspace knowledge is needed, use the minimum KB lookups required to answer accurately.',
+            '- For feature, workflow, or terminology questions about the app, default to this sequence: `search-kb` for the topic, `get-article` for the best 1-3 hits, then answer clearly in plain English.',
+            '',
             'Tool rules:',
             '- Use KB Vault tools and structured article/template data only when they help answer the user.',
             '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
+            '- Do NOT use shell or terminal for anything except running `kb` commands.',
+            '- Do not use tools just to discover what tools exist or to explore the environment.',
+            '- Do not use `batch-context`, `find-related-articles`, proposal commands, or form-editing commands unless the current route or user request clearly requires them.',
+            '- Do not use `kb help` unless a needed KB command is genuinely unclear and you cannot proceed with `search-kb` plus `get-article`.',
             '- The preloaded prompt context is for orientation; use KB Vault MCP tools directly when you need to confirm or inspect source records.',
             '- Return only valid JSON in your final answer.',
             '- Do not include preamble, commentary about your reasoning, or markdown fences.',
             '- For informational chat, return only `artifactType` and `response`. Omit `summary`, `html`, `formPatch`, and `payload` unless they are needed.',
             '- Only return `proposal_candidate` when the user explicitly asks you to make or propose changes.',
+            '- Do not stop on a progress update. If you started researching, finish the lookup and answer the user in the same turn whenever possible.',
             '',
             mcpGuidance,
             '',
@@ -488,7 +716,12 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
             'KB command rules for chat:',
             '- When research or data lookup is needed, use only `kb` commands.',
             '- Never use terminal commands like grep, Read File, codebase search, or general filesystem exploration.',
-            '- Prefer these commands when relevant: `kb batch-context --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb find-related-articles --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json`, `kb get-article-family --workspace-id <workspace-id> --family-id <family-id> --json`, `kb app get-form-schema --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --json`, `kb app patch-form --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --version-token <version-token> --patch \'<json object>\' --json`, and `kb help --json`.',
+            '- If the runtime exposes direct KB tools such as `search-kb` and `get-article`, prefer those over Shell or Terminal.',
+            '- If the runtime only exposes Shell or Terminal, you may use it only for exact `kb` CLI commands. Generic terminal usage will be blocked.',
+            '- Default research workflow for app-feature questions: use `search-kb`, then `get-article` for the best 1-3 hits, then answer.',
+            '- Use `kb get-article-family` only when one article is clearly relevant but you need related variants or family context.',
+            '- Use `kb batch-context`, `kb find-related-articles`, `kb app get-form-schema`, and `kb app patch-form` only when the route or the user\'s request clearly calls for batch review, proposal review, or live form editing.',
+            '- Use `kb help --json` only if a needed KB command is genuinely unclear. Do not spend the turn exploring command syntax when `search-kb` plus `get-article` will answer the question.',
             '- Use the KB command output as the source of truth when answering.'
         ].join('\n');
         return [
@@ -497,12 +730,19 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
             `Locale: ${locale}`,
             '',
             'Assistant chat rules:',
-            '- Use kb commands and structured article/template data only when they materially help answer the user or complete an explicit edit/proposal request.',
-            '- If the user is asking a normal question or wants an explanation, answer directly instead of doing unnecessary research.',
+            '- Your primary job is to answer the user\'s request, not to explore the environment or narrate your plan.',
+            '- If the user is asking a normal question or wants an explanation, answer directly unless workspace KB data is needed for accuracy.',
+            '- If the user is asking about a feature, workflow, term, or concept in the app, use the smallest KB lookup path that will let you answer correctly.',
+            '- The default lookup path for app questions is: search the topic, open the best 1-3 matching articles, synthesize the answer, stop.',
             '- If the user explicitly asks you to research, investigate, look something up, or answer from workspace data, do that research now and return the final findings in the same turn.',
-            '- Never use generic terminal commands. Only use kb commands when tool use is needed.',
+            '- Never use generic terminal commands. When tool use is needed, use only exact `kb` commands.',
+            '- If direct KB tools are available, prefer those. If the runtime only exposes Shell or Terminal, it may be used only for exact `kb` CLI commands.',
+            '- Do not use tools just to figure out what you should do next.',
+            '- Avoid `batch-context`, `find-related-articles`, proposal commands, and form-editing commands unless the route or user request clearly requires them.',
+            '- Do not call `kb help` unless command syntax is genuinely blocking progress.',
             '- Do not include preamble, commentary about your reasoning, or markdown fences.',
             '- Follow the output contract in the additional instructions below exactly.',
+            '- Do not stop on a progress update. If you begin researching, finish and answer unless you are truly blocked or need user input.',
             '',
             chatCliGuidance,
             '',
@@ -517,7 +757,8 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
     return JSON.stringify({ session, task: taskPayload });
 }
 const DEFAULT_TRANSCRIPT_DIR = '.meta/agent-transcripts';
-const CLI_PLANNER_ZERO_RESULT_SEARCH_LIMIT = 6;
+const CLI_PLANNER_ZERO_RESULT_SEARCH_LIMIT = 4;
+const CLI_PLANNER_LOW_DIVERSITY_ZERO_RESULT_QUERY_LIMIT = 2;
 function loadConfiguredMcpServers() {
     const raw = node_process_1.default.env.KBV_MCP_TOOLS?.trim();
     if (!raw) {
@@ -878,6 +1119,7 @@ class CursorAcpRuntime {
     toolCallAudit = [];
     mcpServer;
     transports = new Map();
+    acpSessionStates = new Map();
     cursorSessionIds = new Map();
     cursorSessionLookup = new Map();
     activeStreamEmitters = new Map();
@@ -885,7 +1127,12 @@ class CursorAcpRuntime {
     promptCompletionTimers = new Map();
     pendingPromptFallbacks = new Map();
     pendingSessionOperations = new Map();
+    sessionOperationTails = new Map();
     sessionActivityAt = new Map();
+    promptTransportActivityAt = new Map();
+    transcriptLineSequences = new Map();
+    auditedCliToolCallIds = new Map();
+    activePromptStates = new Map();
     cliPlannerLoopState = new Map();
     workspaceAgentModels = new Map();
     debugLogger;
@@ -1058,6 +1305,88 @@ class CursorAcpRuntime {
     markSessionActivity(sessionId) {
         this.sessionActivityAt.set(sessionId, Date.now());
     }
+    markPromptTransportActivity(sessionId) {
+        this.promptTransportActivityAt.set(sessionId, Date.now());
+        this.markSessionActivity(sessionId);
+    }
+    getPromptStructuredResultContract(session, taskPayload) {
+        if (taskPayload.task === 'analyze_batch' && session.type === 'batch_analysis' && session.role === 'planner' && session.mode === 'plan') {
+            return 'batch_planner';
+        }
+        return undefined;
+    }
+    async pruneIdleNonChatSessions(workspaceId, options = {}) {
+        const now = Date.now();
+        const candidates = Array.from(this.sessions.values()).filter((session) => {
+            if (session.workspaceId !== workspaceId || session.id === options.keepSessionId) {
+                return false;
+            }
+            if (session.type === 'assistant_chat' || session.status === 'running' || session.status === 'closed') {
+                return false;
+            }
+            if (options.activeBatchId
+                && session.type === 'batch_analysis'
+                && session.batchId
+                && session.batchId !== options.activeBatchId) {
+                return true;
+            }
+            const updatedAtMs = Date.parse(session.updatedAtUtc);
+            return Number.isFinite(updatedAtMs) && now - updatedAtMs >= NON_CHAT_IDLE_SESSION_TTL_MS;
+        });
+        for (const session of candidates) {
+            this.closeSession({ workspaceId, sessionId: session.id });
+        }
+    }
+    async stopActivePrompt(localSessionId, acpSessionId, transport, reason) {
+        const state = this.activePromptStates.get(localSessionId);
+        if (state?.remotelyStopped) {
+            return;
+        }
+        if (state) {
+            state.remotelyStopped = true;
+        }
+        transport.abortPromptSession(acpSessionId, reason);
+        await this.trackSessionOperation(localSessionId, this.appendTranscriptLine(localSessionId, 'system', 'prompt_abort', JSON.stringify({ reason, acpSessionId })));
+    }
+    maybeResolveStructuredPromptFromStream(localSessionId) {
+        const state = this.activePromptStates.get(localSessionId);
+        if (!state || !state.contract) {
+            return;
+        }
+        const assembledText = assemblePromptMessageText(this.promptMessageChunks.get(localSessionId)).trim();
+        if (!assembledText) {
+            return;
+        }
+        const now = Date.now();
+        const lastTransportActivityAt = this.promptTransportActivityAt.get(localSessionId) ?? now;
+        const idleForMs = now - lastTransportActivityAt;
+        if (state.firstCompleteJsonAtMs === undefined && promptStreamMatchesContract(assembledText, state.contract)) {
+            state.firstCompleteJsonAtMs = now;
+        }
+        if (state.jsonStartedAtMs === undefined && streamedTextLikelyStartsJsonObject(assembledText)) {
+            state.jsonStartedAtMs = now;
+        }
+        if (state.firstCompleteJsonAtMs !== undefined
+            && state.activeToolCalls.size === 0
+            && now - state.firstCompleteJsonAtMs >= BATCH_PLANNER_JSON_STREAM_GRACE_MS) {
+            const resolved = state.transport.resolvePromptSession(state.acpSessionId, {
+                text: assembledText,
+                content: [{ type: 'text', text: assembledText }]
+            });
+            if (resolved) {
+                void this.stopActivePrompt(localSessionId, state.acpSessionId, state.transport, 'Structured planner JSON was captured from the stream; stopping the remote prompt to avoid extra token usage.');
+                this.clearPromptCompletionTimer(localSessionId);
+            }
+            return;
+        }
+        const malformedJsonWindowExceeded = state.jsonStartedAtMs !== undefined
+            && state.firstCompleteJsonAtMs === undefined
+            && state.activeToolCalls.size === 0
+            && idleForMs >= BATCH_PLANNER_MALFORMED_JSON_ABORT_MS;
+        if (malformedJsonWindowExceeded) {
+            void this.stopActivePrompt(localSessionId, state.acpSessionId, state.transport, `Planner entered structured JSON output but did not stabilize into a valid JSON plan after ${state.chunkCount} streamed chunks and ${idleForMs}ms of inactivity. Stop and recover locally.`);
+        }
+    }
     trackSessionOperation(sessionId, operation) {
         const pending = this.pendingSessionOperations.get(sessionId) ?? new Set();
         pending.add(operation);
@@ -1075,6 +1404,22 @@ class CursorAcpRuntime {
             this.markSessionActivity(sessionId);
         });
         return operation;
+    }
+    queueSessionOperation(sessionId, task) {
+        const previous = this.sessionOperationTails.get(sessionId) ?? Promise.resolve();
+        const operation = previous
+            .catch(() => undefined)
+            .then(task);
+        let tail;
+        tail = operation
+            .then(() => undefined, () => undefined)
+            .finally(() => {
+            if (this.sessionOperationTails.get(sessionId) === tail) {
+                this.sessionOperationTails.delete(sessionId);
+            }
+        });
+        this.sessionOperationTails.set(sessionId, tail);
+        return this.trackSessionOperation(sessionId, operation);
     }
     async waitForSessionToSettle(sessionId, idleMs = 350, maxWaitMs = 5000, minWaitMs = 0) {
         const startedAt = Date.now();
@@ -1224,6 +1569,8 @@ class CursorAcpRuntime {
         this.log('agent.runtime.session_new_start', {
             sessionId: session.id,
             mode,
+            requestedSessionMode: session.mode,
+            providerSessionMode,
             agentModelId: agentModelId ?? 'default'
         });
         const response = await transport.request('session/new', provider.buildSessionCreateParams(session.mode), this.config.requestTimeoutMs, session.id);
@@ -1239,6 +1586,11 @@ class CursorAcpRuntime {
         if (!result?.sessionId) {
             throw new Error('Cursor ACP did not return a sessionId');
         }
+        this.acpSessionStates.set(result.sessionId, {
+            createdAtMs: Date.now(),
+            ready: false,
+            waiters: new Set()
+        });
         const reportedModelState = parseSessionModelState(result.models);
         const normalizedRequestedModelId = normalizeAgentModelId(agentModelId);
         const normalizedCurrentModelId = normalizeAgentModelId(reportedModelState?.currentModelId);
@@ -1275,6 +1627,8 @@ class CursorAcpRuntime {
             sessionId: session.id,
             acpSessionId: result.sessionId,
             mode,
+            requestedSessionMode: session.mode,
+            providerSessionMode,
             agentModelId: agentModelId ?? 'default'
         });
         this.cursorSessionIds.set(session.id, {
@@ -1285,6 +1639,60 @@ class CursorAcpRuntime {
         });
         this.cursorSessionLookup.set(result.sessionId, { localSessionId: session.id, mode });
         return result.sessionId;
+    }
+    markAcpSessionReady(acpSessionId) {
+        if (!acpSessionId) {
+            return;
+        }
+        const state = this.acpSessionStates.get(acpSessionId);
+        if (!state || state.ready) {
+            return;
+        }
+        state.ready = true;
+        for (const waiter of state.waiters) {
+            waiter(true);
+        }
+        state.waiters.clear();
+    }
+    clearAcpSessionState(acpSessionId) {
+        if (!acpSessionId) {
+            return;
+        }
+        const state = this.acpSessionStates.get(acpSessionId);
+        if (!state) {
+            return;
+        }
+        for (const waiter of state.waiters) {
+            waiter(false);
+        }
+        state.waiters.clear();
+        this.acpSessionStates.delete(acpSessionId);
+    }
+    async waitForAcpSessionReady(acpSessionId, timeoutMs) {
+        const state = this.acpSessionStates.get(acpSessionId);
+        if (!state) {
+            return false;
+        }
+        if (state.ready) {
+            return true;
+        }
+        if (timeoutMs <= 0) {
+            return false;
+        }
+        return await new Promise((resolve) => {
+            let settled = false;
+            const finish = (ready) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                state.waiters.delete(finish);
+                resolve(ready);
+            };
+            const timer = setTimeout(() => finish(false), timeoutMs);
+            state.waiters.add(finish);
+        });
     }
     async handleMcpJsonMessage(raw) {
         return this.mcpServer.handleJsonMessage(raw);
@@ -1316,21 +1724,25 @@ class CursorAcpRuntime {
                 rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
                 emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
             }, toolCalls, isCancelled, timeoutMs);
-            const settleWindow = getPromptSettleWindow(initialResultPayload, assemblePromptMessageText(this.promptMessageChunks.get(session.id) ?? []));
+            const settleWindow = getBatchAnalysisPromptSettleWindow(initialResultPayload, assemblePromptMessageText(this.promptMessageChunks.get(session.id)).trim());
             const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
             await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
             const resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
+            const finalText = extractPromptResultText(resultPayload);
             const endedAt = new Date().toISOString();
+            const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
             session.updatedAtUtc = endedAt;
             session.status = 'idle';
             return {
                 sessionId: session.id,
+                acpSessionId,
                 kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
                 status: isCancelled() ? 'canceled' : 'ok',
                 transcriptPath,
                 rawOutput,
                 resultPayload,
-                toolCalls,
+                finalText,
+                toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
                 durationMs: Date.parse(endedAt) - startedAtMs,
@@ -1345,16 +1757,19 @@ class CursorAcpRuntime {
             });
             await this.waitForSessionToSettle(session.id, 350, timeoutMs);
             const endedAt = new Date().toISOString();
+            const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
             session.updatedAtUtc = endedAt;
             session.status = 'idle';
             return {
                 sessionId: session.id,
+                acpSessionId,
                 kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
                 status: 'error',
                 transcriptPath,
                 rawOutput,
                 resultPayload: undefined,
-                toolCalls,
+                finalText: undefined,
+                toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
                 durationMs: Date.parse(endedAt) - Date.parse(startedAt),
@@ -1393,14 +1808,16 @@ class CursorAcpRuntime {
                 emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
             }, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs);
             const endedAt = new Date().toISOString();
+            const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
             return {
                 sessionId: session.id,
+                acpSessionId,
                 kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
                 status: isCancelled() ? 'canceled' : 'ok',
                 transcriptPath,
                 rawOutput,
                 resultPayload,
-                toolCalls,
+                toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
                 durationMs: Date.parse(endedAt) - Date.parse(startedAt),
@@ -1414,14 +1831,16 @@ class CursorAcpRuntime {
                 error: error instanceof Error ? error.message : String(error)
             });
             const endedAt = new Date().toISOString();
+            const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
             return {
                 sessionId: session.id,
+                acpSessionId,
                 kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
                 status: 'error',
                 transcriptPath,
                 rawOutput,
                 resultPayload: undefined,
-                toolCalls,
+                toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
                 durationMs: Date.parse(endedAt) - Date.parse(startedAt),
@@ -1454,8 +1873,12 @@ class CursorAcpRuntime {
         });
         try {
             let resultPayload = undefined;
+            let completionState = undefined;
+            let isFinal = undefined;
             let attempt = 0;
+            let autoContinueCount = 0;
             let nextPrompt = request.prompt;
+            const promptSeed = stripAssistantChatContinuation(request.prompt);
             while (true) {
                 let initialResultPayload;
                 try {
@@ -1472,54 +1895,66 @@ class CursorAcpRuntime {
                 catch (error) {
                     const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
                     const canRecoverFromToolPolicy = !isCancelled()
-                        && attempt < ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT
-                        && remainingWaitMs >= 5_000
+                        && attempt < ASSISTANT_CHAT_RECOVERY_RETRY_LIMIT
+                        && remainingWaitMs >= 1_000
                         && isCliToolPolicyViolationError(error);
                     if (!canRecoverFromToolPolicy) {
                         throw error;
                     }
                     attempt += 1;
-                    nextPrompt = ASSISTANT_CHAT_KB_ONLY_RECOVERY_PROMPT;
-                    rawOutput.push(`[assistant-chat kb-only recovery ${attempt}] ${error instanceof Error ? error.message : String(error)}`);
+                    const policyError = error instanceof Error ? error.message : String(error);
+                    nextPrompt = buildAssistantChatContinuationPrompt(promptSeed || nextPrompt, buildAssistantChatKbOnlyRecoveryPrompt(policyError));
+                    rawOutput.push(`[assistant-chat kb-only recovery ${attempt}] ${policyError}`);
                     this.log('agent.runtime.assistant_chat_kb_only_retry', {
                         workspaceId: request.workspaceId,
                         sessionId: session.id,
                         attempt,
-                        reason: error instanceof Error ? error.message : String(error)
+                        reason: policyError
                     });
                     continue;
                 }
                 const settleWindow = ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW;
-                const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
-                await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
+                await this.waitForSessionToSettle(session.id, settleWindow.idleMs, settleWindow.maxWaitMs, settleWindow.minWaitMs);
                 resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
+                const completion = extractAssistantCompletionContract(resultPayload);
+                completionState = completion.completionState;
+                isFinal = completion.isFinal;
                 const resultText = extractPromptResultText(resultPayload);
+                const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
                 const canAutoContinue = !isCancelled()
-                    && attempt < ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT
-                    && Math.max(0, timeoutMs - (Date.now() - startedAtMs)) >= 5_000
-                    && looksLikeAssistantProgressText(resultText);
-                if (!canAutoContinue) {
-                    break;
+                    && autoContinueCount < ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT
+                    && remainingWaitMs >= 5_000
+                    && (isFinal === false
+                        || completionState === 'researching'
+                        || (completionState === undefined
+                            && looksLikeAssistantProgressText(resultText)));
+                if (canAutoContinue) {
+                    autoContinueCount += 1;
+                    nextPrompt = buildAssistantChatContinuationPrompt(promptSeed || nextPrompt, ASSISTANT_CHAT_CONTINUE_PROMPT);
+                    rawOutput.push(`[assistant-chat auto-continue ${autoContinueCount}] ${String(resultText ?? '')}`);
+                    this.log('agent.runtime.assistant_chat_auto_continue', {
+                        workspaceId: request.workspaceId,
+                        sessionId: session.id,
+                        autoContinueCount,
+                        resultText
+                    });
+                    continue;
                 }
-                attempt += 1;
-                nextPrompt = ASSISTANT_CHAT_CONTINUE_PROMPT;
-                rawOutput.push(`[assistant-chat auto-continue ${attempt}] ${String(resultText ?? '')}`);
-                this.log('agent.runtime.assistant_chat_auto_continue', {
-                    workspaceId: request.workspaceId,
-                    sessionId: session.id,
-                    attempt,
-                    preview: (resultText ?? '').slice(0, 160)
-                });
+                break;
             }
             const endedAt = new Date().toISOString();
+            const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
             return {
                 sessionId: session.id,
+                acpSessionId,
                 kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
                 status: isCancelled() ? 'canceled' : 'ok',
+                completionState: completionState ?? 'completed',
+                isFinal: isFinal ?? true,
                 transcriptPath,
                 rawOutput,
                 resultPayload,
-                toolCalls,
+                toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
                 durationMs: Date.parse(endedAt) - startedAtMs,
@@ -1534,14 +1969,18 @@ class CursorAcpRuntime {
             });
             await this.waitForSessionToSettle(session.id, 350, timeoutMs);
             const endedAt = new Date().toISOString();
+            const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
             return {
                 sessionId: session.id,
+                acpSessionId,
                 kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
                 status: 'error',
+                completionState: 'errored',
+                isFinal: true,
                 transcriptPath,
                 rawOutput,
                 resultPayload: undefined,
-                toolCalls,
+                toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
                 durationMs: Date.parse(endedAt) - startedAtMs,
@@ -1549,6 +1988,7 @@ class CursorAcpRuntime {
             };
         }
         finally {
+            this.cleanupPromptState(session.id);
             session.status = 'idle';
             session.updatedAtUtc = new Date().toISOString();
             this.log('agent.runtime.assistant_chat_complete', {
@@ -1589,21 +2029,96 @@ class CursorAcpRuntime {
                 };
             }
         });
+        const ordered = sortTranscriptLines(parsed);
         if (!input.limit) {
             return {
                 workspaceId: input.workspaceId,
                 sessionId: input.sessionId,
-                lines: parsed
+                lines: ordered
             };
         }
         return {
             workspaceId: input.workspaceId,
             sessionId: input.sessionId,
-            lines: parsed.slice(-input.limit)
+            lines: ordered.slice(-input.limit)
         };
     }
     listToolCallAudit(sessionId, workspaceId) {
         return this.toolCallAudit.filter((audit) => audit.sessionId === sessionId && audit.workspaceId === workspaceId);
+    }
+    populateRunToolCalls(target, sessionId, workspaceId) {
+        const recorded = this.listToolCallAudit(sessionId, workspaceId);
+        const fallback = recorded.length > 0 ? recorded : this.extractToolCallAuditFromTranscript(sessionId, workspaceId);
+        target.splice(0, target.length, ...fallback);
+        return target;
+    }
+    extractToolCallAuditFromTranscript(sessionId, workspaceId) {
+        const transcriptPath = this.transcripts.get(sessionId);
+        if (!transcriptPath || !node_fs_1.default.existsSync(transcriptPath)) {
+            return [];
+        }
+        try {
+            const contents = node_fs_1.default.readFileSync(transcriptPath, 'utf8');
+            const seenToolCallIds = new Set();
+            const recovered = [];
+            const transcriptLines = sortTranscriptLines(contents
+                .split('\n')
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .map((line) => {
+                try {
+                    return JSON.parse(line);
+                }
+                catch {
+                    return {
+                        atUtc: new Date().toISOString(),
+                        direction: 'system',
+                        event: 'line_parse_error',
+                        payload: line
+                    };
+                }
+            }));
+            for (const parsedLine of transcriptLines) {
+                if (!parsedLine || parsedLine.event !== 'session_update' || parsedLine.direction !== 'from_agent') {
+                    continue;
+                }
+                let payload = null;
+                try {
+                    payload = JSON.parse(parsedLine.payload);
+                }
+                catch {
+                    payload = null;
+                }
+                const update = payload?.update;
+                if (!update || typeof update.toolCallId !== 'string' || seenToolCallIds.has(update.toolCallId)) {
+                    continue;
+                }
+                const cliAuditLabel = typeof update.title === 'string' && update.title.trim()
+                    ? update.title
+                    : extractCliToolCommand(update.rawInput);
+                if (!cliAuditLabel || shouldDeferCliToolPolicyCheck(update)) {
+                    continue;
+                }
+                seenToolCallIds.add(update.toolCallId);
+                const policy = this.evaluateCliToolPolicy(cliAuditLabel, update.kind, update.rawInput);
+                const auditedToolName = extractKbCliCommandName(cliAuditLabel)
+                    ?? extractKbCliCommandName(extractCliToolCommand(update.rawInput))
+                    ?? cliAuditLabel;
+                recovered.push({
+                    workspaceId,
+                    sessionId,
+                    toolName: auditedToolName,
+                    args: update.rawInput ?? { kind: update.kind },
+                    calledAtUtc: parsedLine.atUtc,
+                    allowed: policy.allowed,
+                    reason: policy.reason
+                });
+            }
+            return recovered;
+        }
+        catch {
+            return [];
+        }
     }
     async stop() {
         await Promise.all(Array.from(this.transports.values()).map((transport) => transport.stop()));
@@ -1619,9 +2134,18 @@ class CursorAcpRuntime {
     async resolveSession(input) {
         const sessionType = input.sessionType ?? ('localeVariantId' in input ? 'article_edit' : 'batch_analysis');
         const requestedMode = input.sessionMode ?? (input.sessionType === 'assistant_chat' ? 'ask' : 'agent');
-        const existing = input.sessionId
-            ? this.getSession(input.sessionId)
-            : ('batchId' in input && sessionType === 'batch_analysis' ? this.findReusableBatchAnalysisSession(input) : null);
+        const sessionReusePolicy = input.sessionReusePolicy ?? 'reuse';
+        if (input.workspaceId && sessionType !== 'assistant_chat') {
+            await this.pruneIdleNonChatSessions(input.workspaceId, {
+                keepSessionId: input.sessionId,
+                activeBatchId: 'batchId' in input ? input.batchId : undefined
+            });
+        }
+        const existing = sessionReusePolicy === 'new_local_session'
+            ? null
+            : input.sessionId
+                ? this.getSession(input.sessionId)
+                : ('batchId' in input && sessionType === 'batch_analysis' ? this.findReusableBatchAnalysisSession(input) : null);
         let session = existing;
         if (!session) {
             if (!input.workspaceId) {
@@ -1641,7 +2165,7 @@ class CursorAcpRuntime {
             session = this.createSession(createRequest);
         }
         else {
-            let needsReset = false;
+            let needsReset = sessionReusePolicy === 'reset_acp';
             if (input.kbAccessMode && input.kbAccessMode !== session.kbAccessMode) {
                 session.kbAccessMode = input.kbAccessMode;
                 needsReset = true;
@@ -1680,22 +2204,25 @@ class CursorAcpRuntime {
     async transit(session, taskPayload, emit, toolCalls, isCancelled, timeoutMs) {
         const mode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
         const provider = this.getProvider(mode);
+        const providerSessionMode = resolveProviderSessionMode(mode, session.mode);
         const requestEnvelope = {
             session,
             task: taskPayload
         };
         this.activeStreamEmitters.set(session.id, emit);
-        this.promptMessageChunks.set(session.id, []);
+        this.promptMessageChunks.set(session.id, createPromptMessageBuffer());
+        this.markPromptTransportActivity(session.id);
         try {
             // Log runtime mode in transcript so CLI-mode runs are identifiable in history
             await this.trackSessionOperation(session.id, this.appendTranscriptLine(session.id, 'system', 'runtime_mode', JSON.stringify({
                 kbAccessMode: mode,
                 provider: provider.provider,
+                requestedSessionMode: session.mode,
+                providerSessionMode,
                 terminalEnabled: provider.terminalEnabled,
                 agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default'
             })));
             await this.trackSessionOperation(session.id, Promise.resolve(emit({ kind: 'session_started', data: { ...requestEnvelope, kbAccessMode: mode }, message: 'Session started' })));
-            const requestEnvelopeString = JSON.stringify(requestEnvelope);
             const promptText = await this.buildPromptText(session, taskPayload);
             const context = {
                 workspaceId: session.workspaceId,
@@ -1732,6 +2259,18 @@ class CursorAcpRuntime {
                 ]
             };
             this.pendingPromptFallbacks.set(session.id, { transport, acpSessionId });
+            this.activePromptStates.set(session.id, {
+                task: String(taskPayload.task ?? ''),
+                role: session.role,
+                workspaceId: session.workspaceId,
+                transport,
+                acpSessionId,
+                contract: this.getPromptStructuredResultContract(session, taskPayload),
+                activeToolCalls: new Set(),
+                toolCallCount: 0,
+                chunkCount: 0,
+                remotelyStopped: false
+            });
             this.startPromptCompletionWatcher(session.id);
             this.log('agent.runtime.prompt_send', {
                 workspaceId: session.workspaceId,
@@ -1744,8 +2283,37 @@ class CursorAcpRuntime {
             });
             let currentAcpSessionId = acpSessionId;
             let retryCount = 0;
+            let sameSessionRetryCount = 0;
             let response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
             while (response.error && retryCount < 2 && isRetriablePromptError(response.error)) {
+                const missingSession = isMissingAcpSessionError(response.error);
+                if (missingSession && sameSessionRetryCount < ACP_SESSION_NOT_FOUND_RETRY_LIMIT) {
+                    sameSessionRetryCount += 1;
+                    const ready = await this.waitForAcpSessionReady(currentAcpSessionId, Math.min(ACP_SESSION_READY_WAIT_MS, Math.max(250, Math.floor(timeoutMs / 4))));
+                    const retryDelayMs = ready
+                        ? Math.min(200 * sameSessionRetryCount, 750)
+                        : Math.min(300 * sameSessionRetryCount, ACP_SESSION_READY_WAIT_MS);
+                    if (retryDelayMs > 0) {
+                        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+                    }
+                    this.log('agent.runtime.prompt_send_same_session_retry', {
+                        workspaceId: session.workspaceId,
+                        sessionId: session.id,
+                        acpSessionId: currentAcpSessionId,
+                        task: taskPayload.task,
+                        kbAccessMode: provider.mode,
+                        agentModelId: this.getWorkspaceAgentModel(session.workspaceId) ?? 'default',
+                        promptLength: promptText.length,
+                        retryCount: sameSessionRetryCount,
+                        reason: response.error.message,
+                        becameReady: ready,
+                        retryDelayMs
+                    });
+                    this.pendingPromptFallbacks.set(session.id, { transport, acpSessionId: currentAcpSessionId });
+                    this.startPromptCompletionWatcher(session.id);
+                    response = await transport.request('session/prompt', requestPayload, timeoutMs, session.id);
+                    continue;
+                }
                 retryCount += 1;
                 this.log('agent.runtime.prompt_send_retry', {
                     workspaceId: session.workspaceId,
@@ -1773,11 +2341,11 @@ class CursorAcpRuntime {
             if (response.error) {
                 throw new Error(response.error.message);
             }
+            this.markAcpSessionReady(currentAcpSessionId);
             const result = response.result && typeof response.result === 'object'
                 ? { ...response.result }
                 : {};
             await this.trackSessionOperation(session.id, Promise.resolve(emit({ kind: 'result', data: response, message: 'Run complete' })));
-            await this.trackSessionOperation(session.id, (0, promises_1.appendFile)(transcriptPath, `${JSON.stringify({ atUtc: new Date().toISOString(), direction: 'to_agent', event: requestEnvelopeString, payload: requestEnvelopeString })}\n`, 'utf8'));
             return result;
         }
         finally {
@@ -1839,67 +2407,103 @@ class CursorAcpRuntime {
             return;
         }
         const localSessionId = sessionInfo.localSessionId;
-        const updateRecord = params.update && typeof params.update === 'object'
-            ? params.update
-            : undefined;
-        if (updateRecord?.sessionUpdate === 'agent_message_chunk') {
-            const text = extractAgentMessageChunkText(updateRecord.content);
-            if (text) {
-                const chunks = appendPromptMessageChunk(this.promptMessageChunks.get(localSessionId) ?? [], text);
-                this.promptMessageChunks.set(localSessionId, chunks);
-                this.schedulePromptCompletionFallback(localSessionId, params.sessionId);
-            }
-        }
-        this.markSessionActivity(localSessionId);
-        const payload = JSON.stringify(message.params);
-        if (!isHiddenAgentThoughtUpdate(message.params)) {
-            await this.trackSessionOperation(localSessionId, this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload));
-        }
-        // Audit and enforce CLI-mode tool calls from ACP session updates so they appear in tool call history
-        if (sessionInfo.mode === 'cli' && params.update?.toolCallId && params.update.title) {
-            const session = this.sessions.get(localSessionId);
-            if (session) {
-                const policy = this.evaluateCliToolPolicy(params.update.title, params.update.kind);
-                this.toolCallAudit.push({
-                    workspaceId: session.workspaceId,
-                    sessionId: localSessionId,
-                    toolName: params.update.title,
-                    args: params.update.rawInput ?? { kind: params.update.kind },
-                    calledAtUtc: new Date().toISOString(),
-                    allowed: policy.allowed,
-                    reason: policy.reason
-                });
-                if (!policy.allowed && typeof params.sessionId === 'string') {
-                    this.log('agent.runtime.cli_tool_policy_violation', {
-                        sessionId: localSessionId,
-                        acpSessionId: params.sessionId,
-                        toolName: params.update.title,
-                        kind: params.update.kind,
-                        reason: policy.reason
-                    });
-                    await this.trackSessionOperation(localSessionId, this.appendTranscriptLine(localSessionId, 'system', 'cli_tool_policy_violation', JSON.stringify({
-                        toolName: params.update.title,
-                        kind: params.update.kind,
-                        reason: policy.reason
-                    })));
-                    const workspaceId = this.sessions.get(localSessionId)?.workspaceId;
-                    this.getTransport('cli', workspaceId).abortPromptSession(params.sessionId, policy.reason);
+        this.markPromptTransportActivity(localSessionId);
+        this.markAcpSessionReady(params.sessionId);
+        await this.queueSessionOperation(localSessionId, async () => {
+            const promptState = this.activePromptStates.get(localSessionId);
+            const updateRecord = params.update && typeof params.update === 'object'
+                ? params.update
+                : undefined;
+            if (updateRecord?.sessionUpdate === 'agent_message_chunk') {
+                const text = extractAgentMessageChunkText(updateRecord.content);
+                if (text) {
+                    const chunks = appendPromptMessageChunk(this.promptMessageChunks.get(localSessionId), text);
+                    this.promptMessageChunks.set(localSessionId, chunks);
+                    if (promptState?.contract) {
+                        promptState.chunkCount += 1;
+                        this.maybeResolveStructuredPromptFromStream(localSessionId);
+                    }
+                    this.schedulePromptCompletionFallback(localSessionId, params.sessionId);
                 }
             }
-        }
-        await this.maybeAbortCliPlannerLoop(localSessionId, params.sessionId, updateRecord);
-        const emit = this.activeStreamEmitters.get(localSessionId);
-        if (!emit) {
-            return;
-        }
-        await this.trackSessionOperation(localSessionId, Promise.resolve(emit({
-            kind: 'progress',
-            data: message.params,
-            message: params.update?.sessionUpdate ? `session/update:${params.update.sessionUpdate}` : 'session/update'
-        })));
+            if (promptState && typeof params.update?.toolCallId === 'string') {
+                const toolCallId = params.update.toolCallId;
+                const normalizedStatus = typeof params.update.status === 'string' ? params.update.status.toLowerCase() : '';
+                if (params.update.sessionUpdate === 'tool_call') {
+                    promptState.activeToolCalls.add(toolCallId);
+                    promptState.toolCallCount += 1;
+                }
+                else if (params.update.sessionUpdate === 'tool_call_update'
+                    && (normalizedStatus === 'completed' || normalizedStatus === 'failed' || normalizedStatus === 'cancelled')) {
+                    promptState.activeToolCalls.delete(toolCallId);
+                }
+                if (promptState.contract === 'batch_planner'
+                    && promptState.toolCallCount > BATCH_PLANNER_MAX_TOOL_CALLS) {
+                    void this.stopActivePrompt(localSessionId, promptState.acpSessionId, promptState.transport, `Planner exceeded the tool-call budget (${promptState.toolCallCount} > ${BATCH_PLANNER_MAX_TOOL_CALLS}). Reuse the evidence already gathered and recover the plan from the current transcript.`);
+                }
+            }
+            this.markSessionActivity(localSessionId);
+            const payload = JSON.stringify(message.params);
+            if (!isHiddenAgentThoughtUpdate(message.params)) {
+                await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
+            }
+            // Audit and enforce CLI-mode tool calls from ACP session updates so they appear in tool call history
+            const cliAuditLabel = typeof params.update?.title === 'string' && params.update.title.trim()
+                ? params.update.title
+                : extractCliToolCommand(params.update?.rawInput);
+            if (sessionInfo.mode === 'cli' && params.update?.toolCallId && cliAuditLabel) {
+                const session = this.sessions.get(localSessionId);
+                const acpToolCallKey = `${params.sessionId ?? 'unknown'}:${params.update.toolCallId}`;
+                const recordedToolCallIds = this.auditedCliToolCallIds.get(localSessionId) ?? new Set();
+                if (session && !shouldDeferCliToolPolicyCheck(params.update) && !recordedToolCallIds.has(acpToolCallKey)) {
+                    recordedToolCallIds.add(acpToolCallKey);
+                    this.auditedCliToolCallIds.set(localSessionId, recordedToolCallIds);
+                    const policy = this.evaluateCliToolPolicy(cliAuditLabel, params.update.kind, params.update.rawInput);
+                    const auditedToolName = extractKbCliCommandName(cliAuditLabel)
+                        ?? extractKbCliCommandName(extractCliToolCommand(params.update.rawInput))
+                        ?? cliAuditLabel;
+                    this.toolCallAudit.push({
+                        workspaceId: session.workspaceId,
+                        sessionId: localSessionId,
+                        toolName: auditedToolName,
+                        args: params.update.rawInput ?? { kind: params.update.kind },
+                        calledAtUtc: new Date().toISOString(),
+                        allowed: policy.allowed,
+                        reason: policy.reason
+                    });
+                    if (!policy.allowed && typeof params.sessionId === 'string') {
+                        const violationReason = `CLI mode blocked illegal tool call "${auditedToolName}": ${policy.reason}`;
+                        this.log('agent.runtime.cli_tool_policy_violation', {
+                            sessionId: localSessionId,
+                            acpSessionId: params.sessionId,
+                            toolName: params.update.title,
+                            kind: params.update.kind,
+                            reason: violationReason
+                        });
+                        await this.appendTranscriptLine(localSessionId, 'system', 'cli_tool_policy_violation', JSON.stringify({
+                            toolName: cliAuditLabel,
+                            kind: params.update.kind,
+                            reason: violationReason
+                        }));
+                        const workspaceId = this.sessions.get(localSessionId)?.workspaceId;
+                        this.getTransport('cli', workspaceId).abortPromptSession(params.sessionId, violationReason);
+                    }
+                }
+            }
+            await this.maybeAbortCliPlannerLoop(localSessionId, params.sessionId, updateRecord);
+            const emit = this.activeStreamEmitters.get(localSessionId);
+            if (!emit) {
+                return;
+            }
+            await Promise.resolve(emit({
+                kind: 'progress',
+                data: message.params,
+                message: params.update?.sessionUpdate ? `session/update:${params.update.sessionUpdate}` : 'session/update'
+            }));
+        });
     }
     consumePromptMessageText(sessionId) {
-        const chunks = this.promptMessageChunks.get(sessionId) ?? [];
+        const chunks = this.promptMessageChunks.get(sessionId);
         this.promptMessageChunks.delete(sessionId);
         return assemblePromptMessageText(chunks);
     }
@@ -1908,14 +2512,24 @@ class CursorAcpRuntime {
             ? { ...result }
             : {};
         const assembledText = this.consumePromptMessageText(sessionId).trim();
+        const explicitText = extractPromptResultText(finalized)?.trim();
+        const canonicalText = selectCanonicalPromptResultText([
+            explicitText ?? '',
+            assembledText,
+            explicitText ? extractLargestBalancedJsonText(explicitText) ?? '' : '',
+            assembledText ? extractLargestBalancedJsonText(assembledText) ?? '' : ''
+        ]);
         if (assembledText) {
-            const explicitText = extractPromptResultText(finalized)?.trim();
-            if (!explicitText || (!looksLikeJsonObjectText(explicitText) && looksLikeJsonObjectText(assembledText))) {
-                finalized.text = assembledText;
-                finalized.content = [{ type: 'text', text: assembledText }];
-            }
-            else {
-                finalized.streamedText = assembledText;
+            finalized.streamedText = assembledText;
+        }
+        if (canonicalText) {
+            finalized.finalText = canonicalText;
+            if (!explicitText
+                || looksLikeBatchProgressText(explicitText)
+                || (!looksLikeJsonObjectText(explicitText) && looksLikeJsonObjectText(canonicalText))
+                || canonicalText.length > explicitText.length) {
+                finalized.text = canonicalText;
+                finalized.content = [{ type: 'text', text: canonicalText }];
             }
         }
         return finalized;
@@ -1925,6 +2539,9 @@ class CursorAcpRuntime {
         this.pendingPromptFallbacks.delete(sessionId);
         this.activeStreamEmitters.delete(sessionId);
         this.promptMessageChunks.delete(sessionId);
+        this.promptTransportActivityAt.delete(sessionId);
+        this.auditedCliToolCallIds.delete(sessionId);
+        this.activePromptStates.delete(sessionId);
         this.cliPlannerLoopState.delete(sessionId);
     }
     clearPromptCompletionTimer(sessionId) {
@@ -1942,11 +2559,18 @@ class CursorAcpRuntime {
                 this.clearPromptCompletionTimer(localSessionId);
                 return;
             }
-            const normalizedAssembledText = assemblePromptMessageText(this.promptMessageChunks.get(localSessionId) ?? []).trim();
+            const normalizedAssembledText = assemblePromptMessageText(this.promptMessageChunks.get(localSessionId)).trim();
             if (!normalizedAssembledText) {
                 return;
             }
-            const lastActivityAt = this.sessionActivityAt.get(localSessionId) ?? Date.now();
+            const promptState = this.activePromptStates.get(localSessionId);
+            if (promptState?.contract) {
+                this.maybeResolveStructuredPromptFromStream(localSessionId);
+                return;
+            }
+            const lastActivityAt = this.promptTransportActivityAt.get(localSessionId)
+                ?? this.sessionActivityAt.get(localSessionId)
+                ?? Date.now();
             if (Date.now() - lastActivityAt < 900) {
                 return;
             }
@@ -1981,12 +2605,14 @@ class CursorAcpRuntime {
         await (0, promises_1.mkdir)(transcriptDir, { recursive: true });
         const filePath = node_path_1.default.join(transcriptDir, `${runId}.jsonl`);
         this.transcripts.set(sessionId, filePath);
-        await (0, promises_1.appendFile)(filePath, `${JSON.stringify({ atUtc: new Date().toISOString(), direction: 'system', event: 'transcript_start', payload: runId })}\n`, 'utf8');
+        this.transcriptLineSequences.set(sessionId, 0);
+        await (0, promises_1.appendFile)(filePath, `${JSON.stringify({ atUtc: new Date().toISOString(), seq: 0, direction: 'system', event: 'transcript_start', payload: runId })}\n`, 'utf8');
         this.markSessionActivity(sessionId);
         return filePath;
     }
     resolveBinary(mode) {
-        return mode === 'cli' ? this.config.cliBinary : this.config.mcpBinary;
+        const cursorBinary = node_process_1.default.env[KBV_CURSOR_BINARY_ENV]?.trim() || resolveDefaultCursorBinary();
+        return cursorBinary || (mode === 'cli' ? this.config.cliBinary : this.config.mcpBinary);
     }
     isCursorAvailable(mode) {
         const checkPaths = [this.resolveBinary(mode), 'cursor', 'cursor.exe'];
@@ -2059,9 +2685,29 @@ class CursorAcpRuntime {
         this.transports.set(transportKey, transport);
         return transport;
     }
-    evaluateCliToolPolicy(toolName, kind) {
+    evaluateCliToolPolicy(toolName, kind, rawInput) {
         const normalizedToolName = toolName.trim().toLowerCase();
         const normalizedKind = kind?.trim().toLowerCase() ?? 'unknown';
+        const command = extractCliToolCommand(rawInput);
+        const commandLikeKbInvocation = looksLikeKbCliShellInvocation(toolName) || looksLikeKbCliShellInvocation(command);
+        const kbCommandName = extractKbCliCommandName(toolName) ?? extractKbCliCommandName(command);
+        if (commandLikeKbInvocation) {
+            return {
+                allowed: true,
+                reason: kbCommandName
+                    ? `CLI mode allows shell transport for kb command "${kbCommandName}"`
+                    : 'CLI mode allows shell transport for kb commands'
+            };
+        }
+        if (normalizedToolName === 'terminal'
+            || normalizedToolName === 'shell'
+            || normalizedKind === 'terminal'
+            || normalizedKind === 'shell') {
+            return {
+                allowed: false,
+                reason: 'CLI mode forbids terminal usage outside of running kb commands'
+            };
+        }
         if (normalizedToolName === 'read file') {
             return {
                 allowed: false,
@@ -2125,17 +2771,56 @@ class CursorAcpRuntime {
         const state = this.cliPlannerLoopState.get(localSessionId) ?? {
             searchKbCalls: 0,
             consecutiveZeroResultSearches: 0,
+            zeroResultQueries: new Set(),
+            duplicateZeroResultQueries: 0,
             aborted: false
         };
         state.searchKbCalls += 1;
+        const query = normalizePlannerSearchQuery(extractSearchKbQueryFromCliCommand(extractCliToolCommand(updateRecord.rawInput)));
         if ((parsed.total ?? 0) === 0) {
             state.consecutiveZeroResultSearches += 1;
+            if (query) {
+                if (state.zeroResultQueries.has(query)) {
+                    state.duplicateZeroResultQueries += 1;
+                }
+                else {
+                    state.zeroResultQueries.add(query);
+                }
+            }
         }
         else {
             state.consecutiveZeroResultSearches = 0;
         }
         this.cliPlannerLoopState.set(localSessionId, state);
-        if (state.aborted || state.consecutiveZeroResultSearches < CLI_PLANNER_ZERO_RESULT_SEARCH_LIMIT) {
+        if (state.aborted) {
+            return;
+        }
+        if (query && state.duplicateZeroResultQueries > 0) {
+            state.aborted = true;
+            const reason = `Planner duplicate zero-result search suppressed for query "${query}" after ${state.searchKbCalls} search-kb calls`;
+            this.log('agent.runtime.cli_planner_duplicate_zero_result_search', {
+                sessionId: localSessionId,
+                acpSessionId,
+                query,
+                searchKbCalls: state.searchKbCalls,
+                duplicateZeroResultQueries: state.duplicateZeroResultQueries
+            });
+            await this.trackSessionOperation(localSessionId, this.appendTranscriptLine(localSessionId, 'system', 'planner_duplicate_zero_result_search', JSON.stringify({
+                reason,
+                query,
+                searchKbCalls: state.searchKbCalls,
+                duplicateZeroResultQueries: state.duplicateZeroResultQueries
+            })));
+            this.getTransport('cli', session.workspaceId).abortPromptSession(acpSessionId, `${reason}. Reuse deterministic prefetch or the earlier zero-result evidence and return the current plan as JSON.`);
+            return;
+        }
+        if (state.consecutiveZeroResultSearches < CLI_PLANNER_ZERO_RESULT_SEARCH_LIMIT) {
+            return;
+        }
+        const distinctZeroResultQueries = state.zeroResultQueries.size;
+        const lowDiversityZeroResultLoop = distinctZeroResultQueries === 0
+            || distinctZeroResultQueries <= CLI_PLANNER_LOW_DIVERSITY_ZERO_RESULT_QUERY_LIMIT;
+        if (!lowDiversityZeroResultLoop) {
             return;
         }
         state.aborted = true;
@@ -2144,14 +2829,17 @@ class CursorAcpRuntime {
             sessionId: localSessionId,
             acpSessionId,
             searchKbCalls: state.searchKbCalls,
-            consecutiveZeroResultSearches: state.consecutiveZeroResultSearches
+            consecutiveZeroResultSearches: state.consecutiveZeroResultSearches,
+            duplicateZeroResultQueries: state.duplicateZeroResultQueries
         });
         await this.trackSessionOperation(localSessionId, this.appendTranscriptLine(localSessionId, 'system', 'planner_loop_breaker', JSON.stringify({
             reason,
             searchKbCalls: state.searchKbCalls,
-            consecutiveZeroResultSearches: state.consecutiveZeroResultSearches
+            consecutiveZeroResultSearches: state.consecutiveZeroResultSearches,
+            duplicateZeroResultQueries: state.duplicateZeroResultQueries,
+            distinctZeroResultQueries
         })));
-        this.getTransport('cli', session.workspaceId).abortPromptSession(acpSessionId, reason);
+        this.getTransport('cli', session.workspaceId).abortPromptSession(acpSessionId, `${reason}. Reuse deterministic prefetch or the earlier zero-result evidence and return the current plan as JSON.`);
     }
     resolveMcpServerConfigs() {
         if (this.runtimeMcpServers.length > 0) {
@@ -2167,7 +2855,7 @@ class CursorAcpRuntime {
             return {
                 mode: 'cli',
                 provider: 'cli',
-                terminalEnabled: true,
+                terminalEnabled: false,
                 buildSessionCreateParams: (sessionMode) => ({
                     cwd: this.config.acpCwd,
                     mcpServers: [],
@@ -2224,7 +2912,7 @@ class CursorAcpRuntime {
             provider: 'mcp',
             ok,
             acpReachable,
-            binaryPath: cursorInstalled ? this.config.mcpBinary : undefined,
+            binaryPath: cursorInstalled ? this.resolveBinary('mcp') : undefined,
             message: ok ? 'MCP access ready' : issues[0] ?? 'MCP access unavailable',
             issues
         };
@@ -2310,6 +2998,7 @@ class CursorAcpRuntime {
         this.pendingPromptFallbacks.delete(sessionId);
         this.cursorSessionIds.delete(sessionId);
         this.cursorSessionLookup.delete(existing.acpSessionId);
+        this.clearAcpSessionState(existing.acpSessionId);
         const session = this.sessions.get(sessionId);
         if (!session) {
             return;
@@ -2319,6 +3008,7 @@ class CursorAcpRuntime {
         if (!transport) {
             return;
         }
+        transport.abortPromptSession(existing.acpSessionId, 'Local KB Vault runtime reset this ACP session because it is no longer the active session.');
         try {
             await transport.request('session/close', { sessionId: existing.acpSessionId }, Math.min(this.config.requestTimeoutMs, 10_000), sessionId);
         }
@@ -2332,8 +3022,11 @@ class CursorAcpRuntime {
             return;
         }
         this.markSessionActivity(sessionId);
+        const nextSeq = (this.transcriptLineSequences.get(sessionId) ?? 0) + 1;
+        this.transcriptLineSequences.set(sessionId, nextSeq);
         await (0, promises_1.appendFile)(path, `${JSON.stringify({
             atUtc: new Date().toISOString(),
+            seq: nextSeq,
             direction,
             event,
             payload
@@ -2614,57 +3307,211 @@ function extractAgentMessageChunkText(value) {
         ? content.text
         : undefined;
 }
-function collapseRepeatedChunkText(value) {
-    let current = value;
-    while (current.trim().length >= 64 && current.length % 2 === 0) {
-        const midpoint = current.length / 2;
-        const left = current.slice(0, midpoint);
-        const right = current.slice(midpoint);
-        if (!left.trim() || left !== right) {
-            break;
-        }
-        current = left;
-    }
-    return current.trim();
+function createPromptMessageBuffer() {
+    return {
+        rawChunks: [],
+        mergedText: ''
+    };
 }
-function findChunkOverlap(left, right) {
+function findSharedPrefixLength(left, right) {
+    const max = Math.min(left.length, right.length);
+    let index = 0;
+    while (index < max && left[index] === right[index]) {
+        index += 1;
+    }
+    return index;
+}
+function findStreamingOverlap(left, right) {
     const maxOverlap = Math.min(left.length, right.length);
-    for (let overlap = maxOverlap; overlap >= 24; overlap -= 1) {
+    for (let overlap = maxOverlap; overlap >= 12; overlap -= 1) {
         if (left.slice(-overlap) === right.slice(0, overlap)) {
             return overlap;
         }
     }
     return 0;
 }
-function appendPromptMessageChunk(chunks, text) {
+function mergeStreamingText(current, incoming) {
+    if (!incoming && incoming !== '') {
+        return current;
+    }
+    if (!current) {
+        return incoming;
+    }
+    if (current === incoming || current.endsWith(incoming)) {
+        return current;
+    }
+    if (incoming.endsWith(current) || incoming.startsWith(current)) {
+        return incoming;
+    }
+    const sharedPrefix = findSharedPrefixLength(current, incoming);
+    if (sharedPrefix >= 12
+        && sharedPrefix >= Math.floor(Math.min(current.length, incoming.length) * 0.6)) {
+        return incoming.length >= current.length ? incoming : current;
+    }
+    const overlap = findStreamingOverlap(current, incoming);
+    if (overlap > 0) {
+        return `${current}${incoming.slice(overlap)}`;
+    }
+    return `${current}${incoming}`;
+}
+function collapseRepeatedChunkText(value) {
+    return value;
+}
+function appendPromptMessageChunk(buffer, text) {
+    const next = buffer ?? createPromptMessageBuffer();
     if (!text && text !== '') {
-        return chunks;
+        return next;
     }
     if (!text.trim() && !/[\r\n]/.test(text)) {
-        return chunks;
+        return next;
     }
-    const assembled = chunks.join('');
-    if (!assembled) {
-        chunks.push(text);
-        return chunks;
-    }
-    if (assembled.endsWith(text)) {
-        return chunks;
-    }
-    const overlap = findChunkOverlap(assembled, text);
-    const suffix = overlap > 0 ? text.slice(overlap) : text;
-    if (suffix) {
-        chunks.push(suffix);
-    }
-    return chunks;
+    next.rawChunks.push(text);
+    next.mergedText = mergeStreamingText(next.mergedText, text);
+    return next;
 }
-function assemblePromptMessageText(chunks) {
-    return collapseRepeatedChunkText(chunks.join(''));
+function scorePromptMessageCandidate(value) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return Number.NEGATIVE_INFINITY;
+    }
+    let score = trimmed.length;
+    if (looksLikeJsonObjectText(trimmed)) {
+        score += 10_000;
+    }
+    return score;
+}
+function assemblePromptMessageText(buffer) {
+    if (!buffer) {
+        return '';
+    }
+    const rawText = collapseRepeatedChunkText(buffer.rawChunks.join(''));
+    const mergedText = collapseRepeatedChunkText(buffer.mergedText);
+    const candidates = Array.from(new Set([rawText, mergedText].map((value) => value.trim()).filter(Boolean)));
+    if (candidates.length === 0) {
+        return '';
+    }
+    return candidates.sort((left, right) => scorePromptMessageCandidate(right) - scorePromptMessageCandidate(left))[0] ?? '';
+}
+function streamedTextLikelyStartsJsonObject(value) {
+    const trimmed = value.trimStart();
+    return trimmed.startsWith('{');
+}
+function extractLargestBalancedJsonObject(value) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return null;
+    }
+    const candidates = [trimmed];
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < trimmed.length; index += 1) {
+        const char = trimmed[index];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            }
+            else if (char === '\\') {
+                escaped = true;
+            }
+            else if (char === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (char === '"') {
+            inString = true;
+            continue;
+        }
+        if (char === '{') {
+            if (depth === 0) {
+                start = index;
+            }
+            depth += 1;
+            continue;
+        }
+        if (char === '}' && depth > 0) {
+            depth -= 1;
+            if (depth === 0 && start >= 0) {
+                candidates.push(trimmed.slice(start, index + 1));
+            }
+        }
+    }
+    let best = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                continue;
+            }
+            const record = parsed;
+            let score = candidate.length;
+            if (typeof record.summary === 'string') {
+                score += 200;
+            }
+            if (Array.isArray(record.coverage)) {
+                score += 300;
+            }
+            if (Array.isArray(record.items)) {
+                score += 300;
+            }
+            if (score > bestScore) {
+                best = record;
+                bestScore = score;
+            }
+        }
+        catch {
+            // ignore malformed candidates
+        }
+    }
+    return best;
+}
+function extractLargestBalancedJsonText(value) {
+    const parsed = extractLargestBalancedJsonObject(value);
+    return parsed ? JSON.stringify(parsed) : undefined;
+}
+function scorePromptFinalTextCandidate(value) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return Number.NEGATIVE_INFINITY;
+    }
+    let score = scorePromptMessageCandidate(trimmed);
+    if (looksLikeAssistantProgressText(trimmed) && !looksLikeJsonObjectText(trimmed)) {
+        score -= 5_000;
+    }
+    if (extractLargestBalancedJsonText(trimmed)) {
+        score += 2_000;
+    }
+    return score;
+}
+function selectCanonicalPromptResultText(candidates) {
+    const unique = Array.from(new Set(candidates.map((value) => value.trim()).filter(Boolean)));
+    if (unique.length === 0) {
+        return undefined;
+    }
+    return unique.sort((left, right) => scorePromptFinalTextCandidate(right) - scorePromptFinalTextCandidate(left))[0];
+}
+function promptStreamMatchesContract(value, contract) {
+    const parsed = extractLargestBalancedJsonObject(value);
+    if (!parsed) {
+        return false;
+    }
+    if (contract === 'batch_planner') {
+        return typeof parsed.summary === 'string' && Array.isArray(parsed.coverage) && Array.isArray(parsed.items);
+    }
+    return false;
 }
 const DEFAULT_PROMPT_SETTLE_WINDOW = {
     idleMs: 350,
     minWaitMs: 0,
     maxWaitMs: 5_000
+};
+const BATCH_PROGRESS_PROMPT_SETTLE_WINDOW = {
+    idleMs: 1_000,
+    minWaitMs: 5_000,
+    maxWaitMs: 45_000
 };
 const NON_JSON_PROMPT_SETTLE_WINDOW = {
     idleMs: 2_500,
@@ -2673,28 +3520,69 @@ const NON_JSON_PROMPT_SETTLE_WINDOW = {
 };
 const ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW = {
     idleMs: 1_000,
-    minWaitMs: 0,
-    maxWaitMs: 8_000
+    minWaitMs: 2_000,
+    maxWaitMs: 15_000
 };
-const ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT = 2;
+const ASSISTANT_CHAT_RECOVERY_RETRY_LIMIT = 2;
+const ASSISTANT_CHAT_CONTINUATION_MARKER = 'Continuation instructions:';
 const ASSISTANT_CHAT_CONTINUE_PROMPT = [
-    'Continue the same user request using the existing session context.',
-    'If research is needed, do it now and then provide the final user-facing answer in this same turn.',
-    'Do not send another progress update, status note, or "I am going to..." message.',
-    'Return the final answer only.'
+    'Complete the same user request using the existing session context.',
+    'Return the final user-facing answer now.',
+    'Do not send a progress update.',
+    'Use only kb commands if one final targeted lookup is still truly required.'
 ].join(' ');
-const ASSISTANT_CHAT_KB_ONLY_RECOVERY_PROMPT = [
-    'Continue the same user request using the existing session context.',
-    'Use only kb commands for research. Do not use terminal utilities, grep, Read File, codebase search, or filesystem exploration.',
-    'Allowed kb commands include: kb batch-context --json, kb find-related-articles --json, kb search-kb --json, kb get-article --json, kb get-article-family --json, kb app get-form-schema --json, kb app patch-form --json, and kb help --json.',
-    'Do the research now and return the final user-facing answer in this same turn.',
-    'Do not send a progress update.'
-].join(' ');
+function buildAssistantChatKbOnlyRecoveryPrompt(policyError) {
+    const violationText = policyError?.trim()
+        ? `The previous attempt was interrupted because you attempted an illegal operation in CLI mode: ${policyError.trim()}.`
+        : 'The previous attempt was interrupted because you attempted an illegal operation in CLI mode.';
+    return [
+        'Continue the same user request using the existing session context.',
+        violationText,
+        'Do not try that illegal operation again.',
+        'The only forbidden action is the illegal Shell or Terminal style operation that triggered the interruption.',
+        'You may still use fresh direct KB tools or exact kb CLI commands in this recovered turn if you do not yet have enough KB context to answer.',
+        'If you already gathered KB context in this session, use it and answer now. If you do not yet have enough context, run the minimum direct KB lookup now and then answer.',
+        'Do not claim that KB commands are forbidden in this turn unless a direct KB command actually failed.',
+        'Use only kb commands for research. Do not use terminal utilities, grep, Read File, codebase search, or filesystem exploration.',
+        'Do not use Shell or Terminal again in this turn except for exact kb CLI commands.',
+        'Your job is to finish answering the user\'s question, not to explore the environment.',
+        'For app-feature and terminology questions, prefer the direct KB tools or this path unless the route clearly requires something else: search-kb, then get-article for the best 1-3 results, then answer.',
+        'Use kb get-article-family only when you need family context from a clearly relevant article.',
+        'Do not use kb batch-context, kb find-related-articles, form-editing commands, or kb help unless they are clearly necessary for this specific request.',
+        'Do the research now and return the final user-facing answer in this same turn.',
+        'Do not send a progress update.'
+    ].join(' ');
+}
+function stripAssistantChatContinuation(promptText) {
+    const trimmed = promptText?.trim() ?? '';
+    if (!trimmed) {
+        return '';
+    }
+    const markerIndex = trimmed.indexOf(ASSISTANT_CHAT_CONTINUATION_MARKER);
+    if (markerIndex < 0) {
+        return trimmed;
+    }
+    return trimmed.slice(0, markerIndex).trim();
+}
+function buildAssistantChatContinuationPrompt(basePromptText, continuationText) {
+    const basePrompt = stripAssistantChatContinuation(basePromptText);
+    if (!basePrompt) {
+        return continuationText;
+    }
+    return [
+        basePrompt,
+        ASSISTANT_CHAT_CONTINUATION_MARKER,
+        continuationText
+    ].join('\n\n');
+}
 function extractPromptResultText(value) {
     if (!value || typeof value !== 'object') {
         return undefined;
     }
     const record = value;
+    if (typeof record.finalText === 'string' && record.finalText.trim()) {
+        return record.finalText;
+    }
     if (typeof record.text === 'string' && record.text.trim()) {
         return record.text;
     }
@@ -2709,38 +3597,6 @@ function extractPromptResultText(value) {
         }
     }
     return undefined;
-}
-function looksLikeAssistantProgressText(value) {
-    const normalized = value?.trim().toLowerCase();
-    if (!normalized) {
-        return false;
-    }
-    if (looksLikeJsonObjectText(normalized)) {
-        return false;
-    }
-    const progressPhrases = [
-        "i'm going to",
-        'i am going to',
-        "i’ll look",
-        'i will look',
-        'let me look',
-        "i'm looking up",
-        'i am looking up',
-        "i'm opening",
-        'i am opening',
-        'opening those now',
-        'opening that now',
-        'so i can answer',
-        'so i can explain',
-        'instead of guessing',
-        'rather than guess',
-        'i found the likely source',
-        'i found the likely source articles',
-        "i'm going to look up",
-        'continue the same task',
-        'i can try to pull'
-    ];
-    return progressPhrases.some((phrase) => normalized.includes(phrase));
 }
 function looksLikeJsonObjectText(value) {
     const trimmed = value.trim();
@@ -2770,6 +3626,32 @@ function getPromptSettleWindow(result, streamedText) {
         return DEFAULT_PROMPT_SETTLE_WINDOW;
     }
     return NON_JSON_PROMPT_SETTLE_WINDOW;
+}
+function getBatchAnalysisPromptSettleWindow(result, streamedText) {
+    const explicitText = extractPromptResultText(result);
+    if ((explicitText && looksLikeJsonObjectText(explicitText)) || (streamedText && looksLikeJsonObjectText(streamedText))) {
+        return DEFAULT_PROMPT_SETTLE_WINDOW;
+    }
+    if (explicitText?.trim() || streamedText?.trim() || looksLikeBatchProgressText(explicitText) || looksLikeBatchProgressText(streamedText)) {
+        return BATCH_PROGRESS_PROMPT_SETTLE_WINDOW;
+    }
+    return DEFAULT_PROMPT_SETTLE_WINDOW;
+}
+function sortTranscriptLines(lines) {
+    return lines
+        .map((line, index) => ({ line, index }))
+        .sort((left, right) => {
+        const leftSeq = typeof left.line.seq === 'number' ? left.line.seq : Number.POSITIVE_INFINITY;
+        const rightSeq = typeof right.line.seq === 'number' ? right.line.seq : Number.POSITIVE_INFINITY;
+        if (leftSeq !== rightSeq) {
+            return leftSeq - rightSeq;
+        }
+        if (left.line.atUtc !== right.line.atUtc) {
+            return left.line.atUtc.localeCompare(right.line.atUtc);
+        }
+        return left.index - right.index;
+    })
+        .map((entry) => entry.line);
 }
 class AgentRuntimeService {
     runtime;

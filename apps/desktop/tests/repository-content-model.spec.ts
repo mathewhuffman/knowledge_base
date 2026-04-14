@@ -446,6 +446,125 @@ test.describe('workspace repository content model', () => {
     expect(eventStream.events.some((event) => event.eventType === 'iteration_completed')).toBeTruthy();
   });
 
+  test('preserves latest approved plan when a newer revision draft exists and returns plans newest-first', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchPlanSnapshot-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 89',
+      'imports/sprint-89.csv',
+      'imports/sprint-89.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const iteration = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'plan_revision',
+      role: 'planner',
+      status: 'running',
+      summary: 'Revising the plan after review feedback.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session'
+    });
+
+    const approvedPlanId = randomUUID();
+    await repository.recordBatchAnalysisPlan({
+      id: approvedPlanId,
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'planning',
+      role: 'planner',
+      verdict: 'approved',
+      planVersion: 1,
+      summary: 'Approved plan with one edit.',
+      coverage: [
+        {
+          pbiId: 'pbi-89',
+          outcome: 'covered',
+          planItemIds: ['plan-item-1']
+        }
+      ],
+      items: [
+        {
+          planItemId: 'plan-item-1',
+          pbiIds: ['pbi-89'],
+          action: 'edit',
+          targetType: 'article',
+          targetTitle: 'Existing article',
+          reason: 'Initial approved edit.',
+          evidence: [],
+          confidence: 0.9,
+          executionStatus: 'approved'
+        }
+      ],
+      openQuestions: [],
+      createdAtUtc: new Date(Date.now() - 10_000).toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session'
+    });
+
+    const revisedDraftPlanId = randomUUID();
+    await repository.recordBatchAnalysisPlan({
+      id: revisedDraftPlanId,
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'plan_revision',
+      role: 'planner',
+      verdict: 'draft',
+      planVersion: 2,
+      summary: 'Revised draft adds a create.',
+      coverage: [
+        {
+          pbiId: 'pbi-89',
+          outcome: 'covered',
+          planItemIds: ['plan-item-2']
+        }
+      ],
+      items: [
+        {
+          planItemId: 'plan-item-2',
+          pbiIds: ['pbi-89'],
+          action: 'create',
+          targetType: 'article',
+          targetTitle: 'New article',
+          reason: 'Revision draft expands the scope.',
+          evidence: [],
+          confidence: 0.88,
+          executionStatus: 'pending'
+        }
+      ],
+      openQuestions: [],
+      createdAtUtc: new Date().toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session'
+    });
+
+    const snapshot = await repository.getBatchAnalysisSnapshot(created.id, batch.id);
+    expect(snapshot.latestApprovedPlan?.id).toBe(approvedPlanId);
+
+    const inspection = await repository.getBatchAnalysisInspection(created.id, batch.id);
+    expect(inspection.plans.map((plan) => plan.id)).toEqual([revisedDraftPlanId, approvedPlanId]);
+    expect(inspection.supersededPlans.map((plan) => plan.id)).toEqual([approvedPlanId]);
+  });
+
   test('humanizes collapsed planner text when parsing plan results', async () => {
     const iteration = {
       id: randomUUID(),
@@ -678,10 +797,15 @@ test.describe('workspace repository content model', () => {
       sessionId: 'review-session'
     });
 
-    await repository.recordBatchAnalysisRun({
+    await repository.recordBatchAnalysisStageRun({
       workspaceId: created.id,
       batchId: batch.id,
-      sessionId: 'worker-session',
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'building',
+      role: 'worker',
+      localSessionId: 'worker-session',
+      acpSessionId: 'worker-acp-session',
       kbAccessMode: 'mcp',
       agentModelId: 'gpt-5.4',
       status: 'complete',
@@ -775,6 +899,7 @@ test.describe('workspace repository content model', () => {
     const inspection = await repository.getBatchAnalysisInspection(created.id, batch.id);
     expect(inspection.snapshot.latestApprovedPlan?.id).toBe(revisedPlanId);
     expect(inspection.plans).toHaveLength(2);
+    expect(inspection.stageRuns.length).toBeGreaterThanOrEqual(1);
     expect(inspection.supersededPlans.map((plan) => plan.id)).toContain(initialPlanId);
     expect(inspection.reviewDeltas).toHaveLength(1);
     expect(inspection.reviewDeltas[0]?.delta.additionalArticleWork).toContain('Escalation article');
@@ -1611,6 +1736,7 @@ test.describe('workspace repository content model', () => {
     const health = await repository.getMigrationHealth(created.id);
     expect(health.workspaces).toHaveLength(1);
     expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledLegacyIterations).toBeGreaterThan(0);
+    expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledLegacyStageRuns).toBeGreaterThan(0);
     expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledLegacyWorkerReports).toBeGreaterThan(0);
     expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledStageEvents).toBeGreaterThan(0);
 
@@ -1625,5 +1751,121 @@ test.describe('workspace repository content model', () => {
     const eventStream = await repository.getBatchAnalysisEventStream(created.id, batch.id, 10);
     expect(eventStream.events.some((event) => event.eventType === 'iteration_started')).toBeTruthy();
     expect(eventStream.events.some((event) => event.eventType === 'iteration_completed')).toBeTruthy();
+  });
+
+  test('does not synthesize a worker report for planner-only failures during repair', async () => {
+    const created = await repository.createWorkspace({
+      name: `PlannerOnlyRepair-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Planner Failure Sprint',
+      'planner-failure.csv',
+      'imports/planner-failure.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'planning',
+      role: 'planner',
+      status: 'failed',
+      summary: 'Planner failed before producing a plan.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-failure-session',
+      startedAtUtc: new Date().toISOString(),
+      endedAtUtc: new Date().toISOString()
+    });
+
+    await repository.recordBatchAnalysisRun({
+      workspaceId: created.id,
+      batchId: batch.id,
+      sessionId: 'planner-failure-session',
+      kbAccessMode: 'mcp',
+      agentModelId: 'gpt-5.4',
+      status: 'failed',
+      startedAtUtc: new Date().toISOString(),
+      endedAtUtc: new Date().toISOString(),
+      transcriptPath: 'transcripts/planner-failure.jsonl',
+      toolCalls: [],
+      rawOutput: ['planner failed'],
+      message: '[planning/planner] Planner failed before producing a plan.'
+    });
+
+    const health = await repository.getMigrationHealth(created.id);
+    expect(health.workspaces[0]?.batchAnalysisRepair?.backfilledLegacyWorkerReports).toBe(0);
+
+    const snapshot = await repository.getBatchAnalysisSnapshot(created.id, batch.id);
+    expect(snapshot.latestIteration?.stage).toBe('planning');
+    expect(snapshot.latestWorkerReport).toBeNull();
+
+    const inspection = await repository.getBatchAnalysisInspection(created.id, batch.id);
+    expect(inspection.workerReports).toHaveLength(0);
+    expect(inspection.stageRuns.some((run) => run.stage === 'planning' && run.role === 'planner')).toBeTruthy();
+  });
+
+  test('latest persisted batch run can reflect planner tool usage even when no worker run exists yet', async () => {
+    const created = await repository.createWorkspace({
+      name: `PlannerRunAudit-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Planner Audit Sprint',
+      'planner-audit.csv',
+      'imports/planner-audit.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.recordBatchAnalysisRun({
+      workspaceId: created.id,
+      batchId: batch.id,
+      sessionId: 'planner-stage-session',
+      kbAccessMode: 'cli',
+      agentModelId: 'gpt-5.4',
+      status: 'failed',
+      startedAtUtc: new Date().toISOString(),
+      endedAtUtc: new Date().toISOString(),
+      transcriptPath: 'transcripts/planner-stage-session.jsonl',
+      toolCalls: [{
+        workspaceId: created.id,
+        sessionId: 'planner-stage-session',
+        toolName: 'search-kb',
+        args: { query: 'View Food Lists' },
+        calledAtUtc: new Date().toISOString(),
+        allowed: true
+      }],
+      rawOutput: ['planner incomplete'],
+      message: '[planning/planner] Planner returned incomplete output.'
+    });
+
+    const latestRun = await repository.getLatestBatchAnalysisRun(created.id, batch.id);
+    expect(latestRun).not.toBeNull();
+    expect(latestRun?.toolCalls).toHaveLength(1);
+    expect(latestRun?.toolCalls[0]?.toolName).toBe('search-kb');
   });
 });

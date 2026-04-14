@@ -30,8 +30,8 @@ function artifactTypeLabel(type: BatchAnalysisTimelineEntry['artifactType']): st
       return 'Amendment';
     case 'final_review':
       return 'Final Review';
-    case 'run':
-      return 'Run';
+    case 'stage_run':
+      return 'Stage Run';
     default:
       return type;
   }
@@ -121,6 +121,15 @@ export function TimelineView({ entries, stageEvents = [] }: TimelineViewProps) {
                   <div className="ba-detail-card-meta">
                     <Badge variant="neutral">{getVisibleStageLabel(event.stage) ?? STAGE_LABELS[event.stage]}</Badge>
                     <Badge variant="neutral">{ROLE_LABELS[event.role]}</Badge>
+                    {typeof event.details?.toolCallCount === 'number' && (
+                      <Badge variant="neutral">{event.details.toolCallCount} tools</Badge>
+                    )}
+                    {typeof event.details?.durationMs === 'number' && (
+                      <Badge variant="neutral">{Math.round(event.details.durationMs / 1000)}s</Badge>
+                    )}
+                    {typeof event.details?.attempt === 'number' && (
+                      <Badge variant="neutral">attempt {event.details.attempt}</Badge>
+                    )}
                     {event.lastReviewVerdict && (
                       <Badge variant={verdictBadgeVariant(event.lastReviewVerdict)}>
                         {event.lastReviewVerdict}

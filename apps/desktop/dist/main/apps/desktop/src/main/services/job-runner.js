@@ -94,7 +94,15 @@ class JobRegistry {
         return { jobId: id, state: finished.state };
     }
     emit(event) {
-        this.emitter.emit('job-event', event);
+        const previous = this.state.get(event.id);
+        const next = {
+            ...(previous ?? {}),
+            ...event,
+            startedAt: event.startedAt ?? previous?.startedAt,
+            endedAt: event.endedAt ?? previous?.endedAt
+        };
+        this.state.set(event.id, next);
+        this.emitter.emit('job-event', next);
     }
     list() {
         return Array.from(this.state.values());

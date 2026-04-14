@@ -12,6 +12,7 @@ import {
   type AiAssistantArtifactDecisionRequest,
   type AiAssistantArtifactDecisionResponse,
   type AiAssistantContextGetRequest,
+  type AiAssistantMessageAuditMetadata,
   type AiAssistantMessageSendRequest,
   type AiAssistantSessionCreateRequest,
   type AiAssistantSessionDeleteRequest,
@@ -21,6 +22,9 @@ import {
   type AiAssistantSessionListResponse,
   type AiAssistantSessionOpenRequest,
   type AiAssistantSessionResetRequest,
+  type AiAssistantTurnCompletionState,
+  type AiAssistantStreamEvent,
+  type AiAssistantToolAuditRecord,
   type AiAssistantTurnResponse,
   type AiAssistantUiAction,
   type AiMessageKind,
@@ -31,6 +35,7 @@ import {
   type AiSessionLifecycleStatus,
   type AiSessionStatus,
   type AiViewContext,
+  type AgentStreamingPayload,
   type DraftPatchPayload,
   type ProposalCandidatePayload,
   type ProposalLineEditOperation,
@@ -45,6 +50,19 @@ import { AppWorkingStateService } from './app-working-state-service';
 
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
 const ASSISTANT_BATCH_NAME = 'AI Assistant Proposals';
+const ASSISTANT_CHAT_RUNTIME_RETRY_LIMIT = 1;
+const ASSISTANT_CHAT_COMPLETION_RETRY_LIMIT = 1;
+const ASSISTANT_CHAT_TRANSCRIPT_IDLE_MS = 1_500;
+const ASSISTANT_CHAT_TRANSCRIPT_MAX_WAIT_MS = 5_000;
+const ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_IDLE_MS = 2_500;
+const ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_MAX_WAIT_MS = 60_000;
+const ASSISTANT_CHAT_TRANSCRIPT_POLL_MS = 250;
+const ASSISTANT_CHAT_COMPLETION_FOLLOWUP_PROMPT = [
+  'Complete the same user request using the research already gathered in this session.',
+  'Return the final user-facing answer now.',
+  'Do not send a progress update.',
+  'Use only kb commands if one final targeted lookup is still truly required.'
+].join(' ');
 
 interface AiSessionRow {
   id: string;
@@ -103,14 +121,30 @@ type RuntimeResultPayload = {
   html?: string;
   formPatch?: TemplatePatchPayload;
   payload?: Record<string, unknown>;
+  completionState?: AiAssistantTurnCompletionState;
+  isFinal?: boolean;
 };
+
+interface AssistantTranscriptInspection {
+  preferredText?: string;
+  sawToolCalls: boolean;
+  hasPostToolAnswer: boolean;
+}
+
+interface AssistantTurnAudit {
+  thoughtText: string;
+  toolEvents: AiAssistantToolAuditRecord[];
+  completionState?: AiAssistantTurnCompletionState;
+  isFinal?: boolean;
+}
 
 export class AiAssistantService {
   constructor(
     private readonly workspaceRepository: WorkspaceRepository,
     private readonly agentRuntime: CursorAcpRuntime,
     private readonly resolveWorkspaceKbAccessMode: (workspaceId: string) => Promise<'mcp' | 'cli'>,
-    private readonly appWorkingStateService: AppWorkingStateService
+    private readonly appWorkingStateService: AppWorkingStateService,
+    private readonly emitAssistantEvent?: (event: AiAssistantStreamEvent) => void
   ) {}
 
   async getContext(input: AiAssistantContextGetRequest): Promise<AiViewContext> {
@@ -273,8 +307,11 @@ export class AiAssistantService {
   async sendMessage(input: AiAssistantMessageSendRequest): Promise<AiAssistantTurnResponse> {
     const context = input.context;
     const db = await this.openAssistantDb(input.workspaceId);
+    const turnId = randomUUID();
+    let activeSessionId = input.sessionId ?? 'pending-session';
     try {
       const session = this.ensureSession(db, context, input.sessionId);
+      activeSessionId = session.id;
       const userMessageTimestamp = new Date().toISOString();
       this.insertMessage(db, {
         id: randomUUID(),
@@ -288,26 +325,123 @@ export class AiAssistantService {
       });
 
       this.updateSessionStatus(db, session.id, input.workspaceId, 'running', context, userMessageTimestamp, input.message.trim());
+      this.publishAssistantEvent({
+        workspaceId: input.workspaceId,
+        sessionId: session.id,
+        turnId,
+        kind: 'turn_started',
+        atUtc: userMessageTimestamp,
+        message: input.message.trim()
+      });
 
       const workspaceKbAccessMode = await this.resolveWorkspaceKbAccessMode(input.workspaceId);
       const kbAccessMode = context.capabilities.canUseUnsavedWorkingState ? 'cli' : workspaceKbAccessMode;
-      const runtimeResult = await this.agentRuntime.runAssistantChat(
-        {
-          workspaceId: input.workspaceId,
-          localeVariantId: this.resolveRuntimeLocaleVariantId(context),
-          sessionId: session.runtimeSessionId ?? undefined,
-          kbAccessMode,
-          sessionMode: 'agent',
-          locale: context.subject?.locale,
-          prompt: this.buildAskPrompt(context, input.message, this.listMessages(db, session.id)),
-          sessionType: 'assistant_chat'
-        },
-        () => undefined,
-        () => false
+      const localeVariantId = this.resolveRuntimeLocaleVariantId(context);
+      let runtimeSessionId = session.runtimeSessionId ?? undefined;
+      let runtimePrompt = this.buildAskPrompt(
+        context,
+        input.message,
+        this.listMessages(db, session.id),
+        runtimeSessionId == null
       );
+      let runtimeAttempt = 0;
+      let completionAttempt = 0;
+      let runtimeResult;
+      let transcriptInspection: AssistantTranscriptInspection | undefined;
+      const turnAudit: AssistantTurnAudit = {
+        thoughtText: '',
+        toolEvents: []
+      };
+
+      while (true) {
+        runtimeResult = await this.agentRuntime.runAssistantChat(
+          {
+            workspaceId: input.workspaceId,
+            localeVariantId,
+            sessionId: runtimeSessionId,
+            kbAccessMode,
+            sessionMode: 'agent',
+            locale: context.subject?.locale,
+            prompt: runtimePrompt,
+            sessionType: 'assistant_chat'
+          },
+          (stream) => {
+            this.publishAssistantStreamEvent(input.workspaceId, session.id, turnId, stream, turnAudit);
+          },
+          () => false
+        );
+        turnAudit.completionState = runtimeResult.completionState;
+        turnAudit.isFinal = runtimeResult.isFinal;
+
+        if (
+          runtimeResult.status === 'error'
+          && runtimeAttempt < ASSISTANT_CHAT_RUNTIME_RETRY_LIMIT
+          && isRetriableAssistantRuntimeFailure(runtimeResult.message)
+        ) {
+          runtimeAttempt += 1;
+          runtimeSessionId = undefined;
+          runtimePrompt = this.buildAskPrompt(
+            context,
+            input.message,
+            this.listMessages(db, session.id),
+            true
+          );
+          continue;
+        }
+
+        await this.waitForTranscriptToQuiesce(
+          runtimeResult.transcriptPath,
+          ASSISTANT_CHAT_TRANSCRIPT_IDLE_MS,
+          ASSISTANT_CHAT_TRANSCRIPT_MAX_WAIT_MS
+        );
+        transcriptInspection = await this.inspectTranscriptAssistantTurn(runtimeResult.transcriptPath);
+
+        if (transcriptInspection.sawToolCalls && !transcriptInspection.hasPostToolAnswer) {
+          await this.waitForTranscriptToQuiesce(
+            runtimeResult.transcriptPath,
+            ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_IDLE_MS,
+            ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_MAX_WAIT_MS
+          );
+          transcriptInspection = await this.inspectTranscriptAssistantTurn(runtimeResult.transcriptPath);
+        }
+
+        const needsContinuationFromContract =
+          runtimeResult.status !== 'error'
+          && runtimeResult.isFinal === false
+          && completionAttempt < ASSISTANT_CHAT_COMPLETION_RETRY_LIMIT;
+
+        const needsContinuationFromLegacyFallback =
+          runtimeResult.status !== 'error'
+          && runtimeResult.isFinal !== false
+          && transcriptInspection.sawToolCalls
+          && !transcriptInspection.hasPostToolAnswer
+          && completionAttempt < ASSISTANT_CHAT_COMPLETION_RETRY_LIMIT;
+
+        if (needsContinuationFromContract || needsContinuationFromLegacyFallback) {
+          completionAttempt += 1;
+          runtimeSessionId = runtimeResult.sessionId;
+          runtimePrompt = this.buildAssistantContinuationPrompt(
+            context,
+            input.message,
+            this.listMessages(db, session.id)
+          );
+          continue;
+        }
+
+        break;
+      }
 
       const directWorkingStateMutationApplied = this.didWorkingStateChangeDuringTurn(context);
-      const transcriptFallbackText = await this.extractTranscriptAssistantText(runtimeResult.transcriptPath);
+      const runtimeToolEvents = mapRuntimeToolAudit(runtimeResult.toolCalls);
+      if (runtimeToolEvents.length > 0) {
+        turnAudit.toolEvents = mergeAssistantToolEvents(turnAudit.toolEvents, runtimeToolEvents);
+      }
+      const transcriptToolEvents = await this.extractTranscriptToolAudit(runtimeResult.transcriptPath);
+      if (transcriptToolEvents.length > 0) {
+        turnAudit.toolEvents = mergeAssistantToolEvents(turnAudit.toolEvents, transcriptToolEvents);
+      }
+      const transcriptFallbackText = transcriptInspection?.preferredText
+        ?? await this.extractTranscriptAssistantText(runtimeResult.transcriptPath);
       const parsed = this.parseRuntimeResult(
         runtimeResult.resultPayload,
         context,
@@ -316,6 +450,8 @@ export class AiAssistantService {
         transcriptFallbackText,
         runtimeResult.status === 'error' ? runtimeResult.message : undefined
       );
+      turnAudit.completionState = parsed.completionState;
+      turnAudit.isFinal = parsed.isFinal;
       const artifact = this.insertArtifact(db, {
         sessionId: session.id,
         workspaceId: input.workspaceId,
@@ -345,6 +481,7 @@ export class AiAssistantService {
         messageKind: artifact.artifactType === 'informational_response' ? 'chat' : 'artifact',
         content: parsed.response,
         metadata: {
+          ...this.buildAssistantMessageAuditMetadata(turnAudit),
           artifactId: artifact.id,
           artifactType: artifact.artifactType,
           ...this.buildContextMetadata(context)
@@ -363,6 +500,15 @@ export class AiAssistantService {
         assistantMessage.createdAtUtc,
         parsed.title
       );
+      this.publishAssistantEvent({
+        workspaceId: input.workspaceId,
+        sessionId: session.id,
+        turnId,
+        kind: 'turn_finished',
+        atUtc: assistantMessage.createdAtUtc,
+        messageId: assistantMessage.id,
+        artifactId: artifact.id
+      });
 
       const refreshedSession = this.requireSessionById(db, input.workspaceId, session.id);
       const refreshedArtifact = this.getArtifact(db, input.workspaceId, artifact.id);
@@ -374,6 +520,26 @@ export class AiAssistantService {
         artifact: refreshedArtifact,
         uiActions
       };
+    } catch (error) {
+      if (activeSessionId !== 'pending-session') {
+        this.updateSessionStatus(
+          db,
+          activeSessionId,
+          input.workspaceId,
+          'error',
+          context,
+          new Date().toISOString()
+        );
+      }
+      this.publishAssistantEvent({
+        workspaceId: input.workspaceId,
+        sessionId: activeSessionId,
+        turnId,
+        kind: 'turn_error',
+        atUtc: new Date().toISOString(),
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
     } finally {
       db.close();
     }
@@ -556,21 +722,70 @@ export class AiAssistantService {
     return created.id;
   }
 
-  private buildAskPrompt(context: AiViewContext, message: string, messages: AiMessageRecord[]): string {
+  private publishAssistantEvent(event: AiAssistantStreamEvent): void {
+    this.emitAssistantEvent?.(event);
+  }
+
+  private publishAssistantStreamEvent(
+    workspaceId: string,
+    sessionId: string,
+    turnId: string,
+    stream: AgentStreamingPayload,
+    audit?: AssistantTurnAudit
+  ): void {
+    const atUtc = stream.atUtc || new Date().toISOString();
+    const normalized = normalizeAssistantStreamPayload(workspaceId, sessionId, turnId, atUtc, stream);
+    if (audit) {
+      applyAssistantAuditEvents(audit, normalized);
+    }
+    for (const event of normalized) {
+      this.publishAssistantEvent(event);
+    }
+  }
+
+  private buildAssistantMessageAuditMetadata(audit: AssistantTurnAudit): AiAssistantMessageAuditMetadata | undefined {
+    const thoughtText = audit.thoughtText.trim();
+    const toolEvents = audit.toolEvents.filter((event) => (
+      !isFilteredAssistantToolName(event.toolName)
+      && Boolean(event.toolName || event.resourceLabel || event.toolStatus)
+    ));
+    if (!thoughtText && toolEvents.length === 0 && !audit.completionState && audit.isFinal === undefined) {
+      return undefined;
+    }
+    return {
+      ...(thoughtText ? { thoughtText } : {}),
+      ...(toolEvents.length > 0 ? { toolEvents } : {}),
+      ...(audit.completionState ? { completionState: audit.completionState } : {}),
+      ...(audit.isFinal !== undefined ? { isFinal: audit.isFinal } : {})
+    };
+  }
+
+  private buildAskPrompt(
+    context: AiViewContext,
+    message: string,
+    messages: AiMessageRecord[],
+    includeTranscript: boolean
+  ): string {
     const allowedArtifacts = this.allowedArtifactTypes(context);
-    const transcript = messages
-      .slice(-8)
-      .map((item) => `${item.role.toUpperCase()} (${item.messageKind}): ${item.content}`)
-      .join('\n');
+    const transcript = includeTranscript
+      ? messages
+          .slice(-8)
+          .map((item) => `${item.role.toUpperCase()} (${item.messageKind}): ${summarizePromptText(item.content, 700)}`)
+          .join('\n')
+      : '';
+    const workingStateSummary = summarizePromptData(context.workingState);
+    const backingDataSummary = summarizePromptData(context.backingData);
 
     return [
       'You are the KB Vault global AI assistant.',
-      'For normal conversational help, explanations, summaries, and workflow guidance, answer in plain text.',
-      'Only return JSON when you are intentionally requesting an artifact action such as creating a proposal, patching a proposal, patching a draft, or patching a template.',
+      'For every assistant-chat reply, return JSON. The `response` field is the only user-visible text.',
+      'Write in clear, natural English. Do not imitate malformed wording from prior assistant turns or raw source content.',
       'When you do return JSON, use this schema:',
       '{',
       '  "command": "none | create_proposal | patch_proposal | patch_draft | patch_template",',
       '  "artifactType": "informational_response | proposal_candidate | proposal_patch | draft_patch | template_patch | clarification_request",',
+      '  "completionState": "completed | researching | needs_user_input | blocked | errored",',
+      '  "isFinal": true,',
       '  "response": "assistant-visible message",',
       '  "summary": "optional short summary for non-chat artifacts only",',
       '  "rationale": "optional rationale",',
@@ -585,19 +800,35 @@ export class AiAssistantService {
       context.subject ? `Subject: ${JSON.stringify(context.subject)}` : 'Subject: none',
       `Capabilities: ${JSON.stringify(context.capabilities)}`,
       `Allowed artifact types: ${allowedArtifacts.join(', ')}`,
-      context.workingState ? `Working state: ${JSON.stringify(context.workingState)}` : 'Working state: none',
-      `Backing data: ${JSON.stringify(context.backingData)}`,
+      context.workingState ? `Working state: ${JSON.stringify(workingStateSummary)}` : 'Working state: none',
+      `Backing data: ${JSON.stringify(backingDataSummary)}`,
+      includeTranscript ? 'Recent messages are included below because this runtime session is new or was recovered.' : '',
       transcript ? `Recent messages:\n${transcript}` : '',
       `User message: ${message.trim()}`,
       'Rules:',
       '- Use working state as the source of truth when it exists.',
       '- Do not silently publish, finalize, or persist user content.',
+      '- Your primary job is to answer the user\'s actual request.',
+      '- Every reply must include `completionState` and `isFinal` in the JSON envelope.',
+      '- For a finished answer, set `completionState="completed"` and `isFinal=true`.',
+      '- If you are still researching or the turn must continue automatically, set `completionState="researching"` and `isFinal=false`.',
+      '- If you need a user answer before continuing, set `completionState="needs_user_input"` and `isFinal=true`.',
+      '- If you are blocked or hit a hard failure, set `completionState="blocked"` or `completionState="errored"` and `isFinal=true`.',
+      '- Do not send a progress update with `isFinal=true`.',
       '- Any mutating result must include an explicit command and valid JSON. Without a valid command, the result will be treated as informational_response.',
-      '- If the user is asking a question, greeting you, asking for explanation, or chatting back and forth, prefer a plain-text answer instead of JSON.',
+      '- If the answer is already clear from the provided context, answer immediately without using tools.',
+      '- If workspace knowledge is needed, use the minimum KB lookup path required to answer accurately.',
+      '- For app-feature, workflow, or terminology questions, default to this sequence: `kb search-kb --workspace-id <workspace-id> --query "<topic>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json` for the best 1-3 matches, then answer the user clearly.',
       '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
-      '- When research or data lookup is needed, use only kb commands. Never use terminal commands like grep, Read File, codebase search, or filesystem exploration.',
-      '- Preferred kb commands for research are: `kb batch-context --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb find-related-articles --workspace-id <workspace-id> --batch-id <batch-id> --json`, `kb search-kb --workspace-id <workspace-id> --query "<query>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json`, `kb get-article-family --workspace-id <workspace-id> --family-id <family-id> --json`, `kb app get-form-schema --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --json`, `kb app patch-form --workspace-id <workspace-id> --route <route> --entity-type <entity-type> --entity-id <entity-id> --version-token <version-token> --patch \'<json object>\' --json`, and `kb help --json`.',
-      '- If you choose JSON for informational_response, return only the user-facing response text. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
+      '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply. If the runtime supports separate thought updates, use those instead of status messages.',
+      '- When research or data lookup is needed, use only the direct KB tools or kb commands needed for the answer. Never use terminal commands like grep, Read File, codebase search, or filesystem exploration.',
+      '- If direct KB tools are available, prefer those. If the runtime only exposes Shell or Terminal, it may be used only for exact `kb` CLI commands.',
+      '- Prefer `search-kb` first and `get-article` second for ordinary user questions about the app.',
+      '- Use `kb get-article-family` only when one clearly relevant article needs family or locale context.',
+      '- Use `kb batch-context`, `kb find-related-articles`, proposal commands, and form-editing commands only when the route or user request clearly requires them.',
+      '- Use `kb help --json` only if a needed KB command is genuinely unclear. Do not spend the turn exploring command syntax when the answer can be produced from `search-kb` plus `get-article`.',
+      '- Do not use tools just to decide what to do next.',
+      '- For informational_response, put only the user-facing reply in `response`. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
       '- On the first meaningful reply in a new chat, include a short human-readable title in "title" based on the user request.',
       '- For informational_response, omit summary unless it is genuinely needed for internal bookkeeping.',
       '- For draft edits, return the full replacement HTML in "html".',
@@ -620,6 +851,18 @@ export class AiAssistantService {
     ].filter(Boolean).join('\n\n');
   }
 
+  private buildAssistantContinuationPrompt(
+    context: AiViewContext,
+    message: string,
+    messages: AiMessageRecord[]
+  ): string {
+    return [
+      this.buildAskPrompt(context, message, messages, true),
+      'Continuation instructions:',
+      ASSISTANT_CHAT_COMPLETION_FOLLOWUP_PROMPT
+    ].join('\n\n');
+  }
+
   private parseRuntimeResult(
     resultPayload: unknown,
     context: AiViewContext,
@@ -628,23 +871,24 @@ export class AiAssistantService {
     transcriptFallbackText?: string,
     runtimeFailureMessage?: string
   ): Required<Pick<RuntimeResultPayload, 'artifactType' | 'response' | 'summary'>> & RuntimeResultPayload {
-    const parsed = extractJsonObject(resultPayload);
+    const parsed = selectPreferredAssistantEnvelope(resultPayload, transcriptFallbackText) ?? extractJsonObject(resultPayload);
     const allowed = new Set(this.allowedArtifactTypes(context));
     const requestedArtifactType = parsed?.artifactType && allowed.has(parsed.artifactType as AiArtifactType)
       ? parsed.artifactType as AiArtifactType
       : 'informational_response';
-    const rawResponse =
+    const primaryResponse =
       extractString(parsed?.response)
       ?? extractString(parsed?.summary)
-      ?? extractAssistantText(resultPayload)
-      ?? transcriptFallbackText
-      ?? runtimeFailureMessage;
+      ?? selectPreferredAssistantReply(resultPayload, transcriptFallbackText);
+    const rawResponse = primaryResponse ?? runtimeFailureMessage;
     const response = unwrapAssistantDisplayText(rawResponse) ?? 'I ran into a runtime error before the assistant produced a reply.';
     const summary = extractString(parsed?.summary) ?? response;
     const html = extractString(parsed?.html) ?? undefined;
     const formPatch = parsed?.formPatch && typeof parsed.formPatch === 'object' ? parsed.formPatch as TemplatePatchPayload : undefined;
     const payload = parsed?.payload && typeof parsed.payload === 'object' ? parsed.payload as Record<string, unknown> : undefined;
     const command = extractString(parsed?.command) ?? 'none';
+    const completionState = normalizeAssistantCompletionState(parsed?.completionState) ?? 'unknown';
+    const isFinal = typeof parsed?.isFinal === 'boolean' ? parsed.isFinal : undefined;
     const confidenceScore = normalizeAssistantConfidenceScore(parsed?.confidenceScore ?? payload?.confidenceScore);
     let artifactType = this.resolveFinalArtifactType({
       command,
@@ -670,6 +914,8 @@ export class AiAssistantService {
     return {
       command,
       artifactType,
+      completionState,
+      isFinal,
       response: artifactType === 'clarification_request'
         ? 'I did not apply that edit yet. Please try again, and I will return an explicit patch instead of a chat-only response.'
         : response,
@@ -857,6 +1103,141 @@ export class AiAssistantService {
     return db;
   }
 
+  private async waitForTranscriptToQuiesce(
+    transcriptPath: string | undefined,
+    idleMs: number,
+    maxWaitMs: number
+  ): Promise<void> {
+    if (!transcriptPath) {
+      return;
+    }
+
+    const startedAt = Date.now();
+    let lastSignature = '';
+    let stableSince = Date.now();
+
+    while (Date.now() - startedAt < maxWaitMs) {
+      let nextSignature = 'missing';
+      try {
+        const stat = await fs.stat(transcriptPath);
+        nextSignature = `${stat.size}:${stat.mtimeMs}`;
+      } catch {
+        nextSignature = 'missing';
+      }
+
+      if (nextSignature !== lastSignature) {
+        lastSignature = nextSignature;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= idleMs) {
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, ASSISTANT_CHAT_TRANSCRIPT_POLL_MS));
+    }
+  }
+
+  private async inspectTranscriptAssistantTurn(
+    transcriptPath: string | undefined
+  ): Promise<AssistantTranscriptInspection> {
+    if (!transcriptPath) {
+      return {
+        preferredText: undefined,
+        sawToolCalls: false,
+        hasPostToolAnswer: false
+      };
+    }
+
+    try {
+      const text = await fs.readFile(transcriptPath, 'utf8');
+      const entries = parseAssistantTranscriptEntries(text);
+      let epoch = 0;
+      let sawToolCalls = false;
+      const chunkPartsByEpoch = new Map<number, string[]>();
+      const candidatesByEpoch = new Map<number, string[]>();
+
+      const ensureChunkParts = (epochKey: number) => {
+        const existing = chunkPartsByEpoch.get(epochKey);
+        if (existing) {
+          return existing;
+        }
+        const created: string[] = [];
+        chunkPartsByEpoch.set(epochKey, created);
+        return created;
+      };
+
+      const ensureCandidates = (epochKey: number) => {
+        const existing = candidatesByEpoch.get(epochKey);
+        if (existing) {
+          return existing;
+        }
+        const created: string[] = [];
+        candidatesByEpoch.set(epochKey, created);
+        return created;
+      };
+
+      for (const entry of entries) {
+        if (entry.type === 'tool') {
+          sawToolCalls = true;
+          epoch += 1;
+          continue;
+        }
+        if (entry.type === 'chunk') {
+          appendAssistantTranscriptChunk(ensureChunkParts(epoch), entry.text);
+          continue;
+        }
+        if (entry.type === 'response') {
+          ensureCandidates(epoch).push(entry.text);
+        }
+      }
+
+      const resolveEpochText = (epochKey: number): string | undefined => {
+        const chunkParts = chunkPartsByEpoch.get(epochKey) ?? [];
+        const candidates: string[] = [];
+        const chunkCandidate = collapseAssistantTranscriptText(chunkParts.join(''));
+        if (chunkCandidate) {
+          candidates.push(chunkCandidate);
+        }
+        candidates.push(...(candidatesByEpoch.get(epochKey) ?? []));
+        return candidates
+          .map((candidate) => candidate.trim())
+          .find(Boolean);
+      };
+
+      const finalEpochText = resolveEpochText(epoch);
+      const hasMeaningfulFinalEpochText = Boolean(finalEpochText && !looksLikeAssistantProgressMessage(finalEpochText));
+      let preferredText = finalEpochText;
+      if (!preferredText) {
+        for (let index = epoch - 1; index >= 0; index -= 1) {
+          const fallback = resolveEpochText(index);
+          if (fallback) {
+            preferredText = fallback;
+            break;
+          }
+        }
+      } else if (looksLikeAssistantProgressMessage(preferredText)) {
+        for (let index = epoch - 1; index >= 0; index -= 1) {
+          const fallback = resolveEpochText(index);
+          if (fallback && !looksLikeAssistantProgressMessage(fallback)) {
+            preferredText = fallback;
+            break;
+          }
+        }
+      }
+
+      return {
+        preferredText,
+        sawToolCalls,
+        hasPostToolAnswer: sawToolCalls ? hasMeaningfulFinalEpochText : Boolean(preferredText && !looksLikeAssistantProgressMessage(preferredText))
+      };
+    } catch {
+      return {
+        preferredText: undefined,
+        sawToolCalls: false,
+        hasPostToolAnswer: false
+      };
+    }
+  }
+
   private async extractTranscriptAssistantText(transcriptPath: string | undefined): Promise<string | undefined> {
     if (!transcriptPath) {
       return undefined;
@@ -867,63 +1248,40 @@ export class AiAssistantService {
       const chunkParts: string[] = [];
       const candidates: string[] = [];
 
-      for (const rawLine of text.split('\n')) {
-        const line = rawLine.trim();
-        if (!line) continue;
-
-        let parsedLine: { direction?: string; event?: string; payload?: string } | null = null;
-        try {
-          parsedLine = JSON.parse(line) as { direction?: string; event?: string; payload?: string };
-        } catch {
+      for (const entry of parseAssistantTranscriptEntries(text)) {
+        if (entry.type === 'response') {
+          candidates.push(entry.text);
           continue;
         }
-        if (!parsedLine || parsedLine.direction !== 'from_agent') {
-          continue;
-        }
-
-        if (parsedLine.event === 'response' && typeof parsedLine.payload === 'string') {
-          try {
-            const payload = JSON.parse(parsedLine.payload) as { result?: unknown };
-            const candidate = extractAssistantText(payload.result);
-            if (candidate) {
-              candidates.push(candidate);
-            }
-          } catch {
-            // ignore malformed transcript response payloads
-          }
-          continue;
-        }
-
-        if (parsedLine.event === 'session_update' && typeof parsedLine.payload === 'string') {
-          try {
-            const payload = JSON.parse(parsedLine.payload) as {
-              update?: {
-                sessionUpdate?: string;
-                content?: { text?: string };
-              };
-            };
-            const chunkText = payload.update?.sessionUpdate === 'agent_message_chunk'
-              ? extractChunkString(payload.update.content?.text)
-              : undefined;
-            if (chunkText) {
-              appendAssistantTranscriptChunk(chunkParts, chunkText);
-            }
-          } catch {
-            // ignore malformed transcript update payloads
-          }
+        if (entry.type === 'chunk') {
+          appendAssistantTranscriptChunk(chunkParts, entry.text);
         }
       }
 
       const chunkCandidate = collapseAssistantTranscriptText(chunkParts.join(''));
       if (chunkCandidate) {
-        candidates.push(chunkCandidate);
+        candidates.unshift(chunkCandidate);
       }
 
       return candidates
-        .map((candidate) => candidate.trim())
-        .find(Boolean);
+        .find((candidate) => candidate.length > 0);
     } catch {
       return undefined;
+    }
+  }
+
+  private async extractTranscriptToolAudit(
+    transcriptPath: string | undefined
+  ): Promise<AiAssistantToolAuditRecord[]> {
+    if (!transcriptPath) {
+      return [];
+    }
+
+    try {
+      const text = await fs.readFile(transcriptPath, 'utf8');
+      return parseAssistantTranscriptToolAudit(text);
+    } catch {
+      return [];
     }
   }
 
@@ -1623,8 +1981,13 @@ function extractJsonObject(value: unknown): Record<string, unknown> | null {
   if (typeof value === 'string') {
     candidates.push(value);
   } else if (value && typeof value === 'object') {
-    candidates.push(JSON.stringify(value));
     const payload = value as Record<string, unknown>;
+    if (looksLikeAssistantEnvelope(payload)) {
+      return payload;
+    }
+    if (typeof payload.streamedText === 'string') {
+      candidates.push(payload.streamedText);
+    }
     if (typeof payload.text === 'string') {
       candidates.push(payload.text);
     }
@@ -1638,26 +2001,9 @@ function extractJsonObject(value: unknown): Record<string, unknown> | null {
   }
 
   for (const candidate of candidates) {
-    const trimmed = candidate.trim();
-    if (!trimmed) continue;
-    try {
-      const direct = JSON.parse(trimmed) as unknown;
-      if (direct && typeof direct === 'object' && !Array.isArray(direct)) {
-        return direct as Record<string, unknown>;
-      }
-    } catch {
-      const start = trimmed.indexOf('{');
-      const end = trimmed.lastIndexOf('}');
-      if (start >= 0 && end > start) {
-        try {
-          const partial = JSON.parse(trimmed.slice(start, end + 1)) as unknown;
-          if (partial && typeof partial === 'object' && !Array.isArray(partial)) {
-            return partial as Record<string, unknown>;
-          }
-        } catch {
-          // continue
-        }
-      }
+    const parsed = extractLastJsonObjectFromText(candidate);
+    if (parsed) {
+      return parsed;
     }
   }
 
@@ -1677,46 +2023,698 @@ function extractString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function extractChunkString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+function looksLikeAssistantEnvelope(value: Record<string, unknown>): boolean {
+  return (
+    typeof value.response === 'string'
+    || typeof value.command === 'string'
+    || typeof value.artifactType === 'string'
+    || typeof value.completionState === 'string'
+    || typeof value.isFinal === 'boolean'
+  );
 }
 
-function extractAssistantText(value: unknown): string | undefined {
-  const candidates: string[] = [];
+function extractLastJsonObjectFromText(value: string | undefined): Record<string, unknown> | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
 
-  if (typeof value === 'string') {
-    candidates.push(value);
-  } else if (value && typeof value === 'object') {
-    const payload = value as Record<string, unknown>;
-    const topLevelText = extractString(payload.text);
-    if (topLevelText) {
-      candidates.push(topLevelText);
+  try {
+    const direct = JSON.parse(trimmed) as unknown;
+    if (direct && typeof direct === 'object' && !Array.isArray(direct)) {
+      return direct as Record<string, unknown>;
     }
-    if (Array.isArray(payload.content)) {
-      for (const item of payload.content) {
-        if (!item || typeof item !== 'object') continue;
-        const record = item as Record<string, unknown>;
-        const text = extractString(record.text);
-        if (text) {
-          candidates.push(text);
+  } catch {
+    // Fall through to substring extraction.
+  }
+
+  let best: Record<string, unknown> | null = null;
+  for (let start = 0; start < trimmed.length; start += 1) {
+    if (trimmed[start] !== '{') {
+      continue;
+    }
+    for (let end = trimmed.lastIndexOf('}'); end > start; end = trimmed.lastIndexOf('}', end - 1)) {
+      try {
+        const candidate = JSON.parse(trimmed.slice(start, end + 1)) as unknown;
+        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+          best = candidate as Record<string, unknown>;
+          break;
         }
+      } catch {
+        // continue searching
       }
     }
   }
 
-  for (const candidate of candidates) {
-    const cleaned = candidate
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line && !/^stop reason:/i.test(line) && !/^end of turn$/i.test(line))
-      .join('\n')
-      .trim();
-    if (cleaned) {
-      return cleaned;
+  return best;
+}
+
+function extractChunkString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function findSharedPrefixLength(left: string, right: string): number {
+  const max = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < max && left[index] === right[index]) {
+    index += 1;
+  }
+  return index;
+}
+
+function findStreamingOverlap(left: string, right: string): number {
+  const maxOverlap = Math.min(left.length, right.length);
+  for (let overlap = maxOverlap; overlap >= 12; overlap -= 1) {
+    if (left.slice(-overlap) === right.slice(0, overlap)) {
+      return overlap;
     }
+  }
+  return 0;
+}
+
+function mergeStreamingText(current: string, incoming: string): string {
+  if (!incoming && incoming !== '') {
+    return current;
+  }
+  if (!current) {
+    return incoming;
+  }
+  if (current === incoming || current.endsWith(incoming)) {
+    return current;
+  }
+  if (incoming.endsWith(current) || incoming.startsWith(current)) {
+    return incoming;
+  }
+
+  const sharedPrefix = findSharedPrefixLength(current, incoming);
+  if (
+    sharedPrefix >= 12
+    && sharedPrefix >= Math.floor(Math.min(current.length, incoming.length) * 0.6)
+  ) {
+    return incoming.length >= current.length ? incoming : current;
+  }
+
+  const overlap = findStreamingOverlap(current, incoming);
+  if (overlap > 0) {
+    return `${current}${incoming.slice(overlap)}`;
+  }
+
+  return `${current}${incoming}`;
+}
+
+function summarizePromptText(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 24).trimEnd()} …[truncated ${normalized.length - maxLength + 24} chars]`;
+}
+
+function summarizePromptData(value: unknown, depth = 0): unknown {
+  if (value == null || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return value;
+    }
+    if (looksLikeMarkupString(trimmed)) {
+      return `[omitted markup/string content, length=${trimmed.length}; use kb commands if needed]`;
+    }
+    return summarizePromptText(trimmed, 400);
+  }
+
+  if (Array.isArray(value)) {
+    const capped = value.slice(0, 10).map((entry) => summarizePromptData(entry, depth + 1));
+    if (value.length > capped.length) {
+      capped.push(`[${value.length - capped.length} more items omitted]`);
+    }
+    return capped;
+  }
+
+  if (typeof value === 'object') {
+    if (depth >= 4) {
+      return '[object omitted for brevity]';
+    }
+    const entries = Object.entries(value as Record<string, unknown>);
+    const summarized: Record<string, unknown> = {};
+    for (const [key, entry] of entries.slice(0, 40)) {
+      if (isLargeMarkupField(key, entry)) {
+        const length = typeof entry === 'string' ? entry.length : 0;
+        summarized[key] = `[omitted ${key}, length=${length}; use kb commands if needed]`;
+        continue;
+      }
+      summarized[key] = summarizePromptData(entry, depth + 1);
+    }
+    if (entries.length > 40) {
+      summarized.__omittedKeys = entries.length - 40;
+    }
+    return summarized;
+  }
+
+  return String(value);
+}
+
+function isLargeMarkupField(key: string, value: unknown): value is string {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const normalizedKey = key.trim().toLowerCase();
+  if (['html', 'sourcehtml', 'previewhtml', 'proposedhtml'].includes(normalizedKey)) {
+    return true;
+  }
+  return value.length > 800 && looksLikeMarkupString(value);
+}
+
+function looksLikeMarkupString(value: string): boolean {
+  return /<\/?[a-z][\s\S]*>/i.test(value);
+}
+
+function applyAssistantAuditEvents(audit: AssistantTurnAudit, events: AiAssistantStreamEvent[]): void {
+  for (const event of events) {
+    if (event.kind === 'thought_chunk' && event.text) {
+      audit.thoughtText = mergeStreamingText(audit.thoughtText, event.text);
+      continue;
+    }
+
+    if (event.kind !== 'tool_call' && event.kind !== 'tool_update') {
+      continue;
+    }
+    if (isFilteredAssistantToolName(event.toolName)) {
+      continue;
+    }
+
+    const existingIndex = event.toolCallId
+      ? audit.toolEvents.findIndex((entry) => entry.toolCallId === event.toolCallId)
+      : -1;
+    const nextEvent: AiAssistantToolAuditRecord = {
+      ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
+      ...(event.toolName ? { toolName: event.toolName } : {}),
+      ...(event.toolStatus ? { toolStatus: event.toolStatus } : {}),
+      ...(event.resourceLabel ? { resourceLabel: event.resourceLabel } : {})
+    };
+
+    if (existingIndex === -1) {
+      audit.toolEvents.push(nextEvent);
+      continue;
+    }
+
+    audit.toolEvents[existingIndex] = {
+      ...audit.toolEvents[existingIndex],
+      ...nextEvent
+    };
+  }
+}
+
+function mergeAssistantToolEvents(
+  current: AiAssistantToolAuditRecord[],
+  incoming: AiAssistantToolAuditRecord[]
+): AiAssistantToolAuditRecord[] {
+  const merged = [...current];
+
+  for (const event of incoming) {
+    const existingIndex = event.toolCallId
+      ? merged.findIndex((entry) => entry.toolCallId === event.toolCallId)
+      : -1;
+
+    if (existingIndex === -1) {
+      merged.push(event);
+      continue;
+    }
+
+    merged[existingIndex] = {
+      ...merged[existingIndex],
+      ...event
+    };
+  }
+
+  return merged;
+}
+
+function isFilteredAssistantToolName(value: string | undefined): boolean {
+  void value;
+  return false;
+}
+
+function mapRuntimeToolAudit(
+  toolCalls: Array<{
+    toolName: string;
+    args: unknown;
+    allowed?: boolean;
+    reason?: string;
+  }> | undefined
+): AiAssistantToolAuditRecord[] {
+  if (!toolCalls?.length) {
+    return [];
+  }
+
+  return toolCalls
+    .map((call) => ({
+      toolName: summarizeAssistantToolName(call.args, undefined, undefined, call.toolName) ?? call.toolName,
+      resourceLabel: summarizeAssistantResourceLabel(call.args),
+      toolStatus: call.allowed === false ? 'blocked' : 'completed'
+    }))
+    .filter((call) => !isFilteredAssistantToolName(call.toolName));
+}
+
+function normalizeAssistantToolKind(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized.includes('shell')) {
+    return 'shell';
+  }
+  if (normalized.includes('mcp')) {
+    return 'mcp';
+  }
+  if (normalized.includes('skill')) {
+    return 'skill';
+  }
+  if (normalized.includes('command')) {
+    return 'command';
+  }
+  return normalized.replace(/[_-]+/g, ' ');
+}
+
+function extractKbCliCommandName(value: string): string | undefined {
+  const normalized = value.replace(/["']/g, ' ').trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  const kbMatch = normalized.match(/(?:^|\s)(?:kb|kb\.exe)\s+([a-z0-9_]+(?:-[a-z0-9_]+)*(?:\s+[a-z0-9_]+(?:-[a-z0-9_]+)*)?)/i);
+  if (kbMatch?.[1]) {
+    return kbMatch[1].trim().toLowerCase();
+  }
+
+  const shimMatch = normalized.match(/kb-vault-cli-shim\/kb(?:\s+|["']\s+)([a-z0-9_]+(?:-[a-z0-9_]+)*(?:\s+[a-z0-9_]+(?:-[a-z0-9_]+)*)?)/i);
+  if (shimMatch?.[1]) {
+    return shimMatch[1].trim().toLowerCase();
   }
 
   return undefined;
+}
+
+function looksLikeKbCliShellInvocation(value: string | undefined): boolean {
+  const normalized = value?.replace(/["']/g, ' ').trim() ?? '';
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /(?:^|\s)(?:kb|kb\.exe)\s+[a-z0-9_-]+/i.test(normalized)
+    || /kb-vault-cli-shim\/kb(?:\s+|["']\s+)[a-z0-9_-]+/i.test(normalized)
+    || /\/kb(?:\s+|["']\s+)[a-z0-9_-]+/i.test(normalized)
+  );
+}
+
+function extractAssistantCommand(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const directCommand = extractString(record.command);
+  if (directCommand) {
+    return directCommand;
+  }
+
+  const stdout = extractString(record.stdout);
+  if (!stdout) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(stdout) as { command?: unknown };
+    return extractString(parsed.command);
+  } catch {
+    return undefined;
+  }
+}
+
+function summarizeAssistantToolName(
+  rawInput: unknown,
+  rawOutput: unknown,
+  kind: unknown,
+  title: unknown
+): string | undefined {
+  const explicitTitle = extractString(title);
+  if (explicitTitle) {
+    const kbCommandName = extractKbCliCommandName(explicitTitle);
+    if (kbCommandName) {
+      return kbCommandName;
+    }
+    return explicitTitle;
+  }
+
+  if (rawInput && typeof rawInput === 'object') {
+    const record = rawInput as Record<string, unknown>;
+    const explicitKeys = ['toolName', 'tool', 'commandName'] as const;
+    for (const key of explicitKeys) {
+      const candidate = extractString(record[key]);
+      if (candidate) {
+        const kbCommandName = extractKbCliCommandName(candidate);
+        if (kbCommandName) {
+          return kbCommandName;
+        }
+        return candidate;
+      }
+    }
+
+    const command = extractString(record.command);
+    if (command) {
+      const kbCommandName = extractKbCliCommandName(command);
+      if (kbCommandName) {
+        return kbCommandName;
+      }
+      const normalizedKind = typeof kind === 'string' ? normalizeAssistantToolKind(kind) : undefined;
+      if (normalizedKind) {
+        return normalizedKind;
+      }
+      const firstToken = command.trim().split(/\s+/, 1)[0]?.trim();
+      if (firstToken) {
+        return firstToken;
+      }
+    }
+  }
+
+  const outputCommand = extractAssistantCommand(rawOutput);
+  if (outputCommand) {
+    const kbCommandName = extractKbCliCommandName(outputCommand);
+    if (kbCommandName) {
+      return kbCommandName;
+    }
+    const normalizedKind = typeof kind === 'string' ? normalizeAssistantToolKind(kind) : undefined;
+    if (normalizedKind) {
+      return normalizedKind;
+    }
+    return outputCommand.split(/\s+/, 1)[0]?.trim() || outputCommand;
+  }
+
+  return typeof kind === 'string' ? normalizeAssistantToolKind(kind) : undefined;
+}
+
+function summarizeAssistantResourceLabel(value: unknown, rawOutput?: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? summarizePromptText(trimmed, 120) : undefined;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const command = extractString(record.command);
+  const query = extractString(record.query);
+  if (query) {
+    return summarizePromptText(`query: ${query}`, 120);
+  }
+
+  const preferredStringKeys = [
+    'resourceName',
+    'name',
+    'title',
+    'path',
+    'file',
+    'articleTitle',
+    'targetTitle',
+    'articleId',
+    'familyId',
+    'localeVariantId',
+    'revisionId',
+    'batchId',
+    'entityId',
+    'route',
+    'url'
+  ] as const;
+  for (const key of preferredStringKeys) {
+    const candidate = extractString(record[key]);
+    if (candidate) {
+      return summarizePromptText(`${key}: ${candidate}`, 120);
+    }
+  }
+
+  if (command) {
+    return summarizePromptText(command, 120);
+  }
+
+  const args = Array.isArray(record.args)
+    ? record.args.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : [];
+  if (args.length > 0) {
+    return summarizePromptText(args.join(' '), 120);
+  }
+
+  const outputCommand = extractAssistantCommand(rawOutput);
+  if (outputCommand) {
+    return summarizePromptText(outputCommand, 120);
+  }
+
+  return undefined;
+}
+
+function normalizeAssistantStreamPayload(
+  workspaceId: string,
+  sessionId: string,
+  turnId: string,
+  atUtc: string,
+  stream: AgentStreamingPayload
+): AiAssistantStreamEvent[] {
+  if (stream.kind !== 'progress' || !stream.data || typeof stream.data !== 'object') {
+    return [];
+  }
+
+  const params = stream.data as {
+    update?: {
+      sessionUpdate?: unknown;
+      toolCallId?: unknown;
+      title?: unknown;
+      kind?: unknown;
+      status?: unknown;
+      rawInput?: unknown;
+      rawOutput?: unknown;
+      content?: { text?: unknown };
+    };
+  };
+  const update = params.update;
+  const sessionUpdate = typeof update?.sessionUpdate === 'string' ? update.sessionUpdate : '';
+  const text = extractChunkString(update?.content?.text);
+
+  if (sessionUpdate === 'agent_message_chunk' && text) {
+    return [{
+      workspaceId,
+      sessionId,
+      turnId,
+      kind: 'response_chunk',
+      atUtc,
+      text
+    }];
+  }
+
+  if (sessionUpdate === 'agent_thought_chunk' && text) {
+    return [{
+      workspaceId,
+      sessionId,
+      turnId,
+      kind: 'thought_chunk',
+      atUtc,
+      text
+    }];
+  }
+
+  if (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') {
+    return [{
+      workspaceId,
+      sessionId,
+      turnId,
+      kind: sessionUpdate === 'tool_call' ? 'tool_call' : 'tool_update',
+      atUtc,
+      toolCallId: typeof update?.toolCallId === 'string' ? update.toolCallId : undefined,
+      toolName: summarizeAssistantToolName(update?.rawInput, update?.rawOutput, update?.kind, update?.title),
+      toolStatus: typeof update?.status === 'string' ? update.status : undefined,
+      resourceLabel: summarizeAssistantResourceLabel(update?.rawInput, update?.rawOutput)
+    }];
+  }
+
+  return [];
+}
+
+function extractAssistantExplicitText(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const payload = value as Record<string, unknown>;
+  const topLevelText = extractString(payload.text);
+  if (topLevelText) {
+    return topLevelText;
+  }
+  if (Array.isArray(payload.content)) {
+    for (const item of payload.content) {
+      if (!item || typeof item !== 'object') continue;
+      const text = extractString((item as Record<string, unknown>).text);
+      if (text) {
+        return text;
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractAssistantStreamedText(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const payload = value as Record<string, unknown>;
+  return extractChunkString(payload.streamedText);
+}
+
+function scoreAssistantEnvelope(value: Record<string, unknown>): number {
+  let score = 0;
+  const completionState = normalizeAssistantCompletionState(value.completionState);
+  switch (completionState) {
+    case 'completed':
+      score += 40;
+      break;
+    case 'needs_user_input':
+      score += 15;
+      break;
+    case 'blocked':
+      score += 10;
+      break;
+    case 'researching':
+      score += 5;
+      break;
+    default:
+      break;
+  }
+
+  if (typeof value.response === 'string' && value.response.trim()) {
+    score += 8;
+  }
+  if (typeof value.artifactType === 'string') {
+    score += 4;
+    if (value.artifactType === 'informational_response') {
+      score += 4;
+    }
+  }
+  if (typeof value.isFinal === 'boolean' && value.isFinal) {
+    score += 2;
+  }
+
+  return score;
+}
+
+function selectPreferredAssistantEnvelope(
+  resultPayload: unknown,
+  transcriptFallbackText?: string
+): Record<string, unknown> | null {
+  const directObject =
+    resultPayload && typeof resultPayload === 'object' && !Array.isArray(resultPayload)
+      ? resultPayload as Record<string, unknown>
+      : null;
+  const directEnvelope = directObject && looksLikeAssistantEnvelope(directObject) ? directObject : null;
+  const candidates = [
+    { rank: 4, parsed: extractLastJsonObjectFromText(transcriptFallbackText) },
+    { rank: 3, parsed: extractLastJsonObjectFromText(extractAssistantStreamedText(resultPayload)) },
+    { rank: 2, parsed: extractLastJsonObjectFromText(extractAssistantExplicitText(resultPayload)) },
+    { rank: 1, parsed: directEnvelope }
+  ];
+
+  let best: Record<string, unknown> | null = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  for (const candidate of candidates) {
+    if (!candidate.parsed) {
+      continue;
+    }
+    const score = scoreAssistantEnvelope(candidate.parsed) * 10 + candidate.rank;
+    if (score > bestScore) {
+      best = candidate.parsed;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
+
+function normalizeAssistantCompletionState(value: unknown): AiAssistantTurnCompletionState | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  switch (value.trim().toLowerCase()) {
+    case 'completed':
+      return 'completed';
+    case 'researching':
+      return 'researching';
+    case 'needs_user_input':
+    case 'needs-user-input':
+      return 'needs_user_input';
+    case 'blocked':
+      return 'blocked';
+    case 'errored':
+    case 'error':
+      return 'errored';
+    case 'unknown':
+      return 'unknown';
+    default:
+      return undefined;
+  }
+}
+
+function looksLikeAssistantProgressMessage(value: string): boolean {
+  const normalized = value.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    /^(gathering|checking|looking|researching|reviewing|investigating|loading|searching)\b/.test(normalized)
+    || /^i(?:'m| am) (gathering|checking|looking|researching|reviewing|investigating)\b/.test(normalized)
+    || normalized.includes('returning only the structured json')
+    || normalized.includes('return the final answer')
+    || normalized.includes('using the cli and then returning')
+    || normalized.includes('do not send a progress update')
+  );
+}
+
+function selectPreferredAssistantReply(
+  resultPayload: unknown,
+  transcriptFallbackText?: string
+): string | undefined {
+  const preferredEnvelope = selectPreferredAssistantEnvelope(resultPayload, transcriptFallbackText);
+  const preferredResponse = extractString(preferredEnvelope?.response) ?? extractString(preferredEnvelope?.summary);
+  if (preferredResponse) {
+    return preferredResponse;
+  }
+
+  const explicit = unwrapAssistantDisplayText(extractAssistantExplicitText(resultPayload));
+  const streamed = unwrapAssistantDisplayText(extractAssistantStreamedText(resultPayload));
+  const transcript = unwrapAssistantDisplayText(transcriptFallbackText);
+
+  if (explicit && !looksLikeAssistantProgressMessage(explicit)) {
+    return explicit;
+  }
+
+  for (const candidate of [streamed, transcript, explicit]) {
+    if (candidate && !looksLikeAssistantProgressMessage(candidate)) {
+      return candidate;
+    }
+  }
+
+  return explicit ?? streamed ?? transcript;
+}
+
+function isRetriableAssistantRuntimeFailure(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized === 'internal error' || (normalized.includes('session') && normalized.includes('not found'));
 }
 
 function unwrapAssistantDisplayText(value: string | undefined): string | undefined {
@@ -1734,27 +2732,7 @@ function unwrapAssistantDisplayText(value: string | undefined): string | undefin
 }
 
 function collapseAssistantTranscriptText(value: string): string {
-  let current = value;
-  while (current.trim().length >= 64 && current.length % 2 === 0) {
-    const midpoint = current.length / 2;
-    const left = current.slice(0, midpoint);
-    const right = current.slice(midpoint);
-    if (!left.trim() || left !== right) {
-      break;
-    }
-    current = left;
-  }
-  return current.trim();
-}
-
-function findAssistantTranscriptChunkOverlap(left: string, right: string): number {
-  const maxOverlap = Math.min(left.length, right.length);
-  for (let overlap = maxOverlap; overlap >= 24; overlap -= 1) {
-    if (left.slice(-overlap) === right.slice(0, overlap)) {
-      return overlap;
-    }
-  }
-  return 0;
+  return value;
 }
 
 function appendAssistantTranscriptChunk(chunks: string[], text: string): void {
@@ -1764,36 +2742,168 @@ function appendAssistantTranscriptChunk(chunks: string[], text: string): void {
   if (!text.trim() && !/[\r\n]/.test(text)) {
     return;
   }
+  const current = collapseAssistantTranscriptText(chunks.join(''));
+  chunks.splice(0, chunks.length, mergeStreamingText(current, text));
+}
 
-  const assembled = chunks.join('');
-  if (!assembled) {
-    chunks.push(text);
-    return;
-  }
+type ParsedAssistantTranscriptEntry =
+  | { type: 'tool'; atUtc: string; index: number }
+  | { type: 'chunk'; atUtc: string; index: number; text: string }
+  | { type: 'response'; atUtc: string; index: number; text: string };
 
-  if (assembled.endsWith(text)) {
-    return;
-  }
+type ParsedTranscriptEnvelope = {
+  atUtc?: string;
+  direction?: string;
+  event?: string;
+  payload?: string;
+};
 
-  const overlap = findAssistantTranscriptChunkOverlap(assembled, text);
-  const suffix = overlap > 0 ? text.slice(overlap) : text;
-  if (suffix) {
-    chunks.push(suffix);
+function parseAssistantTranscriptEnvelope(line: string): ParsedTranscriptEnvelope | null {
+  try {
+    return JSON.parse(line) as ParsedTranscriptEnvelope;
+  } catch {
+    return null;
   }
 }
 
-function stringifyResult(value: unknown): string {
-  if (typeof value === 'string' && value.trim()) {
-    return value.trim();
-  }
-  if (value && typeof value === 'object') {
-    const text = extractString((value as Record<string, unknown>).text);
-    if (text) {
-      return text;
+function parseAssistantTranscriptEntries(text: string): ParsedAssistantTranscriptEntry[] {
+  const entries: ParsedAssistantTranscriptEntry[] = [];
+
+  for (const [index, rawLine] of text.split('\n').entries()) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
     }
-    return JSON.stringify(value);
+
+    const parsedLine = parseAssistantTranscriptEnvelope(line);
+    if (!parsedLine) {
+      continue;
+    }
+    if (!parsedLine || parsedLine.direction !== 'from_agent') {
+      continue;
+    }
+
+    const atUtc = typeof parsedLine.atUtc === 'string' ? parsedLine.atUtc : '';
+    if (parsedLine.event === 'session_update' && typeof parsedLine.payload === 'string') {
+      try {
+        const payload = JSON.parse(parsedLine.payload) as {
+          update?: {
+            sessionUpdate?: string;
+            content?: { text?: unknown };
+          };
+        };
+        const updateType = payload.update?.sessionUpdate;
+        if (updateType === 'tool_call' || updateType === 'tool_call_update') {
+          entries.push({ type: 'tool', atUtc, index });
+          continue;
+        }
+        if (updateType === 'agent_message_chunk') {
+          const chunkText = extractChunkString(payload.update?.content?.text);
+          if (chunkText) {
+            entries.push({ type: 'chunk', atUtc, index, text: chunkText });
+          }
+        }
+      } catch {
+        // ignore malformed transcript update payloads
+      }
+      continue;
+    }
+
+    if (parsedLine.event === 'response' && typeof parsedLine.payload === 'string') {
+      try {
+        const payload = JSON.parse(parsedLine.payload) as { result?: unknown };
+        const candidate = unwrapAssistantDisplayText(
+          extractAssistantExplicitText(payload.result) ?? extractAssistantStreamedText(payload.result)
+        );
+        if (candidate) {
+          entries.push({ type: 'response', atUtc, index, text: candidate });
+        }
+      } catch {
+        // ignore malformed transcript response payloads
+      }
+    }
   }
-  return 'Assistant completed the request.';
+
+  entries.sort((left, right) => {
+    const timeCompare = left.atUtc.localeCompare(right.atUtc);
+    return timeCompare !== 0 ? timeCompare : left.index - right.index;
+  });
+
+  return entries;
+}
+
+function parseAssistantTranscriptToolAudit(text: string): AiAssistantToolAuditRecord[] {
+  const entries: Array<AiAssistantToolAuditRecord & { atUtc: string; index: number }> = [];
+
+  for (const [index, rawLine] of text.split('\n').entries()) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+
+    const parsedLine = parseAssistantTranscriptEnvelope(line);
+    if (!parsedLine) {
+      continue;
+    }
+
+    const atUtc = typeof parsedLine.atUtc === 'string' ? parsedLine.atUtc : '';
+
+    if (parsedLine.direction === 'system' && parsedLine.event === 'tool_call_audit' && typeof parsedLine.payload === 'string') {
+      const payload = safeParseJson<Record<string, unknown>>(parsedLine.payload);
+      if (!payload) {
+        continue;
+      }
+
+      entries.push({
+        atUtc,
+        index,
+        toolName: extractString(payload.toolName) ?? summarizeAssistantToolName(payload.args, undefined, undefined, undefined),
+        resourceLabel: summarizeAssistantResourceLabel(payload.args),
+        toolStatus: payload.allowed === false ? 'blocked' : undefined
+      });
+      continue;
+    }
+
+    if (parsedLine.direction === 'from_agent' && parsedLine.event === 'session_update' && typeof parsedLine.payload === 'string') {
+      const payload = safeParseJson<{
+        update?: {
+          sessionUpdate?: unknown;
+          toolCallId?: unknown;
+          title?: unknown;
+          kind?: unknown;
+          status?: unknown;
+          rawInput?: unknown;
+          rawOutput?: unknown;
+        };
+      }>(parsedLine.payload);
+      const update = payload?.update;
+      const updateType = typeof update?.sessionUpdate === 'string' ? update.sessionUpdate : '';
+      if (updateType !== 'tool_call' && updateType !== 'tool_call_update') {
+        continue;
+      }
+
+      entries.push({
+        atUtc,
+        index,
+        toolCallId: typeof update?.toolCallId === 'string' ? update.toolCallId : undefined,
+        toolName: summarizeAssistantToolName(update?.rawInput, update?.rawOutput, update?.kind, update?.title),
+        toolStatus: typeof update?.status === 'string' ? update.status : undefined,
+        resourceLabel: summarizeAssistantResourceLabel(update?.rawInput, update?.rawOutput)
+      });
+    }
+  }
+
+  entries.sort((left, right) => {
+    const timeCompare = left.atUtc.localeCompare(right.atUtc);
+    return timeCompare !== 0 ? timeCompare : left.index - right.index;
+  });
+
+  return mergeAssistantToolEvents(
+    [],
+    entries
+      .map(({ atUtc: _atUtc, index: _index, ...entry }) => entry)
+      .filter((entry) => !isFilteredAssistantToolName(entry.toolName))
+  );
 }
 
 function looksLikeArticleChangeRequest(userMessage: string): boolean {

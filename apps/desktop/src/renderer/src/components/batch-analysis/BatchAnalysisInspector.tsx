@@ -79,14 +79,57 @@ export function BatchAnalysisInspector({
     [inspection.timeline],
   );
 
-  const latestPlanReview = inspection.reviews[inspection.reviews.length - 1] ?? null;
-  const latestFinalReview = inspection.finalReviews[inspection.finalReviews.length - 1] ?? null;
+  const latestPlanReview = inspection.reviews[0] ?? null;
+  const latestFinalReview = inspection.finalReviews[0] ?? null;
   const latestPlanReviewDelta = latestPlanReview
     ? inspection.reviewDeltas.find((delta) => delta.reviewId === latestPlanReview.id) ?? null
     : null;
   const latestFinalReviewDelta = latestFinalReview
     ? inspection.finalReviewReworkPlans.find((delta) => delta.finalReviewId === latestFinalReview.id) ?? null
     : null;
+  const stageMetrics = useMemo(() => {
+    const events = eventStream?.events ?? [];
+    const grouped = new Map<string, {
+      stage: string;
+      role: string;
+      toolCallCount: number;
+      durationMs?: number;
+      attempts: number;
+      retries: number;
+    }>();
+    for (const event of events) {
+      const toolCallCount = typeof event.details?.toolCallCount === 'number' ? event.details.toolCallCount : undefined;
+      const durationMs = typeof event.details?.durationMs === 'number' ? event.details.durationMs : undefined;
+      const attempt = typeof event.details?.attempt === 'number' ? event.details.attempt : undefined;
+      const retryType = typeof event.details?.retryType === 'string' ? event.details.retryType : undefined;
+      if (toolCallCount == null && durationMs == null && attempt == null && !retryType) {
+        continue;
+      }
+      const key = `${event.stage}:${event.role}`;
+      const existing = grouped.get(key) ?? {
+        stage: event.stage,
+        role: event.role,
+        toolCallCount: 0,
+        durationMs: undefined,
+        attempts: 0,
+        retries: 0
+      };
+      if (toolCallCount != null) {
+        existing.toolCallCount = Math.max(existing.toolCallCount, toolCallCount);
+      }
+      if (durationMs != null) {
+        existing.durationMs = Math.max(existing.durationMs ?? 0, durationMs);
+      }
+      if (attempt != null) {
+        existing.attempts = Math.max(existing.attempts, attempt);
+      }
+      if (retryType) {
+        existing.retries += 1;
+      }
+      grouped.set(key, existing);
+    }
+    return Array.from(grouped.values());
+  }, [eventStream?.events]);
 
   const failedStage = useMemo(() => {
     if (currentStage === 'failed' || currentStage === 'canceled') {
@@ -179,6 +222,30 @@ export function BatchAnalysisInspector({
             {/* Execution counts */}
             {executionCounts && executionCounts.total > 0 && (
               <ExecCountsSummary counts={executionCounts} />
+            )}
+
+            {stageMetrics.length > 0 && (
+              <div className="ba-overview-section">
+                <h4 className="ba-section-heading">Stage Metrics</h4>
+                <div className="ba-detail-list">
+                  {stageMetrics.map((metric) => (
+                    <div key={`${metric.stage}:${metric.role}`} className="ba-detail-card">
+                      <div className="ba-detail-card-header">
+                        <div className="ba-detail-card-title">
+                          {getVisibleStageLabel(metric.stage as typeof currentStage) ?? STAGE_LABELS[metric.stage as keyof typeof STAGE_LABELS]}
+                        </div>
+                        <div className="ba-detail-card-meta">
+                          <Badge variant="neutral">{ROLE_LABELS[metric.role as keyof typeof ROLE_LABELS]}</Badge>
+                          <span>{metric.toolCallCount} tools</span>
+                          {metric.durationMs != null && <span>{Math.round(metric.durationMs / 1000)}s</span>}
+                          {metric.attempts > 0 && <span>attempt {metric.attempts}</span>}
+                          {metric.retries > 0 && <span>{metric.retries} retry</span>}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
 
             {/* Compact plan */}

@@ -74,6 +74,7 @@ export function AssistantPanelContent({
     sessions,
     messages,
     artifact,
+    pendingTurn,
     loading,
     sending,
     error,
@@ -99,7 +100,7 @@ export function AssistantPanelContent({
   const showArtifact = artifact
     && artifact.artifactType !== 'informational_response'
     && (artifact.status === 'pending' || artifact.status === 'applied');
-  const showTranscript = messages.length > 0;
+  const showTranscript = messages.length > 0 || Boolean(pendingTurn);
 
   return (
     <aside
@@ -158,12 +159,12 @@ export function AssistantPanelContent({
           )}
 
           {showTranscript ? (
-            <AssistantTranscript messages={messages} loading={sending} />
+            <AssistantTranscript messages={messages} pendingTurn={pendingTurn} loading={sending} />
           ) : (
-            !loading && <AssistantEmptyState context={routeContext} />
+            !(loading || pendingTurn) && <AssistantEmptyState context={routeContext} />
           )}
 
-          {loading && !showTranscript && (
+          {loading && !showTranscript && !pendingTurn && (
             <div className="ai-panel__loading" role="status" aria-label="Loading">
               <div className="ai-typing ai-typing--large">
                 <span /><span /><span />

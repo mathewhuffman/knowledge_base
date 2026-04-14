@@ -1,4 +1,10 @@
-import { JobEvent, type AppWorkingStatePatchAppliedEvent, type RpcResponse, type JobPayload } from '@kb-vault/shared-types';
+import {
+  JobEvent,
+  type AiAssistantStreamEvent,
+  type AppWorkingStatePatchAppliedEvent,
+  type RpcResponse,
+  type JobPayload
+} from '@kb-vault/shared-types';
 
 export interface KbvApi {
   invoke: <T>(method: string, payload?: unknown) => Promise<RpcResponse<T>>;
@@ -6,6 +12,7 @@ export interface KbvApi {
   cancelJob: (jobId: string) => Promise<JobPayload>;
   emitJobEvents: (handler: (event: JobEvent) => void) => () => void;
   emitAppWorkingStateEvents: (handler: (event: AppWorkingStatePatchAppliedEvent) => void) => () => void;
+  emitAiAssistantEvents: (handler: (event: AiAssistantStreamEvent) => void) => () => void;
 }
 
 declare global {

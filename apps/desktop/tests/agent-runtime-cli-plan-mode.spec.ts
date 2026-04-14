@@ -181,6 +181,7 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+
 async function readLoggedRequests(logPath: string): Promise<LoggedRequest[]> {
   const contents = await readFile(logPath, 'utf8');
   return contents
@@ -190,7 +191,7 @@ async function readLoggedRequests(logPath: string): Promise<LoggedRequest[]> {
     .map((line) => JSON.parse(line) as LoggedRequest);
 }
 
-test.describe('agent runtime CLI planner mode fallback', () => {
+test.describe('agent runtime CLI planner mode', () => {
   let tempRoot: string;
   let previousCursorBinary: string | undefined;
   let previousAcpCwd: string | undefined;
@@ -223,7 +224,7 @@ test.describe('agent runtime CLI planner mode fallback', () => {
     await rm(tempRoot, { recursive: true, force: true });
   });
 
-  test('CLI planner sessions fall back to ACP agent mode', async () => {
+  test('CLI planner sessions keep local plan semantics but request ACP agent mode', async () => {
     const logPath = path.join(tempRoot, 'cli-plan-fallback-log.jsonl');
     const binaryPath = await createFakeAcpBinary(tempRoot, logPath);
     process.env.KBV_CURSOR_BINARY = binaryPath;
@@ -246,6 +247,7 @@ test.describe('agent runtime CLI planner mode fallback', () => {
       );
 
       expect(result.status).toBe('ok');
+      expect(runtime.getSession(result.sessionId)?.mode).toBe('plan');
 
       const requests = await readLoggedRequests(logPath);
       const sessionNewRequest = requests.find((entry) => entry.method === 'session/new');
@@ -254,6 +256,45 @@ test.describe('agent runtime CLI planner mode fallback', () => {
           mode: 'agent'
         }
       });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('stale non-chat sessions are closed before starting a new batch run', async () => {
+    const logPath = path.join(tempRoot, 'cli-plan-stale-session-log.jsonl');
+    const binaryPath = await createFakeAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+    const staleSession = runtime.createSession({
+      workspaceId: 'workspace-1',
+      kbAccessMode: 'cli',
+      type: 'batch_analysis',
+      mode: 'plan',
+      role: 'planner',
+      batchId: 'stale-batch'
+    });
+    staleSession.updatedAtUtc = new Date(Date.now() - (16 * 60 * 1_000)).toISOString();
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'cli',
+          agentRole: 'planner',
+          sessionMode: 'plan'
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      const sessions = runtime.listSessions('workspace-1', true);
+      expect(sessions.find((session) => session.id === staleSession.id)?.status).toBe('closed');
     } finally {
       await runtime.stop();
     }

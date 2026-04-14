@@ -66,9 +66,16 @@ import {
   type MCPRecordAgentNotesInput,
   type MCPFindRelatedArticlesInput,
   type AgentStreamingPayload,
+  type AgentRunResult,
   type BatchAnalysisStageEventDetails,
   type BatchAnalysisIterationRecord,
   type BatchAnalysisPlan,
+  type BatchAnalysisSessionReusePolicy,
+  type BatchPlannerArticleMatch,
+  type BatchPlannerArticleMatchResult,
+  type BatchPlannerPrefetch,
+  type BatchPlannerPrefetchCluster,
+  type BatchPlannerRelationMatch,
   type BatchAnalysisStageStatus,
   type BatchPlanReview,
   type ProposalIngestRequest,
@@ -107,6 +114,7 @@ import {
   type AiAssistantSessionListRequest,
   type AiAssistantSessionOpenRequest,
   type AiAssistantSessionResetRequest,
+  type AiAssistantStreamEvent,
   type AppWorkingStatePatchAppliedEvent,
   type AppWorkingStatePatchRequest,
   type AppWorkingStateRegistration,
@@ -324,64 +332,29 @@ const readTranscriptLines = async (transcriptPath?: string, limit?: number): Pro
           } as AgentTranscriptLine;
         }
       });
+    const ordered = parsed
+      .map((line, index) => ({ line, index }))
+      .sort((left, right) => {
+        const leftSeq = typeof left.line.seq === 'number' ? left.line.seq : Number.POSITIVE_INFINITY;
+        const rightSeq = typeof right.line.seq === 'number' ? right.line.seq : Number.POSITIVE_INFINITY;
+        if (leftSeq !== rightSeq) {
+          return leftSeq - rightSeq;
+        }
+        if (left.line.atUtc !== right.line.atUtc) {
+          return left.line.atUtc.localeCompare(right.line.atUtc);
+        }
+        return left.index - right.index;
+      })
+      .map((entry) => entry.line);
 
-    return typeof limit === 'number' && limit > 0 ? parsed.slice(-limit) : parsed;
+    return typeof limit === 'number' && limit > 0 ? ordered.slice(-limit) : ordered;
   } catch {
     return [];
   }
 };
 
-type PlannerPrefetchCluster = {
-  clusterId: string;
-  label: string;
-  pbiIds: string[];
-  sampleTitles: string[];
-  queries: string[];
-};
-
-type PlannerPrefetchSummary = {
-  priorAnalysis: {
-    latestPlanSummary?: string;
-    latestApprovedPlanSummary?: string;
-    latestReviewVerdict?: string;
-    latestFinalVerdict?: string;
-  } | null;
-  topicClusters: PlannerPrefetchCluster[];
-  articleMatches: Array<{
-    clusterId: string;
-    query: string;
-    total: number;
-    topResults: Array<{
-      title: string;
-      familyId: string;
-      localeVariantId: string;
-      score: number;
-      matchContext?: string;
-      snippet: string;
-    }>;
-  }>;
-  relationMatches: Array<{
-    title: string;
-    familyId: string;
-    strengthScore: number;
-    relationType: string;
-    evidence: string[];
-  }>;
-};
-
-const PLANNER_CLUSTER_STOPWORDS = new Set([
-  'a', 'an', 'and', 'the', 'for', 'of', 'to', 'in', 'on', 'with', 'from', 'by',
-  'tab', 'page', 'view', 'workflow', 'behavior', 'state', 'visibility', 'navigation',
-  'related', 'scenarios', 'management', 'details', 'table', 'modal'
-]);
-
 const normalizePlannerPhrase = (value: string): string =>
   value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-
-const tokenizePlannerPhrase = (value: string): string[] =>
-  normalizePlannerPhrase(value)
-    .split(' ')
-    .filter((token) => token.length >= 3 && !PLANNER_CLUSTER_STOPWORDS.has(token));
 
 const dedupeStrings = (values: Array<string | undefined | null>): string[] =>
   Array.from(new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))));
@@ -416,54 +389,204 @@ const extractPlannerPbiRows = (uploadedPbis: unknown): Array<{
     .filter((row): row is { pbiId: string; title: string; titlePath: string[] } => Boolean(row));
 };
 
-const computePlannerTokenSimilarity = (left: string[], right: string[]): number => {
-  if (left.length === 0 || right.length === 0) {
-    return 0;
+const PLANNER_GENERIC_PATH_SEGMENTS = new Set([
+  'food list',
+  'food lists',
+  'food item',
+  'food items',
+  'permission',
+  'related scenarios',
+  'additional actions'
+]);
+
+const plannerIncludesWord = (value: string, word: string): boolean =>
+  normalizePlannerPhrase(value).split(' ').includes(word);
+
+const plannerCombinePathSegments = (...segments: Array<string | undefined>): string =>
+  dedupeStrings(segments).join(' ').trim();
+
+const buildPlannerSpecificPhrase = (row: { title: string; titlePath: string[] }): string => {
+  const path = dedupeStrings([...row.titlePath, row.title]);
+  const leaf = path[path.length - 1] ?? row.title;
+  const parent = path.length >= 2 ? path[path.length - 2] : '';
+
+  const normalizedLeaf = normalizePlannerPhrase(leaf);
+  if (normalizedLeaf === 'additional actions' && parent) {
+    return plannerCombinePathSegments(parent, 'Additional Actions');
   }
-  const leftSet = new Set(left);
-  const rightSet = new Set(right);
-  let overlap = 0;
-  for (const token of leftSet) {
-    if (rightSet.has(token)) {
-      overlap += 1;
-    }
+  if ((normalizedLeaf === 'related scenarios' || normalizedLeaf === 'permission') && parent) {
+    return plannerCombinePathSegments(parent, leaf);
   }
-  return overlap / Math.max(leftSet.size, rightSet.size);
+  if (PLANNER_GENERIC_PATH_SEGMENTS.has(normalizedLeaf) && parent) {
+    return plannerCombinePathSegments(parent, leaf);
+  }
+
+  return leaf;
 };
 
-const buildPlannerTopicClusters = (uploadedPbis: unknown): PlannerPrefetchCluster[] => {
+const classifyPlannerSurface = (row: { title: string; titlePath: string[] }): {
+  clusterKey: string;
+  clusterLabel: string;
+  queryCandidates: string[];
+} => {
+  const path = dedupeStrings([...row.titlePath, row.title]);
+  const specificPhrase = buildPlannerSpecificPhrase(row);
+  const combined = normalizePlannerPhrase(path.join(' '));
+  const leaf = normalizePlannerPhrase(path[path.length - 1] ?? row.title);
+  const hasFoodItem = combined.includes('food item');
+  const hasFoodList = combined.includes('food list');
+  const hasDuplicate = combined.includes('duplicate') || combined.includes('duplicating');
+  const hasDelete = combined.includes('delete');
+  const hasCreate = combined.includes('create');
+  const hasEdit = combined.includes('edit');
+  const hasSearch = combined.includes('search');
+  const hasFilter = combined.includes('filter');
+  const hasSort = combined.includes('sort');
+  const hasPagination = combined.includes('pagination');
+  const hasNavigate = combined.includes('navigating');
+  const hasDetail = combined.includes('detail');
+  const hasLocation = combined.includes('location');
+  const hasPermission = combined.includes('permission');
+  const hasTable = combined.includes('table');
+
+  if (hasDuplicate && hasFoodItem) {
+    return {
+      clusterKey: 'duplicate-food-item',
+      clusterLabel: 'Duplicate a Food Item',
+      queryCandidates: [
+        'Duplicate Food Item',
+        'Duplicating Food Item',
+        'Food Item Additional Actions'
+      ]
+    };
+  }
+
+  if (hasDuplicate && hasFoodList) {
+    return {
+      clusterKey: 'duplicate-food-list',
+      clusterLabel: 'Duplicate a Food List',
+      queryCandidates: [
+        'Duplicate Food List',
+        'Duplicating Food List',
+        'Food List Additional Actions'
+      ]
+    };
+  }
+
+  if (hasDelete && hasFoodItem) {
+    return {
+      clusterKey: 'delete-food-item',
+      clusterLabel: 'Delete a Food Item',
+      queryCandidates: [
+        'Delete a Food Item',
+        'Food Item Additional Actions'
+      ]
+    };
+  }
+
+  if (hasDelete && hasFoodList) {
+    return {
+      clusterKey: 'delete-food-list',
+      clusterLabel: 'Delete a Food List',
+      queryCandidates: [
+        'Delete a Food List',
+        'Food List Additional Actions'
+      ]
+    };
+  }
+
+  if (hasCreate && hasFoodItem) {
+    return {
+      clusterKey: 'create-food-item',
+      clusterLabel: 'Create a Food Item',
+      queryCandidates: [
+        'Create a Food Item',
+        'Create Food Item'
+      ]
+    };
+  }
+
+  if (hasCreate && hasFoodList) {
+    return {
+      clusterKey: 'create-food-list',
+      clusterLabel: 'Create a Food List',
+      queryCandidates: [
+        'Create a Food List',
+        'Create Food List'
+      ]
+    };
+  }
+
+  if (hasFoodList && (hasSearch || hasFilter || hasSort || hasPagination || hasNavigate)) {
+    return {
+      clusterKey: 'food-list-index-surface',
+      clusterLabel: 'View Food Lists',
+      queryCandidates: [
+        'View Food Lists',
+        'Navigating to Food List',
+        'Searching Food List Table',
+        'Filters & Sorts',
+        'Table Pagination'
+      ]
+    };
+  }
+
+  if (hasFoodList && (hasDetail || hasLocation || hasPermission || hasEdit || hasTable || leaf.includes('details tab'))) {
+    return {
+      clusterKey: 'food-list-detail-surface',
+      clusterLabel: 'View and Edit a Food List',
+      queryCandidates: [
+        'View and Edit a Food List',
+        'Edit Food List Title',
+        'Details Tab',
+        'Food Items Table',
+        'Location Tab Visibility and Navigation',
+        'Food List Permissions'
+      ]
+    };
+  }
+
+  return {
+    clusterKey: normalizePlannerPhrase(specificPhrase).replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || `cluster-${randomUUID()}`,
+    clusterLabel: specificPhrase,
+    queryCandidates: [specificPhrase, ...path]
+  };
+};
+
+const buildPlannerTopicClusters = (uploadedPbis: unknown): BatchPlannerPrefetchCluster[] => {
   const rows = extractPlannerPbiRows(uploadedPbis);
-  const clusters: Array<PlannerPrefetchCluster & { tokenSets: string[][] }> = [];
+  const clusters = new Map<string, BatchPlannerPrefetchCluster>();
 
   for (const row of rows) {
-    const phrases = dedupeStrings([row.title, ...row.titlePath]);
-    const tokenSets = phrases.map((phrase) => tokenizePlannerPhrase(phrase)).filter((tokens) => tokens.length > 0);
-    const existing = clusters.find((cluster) =>
-      tokenSets.some((tokens) => cluster.tokenSets.some((candidate) => computePlannerTokenSimilarity(tokens, candidate) >= 0.55))
-    );
+    const specificPhrase = buildPlannerSpecificPhrase(row);
+    const surface = classifyPlannerSurface(row);
+    const queryCandidates = dedupeStrings([
+      ...surface.queryCandidates,
+      specificPhrase,
+      row.title,
+      ...row.titlePath.slice(-2)
+    ]).slice(0, 6);
 
+    const existing = clusters.get(surface.clusterKey);
     if (existing) {
       if (!existing.pbiIds.includes(row.pbiId)) {
         existing.pbiIds.push(row.pbiId);
       }
-      existing.sampleTitles = dedupeStrings([...existing.sampleTitles, row.title]).slice(0, 4);
-      existing.queries = dedupeStrings([...existing.queries, ...phrases]).slice(0, 4);
-      existing.tokenSets.push(...tokenSets);
+      existing.sampleTitles = dedupeStrings([...existing.sampleTitles, row.title, specificPhrase]).slice(0, 6);
+      existing.queries = dedupeStrings([...existing.queries, ...queryCandidates]).slice(0, 6);
       continue;
     }
 
-    clusters.push({
-      clusterId: `cluster-${clusters.length + 1}`,
-      label: row.titlePath[row.titlePath.length - 1] ?? row.title,
+    clusters.set(surface.clusterKey, {
+      clusterId: `cluster-${clusters.size + 1}`,
+      label: surface.clusterLabel,
       pbiIds: [row.pbiId],
-      sampleTitles: [row.title],
-      queries: phrases.slice(0, 4),
-      tokenSets
+      sampleTitles: dedupeStrings([row.title, specificPhrase]).slice(0, 6),
+      queries: queryCandidates
     });
   }
 
-  return clusters
-    .map(({ tokenSets: _tokenSets, ...cluster }) => cluster)
+  return Array.from(clusters.values())
     .sort((left, right) => right.pbiIds.length - left.pbiIds.length || left.label.localeCompare(right.label));
 };
 
@@ -494,7 +617,7 @@ const buildPlannerPrefetch = async (
   workspaceId: string,
   batchId: string,
   uploadedPbis: unknown
-): Promise<PlannerPrefetchSummary> => {
+): Promise<BatchPlannerPrefetch> => {
   const topicClusters = buildPlannerTopicClusters(uploadedPbis);
   const [inspection, relationResponse, articleMatches] = await Promise.all([
     workspaceRepository.getBatchAnalysisInspection(workspaceId, batchId).catch(() => null),
@@ -507,28 +630,30 @@ const buildPlannerPrefetch = async (
     }).catch(() => ({ relations: [] })),
     Promise.all(
       topicClusters.slice(0, 12).flatMap((cluster) =>
-        cluster.queries.slice(0, 2).map(async (query) => {
+        cluster.queries.slice(0, 4).map(async (query) => {
           const search = await workspaceRepository.searchArticles(workspaceId, {
             workspaceId,
             query,
             scope: 'all',
             includeArchived: true
           }).catch(() => ({ total: 0, results: [] as Array<Record<string, unknown>> }));
-          return {
+          const topResults: BatchPlannerArticleMatchResult[] = Array.isArray(search.results)
+            ? search.results.slice(0, 3).map((result) => ({
+                title: typeof result.title === 'string' ? result.title : 'Untitled article',
+                familyId: typeof result.familyId === 'string' ? result.familyId : '',
+                localeVariantId: typeof result.localeVariantId === 'string' ? result.localeVariantId : '',
+                score: typeof result.score === 'number' ? result.score : 0,
+                matchContext: typeof result.matchContext === 'string' ? result.matchContext : undefined,
+                snippet: typeof result.snippet === 'string' ? result.snippet.trim() : ''
+              }))
+            : [];
+          const articleMatch: BatchPlannerArticleMatch = {
             clusterId: cluster.clusterId,
             query,
             total: typeof search.total === 'number' ? search.total : 0,
-            topResults: Array.isArray(search.results)
-              ? search.results.slice(0, 3).map((result) => ({
-                  title: typeof result.title === 'string' ? result.title : 'Untitled article',
-                  familyId: typeof result.familyId === 'string' ? result.familyId : '',
-                  localeVariantId: typeof result.localeVariantId === 'string' ? result.localeVariantId : '',
-                  score: typeof result.score === 'number' ? result.score : 0,
-                  matchContext: typeof result.matchContext === 'string' ? result.matchContext : undefined,
-                  snippet: typeof result.snippet === 'string' ? result.snippet.trim() : ''
-                }))
-              : []
+            topResults
           };
+          return articleMatch;
         })
       )
     )
@@ -546,7 +671,7 @@ const buildPlannerPrefetch = async (
     topicClusters,
     articleMatches,
     relationMatches: Array.isArray((relationResponse as { relations?: unknown[] }).relations)
-      ? ((relationResponse as { relations: Array<Record<string, unknown>> }).relations).slice(0, 12).map((relation) => ({
+      ? ((relationResponse as { relations: Array<Record<string, unknown>> }).relations).slice(0, 12).map((relation): BatchPlannerRelationMatch => ({
           title: typeof relation.targetFamily === 'object' && relation.targetFamily && typeof (relation.targetFamily as { title?: unknown }).title === 'string'
             ? (relation.targetFamily as { title: string }).title
             : 'Untitled family',
@@ -561,16 +686,35 @@ const buildPlannerPrefetch = async (
   };
 };
 
+const dedupeResultTextCandidates = (values: string[]): string[] => {
+  const candidates = new Set<string>();
+  for (const value of values) {
+    const normalized = collapseRepeatedTranscriptText(value);
+    if (!normalized) {
+      continue;
+    }
+    candidates.add(normalized);
+
+    const normalizedJson = normalizeRecoveredJsonText(normalized);
+    if (normalizedJson) {
+      candidates.add(normalizedJson);
+    }
+  }
+  return [...candidates];
+};
+
 const extractResultTextCandidates = (payload: unknown): string[] => {
   if (!payload || typeof payload !== 'object') {
     return [];
   }
   const record = payload as {
+    finalText?: unknown;
     text?: unknown;
     streamedText?: unknown;
     content?: Array<{ type?: string; text?: string }>;
   };
-  const candidates = [
+  return dedupeResultTextCandidates([
+    typeof record.finalText === 'string' ? record.finalText : '',
     typeof record.text === 'string' ? record.text : '',
     Array.isArray(record.content)
       ? record.content
@@ -580,21 +724,152 @@ const extractResultTextCandidates = (payload: unknown): string[] => {
           .trim()
       : '',
     typeof record.streamedText === 'string' ? record.streamedText : ''
-  ].map((value) => collapseRepeatedTranscriptText(value)).filter(Boolean);
-
-  return Array.from(new Set(candidates));
+  ]);
 };
 
-const scoreResultTextCandidate = (candidate: string): number => {
+type BatchAnalysisResultShape = 'planner' | 'plan_review' | 'worker' | 'final_review';
+
+type BatchAnalysisDevBuildPair = {
+  label: string;
+  sourceRelativePath: string;
+  buildRelativePath: string;
+};
+
+const BATCH_ANALYSIS_DEV_BUILD_PAIRS: BatchAnalysisDevBuildPair[] = [
+  {
+    label: 'desktop command registry',
+    sourceRelativePath: 'apps/desktop/src/main/services/command-registry.ts',
+    buildRelativePath: 'apps/desktop/dist/main/services/command-registry.js'
+  },
+  {
+    label: 'desktop batch orchestrator',
+    sourceRelativePath: 'apps/desktop/src/main/services/batch-analysis-orchestrator.ts',
+    buildRelativePath: 'apps/desktop/dist/main/services/batch-analysis-orchestrator.js'
+  },
+  {
+    label: 'desktop workspace repository',
+    sourceRelativePath: 'apps/desktop/src/main/services/workspace-repository.ts',
+    buildRelativePath: 'apps/desktop/dist/main/services/workspace-repository.js'
+  },
+  {
+    label: 'agent runtime',
+    sourceRelativePath: 'packages/agent-runtime/src/index.ts',
+    buildRelativePath: 'apps/desktop/dist/main/packages/agent-runtime/src/index.js'
+  }
+];
+
+const DEV_BUILD_STALENESS_TOLERANCE_MS = 50;
+
+const statMtimeMs = async (filePath: string): Promise<number | null> => {
+  try {
+    return (await fs.stat(filePath)).mtimeMs;
+  } catch {
+    return null;
+  }
+};
+
+const evaluateBatchAnalysisDevBuildFreshness = async (
+  repoRoot: string,
+  pairs: BatchAnalysisDevBuildPair[] = BATCH_ANALYSIS_DEV_BUILD_PAIRS
+): Promise<{
+  stale: boolean;
+  message?: string;
+  stalePairs: Array<{
+    label: string;
+    sourcePath: string;
+    buildPath: string;
+  }>;
+}> => {
+  const stalePairs: Array<{
+    label: string;
+    sourcePath: string;
+    buildPath: string;
+  }> = [];
+  let discoveredSourceCount = 0;
+
+  for (const pair of pairs) {
+    const sourcePath = path.join(repoRoot, pair.sourceRelativePath);
+    const buildPath = path.join(repoRoot, pair.buildRelativePath);
+    const sourceMtimeMs = await statMtimeMs(sourcePath);
+    if (sourceMtimeMs === null) {
+      continue;
+    }
+    discoveredSourceCount += 1;
+    const buildMtimeMs = await statMtimeMs(buildPath);
+    if (buildMtimeMs === null || sourceMtimeMs > buildMtimeMs + DEV_BUILD_STALENESS_TOLERANCE_MS) {
+      stalePairs.push({
+        label: pair.label,
+        sourcePath,
+        buildPath
+      });
+    }
+  }
+
+  if (discoveredSourceCount === 0 || stalePairs.length === 0) {
+    return { stale: false, stalePairs: [] };
+  }
+
+  const examples = stalePairs
+    .slice(0, 3)
+    .map((pair) => `${pair.label} (${path.relative(repoRoot, pair.sourcePath)} > ${path.relative(repoRoot, pair.buildPath)})`)
+    .join('; ');
+
+  return {
+    stale: true,
+    message: `Batch analyzation is running against a stale desktop main build. Restart the desktop dev process before running it again. Newer source files were detected: ${examples}.`,
+    stalePairs
+  };
+};
+
+const getBatchAnalysisDevBuildFreshnessMessage = async (): Promise<string | null> => {
+  const repoRoot = path.resolve(__dirname, '..', '..', '..', '..', '..');
+  const freshness = await evaluateBatchAnalysisDevBuildFreshness(repoRoot);
+  return freshness.stale ? freshness.message ?? 'Batch analyzation is running against a stale desktop main build.' : null;
+};
+
+const matchesExpectedBatchResultShape = (
+  parsed: Record<string, unknown>,
+  expectedShape?: BatchAnalysisResultShape
+): boolean => {
+  if (!expectedShape) {
+    return true;
+  }
+
+  switch (expectedShape) {
+    case 'planner':
+      return Array.isArray(parsed.coverage) && Array.isArray(parsed.items);
+    case 'plan_review':
+      return typeof parsed.verdict === 'string' && parsed.delta !== null && typeof parsed.delta === 'object';
+    case 'worker':
+      return Array.isArray(parsed.executedItems) || Array.isArray(parsed.discoveredWork);
+    case 'final_review':
+      return typeof parsed.verdict === 'string' && parsed.delta !== null && typeof parsed.delta === 'object' && 'allPbisMapped' in parsed;
+    default:
+      return true;
+  }
+};
+
+const scoreResultTextCandidate = (candidate: string, expectedShape?: BatchAnalysisResultShape): number => {
   const trimmed = candidate.trim();
   if (!trimmed) {
     return -1;
   }
-  if (extractJsonObject(trimmed)) {
+  const extracted = extractJsonObject(trimmed);
+  if (extracted && matchesExpectedBatchResultShape(extracted, expectedShape)) {
     return 10_000 + trimmed.length;
   }
 
   let score = trimmed.length;
+  if (expectedShape && !trimmed.includes('{')) {
+    score -= 1_500;
+  }
+  if (
+    expectedShape
+    && !trimmed.includes('{')
+    && /^(reviewing|checking|searching|probing|let me|i['’]m)\b/i.test(trimmed)
+  ) {
+    score -= 3_000;
+  }
   if (trimmed.startsWith('{')) {
     score += 500;
   }
@@ -610,30 +885,68 @@ const scoreResultTextCandidate = (candidate: string): number => {
   if (trimmed.includes('"verdict"')) {
     score += 300;
   }
+  if (expectedShape === 'planner') {
+    if (trimmed.includes('"coverage"')) {
+      score += 600;
+    }
+    if (trimmed.includes('"items"')) {
+      score += 600;
+    }
+    if (trimmed.includes('"status"')) {
+      score -= 700;
+    }
+  }
+  if (expectedShape === 'plan_review' || expectedShape === 'final_review') {
+    if (trimmed.includes('"delta"')) {
+      score += 450;
+    }
+    if (trimmed.includes('"status"')) {
+      score -= 700;
+    }
+  }
+  if (expectedShape === 'worker' && trimmed.includes('"executedItems"')) {
+    score += 600;
+  }
   score += (trimmed.match(/\{/g) ?? []).length * 25;
   return score;
 };
 
-const selectBestResultText = (candidates: string[]): string => {
+const selectBestResultText = (candidates: string[], expectedShape?: BatchAnalysisResultShape): string => {
   if (candidates.length === 0) {
     return '';
   }
   return [...candidates]
-    .sort((left, right) => scoreResultTextCandidate(right) - scoreResultTextCandidate(left))[0] ?? '';
+    .sort((left, right) => scoreResultTextCandidate(right, expectedShape) - scoreResultTextCandidate(left, expectedShape))[0] ?? '';
+};
+
+const selectBestParseableResultText = (candidates: string[], expectedShape?: BatchAnalysisResultShape): string => {
+  const parseableCandidates = candidates.filter((candidate) => {
+    const extracted = extractJsonObject(candidate);
+    return Boolean(extracted && matchesExpectedBatchResultShape(extracted, expectedShape));
+  });
+  if (parseableCandidates.length === 0) {
+    return '';
+  }
+
+  const pureJsonCandidates = parseableCandidates.filter((candidate) => candidate.trim().startsWith('{'));
+  return selectBestResultText(
+    pureJsonCandidates.length > 0 ? pureJsonCandidates : parseableCandidates,
+    expectedShape
+  );
 };
 
 const collapseRepeatedTranscriptText = (value: string): string => {
-  let current = value.trim();
-  while (current.length >= 64 && current.length % 2 === 0) {
+  let current = value;
+  while (current.trim().length >= 64 && current.length % 2 === 0) {
     const midpoint = current.length / 2;
-    const left = current.slice(0, midpoint).trim();
-    const right = current.slice(midpoint).trim();
-    if (!left || left !== right) {
+    const left = current.slice(0, midpoint);
+    const right = current.slice(midpoint);
+    if (!left.trim() || left.trim() !== right.trim()) {
       break;
     }
     current = left;
   }
-  return current;
+  return current.trim() ? current : '';
 };
 
 const findTranscriptChunkOverlap = (left: string, right: string): number => {
@@ -669,6 +982,145 @@ const appendTranscriptChunk = (chunks: string[], chunk: string): void => {
   }
 };
 
+const looksLikeStructuredBatchResultText = (
+  text: string,
+  expectedShape: BatchAnalysisResultShape
+): boolean => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed.startsWith('{') || trimmed.startsWith('```json')) {
+    return true;
+  }
+  switch (expectedShape) {
+    case 'planner':
+      return trimmed.includes('"coverage"') || trimmed.includes('"items"');
+    case 'plan_review':
+      return trimmed.includes('"verdict"') || trimmed.includes('"delta"') || trimmed.includes('"requestedChanges"');
+    case 'worker':
+      return trimmed.includes('"executedItems"') || trimmed.includes('"discoveredWork"');
+    case 'final_review':
+      return trimmed.includes('"verdict"') || trimmed.includes('"delta"') || trimmed.includes('"allPbisMapped"');
+    default:
+      return false;
+  }
+};
+
+const shouldRetryReviewWithFreshSession = (resolution: {
+  text: string;
+  initialCandidateCount: number;
+  transcriptCandidateCount: number;
+  parseable: boolean;
+}): boolean => {
+  if (resolution.parseable) {
+    return false;
+  }
+  const trimmed = resolution.text.trim();
+  if (!trimmed) {
+    return resolution.initialCandidateCount === 0 && resolution.transcriptCandidateCount === 0;
+  }
+  if (detectBatchInfrastructureFailureText(trimmed)) {
+    return false;
+  }
+  return looksLikeStructuredBatchResultText(trimmed, 'plan_review')
+    || /^(reviewing|checking|searching|finding|looking|investigating)\b/i.test(trimmed)
+    || /^i['’]m\s+(reviewing|checking|searching|finding|looking|investigating)\b/i.test(trimmed);
+};
+
+class BatchAnalysisTerminalError extends Error {
+  constructor(
+    message: string,
+    readonly terminalStage: BatchAnalysisIterationRecord['stage'],
+    readonly terminalStatus: BatchAnalysisIterationRecord['status']
+  ) {
+    super(message);
+    this.name = 'BatchAnalysisTerminalError';
+  }
+}
+
+const detectBatchInfrastructureFailureText = (text: string): { message: string; code?: string } | null => {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('```')) {
+    return null;
+  }
+
+  const normalized = trimmed.toLowerCase();
+  const looksLikeExplicitError =
+    /^error\b/i.test(trimmed)
+    || /^failed\b/i.test(trimmed)
+    || normalized.includes('provider error')
+    || normalized.includes('runtime error')
+    || normalized.includes('transport error');
+  const infrastructureSignals = [
+    'resource_exhausted',
+    'rate limit',
+    'rate_limit',
+    'temporarily unavailable',
+    'service unavailable',
+    'server overloaded',
+    'internal server error',
+    'network error',
+    'connection reset',
+    'connection aborted',
+    'timeout',
+    'timed out'
+  ];
+  if (!looksLikeExplicitError && !infrastructureSignals.some((signal) => normalized.includes(signal))) {
+    return null;
+  }
+
+  const codeMatch = trimmed.match(/\[([a-z0-9_:-]+)\]/i);
+  return {
+    message: trimmed,
+    code: codeMatch?.[1]?.trim().toLowerCase() || undefined
+  };
+};
+
+const detectPlannerInfrastructureFailure = (
+  resultStatus: AgentRunResult['status'],
+  resolution: { text: string }
+): { message: string; code?: string } | null => {
+  if (resultStatus === 'error' || resultStatus === 'timeout') {
+    const trimmed = resolution.text.trim();
+    return {
+      message: trimmed || `Planner runtime returned status "${resultStatus}".`
+    };
+  }
+  return detectBatchInfrastructureFailureText(resolution.text);
+};
+
+const shouldRetryPlannerWithFreshSession = (resolution: {
+  text: string;
+  initialCandidateCount: number;
+  transcriptCandidateCount: number;
+  parseable: boolean;
+}): boolean => {
+  if (resolution.parseable) {
+    return false;
+  }
+  const trimmed = resolution.text.trim();
+  if (!trimmed) {
+    return true;
+  }
+  if (detectBatchInfrastructureFailureText(trimmed)) {
+    return false;
+  }
+  return !salvagePlannerJsonText(trimmed) && trimmed.length < 3_000;
+};
+
+const plannerOutputLooksStructuredButIncomplete = (text: string): boolean => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  return trimmed.startsWith('{')
+    || trimmed.startsWith('```json')
+    || trimmed.includes('"coverage"')
+    || trimmed.includes('"items"');
+};
+
 const normalizeRecoveredJsonText = (text: string): string | null => {
   const extracted = extractJsonObject(text);
   return extracted ? JSON.stringify(extracted) : null;
@@ -685,6 +1137,15 @@ const extractJsonStringField = (text: string, fieldName: string): string | null 
   } catch {
     return match[1];
   }
+};
+
+const extractJsonBooleanField = (text: string, fieldName: string): boolean | null => {
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`"${escapedField}"\\s*:\\s*(true|false)`, 's').exec(text);
+  if (!match) {
+    return null;
+  }
+  return match[1] === 'true';
 };
 
 const findJsonArrayStart = (text: string, fieldName: string): number => {
@@ -805,13 +1266,36 @@ const extractCompleteJsonStringsFromArray = (text: string, fieldName: string): s
   return results;
 };
 
+const UUID_LIKE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const normalizeRecoveredPlannerTargetId = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return UUID_LIKE_PATTERN.test(trimmed) ? trimmed : undefined;
+};
+
+const recoveredPlannerItemLooksLikeCreate = (item: Record<string, unknown>): boolean => {
+  const title = typeof item.targetTitle === 'string' ? item.targetTitle.trim().toLowerCase() : '';
+  const reason = typeof item.reason === 'string' ? item.reason.trim().toLowerCase() : '';
+  const combined = `${title} ${reason}`.trim();
+  return title.startsWith('create')
+    || title.startsWith('add')
+    || title.startsWith('new')
+    || /\bnet new\b/.test(combined)
+    || /\bnew article\b/.test(combined)
+    || /\bcreate\b/.test(combined)
+    || /\bintroduc(?:e|ing|tion)\b/.test(combined);
+};
+
 const salvagePlannerJsonText = (text: string): string | null => {
   const summary = extractJsonStringField(text, 'summary');
   const rawCoverage = extractCompleteJsonObjectsFromArray(text, 'coverage');
   const rawItems = extractCompleteJsonObjectsFromArray(text, 'items');
   const openQuestions = extractCompleteJsonStringsFromArray(text, 'openQuestions');
 
-  const items: Array<Record<string, unknown> & { planItemId: string }> = rawItems
+  const items: Array<Record<string, unknown> & { planItemId: string; dependsOn: string[] }> = rawItems
     .filter((item) =>
       typeof item.planItemId === 'string'
       && Array.isArray(item.pbiIds)
@@ -820,22 +1304,58 @@ const salvagePlannerJsonText = (text: string): string | null => {
       && typeof item.targetTitle === 'string'
       && typeof item.reason === 'string'
     )
-    .map((item) => ({
-      ...item,
-      planItemId: item.planItemId as string,
-      pbiIds: (item.pbiIds as unknown[]).filter((value): value is string => typeof value === 'string'),
-      evidence: Array.isArray(item.evidence)
-        ? (item.evidence as Array<Record<string, unknown>>).filter((evidence) =>
-            evidence
-            && typeof evidence === 'object'
-            && typeof evidence.kind === 'string'
-            && typeof evidence.ref === 'string'
-            && typeof evidence.summary === 'string'
-          )
-        : [],
-      confidence: typeof item.confidence === 'number' ? item.confidence : 0.5,
-      executionStatus: typeof item.executionStatus === 'string' ? item.executionStatus : 'pending'
-    }) as Record<string, unknown> & { planItemId: string });
+    .map((item) => {
+      const rawAction = typeof item.action === 'string' ? item.action : 'no_impact';
+      const retainedTargetArticleId = normalizeRecoveredPlannerTargetId(item.targetArticleId);
+      const retainedTargetFamilyId = normalizeRecoveredPlannerTargetId(item.targetFamilyId);
+      const hasRetainedArticleTarget = Boolean(retainedTargetArticleId || retainedTargetFamilyId);
+      const promoteToCreate =
+        rawAction === 'no_impact'
+        && !hasRetainedArticleTarget
+        && recoveredPlannerItemLooksLikeCreate(item);
+      const action =
+        rawAction === 'create' || rawAction === 'edit' || rawAction === 'retire' || rawAction === 'no_impact'
+          ? rawAction
+          : 'no_impact';
+      const normalizedAction = promoteToCreate ? 'create' : action;
+      const rawTargetType = typeof item.targetType === 'string' ? item.targetType : 'unknown';
+      const targetType =
+        normalizedAction === 'create'
+          ? 'new_article'
+          : rawTargetType === 'article' && !hasRetainedArticleTarget
+            ? 'unknown'
+            : rawTargetType === 'article'
+              || rawTargetType === 'article_family'
+              || rawTargetType === 'article_set'
+              || rawTargetType === 'new_article'
+              || rawTargetType === 'unknown'
+                ? rawTargetType
+                : 'unknown';
+      return {
+        planItemId: item.planItemId as string,
+        pbiIds: (item.pbiIds as unknown[]).filter((value): value is string => typeof value === 'string'),
+        action: normalizedAction,
+        targetType,
+        ...(retainedTargetArticleId ? { targetArticleId: retainedTargetArticleId } : {}),
+        ...(retainedTargetFamilyId ? { targetFamilyId: retainedTargetFamilyId } : {}),
+        targetTitle: item.targetTitle,
+        reason: item.reason,
+        evidence: Array.isArray(item.evidence)
+          ? (item.evidence as Array<Record<string, unknown>>).filter((evidence) =>
+              evidence
+              && typeof evidence === 'object'
+              && typeof evidence.kind === 'string'
+              && typeof evidence.ref === 'string'
+              && typeof evidence.summary === 'string'
+            )
+          : [],
+        confidence: typeof item.confidence === 'number' ? item.confidence : 0.5,
+        dependsOn: Array.isArray(item.dependsOn)
+          ? (item.dependsOn as unknown[]).filter((value): value is string => typeof value === 'string')
+          : [],
+        executionStatus: typeof item.executionStatus === 'string' ? item.executionStatus : 'pending'
+      } as Record<string, unknown> & { planItemId: string; dependsOn: string[] };
+    });
 
   if (items.length === 0) {
     return null;
@@ -856,11 +1376,119 @@ const salvagePlannerJsonText = (text: string): string | null => {
     return null;
   }
 
+  const normalizedItems = items.map((item) => ({
+    ...item,
+    dependsOn: item.dependsOn.filter((dependencyId) => itemIds.has(dependencyId) && dependencyId !== item.planItemId)
+  }));
+
   return JSON.stringify({
     summary: summary ?? 'Recovered planner draft from truncated output.',
     coverage,
-    items,
+    items: normalizedItems,
     openQuestions
+  });
+};
+
+const summarizePlannerRecoveryContext = (text: string): string => {
+  const normalized = text.trim();
+  const salvaged = salvagePlannerJsonText(normalized);
+  if (salvaged) {
+    return salvaged;
+  }
+
+  const summary = extractJsonStringField(normalized, 'summary');
+  const coverage = extractCompleteJsonObjectsFromArray(normalized, 'coverage')
+    .filter((entry) => typeof entry.pbiId === 'string')
+    .slice(0, 12)
+    .map((entry) => ({
+      pbiId: entry.pbiId,
+      outcome: entry.outcome,
+      planItemIds: Array.isArray(entry.planItemIds) ? entry.planItemIds : []
+    }));
+  const items = extractCompleteJsonObjectsFromArray(normalized, 'items')
+    .filter((entry) => typeof entry.planItemId === 'string')
+    .slice(0, 12)
+    .map((entry) => ({
+      planItemId: entry.planItemId,
+      pbiIds: Array.isArray(entry.pbiIds) ? entry.pbiIds : [],
+      action: entry.action,
+      targetTitle: entry.targetTitle,
+      targetArticleId: entry.targetArticleId,
+      targetFamilyId: entry.targetFamilyId,
+      confidence: entry.confidence
+    }));
+  const openQuestions = extractCompleteJsonStringsFromArray(normalized, 'openQuestions').slice(0, 12);
+
+  if (summary || coverage.length > 0 || items.length > 0 || openQuestions.length > 0) {
+    return JSON.stringify({
+      summary: summary ?? 'Recovered partial planner draft context.',
+      coverage,
+      items,
+      openQuestions
+    }, null, 2);
+  }
+
+  return normalized.slice(0, 6_000);
+};
+
+const salvagePlanReviewJsonText = (text: string): string | null => {
+  const normalized = normalizeRecoveredJsonText(text);
+  if (normalized) {
+    const parsed = extractJsonObject(normalized);
+    if (parsed && matchesExpectedBatchResultShape(parsed, 'plan_review')) {
+      return normalized;
+    }
+  }
+
+  const summary = extractJsonStringField(text, 'summary');
+  const verdict = extractJsonStringField(text, 'verdict');
+  const requestedChanges = extractCompleteJsonStringsFromArray(text, 'requestedChanges');
+  const missingPbiIds = extractCompleteJsonStringsFromArray(text, 'missingPbiIds');
+  const missingCreates = extractCompleteJsonStringsFromArray(text, 'missingCreates');
+  const missingEdits = extractCompleteJsonStringsFromArray(text, 'missingEdits');
+  const additionalArticleWork = extractCompleteJsonStringsFromArray(text, 'additionalArticleWork');
+  const targetCorrections = extractCompleteJsonStringsFromArray(text, 'targetCorrections');
+  const overlapConflicts = extractCompleteJsonStringsFromArray(text, 'overlapConflicts');
+
+  const hasAnyStructuredSignal =
+    typeof summary === 'string'
+    || typeof verdict === 'string'
+    || requestedChanges.length > 0
+    || missingPbiIds.length > 0
+    || missingCreates.length > 0
+    || missingEdits.length > 0
+    || additionalArticleWork.length > 0
+    || targetCorrections.length > 0
+    || overlapConflicts.length > 0;
+
+  if (!hasAnyStructuredSignal) {
+    return null;
+  }
+
+  return JSON.stringify({
+    summary: summary ?? 'Recovered plan review output from truncated response.',
+    verdict: verdict === 'approved' || verdict === 'needs_human_review' ? verdict : 'needs_revision',
+    didAccountForEveryPbi: extractJsonBooleanField(text, 'didAccountForEveryPbi') ?? false,
+    hasMissingCreates: extractJsonBooleanField(text, 'hasMissingCreates') ?? (missingCreates.length > 0),
+    hasMissingEdits: extractJsonBooleanField(text, 'hasMissingEdits') ?? (missingEdits.length > 0),
+    hasTargetIssues: extractJsonBooleanField(text, 'hasTargetIssues') ?? (targetCorrections.length > 0),
+    hasOverlapOrConflict: extractJsonBooleanField(text, 'hasOverlapOrConflict') ?? (overlapConflicts.length > 0),
+    foundAdditionalArticleWork: extractJsonBooleanField(text, 'foundAdditionalArticleWork') ?? (additionalArticleWork.length > 0),
+    underScopedKbImpact: extractJsonBooleanField(text, 'underScopedKbImpact') ?? (
+      missingCreates.length > 0
+      || missingEdits.length > 0
+      || additionalArticleWork.length > 0
+    ),
+    delta: {
+      summary: summary ?? 'Recovered plan review output from truncated response.',
+      requestedChanges,
+      missingPbiIds,
+      missingCreates,
+      missingEdits,
+      additionalArticleWork,
+      targetCorrections,
+      overlapConflicts
+    }
   });
 };
 
@@ -919,11 +1547,40 @@ const buildStageEventTextPreview = (value: string | undefined, limit = STAGE_EVE
   return normalized.length > limit ? `${normalized.slice(0, limit)}...` : normalized;
 };
 
-const extractTranscriptResultTextCandidates = (lines: AgentTranscriptLine[]): string[] => {
+const isPromptRequestTranscriptLine = (line: AgentTranscriptLine): boolean => {
+  if (line.direction !== 'to_agent' || line.event !== 'request') {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(line.payload) as { method?: unknown };
+    return parsed.method === 'session/prompt';
+  } catch {
+    return false;
+  }
+};
+
+const extractTranscriptResultTextCandidates = (
+  lines: AgentTranscriptLine[],
+  scope: 'latest_request' | 'all' = 'latest_request'
+): string[] => {
+  const relevantLines =
+    scope === 'all'
+      ? lines
+      : (() => {
+          const reversedIndex = [...lines].reverse().findIndex(
+            (line) => isPromptRequestTranscriptLine(line)
+          );
+          if (reversedIndex < 0) {
+            return lines;
+          }
+          const lastRequestIndex = lines.length - reversedIndex - 1;
+          return lines.slice(lastRequestIndex + 1);
+        })();
   const chunkParts: string[] = [];
+  const rawChunkParts: string[] = [];
   const candidates: string[] = [];
 
-  for (const line of lines) {
+  for (const line of relevantLines) {
     if (line.direction !== 'from_agent') {
       continue;
     }
@@ -947,6 +1604,7 @@ const extractTranscriptResultTextCandidates = (lines: AgentTranscriptLine[]): st
           };
         };
         if (parsed.update?.sessionUpdate === 'agent_message_chunk' && typeof parsed.update.content?.text === 'string') {
+          rawChunkParts.push(parsed.update.content.text);
           appendTranscriptChunk(chunkParts, parsed.update.content.text);
         }
       } catch {
@@ -956,14 +1614,31 @@ const extractTranscriptResultTextCandidates = (lines: AgentTranscriptLine[]): st
   }
 
   if (chunkParts.length > 0) {
-    candidates.push(collapseRepeatedTranscriptText(chunkParts.join('')));
+    candidates.push(chunkParts.join(''));
+  }
+  if (rawChunkParts.length > 0) {
+    candidates.push(rawChunkParts.join('').trim());
   }
 
-  return Array.from(new Set(candidates.map((value) => value.trim()).filter(Boolean)));
+  return dedupeResultTextCandidates(candidates.map((value) => value.trim()).filter(Boolean));
 };
 
 const extractResultText = (payload: unknown): string =>
   selectBestResultText(extractResultTextCandidates(payload));
+
+export const __commandRegistryTestables = {
+  buildPlannerTopicClusters,
+  extractTranscriptResultTextCandidates,
+  summarizePlannerRecoveryContext,
+  salvagePlannerJsonText,
+  salvagePlanReviewJsonText,
+  evaluateBatchAnalysisDevBuildFreshness,
+  shouldRetryPlannerWithFreshSession,
+  selectBestResultText,
+  selectBestParseableResultText,
+  matchesExpectedBatchResultShape,
+  shouldRetryReviewWithFreshSession
+};
 
 const ARTICLE_AI_PRESET_PROMPTS: Record<ArticleAiPresetAction, string> = {
   [ArticleAiPresetAction.REWRITE_TONE]: 'Rewrite the article for clearer tone and readability while preserving factual meaning.',
@@ -1094,7 +1769,8 @@ const resolveBatchAnalysisResultText = async (
   agentRuntime: CursorAcpRuntime,
   workspaceId: string,
   sessionId: string | undefined,
-  payload: unknown
+  payload: unknown,
+  expectedShape?: BatchAnalysisResultShape
 ): Promise<{
   text: string;
   usedTranscript: boolean;
@@ -1103,8 +1779,10 @@ const resolveBatchAnalysisResultText = async (
   parseable: boolean;
 }> => {
   const initialCandidates = extractResultTextCandidates(payload);
-  const initialBest = selectBestResultText(initialCandidates);
-  if (extractJsonObject(initialBest)) {
+  const initialBest = selectBestParseableResultText(initialCandidates, expectedShape)
+    || selectBestResultText(initialCandidates, expectedShape);
+  const initialParsed = extractJsonObject(initialBest);
+  if (initialParsed && matchesExpectedBatchResultShape(initialParsed, expectedShape)) {
     return {
       text: initialBest,
       usedTranscript: false,
@@ -1129,14 +1807,21 @@ const resolveBatchAnalysisResultText = async (
     sessionId,
     limit: 0
   });
-  const transcriptCandidates = extractTranscriptResultTextCandidates(transcript.lines);
-  const resolved = selectBestResultText([...initialCandidates, ...transcriptCandidates]);
+  const latestTranscriptCandidates = extractTranscriptResultTextCandidates(transcript.lines, 'latest_request');
+  const transcriptCandidates =
+    latestTranscriptCandidates.length > 0
+      ? latestTranscriptCandidates
+      : extractTranscriptResultTextCandidates(transcript.lines, 'all');
+  const combinedCandidates = [...initialCandidates, ...transcriptCandidates];
+  const resolved = selectBestParseableResultText(combinedCandidates, expectedShape)
+    || selectBestResultText(combinedCandidates, expectedShape);
+  const resolvedParsed = extractJsonObject(resolved);
   return {
     text: resolved,
     usedTranscript: transcriptCandidates.length > 0 && transcriptCandidates.includes(resolved),
     initialCandidateCount: initialCandidates.length,
     transcriptCandidateCount: transcriptCandidates.length,
-    parseable: Boolean(extractJsonObject(resolved))
+    parseable: Boolean(resolvedParsed && matchesExpectedBatchResultShape(resolvedParsed, expectedShape))
   };
 };
 
@@ -1229,7 +1914,8 @@ export function registerCoreCommands(
   bus: CommandBus,
   jobs: JobRegistry,
   workspaceRoot: string,
-  emitAppWorkingStateEvent?: (event: AppWorkingStatePatchAppliedEvent) => void
+  emitAppWorkingStateEvent?: (event: AppWorkingStatePatchAppliedEvent) => void,
+  emitAiAssistantEvent?: (event: AiAssistantStreamEvent) => void
 ) {
   const workspaceRepository = new WorkspaceRepository(workspaceRoot);
   const batchAnalysisOrchestrator = new BatchAnalysisOrchestrator(workspaceRepository);
@@ -1484,7 +2170,8 @@ export function registerCoreCommands(
     workspaceRepository,
     agentRuntime,
     resolveWorkspaceKbAccessMode,
-    appWorkingStateService
+    appWorkingStateService,
+    emitAiAssistantEvent
   );
   const buildZendeskClient = async (workspaceId: string): Promise<ZendeskClient> => {
     const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
@@ -3500,9 +4187,31 @@ export function registerCoreCommands(
     const workspaceSettings = await workspaceRepository.getWorkspaceSettings(input.workspaceId);
     const agentModelId = workspaceSettings.acpModelId;
     await agentRuntime.setWorkspaceAgentModel(input.workspaceId, agentModelId);
-    let kbAccessMode = input.kbAccessMode ?? workspaceMode;
+    const requestedKbAccessMode = input.kbAccessMode;
+    let kbAccessMode = requestedKbAccessMode ?? workspaceMode;
     const providerHealth = await agentRuntime.checkHealth(input.workspaceId, kbAccessMode, workspaceMode);
-    const selectedProvider = providerHealth.providers[kbAccessMode];
+    let selectedProvider = providerHealth.providers[kbAccessMode];
+    if (!selectedProvider.ok && !requestedKbAccessMode) {
+      const fallbackMode: KbAccessMode = kbAccessMode === 'mcp' ? 'cli' : 'mcp';
+      const fallbackProvider = providerHealth.providers[fallbackMode];
+      if (fallbackProvider.ok) {
+        emit({
+          id: payload.jobId,
+          command: payload.command,
+          state: JobState.RUNNING,
+          progress: 12,
+          message: `Preferred runtime ${kbAccessMode.toUpperCase()} is not ready; falling back to ${fallbackMode.toUpperCase()}.`,
+          metadata: {
+            batchId: input.batchId,
+            requestedKbAccessMode: kbAccessMode,
+            kbAccessMode: fallbackMode,
+            agentModelId
+          }
+        });
+        kbAccessMode = fallbackMode;
+        selectedProvider = fallbackProvider;
+      }
+    }
     if (!selectedProvider.ok) {
       emit({
         id: payload.jobId,
@@ -3530,6 +4239,24 @@ export function registerCoreCommands(
       batchId: input.batchId,
       workspaceId: input.workspaceId
     });
+    const staleDevBuildMessage = await getBatchAnalysisDevBuildFreshnessMessage();
+    if (staleDevBuildMessage) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: staleDevBuildMessage
+      });
+      logger.warn('[agent.analysis.trace] blocked batch analyzation because desktop dev build is stale', {
+        jobId: payload.jobId,
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        reason: staleDevBuildMessage
+      });
+      return;
+    }
+
     const batchContext = await workspaceRepository.getBatchContext(input.workspaceId, input.batchId);
     if (!batchContext) {
       emit({
@@ -3660,6 +4387,66 @@ export function registerCoreCommands(
         createdAtUtc: new Date().toISOString()
       });
     };
+    const persistBatchStageRun = async (params: {
+      stage: BatchAnalysisStageStatus;
+      role: BatchAnalysisIterationRecord['role'];
+      result: {
+        sessionId?: string;
+        acpSessionId?: string;
+        kbAccessMode?: KbAccessMode;
+        status: 'ok' | 'error' | 'timeout' | 'canceled';
+        startedAtUtc: string;
+        endedAtUtc?: string;
+        transcriptPath?: string;
+        toolCalls?: unknown[];
+        rawOutput?: string[];
+        message?: string;
+      };
+      promptTemplate?: string;
+      retryType?: string;
+      sessionReusePolicy?: BatchAnalysisSessionReusePolicy;
+      resolution?: {
+        parseable: boolean;
+        usedTranscript: boolean;
+        initialCandidateCount: number;
+        transcriptCandidateCount: number;
+        text: string;
+      };
+    }) => {
+      await workspaceRepository.recordBatchAnalysisStageRun({
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        iterationId: liveIteration.id,
+        iteration: liveIteration.iteration,
+        stage: params.stage,
+        role: params.role,
+        retryType: params.retryType,
+        sessionReusePolicy: params.sessionReusePolicy,
+        localSessionId: params.result.sessionId,
+        acpSessionId: params.result.acpSessionId,
+        kbAccessMode: params.result.kbAccessMode ?? kbAccessMode,
+        agentModelId,
+        status:
+          params.result.status === 'ok'
+            ? 'complete'
+            : params.result.status === 'canceled'
+              ? 'canceled'
+              : 'failed',
+        startedAtUtc: params.result.startedAtUtc,
+        endedAtUtc: params.result.endedAtUtc,
+        promptTemplate: params.promptTemplate,
+        transcriptPath: params.result.transcriptPath,
+        toolCalls: Array.isArray(params.result.toolCalls) ? params.result.toolCalls as AgentRunResult['toolCalls'] : [],
+        rawOutput: params.result.rawOutput,
+        message: `[${params.stage}/${params.role}] ${params.result.message ?? params.result.status}`,
+        parseable: params.resolution?.parseable,
+        usedTranscriptRecovery: params.resolution?.usedTranscript,
+        initialCandidateCount: params.resolution?.initialCandidateCount,
+        transcriptCandidateCount: params.resolution?.transcriptCandidateCount,
+        textLength: params.resolution?.text.length,
+        resultTextPreview: params.resolution ? buildStageEventTextPreview(params.resolution.text) : undefined
+      });
+    };
     try {
       streamMetadata.iterationId = orchestrationIteration.id;
       streamMetadata.stage = orchestrationIteration.stage;
@@ -3760,15 +4547,193 @@ export function registerCoreCommands(
           supersedesPlanId: priorPlanJson ? (JSON.parse(priorPlanJson) as { id?: string }).id : undefined
         });
 
-      const plannerResolution = await resolveBatchAnalysisResultText(
+      let plannerResolution = await resolveBatchAnalysisResultText(
         agentRuntime,
         input.workspaceId,
         plannerResult.sessionId,
-        plannerResult.resultPayload
+        plannerResult.resultPayload,
+        'planner'
       );
+      await persistBatchStageRun({
+        stage: planningStage,
+        role: 'planner',
+        result: plannerResult,
+        promptTemplate: plannerPrompt,
+        resolution: plannerResolution
+      });
+      let plannerJsonRetried = false;
+      let plannerRuntimeRetried = false;
+      while (true) {
+        const infrastructureFailure = detectPlannerInfrastructureFailure(plannerResult.status, plannerResolution);
+        if (infrastructureFailure && !plannerRuntimeRetried) {
+          plannerRuntimeRetried = true;
+          await logAnalysisProgress('Planner hit a provider/runtime failure; retrying once in a fresh local session.', {
+            stage: planningStage,
+            role: 'planner',
+            sessionId: plannerResult.sessionId
+          }, {
+            attempt,
+            retryType: 'planner_runtime_retry',
+            transitionReason: 'planner_runtime_failure_retry',
+            triggerBranch: 'detectPlannerInfrastructureFailure returned true',
+            infrastructureError: infrastructureFailure.message,
+            infrastructureCode: infrastructureFailure.code,
+            resultTextPreview: buildStageEventTextPreview(plannerResolution.text, 500)
+          });
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 30,
+            message: 'Planner hit a provider/runtime failure. Retrying in a fresh session...',
+            metadata: buildStreamMetadata({ sessionId: plannerResult.sessionId })
+          });
+          plannerResult = await agentRuntime.runBatchAnalysis(
+            {
+              ...input,
+              sessionReusePolicy: 'new_local_session',
+              kbAccessMode,
+              agentRole: 'planner',
+              sessionMode: 'plan',
+              prompt: plannerPrompt
+            },
+            (stream: AgentStreamingPayload) => {
+              emit({
+                id: payload.jobId,
+                command: payload.command,
+                state: JobState.RUNNING,
+                progress: 31,
+                message: JSON.stringify(stream),
+                metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+              });
+            },
+            isCancelled
+          );
+          liveSessionId = plannerResult.sessionId;
+          plannerResolution = await resolveBatchAnalysisResultText(
+            agentRuntime,
+            input.workspaceId,
+            plannerResult.sessionId,
+            plannerResult.resultPayload,
+            'planner'
+          );
+          await persistBatchStageRun({
+            stage: planningStage,
+            role: 'planner',
+            result: plannerResult,
+            promptTemplate: plannerPrompt,
+            retryType: 'planner_runtime_retry',
+            sessionReusePolicy: 'new_local_session',
+            resolution: plannerResolution
+          });
+          continue;
+        }
+
+        if (!infrastructureFailure && shouldRetryPlannerWithFreshSession(plannerResolution) && !plannerJsonRetried) {
+          plannerJsonRetried = true;
+          await logAnalysisProgress('Planner result was incomplete; retrying once with a strict JSON-only restatement prompt.', {
+            stage: planningStage,
+            role: 'planner',
+            sessionId: plannerResult.sessionId
+          }, {
+            attempt,
+            retryType: 'planner_json_retry',
+            transitionReason: 'planner_empty_or_partial_output_retry',
+            triggerBranch: 'shouldRetryPlannerWithFreshSession returned true',
+            resultTextPreview: buildStageEventTextPreview(plannerResolution.text, 500)
+          });
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 30,
+            message: 'Planner returned incomplete output. Retrying once with a strict JSON-only restatement...',
+            metadata: buildStreamMetadata({ sessionId: plannerResult.sessionId })
+          });
+          const retryPrompt = plannerOutputLooksStructuredButIncomplete(plannerResolution.text)
+            ? batchAnalysisOrchestrator.buildPlannerRepairPrompt({
+                originalPrompt: plannerPrompt,
+                priorOutput: summarizePlannerRecoveryContext(plannerResolution.text),
+                parseError: 'Planner response was partial JSON and could not be validated safely.'
+              })
+            : batchAnalysisOrchestrator.buildPlannerJsonRetryPrompt({
+                originalPrompt: plannerPrompt,
+                priorOutput: summarizePlannerRecoveryContext(plannerResolution.text),
+                parseError: 'Planner response was empty, partial, or not safely parseable.'
+              });
+          plannerResult = await agentRuntime.runBatchAnalysis(
+            {
+              ...input,
+              sessionReusePolicy: 'reset_acp',
+              kbAccessMode,
+              agentRole: 'planner',
+              sessionMode: 'plan',
+              prompt: retryPrompt
+            },
+            (stream: AgentStreamingPayload) => {
+              emit({
+                id: payload.jobId,
+                command: payload.command,
+                state: JobState.RUNNING,
+                progress: 31,
+                message: JSON.stringify(stream),
+                metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+              });
+            },
+            isCancelled
+          );
+          liveSessionId = plannerResult.sessionId;
+          plannerResolution = await resolveBatchAnalysisResultText(
+            agentRuntime,
+            input.workspaceId,
+            plannerResult.sessionId,
+            plannerResult.resultPayload,
+            'planner'
+          );
+          await persistBatchStageRun({
+            stage: planningStage,
+            role: 'planner',
+            result: plannerResult,
+            promptTemplate: retryPrompt,
+            retryType: 'planner_json_retry',
+            sessionReusePolicy: 'reset_acp',
+            resolution: plannerResolution
+          });
+          continue;
+        }
+
+        if (infrastructureFailure) {
+          const failureMessage = `Planner failed due to provider/runtime error: ${infrastructureFailure.message}`;
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 32,
+            message: failureMessage,
+            metadata: buildStreamMetadata({ sessionId: plannerResult.sessionId })
+          });
+          await logAnalysisProgress('Planner failed due to a provider/runtime error and could not recover automatically.', {
+            stage: 'failed',
+            role: 'planner',
+            sessionId: plannerResult.sessionId
+          }, {
+            attempt,
+            transitionReason: 'planner_runtime_failure',
+            triggerBranch: 'planner runtime retry budget exhausted',
+            infrastructureError: infrastructureFailure.message,
+            infrastructureCode: infrastructureFailure.code,
+            resultTextPreview: buildStageEventTextPreview(plannerResolution.text, 500)
+          });
+          throw new BatchAnalysisTerminalError(failureMessage, 'failed', 'failed');
+        }
+
+        break;
+      }
       const plannerText = plannerResolution.text;
       await logAnalysisProgress('Planner response received.', { stage: planningStage, role: 'planner', sessionId: plannerResult.sessionId }, {
         attempt,
+        durationMs: plannerResult.durationMs,
+        toolCallCount: plannerResult.toolCalls.length,
         rawOutputCount: plannerResult.rawOutput.length,
         transcriptPath: plannerResult.transcriptPath,
         textLength: plannerText.length,
@@ -3800,140 +4765,92 @@ export function registerCoreCommands(
             });
             salvageSucceeded = true;
           } catch {
-            // fall through to repair prompt
+            salvageSucceeded = false;
           }
         }
         if (salvageSucceeded) {
           // Continue through the normal reviewer flow below using the locally salvaged plan.
         } else {
-          await logAnalysisProgress('Planner output could not be parsed; starting repair prompt.', {
-            stage: planningStage,
+          const fallbackMessage = 'Planner returned incomplete output and could not be salvaged locally. Human review is required before execution can continue.';
+          emit({
+            id: payload.jobId,
+            command: payload.command,
+            state: JobState.RUNNING,
+            progress: 32,
+            message: fallbackMessage,
+            metadata: buildStreamMetadata({ sessionId: plannerResult.sessionId })
+          });
+          await logAnalysisProgress('Planner output could not be salvaged locally; escalating to human review.', {
+            stage: 'needs_human_review',
             role: 'planner',
             sessionId: plannerResult.sessionId
           }, {
             attempt,
             parseError,
+            textLength: plannerText.length,
+            transitionReason: 'planner_local_salvage_failed',
+            triggerBranch: 'local planner salvage returned null or remained invalid',
             resultTextPreview: buildStageEventTextPreview(plannerText, 500)
           });
-          emit({
-            id: payload.jobId,
-            command: payload.command,
-            state: JobState.RUNNING,
-            progress: 30,
-            message: 'Planner returned non-JSON or incomplete output. Requesting a strict JSON repair pass...',
-            metadata: buildStreamMetadata({ sessionId: plannerResult.sessionId })
-          });
-
-          const repairedPlannerResult = await agentRuntime.runBatchAnalysis(
-            {
-              ...input,
-              sessionId: liveSessionId,
-              kbAccessMode,
-              agentRole: 'planner',
-              sessionMode: 'plan',
-              prompt: batchAnalysisOrchestrator.buildPlannerRepairPrompt({
-                originalPrompt: plannerPrompt,
-                priorOutput: plannerText.slice(0, 6_000),
-                parseError
-              })
-            },
-            (stream: AgentStreamingPayload) => {
-              emit({
-                id: payload.jobId,
-                command: payload.command,
-                state: JobState.RUNNING,
-                progress: 32,
-                message: JSON.stringify(stream),
-                metadata: buildStreamMetadata({ sessionId: stream.sessionId })
-              });
-            },
-            isCancelled
-          );
-          liveSessionId = repairedPlannerResult.sessionId;
-          const repairedPlannerResolution = await resolveBatchAnalysisResultText(
-            agentRuntime,
-            input.workspaceId,
-            repairedPlannerResult.sessionId,
-            repairedPlannerResult.resultPayload
-          );
-          await logAnalysisProgress('Planner repair response received.', {
-            stage: planningStage,
-            role: 'planner',
-            sessionId: repairedPlannerResult.sessionId
-          }, {
-            attempt,
-            rawOutputCount: repairedPlannerResult.rawOutput.length,
-            transcriptPath: repairedPlannerResult.transcriptPath,
-            textLength: repairedPlannerResolution.text.length,
-            parseable: repairedPlannerResolution.parseable,
-            usedTranscriptRecovery: repairedPlannerResolution.usedTranscript,
-            payloadCandidateCount: repairedPlannerResolution.initialCandidateCount,
-            transcriptCandidateCount: repairedPlannerResolution.transcriptCandidateCount,
-            resultTextPreview: buildStageEventTextPreview(repairedPlannerResolution.text)
-          });
-          const normalizedRepairedPlannerText = normalizeRecoveredJsonText(repairedPlannerResolution.text);
-          const salvagedRepairedPlannerText =
-            normalizedRepairedPlannerText
-            ?? salvagePlannerJsonText(repairedPlannerResolution.text)
-            ?? salvagePlannerJsonText(plannerText);
-          try {
-            draftPlan = parseDraftPlan(
-              salvagedRepairedPlannerText ?? repairedPlannerResolution.text,
-              repairedPlannerResult.sessionId
-            );
-            if (salvagedRepairedPlannerText && !repairedPlannerResolution.parseable) {
-              await logAnalysisProgress('Planner repair output was salvaged locally.', {
-                stage: planningStage,
-                role: 'planner',
-                sessionId: repairedPlannerResult.sessionId
-              }, {
-                attempt,
-                textLength: repairedPlannerResolution.text.length
-              });
-            }
-          } catch (repairError) {
-            const fallbackMessage = 'Planner repair output remained malformed after recovery attempts.';
-            await logAnalysisProgress('Planner repair output was malformed; escalating safely.', {
-              stage: 'needs_human_review',
-              role: 'planner',
-              sessionId: repairedPlannerResult.sessionId
-            }, {
-              attempt,
-              error: repairError instanceof Error ? repairError.message : String(repairError),
-              textLength: repairedPlannerResolution.text.length,
-              transitionReason: 'planner_repair_output_malformed',
-              triggerBranch: 'planner repair parse failed after recovery attempts',
-              resultTextPreview: buildStageEventTextPreview(repairedPlannerResolution.text)
-            });
-            await workspaceRepository.updateBatchAnalysisIteration({
-              workspaceId: input.workspaceId,
-              iterationId: orchestrationIteration.id,
-              stage: 'needs_human_review',
-              role: 'planner',
-              status: 'needs_human_review',
-              summary: fallbackMessage,
-              agentModelId,
-              sessionId: repairedPlannerResult.sessionId
-            });
-            emit({
-              id: payload.jobId,
-              command: payload.command,
-              state: JobState.FAILED,
-              progress: 100,
-              message: fallbackMessage,
-              metadata: buildStreamMetadata({
-                stage: 'needs_human_review',
-                role: 'planner',
-                sessionId: repairedPlannerResult.sessionId,
-                status: 'error'
-              })
-            });
-            throw new Error(fallbackMessage);
-          }
+          throw new Error(fallbackMessage);
         }
       }
       if (!draftPlan) {
         throw new Error('Planner did not produce a draft plan');
+      }
+      const normalizedBatchReferences = batchAnalysisOrchestrator.normalizePlanBatchReferences({
+        plan: draftPlan,
+        uploadedPbis
+      });
+      draftPlan = normalizedBatchReferences.plan;
+      if (normalizedBatchReferences.repairs.length > 0) {
+        await logAnalysisProgress('Deterministic batch-reference normalization repaired planner PBI references before review.', {
+          stage: planningStage,
+          role: 'planner',
+          sessionId: draftPlan.sessionId
+        }, {
+          attempt,
+          referenceRepairs: normalizedBatchReferences.repairs,
+          transitionReason: 'deterministic_batch_reference_repair'
+        });
+      }
+      if (normalizedBatchReferences.unresolvedReferenceIssues.length > 0) {
+        await logAnalysisProgress('Deterministic batch-reference validation found unresolved planner references.', {
+          stage: planningStage,
+          role: 'planner',
+          sessionId: draftPlan.sessionId
+        }, {
+          attempt,
+          unresolvedReferenceIssues: normalizedBatchReferences.unresolvedReferenceIssues,
+          transitionReason: 'deterministic_batch_reference_validation_failed'
+        });
+      }
+      const normalizedDraftPlanResult = await batchAnalysisOrchestrator.normalizePlanTargets({
+        workspaceId: input.workspaceId,
+        plan: draftPlan
+      });
+      draftPlan = normalizedDraftPlanResult.plan;
+      if (normalizedDraftPlanResult.repairs.length > 0) {
+        await logAnalysisProgress('Deterministic target normalization repaired planner targets before review.', {
+          stage: planningStage,
+          role: 'planner',
+          sessionId: draftPlan.sessionId
+        }, {
+          attempt,
+          targetRepairs: normalizedDraftPlanResult.repairs,
+          transitionReason: 'deterministic_target_repair'
+        });
+      }
+      if (normalizedDraftPlanResult.unresolvedTargetIssues.length > 0) {
+        await logAnalysisProgress('Deterministic target validation found unresolved planner targets.', {
+          stage: planningStage,
+          role: 'planner',
+          sessionId: draftPlan.sessionId
+        }, {
+          attempt,
+          unresolvedTargetIssues: normalizedDraftPlanResult.unresolvedTargetIssues,
+          transitionReason: 'deterministic_target_validation_failed'
+        });
       }
       await batchAnalysisOrchestrator.recordPlan(draftPlan);
       await logAnalysisProgress('Planner draft plan recorded.', { stage: planningStage, role: 'planner', sessionId: draftPlan.sessionId }, {
@@ -3964,18 +4881,20 @@ export function registerCoreCommands(
         message: 'Reviewing plan for missed creates, edits, and target issues...',
         metadata: buildStreamMetadata()
       });
-      const reviewResult = await agentRuntime.runBatchAnalysis(
+      const reviewPrompt = batchAnalysisOrchestrator.buildPlanReviewerPrompt({
+        batchContext,
+        uploadedPbis,
+        plan: draftPlan,
+        plannerPrefetch
+      });
+      let reviewResult = await agentRuntime.runBatchAnalysis(
         {
           ...input,
           sessionId: liveSessionId,
           kbAccessMode,
           agentRole: 'plan-reviewer',
           sessionMode: 'plan',
-          prompt: batchAnalysisOrchestrator.buildPlanReviewerPrompt({
-            batchContext,
-            uploadedPbis,
-            plan: draftPlan
-          })
+          prompt: reviewPrompt
         },
         (stream: AgentStreamingPayload) => {
           emit({
@@ -3990,12 +4909,71 @@ export function registerCoreCommands(
         isCancelled
       );
       liveSessionId = reviewResult.sessionId;
-      const reviewResolution = await resolveBatchAnalysisResultText(
+      let reviewResolution = await resolveBatchAnalysisResultText(
         agentRuntime,
         input.workspaceId,
         reviewResult.sessionId,
-        reviewResult.resultPayload
+        reviewResult.resultPayload,
+        'plan_review'
       );
+      await persistBatchStageRun({
+        stage: 'plan_reviewing',
+        role: 'plan-reviewer',
+        result: reviewResult,
+        promptTemplate: reviewPrompt,
+        resolution: reviewResolution
+      });
+      const reviewNeedsResetRetry = shouldRetryReviewWithFreshSession(reviewResolution);
+      if (reviewNeedsResetRetry) {
+        await logAnalysisProgress('Plan reviewer returned no parseable output; retrying once in a fresh session.', {
+          stage: 'plan_reviewing',
+          role: 'plan-reviewer',
+          sessionId: reviewResult.sessionId
+        }, {
+          attempt,
+          transitionReason: 'plan_review_empty_output_retry',
+          triggerBranch: 'reviewResolution had zero candidates and empty text'
+        });
+
+        reviewResult = await agentRuntime.runBatchAnalysis(
+          {
+            ...input,
+            sessionReusePolicy: 'reset_acp',
+            kbAccessMode,
+            agentRole: 'plan-reviewer',
+            sessionMode: 'plan',
+            prompt: reviewPrompt
+          },
+          (stream: AgentStreamingPayload) => {
+            emit({
+              id: payload.jobId,
+              command: payload.command,
+              state: JobState.RUNNING,
+              progress: 44,
+              message: JSON.stringify(stream),
+              metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+            });
+          },
+          isCancelled
+        );
+        liveSessionId = reviewResult.sessionId;
+        reviewResolution = await resolveBatchAnalysisResultText(
+          agentRuntime,
+          input.workspaceId,
+          reviewResult.sessionId,
+          reviewResult.resultPayload,
+          'plan_review'
+        );
+        await persistBatchStageRun({
+          stage: 'plan_reviewing',
+          role: 'plan-reviewer',
+          result: reviewResult,
+          promptTemplate: reviewPrompt,
+          retryType: 'plan_review_empty_output_retry',
+          sessionReusePolicy: 'reset_acp',
+          resolution: reviewResolution
+        });
+      }
       const reviewText = reviewResolution.text;
       await logAnalysisProgress('Plan reviewer response received.', {
         stage: 'plan_reviewing',
@@ -4003,6 +4981,8 @@ export function registerCoreCommands(
         sessionId: reviewResult.sessionId
       }, {
         attempt,
+        durationMs: reviewResult.durationMs,
+        toolCallCount: reviewResult.toolCalls.length,
         rawOutputCount: reviewResult.rawOutput.length,
         transcriptPath: reviewResult.transcriptPath,
         textLength: reviewText.length,
@@ -4013,6 +4993,7 @@ export function registerCoreCommands(
         resultTextPreview: buildStageEventTextPreview(reviewText)
       });
       const normalizedReviewText = normalizeRecoveredJsonText(reviewText);
+      const salvagedReviewText = normalizedReviewText ?? salvagePlanReviewJsonText(reviewText);
       let review: BatchPlanReview;
       try {
         review = batchAnalysisOrchestrator.parsePlanReviewResult({
@@ -4020,11 +5001,11 @@ export function registerCoreCommands(
           batchId: input.batchId,
           iteration: orchestrationIteration,
           plan: draftPlan,
-          resultText: normalizedReviewText ?? reviewText,
+          resultText: salvagedReviewText ?? reviewText,
           agentModelId,
           sessionId: reviewResult.sessionId
         });
-        if (normalizedReviewText && !reviewResolution.parseable) {
+        if (salvagedReviewText && !reviewResolution.parseable) {
           await logAnalysisProgress('Plan review output salvaged locally.', {
             stage: 'plan_reviewing',
             role: 'plan-reviewer',
@@ -4057,6 +5038,94 @@ export function registerCoreCommands(
           triggerBranch: 'plan review parse failed and malformed fallback was used',
           resultTextPreview: buildStageEventTextPreview(reviewText)
         });
+      }
+      const deterministicReviewGuard = batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard({
+        plan: draftPlan,
+        review,
+        plannerPrefetch,
+        unresolvedTargetIssues: normalizedDraftPlanResult.unresolvedTargetIssues,
+        unresolvedReferenceIssues: normalizedBatchReferences.unresolvedReferenceIssues
+      });
+      review = deterministicReviewGuard.review;
+      if (deterministicReviewGuard.missingEditTargets.length > 0) {
+        await logAnalysisProgress(
+          deterministicReviewGuard.forcedRevision
+            ? 'Deterministic review guard blocked approval because likely edit targets were missing from the plan.'
+            : 'Deterministic review guard added likely missing edit targets to the review delta.',
+          {
+            stage: 'plan_reviewing',
+            role: 'plan-reviewer',
+            sessionId: review.sessionId
+          },
+          {
+            attempt,
+            forcedRevision: deterministicReviewGuard.forcedRevision,
+            missingEditTargets: deterministicReviewGuard.missingEditTargets,
+            transitionReason: deterministicReviewGuard.forcedRevision
+              ? 'deterministic_prefetch_missing_edits'
+              : 'deterministic_prefetch_review_delta_augmented'
+          }
+        );
+      }
+      if (deterministicReviewGuard.missingCreateTargets.length > 0) {
+        await logAnalysisProgress(
+          deterministicReviewGuard.forcedRevision
+            ? 'Deterministic review guard blocked approval because likely net-new article work was missing from the plan.'
+            : 'Deterministic review guard added likely net-new article work to the review delta.',
+          {
+            stage: 'plan_reviewing',
+            role: 'plan-reviewer',
+            sessionId: review.sessionId
+          },
+          {
+            attempt,
+            forcedRevision: deterministicReviewGuard.forcedRevision,
+            missingCreateTargets: deterministicReviewGuard.missingCreateTargets,
+            transitionReason: deterministicReviewGuard.forcedRevision
+              ? 'deterministic_prefetch_missing_creates'
+              : 'deterministic_prefetch_review_delta_augmented'
+          }
+        );
+      }
+      if (deterministicReviewGuard.unresolvedTargetIssues.length > 0) {
+        await logAnalysisProgress(
+          deterministicReviewGuard.forcedRevision
+            ? 'Deterministic target validation blocked approval because the plan still referenced unresolved KB targets.'
+            : 'Deterministic target validation added unresolved KB target corrections to the review delta.',
+          {
+            stage: 'plan_reviewing',
+            role: 'plan-reviewer',
+            sessionId: review.sessionId
+          },
+          {
+            attempt,
+            forcedRevision: deterministicReviewGuard.forcedRevision,
+            unresolvedTargetIssues: deterministicReviewGuard.unresolvedTargetIssues,
+            transitionReason: deterministicReviewGuard.forcedRevision
+              ? 'deterministic_invalid_target_blocked_approval'
+              : 'deterministic_invalid_target_review_delta_augmented'
+          }
+        );
+      }
+      if (deterministicReviewGuard.unresolvedReferenceIssues.length > 0) {
+        await logAnalysisProgress(
+          deterministicReviewGuard.forcedRevision
+            ? 'Deterministic batch-reference validation blocked approval because the plan still referenced unresolved uploaded PBIs.'
+            : 'Deterministic batch-reference validation added unresolved uploaded PBI corrections to the review delta.',
+          {
+            stage: 'plan_reviewing',
+            role: 'plan-reviewer',
+            sessionId: review.sessionId
+          },
+          {
+            attempt,
+            forcedRevision: deterministicReviewGuard.forcedRevision,
+            unresolvedReferenceIssues: deterministicReviewGuard.unresolvedReferenceIssues,
+            transitionReason: deterministicReviewGuard.forcedRevision
+              ? 'deterministic_invalid_batch_reference_blocked_approval'
+              : 'deterministic_invalid_batch_reference_review_delta_augmented'
+          }
+        );
       }
       await batchAnalysisOrchestrator.recordReview(review);
       await logAnalysisProgress('Plan review recorded.', {
@@ -4216,14 +5285,15 @@ export function registerCoreCommands(
 
     const runAnalysis = async (mode: KbAccessMode, plan: BatchAnalysisPlan, extraInstructions?: string) => {
       streamMetadata.kbAccessMode = mode;
-      return agentRuntime.runBatchAnalysis(
+      const promptTemplate = batchAnalysisOrchestrator.buildWorkerPrompt(plan, extraInstructions ?? input.prompt);
+      const result = await agentRuntime.runBatchAnalysis(
         {
           ...input,
           sessionId: liveSessionId,
           kbAccessMode: mode,
           agentRole: 'worker',
           sessionMode: 'agent',
-          prompt: batchAnalysisOrchestrator.buildWorkerPrompt(plan, extraInstructions ?? input.prompt)
+          prompt: promptTemplate
         },
         (stream: AgentStreamingPayload) => {
           emit({
@@ -4237,17 +5307,21 @@ export function registerCoreCommands(
         },
         isCancelled
       );
+      return { result, promptTemplate };
     };
 
     const executeWorkerPass = async (
       approvedPlan: BatchAnalysisPlan,
       extraInstructions?: string
     ): Promise<{
-      result: Awaited<ReturnType<typeof runAnalysis>>;
+      result: Awaited<ReturnType<typeof agentRuntime.runBatchAnalysis>>;
       workerSummary: string;
       discoveredWork: ReturnType<typeof batchAnalysisOrchestrator.parseWorkerResult>['discoveredWork'];
     }> => {
-      let workerResult = await runAnalysis(kbAccessMode, approvedPlan, extraInstructions);
+      const workerStage = (streamMetadata.stage ?? liveIteration.stage) as Extract<BatchAnalysisStageStatus, 'building' | 'reworking'>;
+      let workerAttempt = await runAnalysis(kbAccessMode, approvedPlan, extraInstructions);
+      let workerResult = workerAttempt.result;
+      let workerPromptTemplate = workerAttempt.promptTemplate;
 
       if (workerResult.status === 'ok' && kbAccessMode === 'cli') {
         const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
@@ -4272,8 +5346,25 @@ export function registerCoreCommands(
             message: 'CLI analysis hit blocked tool usage and created no proposals. Retrying in MCP mode.',
             metadata: buildStreamMetadata({ kbAccessMode: 'mcp' })
           });
+          const cliWorkerResolution = await resolveBatchAnalysisResultText(
+            agentRuntime,
+            input.workspaceId,
+            workerResult.sessionId,
+            workerResult.resultPayload,
+            'worker'
+          );
+          await persistBatchStageRun({
+            stage: workerStage,
+            role: 'worker',
+            result: workerResult,
+            promptTemplate: workerPromptTemplate,
+            retryType: 'cli_policy_retry',
+            resolution: cliWorkerResolution
+          });
           kbAccessMode = 'mcp';
-          workerResult = await runAnalysis('mcp', approvedPlan, extraInstructions);
+          workerAttempt = await runAnalysis('mcp', approvedPlan, extraInstructions);
+          workerResult = workerAttempt.result;
+          workerPromptTemplate = workerAttempt.promptTemplate;
         }
       }
 
@@ -4281,10 +5372,18 @@ export function registerCoreCommands(
         agentRuntime,
         input.workspaceId,
         workerResult.sessionId,
-        workerResult.resultPayload
+        workerResult.resultPayload,
+        'worker'
       );
+      await persistBatchStageRun({
+        stage: workerStage,
+        role: 'worker',
+        result: workerResult,
+        promptTemplate: workerPromptTemplate,
+        resolution: workerResolution
+      });
       await logAnalysisProgress('Worker response received.', {
-        stage: 'building',
+        stage: workerStage,
         role: 'worker',
         sessionId: workerResult.sessionId
       }, {
@@ -4309,7 +5408,7 @@ export function registerCoreCommands(
         );
         if (locallySalvagedWorker && !workerResolution.parseable) {
           await logAnalysisProgress('Worker output salvaged locally.', {
-            stage: 'building',
+            stage: workerStage,
             role: 'worker',
             sessionId: workerResult.sessionId
           }, {
@@ -4324,7 +5423,7 @@ export function registerCoreCommands(
           discoveredWork: []
         };
         await logAnalysisProgress('Worker output was malformed; using execution fallback summary.', {
-          stage: 'building',
+          stage: workerStage,
           role: 'worker',
           sessionId: workerResult.sessionId
         }, {
@@ -4440,21 +5539,30 @@ export function registerCoreCommands(
         agentRuntime,
         input.workspaceId,
         amendmentPlannerResult.sessionId,
-        amendmentPlannerResult.resultPayload
+        amendmentPlannerResult.resultPayload,
+        'planner'
       );
+      await persistBatchStageRun({
+        stage: 'worker_discovery_review',
+        role: 'planner',
+        result: amendmentPlannerResult,
+        resolution: amendmentPlannerResolution
+      });
       await logAnalysisProgress('Amendment planner response received.', {
         stage: 'worker_discovery_review',
         role: 'planner',
         sessionId: amendmentPlannerResult.sessionId
       }, {
         amendmentLoop: amendmentLoops,
+        durationMs: amendmentPlannerResult.durationMs,
+        toolCallCount: amendmentPlannerResult.toolCalls.length,
         textLength: amendmentPlannerResolution.text.length,
         parseable: amendmentPlannerResolution.parseable,
         usedTranscriptRecovery: amendmentPlannerResolution.usedTranscript,
         payloadCandidateCount: amendmentPlannerResolution.initialCandidateCount,
         transcriptCandidateCount: amendmentPlannerResolution.transcriptCandidateCount
       });
-      const amendmentDraftPlan = batchAnalysisOrchestrator.parsePlannerResult({
+      let amendmentDraftPlan = batchAnalysisOrchestrator.parsePlannerResult({
         workspaceId: input.workspaceId,
         batchId: input.batchId,
         iteration: orchestrationIteration,
@@ -4464,6 +5572,60 @@ export function registerCoreCommands(
         planVersion: activeApprovedPlan.planVersion + 1,
         supersedesPlanId: activeApprovedPlan.id
       });
+      const normalizedAmendmentBatchReferences = batchAnalysisOrchestrator.normalizePlanBatchReferences({
+        plan: amendmentDraftPlan,
+        uploadedPbis
+      });
+      amendmentDraftPlan = normalizedAmendmentBatchReferences.plan;
+      if (normalizedAmendmentBatchReferences.repairs.length > 0) {
+        await logAnalysisProgress('Deterministic batch-reference normalization repaired amendment planner PBI references before review.', {
+          stage: 'worker_discovery_review',
+          role: 'planner',
+          sessionId: amendmentDraftPlan.sessionId
+        }, {
+          amendmentLoop: amendmentLoops,
+          referenceRepairs: normalizedAmendmentBatchReferences.repairs,
+          transitionReason: 'deterministic_batch_reference_repair'
+        });
+      }
+      if (normalizedAmendmentBatchReferences.unresolvedReferenceIssues.length > 0) {
+        await logAnalysisProgress('Deterministic batch-reference validation found unresolved amendment planner references.', {
+          stage: 'worker_discovery_review',
+          role: 'planner',
+          sessionId: amendmentDraftPlan.sessionId
+        }, {
+          amendmentLoop: amendmentLoops,
+          unresolvedReferenceIssues: normalizedAmendmentBatchReferences.unresolvedReferenceIssues,
+          transitionReason: 'deterministic_batch_reference_validation_failed'
+        });
+      }
+      const normalizedAmendmentDraftPlanResult = await batchAnalysisOrchestrator.normalizePlanTargets({
+        workspaceId: input.workspaceId,
+        plan: amendmentDraftPlan
+      });
+      amendmentDraftPlan = normalizedAmendmentDraftPlanResult.plan;
+      if (normalizedAmendmentDraftPlanResult.repairs.length > 0) {
+        await logAnalysisProgress('Deterministic target normalization repaired amendment planner targets before review.', {
+          stage: 'worker_discovery_review',
+          role: 'planner',
+          sessionId: amendmentDraftPlan.sessionId
+        }, {
+          amendmentLoop: amendmentLoops,
+          targetRepairs: normalizedAmendmentDraftPlanResult.repairs,
+          transitionReason: 'deterministic_target_repair'
+        });
+      }
+      if (normalizedAmendmentDraftPlanResult.unresolvedTargetIssues.length > 0) {
+        await logAnalysisProgress('Deterministic target validation found unresolved amendment planner targets.', {
+          stage: 'worker_discovery_review',
+          role: 'planner',
+          sessionId: amendmentDraftPlan.sessionId
+        }, {
+          amendmentLoop: amendmentLoops,
+          unresolvedTargetIssues: normalizedAmendmentDraftPlanResult.unresolvedTargetIssues,
+          transitionReason: 'deterministic_target_validation_failed'
+        });
+      }
       await batchAnalysisOrchestrator.recordPlan(amendmentDraftPlan);
 
       streamMetadata.role = 'plan-reviewer';
@@ -4478,7 +5640,8 @@ export function registerCoreCommands(
           prompt: batchAnalysisOrchestrator.buildPlanReviewerPrompt({
             batchContext,
             uploadedPbis,
-            plan: amendmentDraftPlan
+            plan: amendmentDraftPlan,
+            plannerPrefetch
           })
         },
         (stream: AgentStreamingPayload) => {
@@ -4498,14 +5661,23 @@ export function registerCoreCommands(
         agentRuntime,
         input.workspaceId,
         amendmentReviewResult.sessionId,
-        amendmentReviewResult.resultPayload
+        amendmentReviewResult.resultPayload,
+        'plan_review'
       );
+      await persistBatchStageRun({
+        stage: 'worker_discovery_review',
+        role: 'plan-reviewer',
+        result: amendmentReviewResult,
+        resolution: amendmentReviewResolution
+      });
       await logAnalysisProgress('Amendment reviewer response received.', {
         stage: 'worker_discovery_review',
         role: 'plan-reviewer',
         sessionId: amendmentReviewResult.sessionId
       }, {
         amendmentLoop: amendmentLoops,
+        durationMs: amendmentReviewResult.durationMs,
+        toolCallCount: amendmentReviewResult.toolCalls.length,
         textLength: amendmentReviewResolution.text.length,
         parseable: amendmentReviewResolution.parseable,
         usedTranscriptRecovery: amendmentReviewResolution.usedTranscript,
@@ -4514,6 +5686,9 @@ export function registerCoreCommands(
         resultTextPreview: buildStageEventTextPreview(amendmentReviewResolution.text)
       });
       const normalizedAmendmentReviewText = normalizeRecoveredJsonText(amendmentReviewResolution.text);
+      const salvagedAmendmentReviewText =
+        normalizedAmendmentReviewText
+        ?? salvagePlanReviewJsonText(amendmentReviewResolution.text);
       let amendmentReview: BatchPlanReview;
       try {
         amendmentReview = batchAnalysisOrchestrator.parsePlanReviewResult({
@@ -4521,11 +5696,11 @@ export function registerCoreCommands(
           batchId: input.batchId,
           iteration: orchestrationIteration,
           plan: amendmentDraftPlan,
-          resultText: normalizedAmendmentReviewText ?? amendmentReviewResolution.text,
+          resultText: salvagedAmendmentReviewText ?? amendmentReviewResolution.text,
           agentModelId,
           sessionId: amendmentReviewResult.sessionId
         });
-        if (normalizedAmendmentReviewText && !amendmentReviewResolution.parseable) {
+        if (salvagedAmendmentReviewText && !amendmentReviewResolution.parseable) {
           await logAnalysisProgress('Amendment review output salvaged locally.', {
             stage: 'worker_discovery_review',
             role: 'plan-reviewer',
@@ -4558,6 +5733,94 @@ export function registerCoreCommands(
           triggerBranch: 'amendment review parse failed and malformed fallback was used',
           resultTextPreview: buildStageEventTextPreview(amendmentReviewResolution.text)
         });
+      }
+      const deterministicAmendmentReviewGuard = batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard({
+        plan: amendmentDraftPlan,
+        review: amendmentReview,
+        plannerPrefetch,
+        unresolvedTargetIssues: normalizedAmendmentDraftPlanResult.unresolvedTargetIssues,
+        unresolvedReferenceIssues: normalizedAmendmentBatchReferences.unresolvedReferenceIssues
+      });
+      amendmentReview = deterministicAmendmentReviewGuard.review;
+      if (deterministicAmendmentReviewGuard.missingEditTargets.length > 0) {
+        await logAnalysisProgress(
+          deterministicAmendmentReviewGuard.forcedRevision
+            ? 'Deterministic review guard blocked amendment approval because likely edit targets were still missing.'
+            : 'Deterministic review guard added likely missing edit targets to the amendment review delta.',
+          {
+            stage: 'worker_discovery_review',
+            role: 'plan-reviewer',
+            sessionId: amendmentReview.sessionId
+          },
+          {
+            amendmentLoop: amendmentLoops,
+            forcedRevision: deterministicAmendmentReviewGuard.forcedRevision,
+            missingEditTargets: deterministicAmendmentReviewGuard.missingEditTargets,
+            transitionReason: deterministicAmendmentReviewGuard.forcedRevision
+              ? 'deterministic_prefetch_missing_edits'
+              : 'deterministic_prefetch_review_delta_augmented'
+          }
+        );
+      }
+      if (deterministicAmendmentReviewGuard.missingCreateTargets.length > 0) {
+        await logAnalysisProgress(
+          deterministicAmendmentReviewGuard.forcedRevision
+            ? 'Deterministic review guard blocked amendment approval because likely net-new article work was still missing.'
+            : 'Deterministic review guard added likely net-new article work to the amendment review delta.',
+          {
+            stage: 'worker_discovery_review',
+            role: 'plan-reviewer',
+            sessionId: amendmentReview.sessionId
+          },
+          {
+            amendmentLoop: amendmentLoops,
+            forcedRevision: deterministicAmendmentReviewGuard.forcedRevision,
+            missingCreateTargets: deterministicAmendmentReviewGuard.missingCreateTargets,
+            transitionReason: deterministicAmendmentReviewGuard.forcedRevision
+              ? 'deterministic_prefetch_missing_creates'
+              : 'deterministic_prefetch_review_delta_augmented'
+          }
+        );
+      }
+      if (deterministicAmendmentReviewGuard.unresolvedTargetIssues.length > 0) {
+        await logAnalysisProgress(
+          deterministicAmendmentReviewGuard.forcedRevision
+            ? 'Deterministic target validation blocked amendment approval because the plan still referenced unresolved KB targets.'
+            : 'Deterministic target validation added unresolved KB target corrections to the amendment review delta.',
+          {
+            stage: 'worker_discovery_review',
+            role: 'plan-reviewer',
+            sessionId: amendmentReview.sessionId
+          },
+          {
+            amendmentLoop: amendmentLoops,
+            forcedRevision: deterministicAmendmentReviewGuard.forcedRevision,
+            unresolvedTargetIssues: deterministicAmendmentReviewGuard.unresolvedTargetIssues,
+            transitionReason: deterministicAmendmentReviewGuard.forcedRevision
+              ? 'deterministic_invalid_target_blocked_approval'
+              : 'deterministic_invalid_target_review_delta_augmented'
+          }
+        );
+      }
+      if (deterministicAmendmentReviewGuard.unresolvedReferenceIssues.length > 0) {
+        await logAnalysisProgress(
+          deterministicAmendmentReviewGuard.forcedRevision
+            ? 'Deterministic batch-reference validation blocked amendment approval because the plan still referenced unresolved uploaded PBIs.'
+            : 'Deterministic batch-reference validation added unresolved uploaded PBI corrections to the amendment review delta.',
+          {
+            stage: 'worker_discovery_review',
+            role: 'plan-reviewer',
+            sessionId: amendmentReview.sessionId
+          },
+          {
+            amendmentLoop: amendmentLoops,
+            forcedRevision: deterministicAmendmentReviewGuard.forcedRevision,
+            unresolvedReferenceIssues: deterministicAmendmentReviewGuard.unresolvedReferenceIssues,
+            transitionReason: deterministicAmendmentReviewGuard.forcedRevision
+              ? 'deterministic_invalid_batch_reference_blocked_approval'
+              : 'deterministic_invalid_batch_reference_review_delta_augmented'
+          }
+        );
       }
       await batchAnalysisOrchestrator.recordReview(amendmentReview);
 
@@ -4729,6 +5992,7 @@ export function registerCoreCommands(
     }, {
       status: workerPass.result.status,
       kbAccessMode,
+      durationMs: workerPass.result.durationMs,
       toolCallCount: workerPass.result.toolCalls.length,
       transcriptPath: workerPass.result.transcriptPath
     });
@@ -4816,13 +6080,22 @@ export function registerCoreCommands(
         agentRuntime,
         input.workspaceId,
         finalReviewResult.sessionId,
-        finalReviewResult.resultPayload
+        finalReviewResult.resultPayload,
+        'final_review'
       );
+      await persistBatchStageRun({
+        stage: 'final_reviewing',
+        role: 'final-reviewer',
+        result: finalReviewResult,
+        resolution: finalReviewResolution
+      });
       await logAnalysisProgress('Final reviewer response received.', {
         stage: 'final_reviewing',
         role: 'final-reviewer',
         sessionId: finalReviewResult.sessionId
       }, {
+        durationMs: finalReviewResult.durationMs,
+        toolCallCount: finalReviewResult.toolCalls.length,
         textLength: finalReviewResolution.text.length,
         parseable: finalReviewResolution.parseable,
         usedTranscriptRecovery: finalReviewResolution.usedTranscript,
@@ -5035,7 +6308,7 @@ export function registerCoreCommands(
           ? 'worker_canceled_before_final_approval'
           : 'worker_failed_before_final_approval',
         triggerBranch: 'worker result was not ok or final review did not approve',
-        triggerArtifactType: 'run',
+        triggerArtifactType: 'stage_run',
         triggerSessionId: workerPass.result.sessionId,
         triggerSummary: workerPass.result.message ?? 'Worker failed before final approval.'
       });
@@ -5084,14 +6357,19 @@ export function registerCoreCommands(
       });
     } catch (error) {
       const failureMessage = error instanceof Error ? error.message : String(error);
+      const explicitTerminalError = error instanceof BatchAnalysisTerminalError ? error : null;
       const terminalStage: BatchAnalysisIterationRecord['stage'] =
-        liveIteration.stage === 'planning' || liveIteration.stage === 'plan_revision' || liveIteration.stage === 'plan_reviewing'
-          ? 'needs_human_review'
-          : liveIteration.stage === 'approved'
-            ? 'failed'
-            : liveIteration.stage;
+        explicitTerminalError?.terminalStage
+        ?? (
+          liveIteration.stage === 'planning' || liveIteration.stage === 'plan_revision' || liveIteration.stage === 'plan_reviewing'
+            ? 'needs_human_review'
+            : liveIteration.stage === 'approved'
+              ? 'failed'
+              : liveIteration.stage
+        );
       const terminalStatus: BatchAnalysisIterationRecord['status'] =
-        terminalStage === 'needs_human_review' ? 'needs_human_review' : 'failed';
+        explicitTerminalError?.terminalStatus
+        ?? (terminalStage === 'needs_human_review' ? 'needs_human_review' : 'failed');
       logger.error('[agent.analysis.run] orchestration failed', {
         jobId: payload.jobId,
         workspaceId: input.workspaceId,

@@ -116,12 +116,13 @@ function PlanItemRow({
 export function PlanView({ plans, supersededPlans, compact }: PlanViewProps) {
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
   const [showSuperseded, setShowSuperseded] = useState(false);
+  const [showAllCompactItems, setShowAllCompactItems] = useState(false);
 
-  const latestPlan = plans[plans.length - 1] ?? null;
+  const latestPlan = plans[0] ?? null;
   const displayItems = useMemo(() => {
     if (!latestPlan) return [];
-    return compact ? latestPlan.items.slice(0, 5) : latestPlan.items;
-  }, [latestPlan, compact]);
+    return compact && !showAllCompactItems ? latestPlan.items.slice(0, 5) : latestPlan.items;
+  }, [latestPlan, compact, showAllCompactItems]);
 
   if (!latestPlan) {
     return (
@@ -185,9 +186,15 @@ export function PlanView({ plans, supersededPlans, compact }: PlanViewProps) {
           />
         ))}
         {compact && totalItems > 5 && (
-          <div className="ba-plan-more">
-            +{totalItems - 5} more item{totalItems - 5 !== 1 ? 's' : ''}
-          </div>
+          <button
+            type="button"
+            className="ba-plan-more btn btn-ghost btn-sm"
+            onClick={() => setShowAllCompactItems((current) => !current)}
+          >
+            {showAllCompactItems
+              ? 'Show fewer items'
+              : `+${totalItems - 5} more item${totalItems - 5 !== 1 ? 's' : ''}`}
+          </button>
         )}
       </div>
 

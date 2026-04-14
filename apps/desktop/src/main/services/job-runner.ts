@@ -125,7 +125,15 @@ export class JobRegistry {
   }
 
   private emit(event: JobEvent) {
-    this.emitter.emit('job-event', event);
+    const previous = this.state.get(event.id);
+    const next: JobStatus = {
+      ...(previous ?? {}),
+      ...event,
+      startedAt: event.startedAt ?? previous?.startedAt,
+      endedAt: event.endedAt ?? previous?.endedAt
+    };
+    this.state.set(event.id, next);
+    this.emitter.emit('job-event', next);
   }
 
   list(): JobStatus[] {

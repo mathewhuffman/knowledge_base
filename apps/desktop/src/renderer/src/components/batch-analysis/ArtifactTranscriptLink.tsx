@@ -23,8 +23,8 @@ function artifactIcon(type: BatchAnalysisTranscriptLink['artifactType']): string
       return 'Final Review';
     case 'iteration':
       return 'Iteration';
-    case 'run':
-      return 'Run';
+    case 'stage_run':
+      return 'Stage Run';
     default:
       return type;
   }

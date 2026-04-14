@@ -3,6 +3,7 @@ import type { KbAccessMode } from './batch2';
 export type AgentSessionType = 'batch_analysis' | 'article_edit' | 'assistant_chat';
 export type AgentSessionMode = 'plan' | 'agent' | 'ask';
 export type BatchAnalysisAgentRole = 'planner' | 'plan-reviewer' | 'worker' | 'final-reviewer';
+export type BatchAnalysisSessionReusePolicy = 'reuse' | 'reset_acp' | 'new_local_session';
 export type BatchAnalysisStageStatus =
   | 'queued'
   | 'planning'
@@ -120,6 +121,7 @@ export interface AgentAnalysisRunRequest {
   kbAccessMode?: KbAccessMode;
   locale?: string;
   sessionId?: string;
+  sessionReusePolicy?: BatchAnalysisSessionReusePolicy;
   sessionType?: AgentSessionType;
   sessionMode?: AgentSessionMode;
   agentRole?: BatchAnalysisAgentRole;
@@ -136,6 +138,7 @@ export interface AgentArticleEditRunRequest {
   kbAccessMode?: KbAccessMode;
   locale?: string;
   sessionId?: string;
+  sessionReusePolicy?: BatchAnalysisSessionReusePolicy;
   sessionType?: AgentSessionType;
   sessionMode?: AgentSessionMode;
   agentRole?: BatchAnalysisAgentRole;
@@ -149,6 +152,7 @@ export interface AgentAssistantChatRunRequest {
   kbAccessMode?: KbAccessMode;
   locale?: string;
   sessionId?: string;
+  sessionReusePolicy?: BatchAnalysisSessionReusePolicy;
   sessionType?: AgentSessionType;
   sessionMode?: AgentSessionMode;
   agentRole?: BatchAnalysisAgentRole;
@@ -201,6 +205,8 @@ export interface AgentHealthCheckResponse {
   availableModes: KbAccessMode[];
 }
 
+import type { AiAssistantTurnCompletionState } from './ai-assistant';
+
 export interface AgentTranscriptRequest {
   workspaceId: string;
   sessionId: string;
@@ -209,6 +215,7 @@ export interface AgentTranscriptRequest {
 
 export interface AgentTranscriptLine {
   atUtc: string;
+  seq?: number;
   direction: 'to_agent' | 'from_agent' | 'system';
   event: string;
   payload: string;
@@ -232,11 +239,15 @@ export interface AgentToolCallAudit {
 
 export interface AgentRunResult {
   sessionId: string;
+  acpSessionId?: string;
   kbAccessMode: KbAccessMode;
   status: 'ok' | 'error' | 'timeout' | 'canceled';
+  completionState?: AiAssistantTurnCompletionState;
+  isFinal?: boolean;
   transcriptPath: string;
   rawOutput: string[];
   resultPayload?: unknown;
+  finalText?: string;
   toolCalls: AgentToolCallAudit[];
   startedAtUtc: string;
   endedAtUtc: string;
@@ -249,6 +260,7 @@ export interface PersistedAgentAnalysisRun {
   workspaceId: string;
   batchId: string;
   sessionId?: string;
+  acpSessionId?: string;
   kbAccessMode?: KbAccessMode;
   agentModelId?: string;
   status: 'running' | 'complete' | 'failed' | 'canceled';
@@ -260,6 +272,39 @@ export interface PersistedAgentAnalysisRun {
   rawOutput?: string[];
   resultPayload?: unknown;
   message?: string;
+}
+
+export interface BatchAnalysisStageRunRecord {
+  id: string;
+  workspaceId: string;
+  batchId: string;
+  iterationId: string;
+  iteration: number;
+  stage: BatchAnalysisStageStatus;
+  role: BatchAnalysisAgentRole;
+  attempt: number;
+  retryType?: string;
+  sessionReusePolicy?: BatchAnalysisSessionReusePolicy;
+  localSessionId?: string;
+  acpSessionId?: string;
+  kbAccessMode?: KbAccessMode;
+  agentModelId?: string;
+  status: PersistedAgentAnalysisRun['status'];
+  promptTemplate?: string;
+  transcriptPath?: string;
+  toolCallCount: number;
+  toolCalls: AgentToolCallAudit[];
+  rawOutput?: string[];
+  message?: string;
+  parseable?: boolean;
+  usedTranscriptRecovery?: boolean;
+  initialCandidateCount?: number;
+  transcriptCandidateCount?: number;
+  textLength?: number;
+  resultTextPreview?: string;
+  createdAtUtc: string;
+  startedAtUtc: string;
+  endedAtUtc?: string;
 }
 
 export interface PersistedAgentAnalysisRunResponse {
@@ -455,6 +500,52 @@ export interface BatchAnalysisExecutionCounts {
   rejected: number;
 }
 
+export interface BatchPlannerPrefetchPriorAnalysis {
+  latestPlanSummary?: string;
+  latestApprovedPlanSummary?: string;
+  latestReviewVerdict?: string;
+  latestFinalVerdict?: string;
+}
+
+export interface BatchPlannerPrefetchCluster {
+  clusterId: string;
+  label: string;
+  pbiIds: string[];
+  sampleTitles: string[];
+  queries: string[];
+}
+
+export interface BatchPlannerArticleMatchResult {
+  title: string;
+  familyId: string;
+  localeVariantId: string;
+  score: number;
+  matchContext?: string;
+  snippet: string;
+}
+
+export interface BatchPlannerArticleMatch {
+  clusterId: string;
+  query: string;
+  total: number;
+  topResults: BatchPlannerArticleMatchResult[];
+}
+
+export interface BatchPlannerRelationMatch {
+  title: string;
+  familyId: string;
+  strengthScore: number;
+  relationType: string;
+  evidence: string[];
+}
+
+export interface BatchPlannerPrefetch {
+  priorAnalysis: BatchPlannerPrefetchPriorAnalysis | null;
+  topicClusters: BatchPlannerPrefetchCluster[];
+  articleMatches: BatchPlannerArticleMatch[];
+  relationMatches: BatchPlannerRelationMatch[];
+}
+
 export interface BatchAnalysisIterationRecord {
   id: string;
   workspaceId: string;
@@ -512,7 +603,7 @@ export interface BatchAnalysisFinalReviewDeltaRecord {
 }
 
 export interface BatchAnalysisTranscriptLink {
-  artifactType: 'iteration' | 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'run';
+  artifactType: 'iteration' | 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'stage_run';
   artifactId: string;
   iterationId?: string;
   iteration?: number;
@@ -525,7 +616,7 @@ export interface BatchAnalysisTranscriptLink {
 }
 
 export interface BatchAnalysisTimelineEntry {
-  artifactType: 'iteration' | 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'run';
+  artifactType: 'iteration' | 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'stage_run';
   artifactId: string;
   iterationId?: string;
   iteration?: number;
@@ -547,6 +638,7 @@ export interface BatchAnalysisInspectionResponse {
   batchId: string;
   snapshot: BatchAnalysisSnapshotResponse;
   iterations: BatchAnalysisIterationRecord[];
+  stageRuns: BatchAnalysisStageRunRecord[];
   plans: BatchAnalysisPlan[];
   supersededPlans: BatchAnalysisPlan[];
   reviews: BatchPlanReview[];
@@ -586,7 +678,7 @@ export interface BatchAnalysisStageEventDetails {
   previousRole?: BatchAnalysisAgentRole;
   transitionReason?: string;
   triggerBranch?: string;
-  triggerArtifactType?: 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'run' | 'session' | 'system';
+  triggerArtifactType?: 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'stage_run' | 'session' | 'system';
   triggerArtifactId?: string;
   triggerSessionId?: string;
   triggerVerdict?: BatchAnalysisArtifactVerdict | 'draft';

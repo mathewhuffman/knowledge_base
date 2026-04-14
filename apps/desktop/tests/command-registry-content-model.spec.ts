@@ -83,6 +83,60 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createAssistantChatCorruptStreamBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-assistant-chat-corrupt-stream');
+  const source = `#!/usr/bin/env node
+const readline = require('node:readline');
+const sessionId = 'fake-assistant-chat-corrupt-stream';
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: 'Areas are the main container. Schedules define when an area runs, and setups define how that area is organized.'
+      }
+    }) + '\\n');
+
+    const corruptUpdate = {
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: 'Areas are the main container. It represents a of operation section the where people work. =Area the section of the business'
+          }
+        }
+      }
+    };
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify(corruptUpdate) + '\\n');
+    }, 20);
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
 async function createFakeBatchAnalysisAcpBinary(root: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-batch-analysis-agent');
   const source = `#!/usr/bin/env node
@@ -280,6 +334,425 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createDeterministicPrefetchBatchAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-deterministic-prefetch-agent');
+  const source = `#!${process.execPath}
+const readline = require('node:readline');
+const sessionId = 'fake-batch-analysis-deterministic-prefetch-session';
+let reviewCount = 0;
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      const revised = promptText.includes('Reviewer delta summary:');
+      payload = revised
+        ? {
+            summary: 'Revised plan now targets the existing KB articles.',
+            coverage: [
+              { pbiId: '101', outcome: 'covered', planItemIds: ['item-1'] },
+              { pbiId: '102', outcome: 'covered', planItemIds: ['item-2'] }
+            ],
+            items: [
+              {
+                planItemId: 'item-1',
+                pbiIds: ['101'],
+                action: 'edit',
+                targetType: 'article',
+                targetTitle: 'Team Dashboard',
+                reason: 'Existing Team Dashboard article should be updated instead of creating a new article.',
+                evidence: [{ kind: 'search', ref: 'cluster-1', summary: 'Deterministic prefetch found the existing Team Dashboard article.' }],
+                confidence: 0.92,
+                executionStatus: 'pending'
+              },
+              {
+                planItemId: 'item-2',
+                pbiIds: ['102'],
+                action: 'edit',
+                targetType: 'article',
+                targetTitle: 'Leadership Tile Settings',
+                reason: 'Existing Leadership Tile Settings article should be updated.',
+                evidence: [{ kind: 'search', ref: 'cluster-2', summary: 'Deterministic prefetch found the existing Leadership Tile Settings article.' }],
+                confidence: 0.88,
+                executionStatus: 'pending'
+              }
+            ],
+            openQuestions: []
+          }
+        : {
+            summary: 'Initial plan proposes one new article.',
+            coverage: [
+              { pbiId: '101', outcome: 'covered', planItemIds: ['item-1'] },
+              { pbiId: '102', outcome: 'covered', planItemIds: ['item-1'] }
+            ],
+            items: [
+              {
+                planItemId: 'item-1',
+                pbiIds: ['101', '102'],
+                action: 'create',
+                targetType: 'new_article',
+                targetTitle: 'New dashboard leadership guide',
+                reason: 'Bundle the work into a new article.',
+                evidence: [{ kind: 'pbi', ref: '101', summary: 'Dashboard update request.' }],
+                confidence: 0.73,
+                executionStatus: 'pending'
+              }
+            ],
+            openQuestions: []
+          };
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      reviewCount += 1;
+      payload = reviewCount === 1
+        ? {
+            summary: 'Plan looks acceptable.',
+            verdict: 'approved',
+            didAccountForEveryPbi: true,
+            hasMissingCreates: false,
+            hasMissingEdits: false,
+            hasTargetIssues: false,
+            hasOverlapOrConflict: false,
+            foundAdditionalArticleWork: false,
+            underScopedKbImpact: false,
+            delta: {
+              summary: 'No changes requested.',
+              requestedChanges: [],
+              missingPbiIds: [],
+              missingCreates: [],
+              missingEdits: [],
+              additionalArticleWork: [],
+              targetCorrections: [],
+              overlapConflicts: []
+            }
+          }
+        : {
+            summary: 'Revised plan is approved.',
+            verdict: 'approved',
+            didAccountForEveryPbi: true,
+            hasMissingCreates: false,
+            hasMissingEdits: false,
+            hasTargetIssues: false,
+            hasOverlapOrConflict: false,
+            foundAdditionalArticleWork: false,
+            underScopedKbImpact: false,
+            delta: {
+              summary: 'No changes requested.',
+              requestedChanges: [],
+              missingPbiIds: [],
+              missingCreates: [],
+              missingEdits: [],
+              additionalArticleWork: [],
+              targetCorrections: [],
+              overlapConflicts: []
+            }
+          };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      payload = {
+        summary: 'Worker executed the approved plan without discovering extra scope.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review approved the batch.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createInvalidTargetRepairBatchAcpBinary(root: string): Promise<{ binaryPath: string; configPath: string }> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-invalid-target-repair-agent');
+  const configPath = path.join(root, 'invalid-target-config.json');
+  const source = `#!${process.execPath}
+const fs = require('node:fs');
+const readline = require('node:readline');
+const sessionId = 'fake-batch-analysis-invalid-target-repair-session';
+const configPath = ${JSON.stringify(configPath)};
+const rl = readline.createInterface({ input: process.stdin });
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    const config = loadConfig() || {};
+    let payload;
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      payload = {
+        summary: 'Planner returned one no-impact target with a malformed locale variant ID.',
+        coverage: [
+          { pbiId: config.invalidPbiId || '301', outcome: 'covered', planItemIds: ['item-1'] }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: [config.invalidPbiId || '301'],
+            action: 'no_impact',
+            targetType: 'article',
+            targetArticleId: config.invalidLocaleVariantId,
+            targetFamilyId: config.familyId,
+            targetTitle: config.targetTitle || 'Create a Food Item',
+            reason: 'This adjacent article should remain no-impact after review.',
+            evidence: [
+              { kind: 'pbi', ref: 'externalId:' + (config.truncatedExternalId || '301'), summary: 'Imported batch evidence.' },
+              { kind: 'search', ref: 'test-search', summary: 'Search surfaced the adjacent live article.' }
+            ],
+            confidence: 0.86,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      };
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      payload = {
+        summary: 'Plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      payload = {
+        summary: 'Worker executed the approved plan without discovering extra scope.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review approved the batch.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return { binaryPath, configPath };
+}
+
+async function createCliPolicyFallbackBatchAnalysisAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-cli-policy-fallback-agent');
+  const source = `#!/usr/bin/env node
+const readline = require('node:readline');
+let sessionCounter = 0;
+let currentSessionId = '';
+let currentTransport = 'cli';
+let cliWorkerPromptCount = 0;
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    sessionCounter += 1;
+    currentTransport = Array.isArray(message.params?.mcpServers) && message.params.mcpServers.length > 0 ? 'mcp' : 'cli';
+    currentSessionId = 'fake-batch-analysis-' + currentTransport + '-' + sessionCounter;
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: currentSessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      payload = {
+        summary: 'Planner draft for fallback coverage.',
+        coverage: [
+          { pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['item-1'] }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'no_impact',
+            targetType: 'article',
+            targetTitle: 'Checklist article',
+            reason: 'Used to exercise CLI fallback handling.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+            confidence: 0.88,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      };
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      payload = {
+        summary: 'Plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      if (currentTransport === 'cli') {
+        cliWorkerPromptCount += 1;
+        payload = {
+          summary: 'CLI worker finished but hit a blocked shell after research.',
+          discoveredWork: []
+        };
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+        const illegalTool = {
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: currentSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'cli-shell-tool',
+              title: 'Shell',
+              kind: 'terminal',
+              rawInput: {
+                command: 'pwd'
+              }
+            }
+          }
+        };
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify(illegalTool) + '\\n');
+        }, 10);
+        return;
+      }
+
+      payload = {
+        summary: 'MCP worker completed after the CLI policy violation.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review approved.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
+    } else {
+      payload = { summary: currentTransport + ' default payload' };
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
 async function createPlannerRepairAcpBinary(root: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-batch-analysis-planner-repair-agent');
   const source = `#!/usr/bin/env node
@@ -352,6 +825,123 @@ rl.on('line', (line) => {
     } else if (promptText.includes('Execute only the approved plan items below.')) {
       payload = {
         summary: 'Executed recovered plan.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review approved.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createPlannerRuntimeRetryAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-planner-runtime-retry-agent');
+  const source = `#!/usr/bin/env node
+const readline = require('node:readline');
+let sessionCounter = 0;
+let plannerPromptCount = 0;
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    sessionCounter += 1;
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: { sessionId: 'fake-batch-analysis-runtime-retry-session-' + String(sessionCounter) }
+    }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Your previous planner answer did not arrive as a complete planner JSON object.')) {
+      payload = 'Error: S: [resource_exhausted] Error';
+    } else if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      plannerPromptCount += 1;
+      if (plannerPromptCount === 1) {
+        payload = 'Gathering KB evidence via the kb CLI before returning the structured plan.';
+      } else {
+        payload = {
+          summary: 'Recovered draft plan after a fresh-session retry.',
+          coverage: [
+            { pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['item-1'] }
+          ],
+          items: [
+            {
+              planItemId: 'item-1',
+              pbiIds: ['pbi-1'],
+              action: 'no_impact',
+              targetType: 'article',
+              targetTitle: 'Recovered planner article',
+              reason: 'A fresh local session recovered from the provider error.',
+              evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+              confidence: 0.86,
+              executionStatus: 'pending'
+            }
+          ],
+          openQuestions: []
+        };
+      }
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      payload = {
+        summary: 'Plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      payload = {
+        summary: 'Worker completed the approved plan.',
         discoveredWork: []
       };
     } else if (promptText.includes('You are the final reviewer for the batch.')) {
@@ -708,10 +1298,62 @@ async function createTestHarness() {
       }
     });
     expect(created.ok).toBe(true);
-    return created.data as { id: string };
+    return created.data as { id: string; path: string };
   };
 
   return { workspaceRoot, bus, jobs, createWorkspace, cleanup: () => rm(workspaceRoot, { recursive: true, force: true }) };
+}
+
+async function createSearchableLiveArticle(params: {
+  bus: CommandBus;
+  workspaceId: string;
+  workspacePath: string;
+  externalKey: string;
+  title: string;
+  locale?: string;
+  html: string;
+}) {
+  const familyResp = await params.bus.execute({
+    method: 'articleFamily.create',
+    payload: {
+      workspaceId: params.workspaceId,
+      externalKey: params.externalKey,
+      title: params.title
+    }
+  });
+  expect(familyResp.ok).toBe(true);
+  const family = familyResp.data as { id: string };
+
+  const variantResp = await params.bus.execute({
+    method: 'localeVariant.create',
+    payload: {
+      workspaceId: params.workspaceId,
+      familyId: family.id,
+      locale: params.locale ?? 'en-us'
+    }
+  });
+  expect(variantResp.ok).toBe(true);
+  const variant = variantResp.data as { id: string };
+
+  const articleFileName = `${params.externalKey}.html`;
+  const articleFilePath = path.join(params.workspacePath, articleFileName);
+  await writeFile(articleFilePath, params.html, 'utf8');
+
+  const revisionResp = await params.bus.execute({
+    method: 'revision.create',
+    payload: {
+      workspaceId: params.workspaceId,
+      localeVariantId: variant.id,
+      revisionType: 'live',
+      branchId: null,
+      filePath: articleFilePath,
+      status: 'open',
+      revisionNumber: 1
+    }
+  });
+  expect(revisionResp.ok).toBe(true);
+
+  return { familyId: family.id, localeVariantId: variant.id, filePath: articleFilePath };
 }
 
 test.describe('command registry content model transitions', () => {
@@ -1143,12 +1785,44 @@ test.describe('command registry content model transitions', () => {
       expect(importResp.ok).toBe(true);
       const batchId = (importResp.data as { batch: { id: string } }).batch.id;
 
-      const jobEvents: Array<{ state: string; progress: number; message?: string; metadata?: Record<string, unknown> }> = [];
-      jobs.setEmitter((event) => {
-        if (event.command === 'agent.analysis.run') {
-          jobEvents.push(event);
+      const seededProposalInputs = [
+        {
+          targetTitle: 'Team Dashboard',
+          rationaleSummary: 'Seeded proposal for deterministic edit coverage.',
+          aiNotes: 'Refresh the team dashboard workflow documentation.',
+          sourceHtml: '<h1>Team Dashboard</h1><p>Current dashboard configuration help.</p>',
+          proposedHtml: '<h1>Team Dashboard</h1><p>Updated dashboard workflow guidance.</p>',
+          relatedPbiIds: ['101']
+        },
+        {
+          targetTitle: 'Leadership Tile Settings',
+          rationaleSummary: 'Seeded proposal for deterministic leadership settings coverage.',
+          aiNotes: 'Refresh the leadership tile settings guidance.',
+          sourceHtml: '<h1>Leadership Tile Settings</h1><p>Configure leadership tiles in the dashboard.</p>',
+          proposedHtml: '<h1>Leadership Tile Settings</h1><p>Updated leadership tile settings guidance.</p>',
+          relatedPbiIds: ['102']
         }
-      });
+      ];
+
+      for (const proposal of seededProposalInputs) {
+        const proposalResp = await bus.execute({
+          method: 'proposal.ingest',
+          payload: {
+            workspaceId: workspace.id,
+            batchId,
+            action: 'edit',
+            targetTitle: proposal.targetTitle,
+            targetLocale: 'en-us',
+            confidenceScore: 0.88,
+            rationaleSummary: proposal.rationaleSummary,
+            aiNotes: proposal.aiNotes,
+            sourceHtml: proposal.sourceHtml,
+            proposedHtml: proposal.proposedHtml,
+            relatedPbiIds: proposal.relatedPbiIds
+          }
+        });
+        expect(proposalResp.ok).toBe(true);
+      }
 
       const job = await jobs.start('agent.analysis.run', {
         workspaceId: workspace.id,
@@ -1231,7 +1905,7 @@ test.describe('command registry content model transitions', () => {
     }
   });
 
-  test('repairs planner output when the first planning response is not valid JSON', async () => {
+  test('escalates to human review when planner output cannot be salvaged locally', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-planner-repair-'));
     process.env.KBV_CURSOR_BINARY = await createPlannerRepairAcpBinary(isolatedRoot);
 
@@ -1259,8 +1933,8 @@ test.describe('command registry content model transitions', () => {
         workspaceId: workspace.id,
         batchId
       });
-      expect(job.state).toBe('SUCCEEDED');
-      expect(jobEvents.some((event) => event.message?.includes('Planner returned non-JSON or incomplete output'))).toBeTruthy();
+      expect(job.state).toBe('FAILED');
+      expect(jobEvents.some((event) => event.message?.includes('Planner returned incomplete output'))).toBeTruthy();
 
       const latestResp = await bus.execute({
         method: 'agent.analysis.latest',
@@ -1274,17 +1948,148 @@ test.describe('command registry content model transitions', () => {
           latestFinalReview?: { verdict: string };
         } | null;
       };
+      expect(latestData.orchestration?.latestIteration?.stage).toBe('needs_human_review');
+      expect(latestData.orchestration?.latestIteration?.role).toBe('planner');
+      expect(latestData.orchestration?.latestApprovedPlan).toBeNull();
+      expect(latestData.orchestration?.latestFinalReview).toBeNull();
+
+      const inspectionResp = await bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        stageRuns: Array<{ stage: string; role: string; retryType?: string }>;
+        workerReports: unknown[];
+      };
+      expect(inspection.workerReports).toHaveLength(0);
+      expect(inspection.stageRuns.some((run) => run.stage === 'planning' && run.role === 'planner')).toBeTruthy();
+      expect(inspection.stageRuns.some((run) => run.retryType === 'planner_json_retry')).toBeTruthy();
+    } finally {
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('retries the planner in a fresh local session when the JSON retry returns a provider error string', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-planner-runtime-retry-'));
+    process.env.KBV_CURSOR_BINARY = await createPlannerRuntimeRetryAcpBinary(isolatedRoot);
+
+    try {
+      const workspace = await createWorkspace();
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'planner-runtime-retry.csv',
+          sourceContent: 'Id,Title,Description\n1,Planner Runtime Retry,Verify planner provider errors retry in a fresh session'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const job = await jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('SUCCEEDED');
+
+      const latestResp = await bus.execute({
+        method: 'agent.analysis.latest',
+        payload: { workspaceId: workspace.id, batchId, limit: 0 }
+      });
+      expect(latestResp.ok).toBe(true);
+      const latestData = latestResp.data as {
+        orchestration?: {
+          latestIteration?: { stage: string; role: string };
+          latestApprovedPlan?: { summary?: string };
+        } | null;
+      };
       expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
-      expect(latestData.orchestration?.latestApprovedPlan?.summary).toBe('Recovered draft plan after repair prompt.');
-      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.targetTitle).toBe('Recovered planner article');
-      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.executionStatus).toBe('executed');
+      expect(latestData.orchestration?.latestApprovedPlan?.summary).toContain('Recovered draft plan');
+
+      const inspectionResp = await bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        stageRuns: Array<{ retryType?: string; sessionReusePolicy?: string; localSessionId?: string }>;
+      };
+      expect(inspection.stageRuns.some((run) => run.retryType === 'planner_json_retry')).toBeTruthy();
+      expect(inspection.stageRuns.some((run) =>
+        run.retryType === 'planner_runtime_retry' && run.sessionReusePolicy === 'new_local_session'
+      )).toBeTruthy();
+
+      const plannerSessionIds = inspection.stageRuns
+        .filter((run) => run.retryType === 'planner_runtime_retry' || run.retryType === 'planner_json_retry' || run.retryType === undefined)
+        .map((run) => run.localSessionId)
+        .filter((value): value is string => typeof value === 'string');
+      expect(new Set(plannerSessionIds).size).toBeGreaterThan(1);
+    } finally {
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('retries batch analysis in MCP mode when a CLI worker hits a blocked shell after completing the turn', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-cli-policy-fallback-'));
+    process.env.KBV_CURSOR_BINARY = await createCliPolicyFallbackBatchAnalysisAcpBinary(isolatedRoot);
+
+    try {
+      const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'cli-policy-fallback.csv',
+          sourceContent: 'Id,Title,Description\n1,Checklist Policy Retry,Verify CLI worker retries in MCP when a blocked shell call happens after research'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const jobEvents: Array<{ message?: string; metadata?: Record<string, unknown> }> = [];
+      jobs.setEmitter((event) => {
+        if (event.command === 'agent.analysis.run') {
+          jobEvents.push(event);
+        }
+      });
+
+      const job = await jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('SUCCEEDED');
+      expect(jobEvents.some((event) => event.message?.includes('Retrying in MCP mode'))).toBeTruthy();
+      expect(jobEvents.some((event) => event.metadata?.kbAccessMode === 'mcp')).toBeTruthy();
+
+      const latestResp = await bus.execute({
+        method: 'agent.analysis.latest',
+        payload: { workspaceId: workspace.id, batchId, limit: 0 }
+      });
+      expect(latestResp.ok).toBe(true);
+      const latestData = latestResp.data as {
+        orchestration?: {
+          latestIteration?: { stage: string; role: string };
+          latestFinalReview?: { verdict: string };
+        } | null;
+      };
+      expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
       expect(latestData.orchestration?.latestFinalReview?.verdict).toBe('approved');
     } finally {
       await rm(isolatedRoot, { recursive: true, force: true });
     }
   });
 
-  test('salvages truncated planner repair output into a registered plan instead of escalating', async () => {
+  test('salvages truncated planner output locally into a registered plan instead of escalating', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-truncated-planner-'));
     process.env.KBV_CURSOR_BINARY = await createTruncatedPlannerRepairAcpBinary(isolatedRoot);
 
@@ -1326,6 +2131,253 @@ test.describe('command registry content model transitions', () => {
       expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.targetTitle).toBe('Edit a Food Item');
       expect(latestData.orchestration?.latestFinalReview?.verdict).toBe('approved');
     } finally {
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('forces revision when deterministic prefetch shows existing edit targets for an under-scoped create-only plan', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-deterministic-prefetch-'));
+    process.env.KBV_CURSOR_BINARY = await createDeterministicPrefetchBatchAcpBinary(isolatedRoot);
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      await createSearchableLiveArticle({
+        bus: harness.bus,
+        workspaceId: workspace.id,
+        workspacePath: workspace.path,
+        externalKey: 'team-dashboard',
+        title: 'Team Dashboard',
+        html: '<h1>Team Dashboard</h1><p>Current dashboard configuration help.</p>'
+      });
+      await createSearchableLiveArticle({
+        bus: harness.bus,
+        workspaceId: workspace.id,
+        workspacePath: workspace.path,
+        externalKey: 'leadership-tile-settings',
+        title: 'Leadership Tile Settings',
+        html: '<h1>Leadership Tile Settings</h1><p>Configure leadership tiles in the dashboard.</p>'
+      });
+
+      const importResp = await harness.bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'deterministic-prefetch.csv',
+          sourceContent: 'Id,Title,Description\n101,Team Dashboard,Update the team dashboard workflow\n102,Leadership Tile Settings,Update leadership tile behavior'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const seededProposalInputs = [
+        {
+          targetTitle: 'Team Dashboard',
+          rationaleSummary: 'Seeded proposal for deterministic edit coverage.',
+          aiNotes: 'Refresh the team dashboard workflow documentation.',
+          sourceHtml: '<h1>Team Dashboard</h1><p>Current dashboard configuration help.</p>',
+          proposedHtml: '<h1>Team Dashboard</h1><p>Updated dashboard workflow guidance.</p>',
+          relatedPbiIds: ['101']
+        },
+        {
+          targetTitle: 'Leadership Tile Settings',
+          rationaleSummary: 'Seeded proposal for deterministic leadership settings coverage.',
+          aiNotes: 'Refresh the leadership tile settings guidance.',
+          sourceHtml: '<h1>Leadership Tile Settings</h1><p>Configure leadership tiles in the dashboard.</p>',
+          proposedHtml: '<h1>Leadership Tile Settings</h1><p>Updated leadership tile settings guidance.</p>',
+          relatedPbiIds: ['102']
+        }
+      ];
+
+      for (const proposal of seededProposalInputs) {
+        const proposalResp = await harness.bus.execute({
+          method: 'proposal.ingest',
+          payload: {
+            workspaceId: workspace.id,
+            batchId,
+            action: 'edit',
+            targetTitle: proposal.targetTitle,
+            targetLocale: 'en-us',
+            confidenceScore: 0.88,
+            rationaleSummary: proposal.rationaleSummary,
+            aiNotes: proposal.aiNotes,
+            sourceHtml: proposal.sourceHtml,
+            proposedHtml: proposal.proposedHtml,
+            relatedPbiIds: proposal.relatedPbiIds
+          }
+        });
+        expect(proposalResp.ok).toBe(true);
+      }
+
+      const job = await harness.jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('SUCCEEDED');
+
+      const inspectionResp = await harness.bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        plans: Array<{ verdict: string; items: Array<{ action: string; targetTitle: string }> }>;
+        reviews: Array<{ verdict: string; summary: string; delta?: { missingEdits?: string[] } }>;
+      };
+
+      expect(inspection.reviews.some((review) =>
+        review.verdict === 'needs_revision'
+        && review.delta?.missingEdits?.includes('Team Dashboard')
+      )).toBeTruthy();
+
+      const latestApprovedPlan = inspection.plans.find((plan) =>
+        plan.verdict === 'approved'
+        && plan.items.every((item) => item.action === 'edit')
+      );
+      expect(latestApprovedPlan).toBeTruthy();
+      expect(latestApprovedPlan?.items.map((item) => item.targetTitle)).toEqual([
+        'Team Dashboard',
+        'Leadership Tile Settings'
+      ]);
+
+      const eventsResp = await harness.bus.execute({
+        method: 'batch.analysis.events.get',
+        payload: { workspaceId: workspace.id, batchId, limit: 100 }
+      });
+      expect(eventsResp.ok).toBe(true);
+      const events = (eventsResp.data as {
+        events: Array<{ details?: { transitionReason?: string; missingEditTargets?: string[] } }>;
+      }).events;
+
+      expect(events.some((event) =>
+        event.details?.transitionReason === 'deterministic_prefetch_missing_edits'
+        && event.details?.missingEditTargets?.includes('Team Dashboard')
+      )).toBeTruthy();
+    } finally {
+      await harness.cleanup();
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('repairs a malformed planner target article ID before review approval and continues into building', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-invalid-target-repair-'));
+    const { binaryPath, configPath } = await createInvalidTargetRepairBatchAcpBinary(isolatedRoot);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+      const article = await createSearchableLiveArticle({
+        bus: harness.bus,
+        workspaceId: workspace.id,
+        workspacePath: workspace.path,
+        externalKey: 'food-list-create-food-item',
+        title: 'Create a Food Item',
+        html: '<h1>Create a Food Item</h1><p>Create an item from a food list.</p>'
+      });
+
+      const invalidLocaleVariantId = `${article.localeVariantId.slice(0, -1)}${article.localeVariantId.endsWith('0') ? '1' : '0'}`;
+      expect(invalidLocaleVariantId).not.toBe(article.localeVariantId);
+      await writeFile(configPath, JSON.stringify({
+        familyId: article.familyId,
+        invalidLocaleVariantId,
+        targetTitle: 'Create a Food Item'
+      }), 'utf8');
+
+      const importResp = await harness.bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'invalid-target-repair.csv',
+          sourceContent: 'Id,Title,Description\n301,Create a Food Item,Validate target repair before worker execution'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const rowsResp = await harness.bus.execute({
+        method: 'pbiBatch.rows.list',
+        payload: {
+          workspaceId: workspace.id,
+          batchId
+        }
+      });
+      expect(rowsResp.ok).toBe(true);
+      const importedRow = (rowsResp.data as {
+        rows: Array<{ id: string; externalId: string }>;
+      }).rows[0];
+      expect(importedRow).toBeTruthy();
+
+      const invalidPbiId = `${importedRow.id.slice(0, 18)}${importedRow.id.slice(19)}`;
+      expect(invalidPbiId).not.toBe(importedRow.id);
+      const truncatedExternalId = importedRow.externalId.slice(0, Math.max(1, importedRow.externalId.length - 1));
+      await writeFile(configPath, JSON.stringify({
+        familyId: article.familyId,
+        invalidLocaleVariantId,
+        invalidPbiId,
+        truncatedExternalId,
+        targetTitle: 'Create a Food Item'
+      }), 'utf8');
+
+      const job = await harness.jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('SUCCEEDED');
+
+      const latestResp = await harness.bus.execute({
+        method: 'agent.analysis.latest',
+        payload: { workspaceId: workspace.id, batchId, limit: 0 }
+      });
+      expect(latestResp.ok).toBe(true);
+      const latestData = latestResp.data as {
+        orchestration?: {
+          latestIteration?: { stage: string };
+          latestApprovedPlan?: { items: Array<{ targetArticleId?: string; targetFamilyId?: string }> };
+        } | null;
+      };
+
+      expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
+      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.pbiIds).toEqual([importedRow.id]);
+      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.targetArticleId).toBe(article.localeVariantId);
+      expect(latestData.orchestration?.latestApprovedPlan?.items[0]?.targetFamilyId).toBe(article.familyId);
+
+      const eventsResp = await harness.bus.execute({
+        method: 'batch.analysis.events.get',
+        payload: { workspaceId: workspace.id, batchId, limit: 100 }
+      });
+      expect(eventsResp.ok).toBe(true);
+      const events = (eventsResp.data as {
+        events: Array<{ stage: string; details?: { transitionReason?: string; targetRepairs?: string[] } }>;
+      }).events;
+
+      expect(events.some((event) =>
+        event.details?.transitionReason === 'deterministic_target_repair'
+        && event.details?.targetRepairs?.some((repair) => repair.includes(article.localeVariantId))
+      )).toBeTruthy();
+      expect(events.some((event) =>
+        event.details?.transitionReason === 'deterministic_batch_reference_repair'
+      )).toBeTruthy();
+      expect(events.some((event) => event.stage === 'building')).toBeTruthy();
+    } finally {
+      await harness.cleanup();
       await rm(isolatedRoot, { recursive: true, force: true });
     }
   });
@@ -1634,6 +2686,63 @@ test.describe('command registry content model transitions', () => {
       });
       expect(refreshedProposal.ok).toBe(true);
       expect((refreshedProposal.data as { diff: { afterHtml: string } }).diff.afterHtml).toContain('AI refined proposal');
+    } finally {
+      await harness.cleanup();
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('prefers the clean assistant reply over corrupt streamed transcript chunks for chat responses', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-ai-chat-corrupt-stream-'));
+    process.env.KBV_CURSOR_BINARY = await createAssistantChatCorruptStreamBinary(isolatedRoot);
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const turn = await harness.bus.execute({
+        method: 'ai.assistant.message.send',
+        payload: {
+          workspaceId: workspace.id,
+          context: {
+            workspaceId: workspace.id,
+            route: AppRoute.KB_VAULT_HOME,
+            routeLabel: 'KB Vault Home',
+            subject: {
+              type: 'workspace',
+              id: workspace.id
+            },
+            workingState: {
+              kind: 'none',
+              payload: null
+            },
+            capabilities: {
+              canChat: true,
+              canCreateProposal: false,
+              canPatchProposal: false,
+              canPatchDraft: false,
+              canPatchTemplate: false,
+              canUseUnsavedWorkingState: false
+            },
+            backingData: {
+              route: AppRoute.KB_VAULT_HOME
+            }
+          },
+          message: 'What is the relationship between areas, schedules, and setups?'
+        }
+      });
+
+      expect(turn.ok).toBe(true);
+      const data = turn.data as {
+        artifact?: { artifactType: string };
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(data.artifact?.artifactType).toBe('informational_response');
+      const assistantMessage = [...data.messages].reverse().find((message) => message.role === 'assistant');
+      expect(assistantMessage?.content).toBe(
+        'Areas are the main container. Schedules define when an area runs, and setups define how that area is organized.'
+      );
+      expect(assistantMessage?.content).not.toContain('=Area');
+      expect(assistantMessage?.content).not.toContain('a of operation section the where people work');
     } finally {
       await harness.cleanup();
       await rm(isolatedRoot, { recursive: true, force: true });

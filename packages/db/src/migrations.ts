@@ -901,6 +901,54 @@ export const migrations: Migration[] = [
       ALTER TABLE batch_analysis_stage_events
         ADD COLUMN details_json TEXT;
     `
+  },
+  {
+    version: 20,
+    name: '0020_batch_analysis_stage_runs',
+    description: 'Persist stage-aware batch analysis run attempts independently from legacy ai_runs.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS batch_analysis_stage_runs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        iteration INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        role TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        retry_type TEXT,
+        session_reuse_policy TEXT,
+        local_session_id TEXT,
+        acp_session_id TEXT,
+        kb_access_mode TEXT,
+        agent_model_id TEXT,
+        status TEXT NOT NULL,
+        prompt_template TEXT,
+        transcript_path TEXT,
+        tool_call_count INTEGER NOT NULL DEFAULT 0,
+        tool_calls_json TEXT NOT NULL DEFAULT '[]',
+        raw_output_json TEXT,
+        message TEXT,
+        parseable INTEGER,
+        used_transcript_recovery INTEGER,
+        initial_candidate_count INTEGER,
+        transcript_candidate_count INTEGER,
+        text_length INTEGER,
+        result_text_preview TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_stage_runs_batch
+        ON batch_analysis_stage_runs(workspace_id, batch_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_stage_runs_iteration
+        ON batch_analysis_stage_runs(iteration_id, created_at ASC);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_analysis_stage_runs_attempt
+        ON batch_analysis_stage_runs(iteration_id, stage, role, attempt);
+    `
   }
 ];
 

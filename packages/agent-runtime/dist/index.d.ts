@@ -44,6 +44,7 @@ export declare class CursorAcpRuntime {
     private readonly toolCallAudit;
     private readonly mcpServer;
     private readonly transports;
+    private readonly acpSessionStates;
     private readonly cursorSessionIds;
     private readonly cursorSessionLookup;
     private readonly activeStreamEmitters;
@@ -51,7 +52,12 @@ export declare class CursorAcpRuntime {
     private readonly promptCompletionTimers;
     private readonly pendingPromptFallbacks;
     private readonly pendingSessionOperations;
+    private readonly sessionOperationTails;
     private readonly sessionActivityAt;
+    private readonly promptTransportActivityAt;
+    private readonly transcriptLineSequences;
+    private readonly auditedCliToolCallIds;
+    private readonly activePromptStates;
     private readonly cliPlannerLoopState;
     private readonly workspaceAgentModels;
     private readonly debugLogger;
@@ -70,7 +76,13 @@ export declare class CursorAcpRuntime {
     private buildTransportKey;
     private restartWorkspaceAcpConnections;
     private markSessionActivity;
+    private markPromptTransportActivity;
+    private getPromptStructuredResultContract;
+    private pruneIdleNonChatSessions;
+    private stopActivePrompt;
+    private maybeResolveStructuredPromptFromStream;
     private trackSessionOperation;
+    private queueSessionOperation;
     private waitForSessionToSettle;
     getSession(sessionId: string): AgentSessionRecord | null;
     setMcpServerConfigs(configs: ReadonlyArray<Record<string, unknown>>): void;
@@ -79,6 +91,9 @@ export declare class CursorAcpRuntime {
     closeSession(input: AgentSessionCloseRequest): AgentSessionRecord | null;
     checkHealth(workspaceId: string, selectedMode?: KbAccessMode, workspaceKbAccessMode?: KbAccessMode): Promise<AgentHealthCheckResponse>;
     private ensureAcpSession;
+    private markAcpSessionReady;
+    private clearAcpSessionState;
+    private waitForAcpSessionReady;
     handleMcpJsonMessage(raw: string | Record<string, unknown>): Promise<string | null>;
     runBatchAnalysis(request: AgentAnalysisRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean): Promise<AgentRunResult>;
     runArticleEdit(request: AgentArticleEditRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean): Promise<AgentRunResult>;
@@ -93,6 +108,8 @@ export declare class CursorAcpRuntime {
         allowed: boolean;
         reason?: string;
     }[];
+    private populateRunToolCalls;
+    private extractToolCallAuditFromTranscript;
     stop(): Promise<void>;
     private findReusableBatchAnalysisSession;
     private resolveSession;

@@ -8,6 +8,7 @@ export type AiSessionLifecycleStatus = 'active' | 'closed' | 'archived';
 export type AiArtifactStatus = 'pending' | 'applied' | 'rejected' | 'superseded';
 export type AiMessageRole = 'system' | 'user' | 'assistant';
 export type AiMessageKind = 'chat' | 'artifact' | 'decision' | 'warning';
+export type AiAssistantTurnCompletionState = 'completed' | 'researching' | 'needs_user_input' | 'blocked' | 'errored' | 'unknown';
 export interface AiViewContextSubject {
     type: AiSubjectType;
     id: string;
@@ -64,6 +65,20 @@ export interface AiMessageRecord {
     content: string;
     metadata?: Record<string, unknown>;
     createdAtUtc: string;
+}
+export interface AiAssistantToolAuditRecord {
+    toolCallId?: string;
+    toolName?: string;
+    toolStatus?: string;
+    resourceLabel?: string;
+}
+export interface AiAssistantMessageAuditMetadata {
+    artifactId?: string;
+    artifactType?: string;
+    thoughtText?: string;
+    toolEvents?: AiAssistantToolAuditRecord[];
+    completionState?: AiAssistantTurnCompletionState;
+    isFinal?: boolean;
 }
 export interface TemplatePatchPayload {
     name?: string;
@@ -184,6 +199,23 @@ export interface AiAssistantTurnResponse {
     context: AiViewContext;
     artifact?: AiArtifactRecord;
     uiActions: AiAssistantUiAction[];
+}
+export type AiAssistantStreamEventKind = 'turn_started' | 'response_chunk' | 'thought_chunk' | 'tool_call' | 'tool_update' | 'turn_finished' | 'turn_error';
+export interface AiAssistantStreamEvent {
+    workspaceId: string;
+    sessionId: string;
+    turnId: string;
+    kind: AiAssistantStreamEventKind;
+    atUtc: string;
+    text?: string;
+    toolCallId?: string;
+    toolName?: string;
+    toolStatus?: string;
+    resourceLabel?: string;
+    message?: string;
+    error?: string;
+    messageId?: string;
+    artifactId?: string;
 }
 export interface AiAssistantSessionResetRequest {
     workspaceId: string;

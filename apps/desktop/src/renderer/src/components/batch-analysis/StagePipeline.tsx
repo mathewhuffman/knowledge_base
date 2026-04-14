@@ -24,9 +24,9 @@ function resolveNodeState(
   failedStage: BatchAnalysisStageStatus | undefined,
 ): PipelineNodeState {
   if (failedStage === stage) return 'failed';
+  if (stage === currentStage) return 'active';
   if (completedStages.has(stage)) return 'done';
   if (stage === 'queued' && currentStage && currentStage !== 'queued') return 'done';
-  if (stage === currentStage) return 'active';
   return 'pending';
 }
 

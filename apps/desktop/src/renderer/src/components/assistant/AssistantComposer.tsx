@@ -119,7 +119,7 @@ export function AssistantComposer({ context, loading, onSend }: AssistantCompose
           onClick={() => void handleSend()}
           aria-label="Send message"
         >
-          <IconSend size={14} />
+          {loading ? <span className="ai-composer__send-spinner" aria-hidden="true" /> : <IconSend size={14} />}
         </button>
       </div>
     </div>

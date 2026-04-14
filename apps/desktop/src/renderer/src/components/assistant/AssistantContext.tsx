@@ -5,6 +5,7 @@ import {
   type AiAssistantArtifactDecisionResponse,
   type AiAssistantSessionGetResponse,
   type AiAssistantSessionListResponse,
+  type AiAssistantStreamEvent,
   type AiAssistantTurnResponse,
   type AiAssistantUiAction,
   type AiMessageRecord,
@@ -27,6 +28,88 @@ function normalizeMessages(messages: AiMessageRecord[]): AiMessageRecord[] {
   return deduped;
 }
 
+interface PendingAssistantToolEvent {
+  toolCallId?: string;
+  toolName?: string;
+  toolStatus?: string;
+  resourceLabel?: string;
+}
+
+function isFilteredAssistantToolName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === 'terminal' || normalized === 'shell';
+}
+
+export interface PendingAssistantTurn {
+  turnId: string;
+  sessionId: string;
+  startedAtUtc: string;
+  responseText: string;
+  thoughtText: string;
+  toolEvents: PendingAssistantToolEvent[];
+  error?: string;
+}
+
+function findSharedPrefixLength(left: string, right: string): number {
+  const max = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < max && left[index] === right[index]) {
+    index += 1;
+  }
+  return index;
+}
+
+function findChunkOverlap(left: string, right: string): number {
+  const maxOverlap = Math.min(left.length, right.length);
+  for (let overlap = maxOverlap; overlap >= 12; overlap -= 1) {
+    if (left.slice(-overlap) === right.slice(0, overlap)) {
+      return overlap;
+    }
+  }
+  return 0;
+}
+
+function appendStreamingText(current: string, chunk: string): string {
+  if (!chunk && chunk !== '') {
+    return current;
+  }
+  if (!current) {
+    return chunk;
+  }
+  if (current === chunk || current.endsWith(chunk)) {
+    return current;
+  }
+  if (chunk.endsWith(current) || chunk.startsWith(current)) {
+    return chunk;
+  }
+  const sharedPrefix = findSharedPrefixLength(current, chunk);
+  if (
+    sharedPrefix >= 12
+    && sharedPrefix >= Math.floor(Math.min(current.length, chunk.length) * 0.6)
+  ) {
+    return chunk.length >= current.length ? chunk : current;
+  }
+  const overlap = findChunkOverlap(current, chunk);
+  return overlap > 0 ? `${current}${chunk.slice(overlap)}` : `${current}${chunk}`;
+}
+
+function upsertPendingToolEvent(
+  current: PendingAssistantToolEvent[],
+  event: PendingAssistantToolEvent
+): PendingAssistantToolEvent[] {
+  if (!event.toolCallId) {
+    return [...current, event];
+  }
+  const next = [...current];
+  const index = next.findIndex((item) => item.toolCallId === event.toolCallId);
+  if (index === -1) {
+    next.push(event);
+    return next;
+  }
+  next[index] = { ...next[index], ...event };
+  return next;
+}
+
 type RouteRegistration = {
   key: string;
   context: AiViewContext;
@@ -45,6 +128,7 @@ type AssistantContextValue = {
   sessions: AiSessionRecord[];
   messages: AiMessageRecord[];
   artifact: AiArtifactRecord | null;
+  pendingTurn: PendingAssistantTurn | null;
   loading: boolean;
   sending: boolean;
   error: string | null;
@@ -104,6 +188,7 @@ export function AiAssistantProvider({
   const [sessions, setSessions] = useState<AiSessionRecord[]>([]);
   const [messages, setMessages] = useState<AiMessageRecord[]>([]);
   const [artifact, setArtifact] = useState<AiArtifactRecord | null>(null);
+  const [pendingTurn, setPendingTurn] = useState<PendingAssistantTurn | null>(null);
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -226,6 +311,77 @@ export function AiAssistantProvider({
     return () => unsubscribe();
   }, [registration]);
 
+  useEffect(() => {
+    if (!window.kbv?.emitAiAssistantEvents) {
+      return;
+    }
+    const unsubscribe = window.kbv.emitAiAssistantEvents((event) => {
+      if (!workspaceId || event.workspaceId !== workspaceId) {
+        return;
+      }
+
+      setPendingTurn((current) => {
+        if (event.kind === 'turn_started') {
+          return {
+            turnId: event.turnId,
+            sessionId: event.sessionId,
+            startedAtUtc: event.atUtc,
+            responseText: '',
+            thoughtText: '',
+            toolEvents: []
+          };
+        }
+
+        if (!current || current.turnId !== event.turnId) {
+          return current;
+        }
+
+        if (event.kind === 'response_chunk' && event.text) {
+          return {
+            ...current,
+            responseText: appendStreamingText(current.responseText, event.text)
+          };
+        }
+
+        if (event.kind === 'thought_chunk' && event.text) {
+          return {
+            ...current,
+            thoughtText: appendStreamingText(current.thoughtText, event.text)
+          };
+        }
+
+        if (event.kind === 'tool_call' || event.kind === 'tool_update') {
+          if (isFilteredAssistantToolName(event.toolName)) {
+            return current;
+          }
+          return {
+            ...current,
+            toolEvents: upsertPendingToolEvent(current.toolEvents, {
+              toolCallId: event.toolCallId,
+              toolName: event.toolName,
+              toolStatus: event.toolStatus,
+              resourceLabel: event.resourceLabel
+            })
+          };
+        }
+
+        if (event.kind === 'turn_error') {
+          return {
+            ...current,
+            error: event.error ?? event.message ?? 'Assistant run failed.'
+          };
+        }
+
+        if (event.kind === 'turn_finished') {
+          return current;
+        }
+
+        return current;
+      });
+    });
+    return () => unsubscribe();
+  }, [workspaceId]);
+
   const runUiActions = useCallback((actions: AiAssistantUiAction[]) => {
     if (actions.length === 0) return;
     for (const action of actions) {
@@ -298,6 +454,7 @@ export function AiAssistantProvider({
       setSessions([]);
       setMessages([]);
       setArtifact(null);
+      setPendingTurn(null);
       setLastSeenAssistantMessageId(null);
       setSending(false);
       setHistoryOpen(false);
@@ -312,6 +469,7 @@ export function AiAssistantProvider({
         setSessions([]);
         setMessages([]);
         setArtifact(null);
+        setPendingTurn(null);
         setLastSeenAssistantMessageId(null);
         setSending(false);
       })
@@ -334,6 +492,7 @@ export function AiAssistantProvider({
       upsertSession(response.data.session ?? null);
       setMessages(normalizeMessages(response.data.messages ?? []));
       setArtifact(response.data.artifact ?? null);
+      setPendingTurn(null);
       await loadSessionList(routeContext.workspaceId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -362,6 +521,7 @@ export function AiAssistantProvider({
       }
       setMessages(normalizeMessages(response.data?.messages ?? []));
       setArtifact(response.data?.artifact ?? null);
+      setPendingTurn(null);
       await loadSessionList(routeContext.workspaceId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -387,6 +547,7 @@ export function AiAssistantProvider({
       upsertSession(response.data.session ?? null);
       setMessages(normalizeMessages(response.data.messages ?? []));
       setArtifact(response.data.artifact ?? null);
+      setPendingTurn(null);
       await loadSessionList(routeContext.workspaceId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -412,6 +573,7 @@ export function AiAssistantProvider({
     };
 
     setMessages((current) => [...current, optimisticMessage]);
+    setPendingTurn(null);
     setSending(true);
     setError(null);
     try {
@@ -422,7 +584,6 @@ export function AiAssistantProvider({
         message: trimmedMessage
       });
       if (!response.ok || !response.data) {
-        setMessages((current) => current.filter((item) => item.id !== optimisticMessage.id));
         setError(response.error?.message ?? 'Failed to send assistant message.');
         return;
       }
@@ -437,10 +598,10 @@ export function AiAssistantProvider({
         setSession(response.data.session);
         setMessages(normalizeMessages(response.data.messages ?? []));
         setArtifact(response.data.artifact ?? null);
+        setPendingTurn(null);
         runUiActions(response.data.uiActions ?? []);
       }
     } catch (err) {
-      setMessages((current) => current.filter((item) => item.id !== optimisticMessage.id));
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
@@ -464,6 +625,7 @@ export function AiAssistantProvider({
       upsertSession(response.data.session ?? null);
       setMessages(normalizeMessages(response.data.messages ?? []));
       setArtifact(response.data.artifact ?? null);
+      setPendingTurn(null);
       if (response.data.messages.length === 0 && response.data.session?.id) {
         removeSession(response.data.session.id);
       } else {
@@ -494,6 +656,7 @@ export function AiAssistantProvider({
       upsertSession(response.data.session ?? null);
       setMessages(normalizeMessages(response.data.messages ?? []));
       setArtifact(response.data.artifact ?? null);
+      setPendingTurn(null);
       runUiActions(response.data.uiActions ?? []);
       await loadSessionList(routeContext.workspaceId);
     } catch (err) {
@@ -537,6 +700,7 @@ export function AiAssistantProvider({
     sessions,
     messages,
     artifact,
+    pendingTurn,
     loading,
     sending,
     error,
@@ -562,6 +726,7 @@ export function AiAssistantProvider({
     messages,
     open,
     openSession,
+    pendingTurn,
     registerView,
     resetSession,
     routeContext,
