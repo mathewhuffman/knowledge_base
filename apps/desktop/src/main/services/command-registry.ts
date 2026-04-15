@@ -83,10 +83,14 @@ import {
   type ProposalReviewDeleteRequest,
   type ProposalReviewBatchListRequest,
   type ProposalReviewSaveWorkingCopyRequest,
+  type ProposalReviewDetailResponse,
   ProposalReviewDecision,
+  ProposalReviewStatus,
   type ProposalReviewGetRequest,
   type ProposalReviewQueueItem,
   type ProposalReviewListRequest,
+  type LocaleVariantRecord,
+  type ArticleFamilyRecord,
   DraftBranchStatus,
   type DraftBranchCreateRequest,
   type DraftBranchDiscardRequest,
@@ -133,7 +137,7 @@ import { KbCliLoopbackService } from './kb-cli-loopback-service';
 import { KbCliRuntimeService } from './kb-cli-runtime-service';
 import { AiAssistantService } from './ai-assistant-service';
 import { AppWorkingStateService } from './app-working-state-service';
-import { BatchAnalysisOrchestrator } from './batch-analysis-orchestrator';
+import { BatchAnalysisOrchestrator, type BatchFinalReviewerProposalContext } from './batch-analysis-orchestrator';
 
 interface RuntimeModelCatalogEntry {
   provider: string;
@@ -358,6 +362,178 @@ const normalizePlannerPhrase = (value: string): string =>
 
 const dedupeStrings = (values: Array<string | undefined | null>): string[] =>
   Array.from(new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))));
+
+const PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX = 'proposal-';
+const FINAL_REVIEW_STAGE_TIMEOUT_MS = 180_000;
+const FINAL_REVIEW_STAGE_WATCHDOG_MS = 210_000;
+
+class BatchStageWatchdogError extends Error {
+  constructor(
+    readonly stage: string,
+    readonly sessionId: string,
+    readonly timeoutMs: number
+  ) {
+    super(`${stage} exceeded the stage watchdog after ${timeoutMs}ms.`);
+    this.name = 'BatchStageWatchdogError';
+  }
+}
+
+const stripHtmlForPromptPreview = (value: string | undefined, maxLength = 240): string | undefined => {
+  const normalized = value
+    ?.replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    ?.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    ?.replace(/<[^>]+>/g, ' ')
+    ?.replace(/&nbsp;/gi, ' ')
+    ?.replace(/&amp;/gi, '&')
+    ?.replace(/&quot;/gi, '"')
+    ?.replace(/&#39;/gi, '\'')
+    ?.replace(/\s+/g, ' ')
+    ?.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1).trimEnd()}…` : normalized;
+};
+
+const summarizeFinalReviewProposalContext = async (
+  workspaceRepository: WorkspaceRepository,
+  workspaceId: string,
+  proposalId: string
+): Promise<BatchFinalReviewerProposalContext | null> => {
+  let detail: ProposalReviewDetailResponse;
+  try {
+    detail = await workspaceRepository.getProposalReviewDetail(workspaceId, proposalId);
+  } catch {
+    return null;
+  }
+
+  const proposal = detail.proposal;
+  const [variant, family] = await Promise.all([
+    proposal.localeVariantId
+      ? workspaceRepository.getLocaleVariant(workspaceId, proposal.localeVariantId).catch(() => null as LocaleVariantRecord | null)
+      : Promise.resolve(null as LocaleVariantRecord | null),
+    proposal.familyId
+      ? workspaceRepository.getArticleFamily(workspaceId, proposal.familyId).catch(() => null as ArticleFamilyRecord | null)
+      : Promise.resolve(null as ArticleFamilyRecord | null)
+  ]);
+
+  const familyExternalKey = family?.externalKey?.trim();
+  const proposalScoped = familyExternalKey?.toLowerCase().startsWith(PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX) ?? false;
+  let targetState: BatchFinalReviewerProposalContext['targetState'] = 'unknown';
+  let targetStateReason = 'Target could not be deterministically classified from persisted proposal metadata.';
+
+  if (proposalScoped) {
+    targetState = proposal.action === ProposalAction.CREATE ? 'net_new_draft_target' : 'proposal_scoped_draft';
+    targetStateReason = `Family external key ${familyExternalKey} marks a generated proposal artifact, so it is not live KB coverage.`;
+  } else if (proposal.action === ProposalAction.CREATE && !proposal.localeVariantId) {
+    targetState = 'net_new_draft_target';
+    targetStateReason = 'Net-new proposal without a live locale variant target yet.';
+  } else if (variant?.status === RevisionState.LIVE) {
+    targetState = 'live_kb_article';
+    targetStateReason = `Locale variant ${variant.id} is a live KB target in family ${variant.familyId}.`;
+  } else if (variant?.status) {
+    targetStateReason = `Locale variant ${variant.id} is currently ${variant.status}, so it should not be treated as live KB without corroborating evidence.`;
+  } else if (familyExternalKey) {
+    targetStateReason = `Family external key ${familyExternalKey} exists, but the locale-variant state could not be verified.`;
+  }
+
+  const changeSummary = detail.diff.changeRegions
+    .slice(0, 8)
+    .map((region) => {
+      const beforeText = stripHtmlForPromptPreview(region.beforeText, 100);
+      const afterText = stripHtmlForPromptPreview(region.afterText, 100);
+      if (beforeText && afterText && beforeText !== afterText) {
+        return `${region.label}: ${beforeText} -> ${afterText}`;
+      }
+      if (afterText) {
+        return `${region.label}: ${afterText}`;
+      }
+      if (beforeText) {
+        return `${region.label}: ${beforeText}`;
+      }
+      return region.label;
+    })
+    .filter(Boolean);
+
+  return {
+    proposalId: proposal.id,
+    action: proposal.action,
+    targetTitle: proposal.targetTitle ?? 'Untitled proposal target',
+    reviewStatus: proposal.reviewStatus,
+    familyId: proposal.familyId,
+    localeVariantId: proposal.localeVariantId,
+    locale: variant?.locale ?? proposal.targetLocale,
+    variantStatus: variant?.status,
+    familyExternalKey,
+    targetState,
+    targetStateReason,
+    relatedPbiIds: detail.relatedPbis.map((item) => item.id),
+    relatedExternalIds: detail.relatedPbis.map((item) => item.externalId).filter(Boolean),
+    rationaleSummary: proposal.rationaleSummary,
+    aiNotes: proposal.aiNotes,
+    changeSummary,
+    proposedContentPreview: stripHtmlForPromptPreview(detail.diff.afterHtml, 260)
+  };
+};
+
+const buildFinalReviewProposalContext = async (
+  workspaceRepository: WorkspaceRepository,
+  workspaceId: string,
+  workerReport: { executedItems: Array<{ proposalId?: string | null; artifactIds?: string[] | null }> }
+): Promise<BatchFinalReviewerProposalContext[]> => {
+  const proposalIds = Array.from(
+    new Set(
+      workerReport.executedItems
+        .flatMap((item) => [
+          item.proposalId?.trim(),
+          ...(item.artifactIds ?? []).map((artifactId) => artifactId.trim())
+        ])
+        .filter((value): value is string => Boolean(value))
+    )
+  );
+  if (proposalIds.length === 0) {
+    return [];
+  }
+
+  const snapshots = await Promise.all(
+    proposalIds.map((proposalId) => summarizeFinalReviewProposalContext(workspaceRepository, workspaceId, proposalId))
+  );
+  return snapshots.filter((item): item is BatchFinalReviewerProposalContext => Boolean(item));
+};
+
+const inferBatchStageFailureStatus = (error: unknown): 'error' | 'timeout' => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|watchdog/i.test(message) ? 'timeout' : 'error';
+};
+
+const runBatchAnalysisWithStageWatchdog = async (
+  agentRuntime: CursorAcpRuntime,
+  request: AgentAnalysisRunRequest,
+  emit: (payload: AgentStreamingPayload) => Promise<void> | void,
+  isCancelled: () => boolean,
+  options: {
+    stage: string;
+    sessionId: string;
+    watchdogMs: number;
+  }
+): Promise<AgentRunResult> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      agentRuntime.runBatchAnalysis(request, emit, isCancelled),
+      new Promise<AgentRunResult>((_, reject) => {
+        timer = setTimeout(() => {
+          agentRuntime.closeSession({ workspaceId: request.workspaceId, sessionId: options.sessionId });
+          reject(new BatchStageWatchdogError(options.stage, options.sessionId, options.watchdogMs));
+        }, options.watchdogMs);
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+};
 
 const extractPlannerPbiRows = (uploadedPbis: unknown): Array<{
   pbiId: string;
@@ -959,6 +1135,92 @@ const findTranscriptChunkOverlap = (left: string, right: string): number => {
   return 0;
 };
 
+const STRUCTURED_BATCH_RESULT_POLL_INTERVAL_MS = 750;
+const STRUCTURED_BATCH_RESULT_IDLE_MS = 2_000;
+const STRUCTURED_BATCH_RESULT_MAX_WAIT_MS = 35_000;
+const STRUCTURED_BATCH_PLANNER_RECOVERY_IDLE_MS = 100_000;
+const STRUCTURED_BATCH_PLANNER_RECOVERY_MAX_WAIT_MS = 180_000;
+
+const getLastTranscriptSequence = (lines: AgentTranscriptLine[]): number => {
+  const sequenced = lines
+    .map((line) => (typeof line.seq === 'number' ? line.seq : Number.NEGATIVE_INFINITY))
+    .filter((seq) => Number.isFinite(seq));
+  if (sequenced.length === 0) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return Math.max(...sequenced);
+};
+
+const shouldAwaitMoreStructuredBatchResult = (params: {
+  text: string;
+  expectedShape?: BatchAnalysisResultShape;
+  parseable: boolean;
+  initialCandidateCount: number;
+  transcriptCandidateCount: number;
+  recoveryAbortReason?: string;
+}): boolean => {
+  if (!params.expectedShape || params.parseable) {
+    return false;
+  }
+  if (params.recoveryAbortReason) {
+    return true;
+  }
+  const trimmed = params.text.trim();
+  if (!trimmed) {
+    return params.initialCandidateCount === 0 || params.transcriptCandidateCount === 0;
+  }
+  if (detectBatchInfrastructureFailureText(trimmed)) {
+    return false;
+  }
+  return (
+    looksLikeStructuredBatchResultText(trimmed, params.expectedShape)
+    || /^(reviewing|checking|searching|finding|looking|investigating)\b/i.test(trimmed)
+    || /^i['’]m\s+(reviewing|checking|searching|finding|looking|investigating)\b/i.test(trimmed)
+  );
+};
+
+const isStructuredBatchRecoveryAbortReason = (
+  reason: string | undefined,
+  expectedShape?: BatchAnalysisResultShape
+): boolean => {
+  const normalized = reason?.trim().toLowerCase() ?? '';
+  if (!normalized || !expectedShape) {
+    return false;
+  }
+  if (normalized.includes('json was captured from the stream')) {
+    return true;
+  }
+  if (normalized.includes('recover locally') || normalized.includes('current transcript')) {
+    return true;
+  }
+  if (expectedShape === 'planner' && normalized.includes('return the current plan as json')) {
+    return true;
+  }
+  return false;
+};
+
+const extractStructuredBatchRecoveryAbortReason = (
+  lines: AgentTranscriptLine[],
+  expectedShape?: BatchAnalysisResultShape
+): string | undefined => {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line || line.event !== 'prompt_abort' || typeof line.payload !== 'string') {
+      continue;
+    }
+    try {
+      const payload = JSON.parse(line.payload) as { reason?: unknown };
+      const reason = typeof payload.reason === 'string' ? payload.reason.trim() : '';
+      if (reason && isStructuredBatchRecoveryAbortReason(reason, expectedShape)) {
+        return reason;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+};
+
 const appendTranscriptChunk = (chunks: string[], chunk: string): void => {
   const normalized = collapseRepeatedTranscriptText(chunk);
   if (!normalized) {
@@ -1039,6 +1301,18 @@ class BatchAnalysisTerminalError extends Error {
   }
 }
 
+const PLAN_HUMAN_REVIEW_GUIDANCE = 'Review the batch plan and plan-review delta in Batch Analysis; no proposal review items were created.';
+
+const buildPlanHumanReviewMessage = (summary?: string): string => {
+  const trimmed = summary?.trim();
+  if (!trimmed) {
+    return `Batch plan requires human review before execution. ${PLAN_HUMAN_REVIEW_GUIDANCE}`;
+  }
+  return /[.!?]$/.test(trimmed)
+    ? `${trimmed} ${PLAN_HUMAN_REVIEW_GUIDANCE}`
+    : `${trimmed}. ${PLAN_HUMAN_REVIEW_GUIDANCE}`;
+};
+
 const detectBatchInfrastructureFailureText = (text: string): { message: string; code?: string } | null => {
   const trimmed = text.trim();
   if (!trimmed || trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('```')) {
@@ -1079,10 +1353,20 @@ const detectBatchInfrastructureFailureText = (text: string): { message: string; 
 
 const detectPlannerInfrastructureFailure = (
   resultStatus: AgentRunResult['status'],
-  resolution: { text: string }
+  resolution: {
+    text: string;
+    parseable: boolean;
+    recoveryAbortReason?: string;
+  }
 ): { message: string; code?: string } | null => {
+  const trimmed = resolution.text.trim();
+  if (resolution.parseable || Boolean(salvagePlannerJsonText(trimmed))) {
+    return null;
+  }
+  if (resolution.recoveryAbortReason && trimmed && !detectBatchInfrastructureFailureText(trimmed)) {
+    return null;
+  }
   if (resultStatus === 'error' || resultStatus === 'timeout') {
-    const trimmed = resolution.text.trim();
     return {
       message: trimmed || `Planner runtime returned status "${resultStatus}".`
     };
@@ -1629,10 +1913,12 @@ const extractResultText = (payload: unknown): string =>
 export const __commandRegistryTestables = {
   buildPlannerTopicClusters,
   extractTranscriptResultTextCandidates,
+  extractStructuredBatchRecoveryAbortReason,
   summarizePlannerRecoveryContext,
   salvagePlannerJsonText,
   salvagePlanReviewJsonText,
   evaluateBatchAnalysisDevBuildFreshness,
+  detectPlannerInfrastructureFailure,
   shouldRetryPlannerWithFreshSession,
   selectBestResultText,
   selectBestParseableResultText,
@@ -1777,6 +2063,7 @@ const resolveBatchAnalysisResultText = async (
   initialCandidateCount: number;
   transcriptCandidateCount: number;
   parseable: boolean;
+  recoveryAbortReason?: string;
 }> => {
   const initialCandidates = extractResultTextCandidates(payload);
   const initialBest = selectBestParseableResultText(initialCandidates, expectedShape)
@@ -1807,21 +2094,78 @@ const resolveBatchAnalysisResultText = async (
     sessionId,
     limit: 0
   });
-  const latestTranscriptCandidates = extractTranscriptResultTextCandidates(transcript.lines, 'latest_request');
-  const transcriptCandidates =
+  let transcriptLines = transcript.lines;
+  let recoveryAbortReason = extractStructuredBatchRecoveryAbortReason(transcriptLines, expectedShape);
+  let latestTranscriptCandidates = extractTranscriptResultTextCandidates(transcriptLines, 'latest_request');
+  let transcriptCandidates =
     latestTranscriptCandidates.length > 0
       ? latestTranscriptCandidates
-      : extractTranscriptResultTextCandidates(transcript.lines, 'all');
-  const combinedCandidates = [...initialCandidates, ...transcriptCandidates];
-  const resolved = selectBestParseableResultText(combinedCandidates, expectedShape)
+      : extractTranscriptResultTextCandidates(transcriptLines, 'all');
+  let combinedCandidates = [...initialCandidates, ...transcriptCandidates];
+  let resolved = selectBestParseableResultText(combinedCandidates, expectedShape)
     || selectBestResultText(combinedCandidates, expectedShape);
-  const resolvedParsed = extractJsonObject(resolved);
+  let resolvedParsed = extractJsonObject(resolved);
+  let parseable = Boolean(resolvedParsed && matchesExpectedBatchResultShape(resolvedParsed, expectedShape));
+
+  if (shouldAwaitMoreStructuredBatchResult({
+    text: resolved,
+    expectedShape,
+    parseable,
+    initialCandidateCount: initialCandidates.length,
+    transcriptCandidateCount: transcriptCandidates.length,
+    recoveryAbortReason
+  })) {
+    const waitStartedAt = Date.now();
+    let lastTranscriptSeq = getLastTranscriptSequence(transcriptLines);
+    let lastTranscriptChangeAt = Date.now();
+    const recoveryWaitEnabled = expectedShape === 'planner' && Boolean(recoveryAbortReason);
+    const maxWaitMs = recoveryWaitEnabled
+      ? STRUCTURED_BATCH_PLANNER_RECOVERY_MAX_WAIT_MS
+      : STRUCTURED_BATCH_RESULT_MAX_WAIT_MS;
+    const idleMs = recoveryWaitEnabled
+      ? STRUCTURED_BATCH_PLANNER_RECOVERY_IDLE_MS
+      : STRUCTURED_BATCH_RESULT_IDLE_MS;
+
+    while (
+      Date.now() - waitStartedAt < maxWaitMs
+      && Date.now() - lastTranscriptChangeAt < idleMs
+      && !parseable
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, STRUCTURED_BATCH_RESULT_POLL_INTERVAL_MS));
+      const nextTranscript = await agentRuntime.getTranscripts({
+        workspaceId,
+        sessionId,
+        limit: 0
+      });
+      const nextTranscriptSeq = getLastTranscriptSequence(nextTranscript.lines);
+      if (nextTranscriptSeq === lastTranscriptSeq) {
+        continue;
+      }
+
+      lastTranscriptSeq = nextTranscriptSeq;
+      lastTranscriptChangeAt = Date.now();
+      transcriptLines = nextTranscript.lines;
+      recoveryAbortReason = extractStructuredBatchRecoveryAbortReason(transcriptLines, expectedShape);
+      latestTranscriptCandidates = extractTranscriptResultTextCandidates(transcriptLines, 'latest_request');
+      transcriptCandidates =
+        latestTranscriptCandidates.length > 0
+          ? latestTranscriptCandidates
+          : extractTranscriptResultTextCandidates(transcriptLines, 'all');
+      combinedCandidates = [...initialCandidates, ...transcriptCandidates];
+      resolved = selectBestParseableResultText(combinedCandidates, expectedShape)
+        || selectBestResultText(combinedCandidates, expectedShape);
+      resolvedParsed = extractJsonObject(resolved);
+      parseable = Boolean(resolvedParsed && matchesExpectedBatchResultShape(resolvedParsed, expectedShape));
+    }
+  }
+
   return {
     text: resolved,
     usedTranscript: transcriptCandidates.length > 0 && transcriptCandidates.includes(resolved),
     initialCandidateCount: initialCandidates.length,
     transcriptCandidateCount: transcriptCandidates.length,
-    parseable: Boolean(resolvedParsed && matchesExpectedBatchResultShape(resolvedParsed, expectedShape))
+    parseable,
+    recoveryAbortReason
   };
 };
 
@@ -2063,10 +2407,12 @@ export function registerCoreCommands(
       if (!batchId) {
         throw new Error('batchId is required for create proposal');
       }
+      const reviewStatus = context.batchId ? ProposalReviewStatus.STAGED_ANALYSIS : ProposalReviewStatus.PENDING_REVIEW;
       const created = await workspaceRepository.createAgentProposal({
         workspaceId: context.workspaceId,
         batchId,
         action: ProposalAction.CREATE,
+        reviewStatus,
         _sessionId: sessionId,
         localeVariantId: input.localeVariantId,
         note: input.note,
@@ -2085,10 +2431,12 @@ export function registerCoreCommands(
       if (!batchId) {
         throw new Error('batchId is required for edit proposal');
       }
+      const reviewStatus = context.batchId ? ProposalReviewStatus.STAGED_ANALYSIS : ProposalReviewStatus.PENDING_REVIEW;
       const created = await workspaceRepository.createAgentProposal({
         workspaceId: context.workspaceId,
         batchId,
         action: ProposalAction.EDIT,
+        reviewStatus,
         _sessionId: sessionId,
         localeVariantId: input.localeVariantId,
         note: input.note,
@@ -2107,10 +2455,12 @@ export function registerCoreCommands(
       if (!batchId) {
         throw new Error('batchId is required for retire proposal');
       }
+      const reviewStatus = context.batchId ? ProposalReviewStatus.STAGED_ANALYSIS : ProposalReviewStatus.PENDING_REVIEW;
       const created = await workspaceRepository.createAgentProposal({
         workspaceId: context.workspaceId,
         batchId,
         action: ProposalAction.RETIRE,
+        reviewStatus,
         _sessionId: sessionId,
         localeVariantId: input.localeVariantId,
         note: input.note,
@@ -2313,6 +2663,18 @@ export function registerCoreCommands(
       const workspaceId = input?.workspaceId;
       if (!workspaceId) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'agent.session.close requires workspaceId');
+      }
+      const existingSession = input?.sessionId ? agentRuntime.getSession(input.sessionId) : null;
+      if (
+        existingSession
+        && existingSession.workspaceId === workspaceId
+        && existingSession.type === 'batch_analysis'
+        && (existingSession.status === 'running' || existingSession.status === 'starting')
+      ) {
+        return createErrorResult(
+          AppErrorCode.INVALID_REQUEST,
+          'Running batch analysis sessions cannot be closed from the generic session panel.'
+        );
       }
       const session = agentRuntime.closeSession(input);
       logger.info('agent.session.close', { requestId, workspaceId, sessionId: input.sessionId });
@@ -4427,7 +4789,7 @@ export function registerCoreCommands(
         kbAccessMode: params.result.kbAccessMode ?? kbAccessMode,
         agentModelId,
         status:
-          params.result.status === 'ok'
+          params.result.status === 'ok' || params.resolution?.parseable
             ? 'complete'
             : params.result.status === 'canceled'
               ? 'canceled'
@@ -4771,7 +5133,9 @@ export function registerCoreCommands(
         if (salvageSucceeded) {
           // Continue through the normal reviewer flow below using the locally salvaged plan.
         } else {
-          const fallbackMessage = 'Planner returned incomplete output and could not be salvaged locally. Human review is required before execution can continue.';
+          const fallbackMessage = buildPlanHumanReviewMessage(
+            'Planner returned incomplete output and could not be salvaged locally.'
+          );
           emit({
             id: payload.jobId,
             command: payload.command,
@@ -5192,6 +5556,7 @@ export function registerCoreCommands(
       }
 
       if (review.verdict === 'needs_human_review') {
+        const humanReviewMessage = buildPlanHumanReviewMessage(review.summary);
         await logAnalysisProgress('Plan review escalated to human review.', {
           stage: 'needs_human_review',
           role: 'plan-reviewer'
@@ -5213,11 +5578,11 @@ export function registerCoreCommands(
           stage: 'needs_human_review',
           role: 'plan-reviewer',
           status: 'needs_human_review',
-          summary: review.summary,
+          summary: humanReviewMessage,
           agentModelId,
           lastReviewVerdict: review.verdict
         });
-        throw new Error(`Plan review escalated to human review: ${review.summary}`);
+        throw new Error(humanReviewMessage);
       }
 
       await logAnalysisProgress('Plan review requested another revision.', {
@@ -5253,6 +5618,9 @@ export function registerCoreCommands(
       reviewDeltaJson = outcome.review.delta ? JSON.stringify(outcome.review.delta) : undefined;
     }
     if (!planningOutcome?.approvedPlan || !approvedPlanId) {
+      const humanReviewMessage = buildPlanHumanReviewMessage(
+        'Planner/reviewer loop did not reach an approved plan within the revision limit.'
+      );
       await logAnalysisProgress('Planner/reviewer loop exhausted without an approved plan.', {
         stage: 'needs_human_review',
         role: 'plan-reviewer'
@@ -5269,7 +5637,7 @@ export function registerCoreCommands(
         stage: 'needs_human_review',
         role: 'plan-reviewer',
         status: 'needs_human_review',
-        summary: 'Planner/reviewer loop did not reach an approved plan within the revision limit.',
+        summary: humanReviewMessage,
         agentModelId
       });
       emit({
@@ -5277,7 +5645,7 @@ export function registerCoreCommands(
         command: payload.command,
         state: JobState.FAILED,
         progress: 100,
-        message: 'Batch analysis requires human review before execution.',
+        message: humanReviewMessage,
         metadata: buildStreamMetadata()
       });
       return;
@@ -5324,14 +5692,17 @@ export function registerCoreCommands(
       let workerPromptTemplate = workerAttempt.promptTemplate;
 
       if (workerResult.status === 'ok' && kbAccessMode === 'cli') {
-        const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
+        const proposalRecords = await workspaceRepository.listBatchProposalRecords(input.workspaceId, input.batchId, {
+          includeStaged: true,
+          openOnly: true
+        });
         const cliPolicyViolations = workerResult.toolCalls.filter((toolCall) =>
           toolCall.allowed === false
           && typeof toolCall.reason === 'string'
           && toolCall.reason.includes('CLI mode forbids')
         );
 
-        if (proposalQueue.queue.length === 0 && cliPolicyViolations.length > 0 && providerHealth.providers.mcp.ok) {
+        if (proposalRecords.length === 0 && cliPolicyViolations.length > 0 && providerHealth.providers.mcp.ok) {
           logger.warn('[agent.analysis.run] cli analysis created no proposals after policy violations; retrying in mcp', {
             jobId: payload.jobId,
             batchId: input.batchId,
@@ -5417,9 +5788,28 @@ export function registerCoreCommands(
           });
         }
       } catch (error) {
-        const proposalQueue = await workspaceRepository.listProposalReviewQueue(input.workspaceId, input.batchId);
+        const proposalRecords = await workspaceRepository.listBatchProposalRecords(input.workspaceId, input.batchId, {
+          includeStaged: true,
+          openOnly: true
+        });
+        const fallbackProposalQueue: ProposalReviewQueueItem[] = proposalRecords.map((proposal) => ({
+          proposalId: proposal.id,
+          queueOrder: proposal.queueOrder,
+          action: proposal.action,
+          reviewStatus: proposal.reviewStatus,
+          articleKey: proposal.localeVariantId
+            ? `locale:${proposal.localeVariantId}`
+            : proposal.familyId
+              ? `family:${proposal.familyId}`
+              : `title:${proposal.targetTitle ?? proposal.id}`,
+          articleLabel: proposal.targetTitle ?? 'Untitled proposal target',
+          locale: proposal.targetLocale,
+          confidenceScore: proposal.confidenceScore,
+          rationaleSummary: proposal.rationaleSummary,
+          relatedPbiCount: 0
+        }));
         workerParsed = {
-          summary: summarizeWorkerExecutionFallback(workerFallbackSummary, proposalQueue.queue),
+          summary: summarizeWorkerExecutionFallback(workerFallbackSummary, fallbackProposalQueue),
           discoveredWork: []
         };
         await logAnalysisProgress('Worker output was malformed; using execution fallback summary.', {
@@ -5429,7 +5819,7 @@ export function registerCoreCommands(
         }, {
           error: error instanceof Error ? error.message : String(error),
           textLength: workerResolution.text.length,
-          proposalCount: proposalQueue.queue.length,
+          proposalCount: proposalRecords.length,
           kbAccessMode: workerResult.kbAccessMode
         });
       }
@@ -6047,64 +6437,153 @@ export function registerCoreCommands(
       streamMetadata.role = 'final-reviewer';
       liveApprovedPlanId = activeApprovedPlan.id;
       liveStageStartedAtUtc = liveIteration.updatedAtUtc;
-
-      const finalReviewResult = await agentRuntime.runBatchAnalysis(
-        {
-          ...input,
-          sessionId: liveSessionId,
-          kbAccessMode,
-          agentRole: 'final-reviewer',
-          sessionMode: 'plan',
-          prompt: batchAnalysisOrchestrator.buildFinalReviewerPrompt({
-            batchContext,
-            uploadedPbis,
-            approvedPlan: activeApprovedPlan,
-            workerReport: latestWorkerReport,
-            discoveredWork: latestWorkerReport.discoveredWork
-          })
-        },
-        (stream: AgentStreamingPayload) => {
-          emit({
-            id: payload.jobId,
-            command: payload.command,
-            state: JobState.RUNNING,
-            progress: 95,
-            message: JSON.stringify(stream),
-            metadata: buildStreamMetadata({ sessionId: stream.sessionId })
-          });
-        },
-        isCancelled
-      );
-      liveSessionId = finalReviewResult.sessionId;
-      const finalReviewResolution = await resolveBatchAnalysisResultText(
-        agentRuntime,
+      const finalReviewSession = agentRuntime.createSession({
+        workspaceId: input.workspaceId,
+        kbAccessMode,
+        type: 'batch_analysis',
+        mode: 'plan',
+        role: 'final-reviewer',
+        batchId: input.batchId,
+        locale: input.locale,
+        templatePackId: input.templatePackId
+      });
+      liveSessionId = finalReviewSession.id;
+      const proposalContext = await buildFinalReviewProposalContext(
+        workspaceRepository,
         input.workspaceId,
-        finalReviewResult.sessionId,
-        finalReviewResult.resultPayload,
-        'final_review'
+        latestWorkerReport
       );
-      await persistBatchStageRun({
-        stage: 'final_reviewing',
-        role: 'final-reviewer',
-        result: finalReviewResult,
-        resolution: finalReviewResolution
+      const finalReviewPrompt = batchAnalysisOrchestrator.buildFinalReviewerPrompt({
+        batchContext,
+        uploadedPbis,
+        approvedPlan: activeApprovedPlan,
+        workerReport: latestWorkerReport,
+        discoveredWork: latestWorkerReport.discoveredWork,
+        proposalContext
       });
-      await logAnalysisProgress('Final reviewer response received.', {
-        stage: 'final_reviewing',
-        role: 'final-reviewer',
-        sessionId: finalReviewResult.sessionId
-      }, {
-        durationMs: finalReviewResult.durationMs,
-        toolCallCount: finalReviewResult.toolCalls.length,
-        textLength: finalReviewResolution.text.length,
-        parseable: finalReviewResolution.parseable,
-        usedTranscriptRecovery: finalReviewResolution.usedTranscript,
-        payloadCandidateCount: finalReviewResolution.initialCandidateCount,
-        transcriptCandidateCount: finalReviewResolution.transcriptCandidateCount,
-        rawOutputCount: finalReviewResult.rawOutput.length,
-        transcriptPath: finalReviewResult.transcriptPath,
-        resultTextPreview: buildStageEventTextPreview(finalReviewResolution.text)
-      });
+      const finalReviewStartedAtUtc = new Date().toISOString();
+      let finalReviewResult: AgentRunResult;
+      let finalReviewResolution: {
+        text: string;
+        usedTranscript: boolean;
+        initialCandidateCount: number;
+        transcriptCandidateCount: number;
+        parseable: boolean;
+        recoveryAbortReason?: string;
+      };
+
+      try {
+        finalReviewResult = await runBatchAnalysisWithStageWatchdog(
+          agentRuntime,
+          {
+            ...input,
+            sessionId: finalReviewSession.id,
+            kbAccessMode,
+            agentRole: 'final-reviewer',
+            sessionMode: 'plan',
+            timeoutMs: FINAL_REVIEW_STAGE_TIMEOUT_MS,
+            prompt: finalReviewPrompt
+          },
+          (stream: AgentStreamingPayload) => {
+            emit({
+              id: payload.jobId,
+              command: payload.command,
+              state: JobState.RUNNING,
+              progress: 95,
+              message: JSON.stringify(stream),
+              metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+            });
+          },
+          isCancelled,
+          {
+            stage: 'final_reviewing',
+            sessionId: finalReviewSession.id,
+            watchdogMs: FINAL_REVIEW_STAGE_WATCHDOG_MS
+          }
+        );
+        liveSessionId = finalReviewResult.sessionId;
+        finalReviewResolution = await resolveBatchAnalysisResultText(
+          agentRuntime,
+          input.workspaceId,
+          finalReviewResult.sessionId,
+          finalReviewResult.resultPayload,
+          'final_review'
+        );
+        await persistBatchStageRun({
+          stage: 'final_reviewing',
+          role: 'final-reviewer',
+          result: finalReviewResult,
+          promptTemplate: finalReviewPrompt,
+          sessionReusePolicy: 'new_local_session',
+          resolution: finalReviewResolution
+        });
+        await logAnalysisProgress('Final reviewer response received.', {
+          stage: 'final_reviewing',
+          role: 'final-reviewer',
+          sessionId: finalReviewResult.sessionId
+        }, {
+          durationMs: finalReviewResult.durationMs,
+          toolCallCount: finalReviewResult.toolCalls.length,
+          textLength: finalReviewResolution.text.length,
+          parseable: finalReviewResolution.parseable,
+          usedTranscriptRecovery: finalReviewResolution.usedTranscript,
+          payloadCandidateCount: finalReviewResolution.initialCandidateCount,
+          transcriptCandidateCount: finalReviewResolution.transcriptCandidateCount,
+          rawOutputCount: finalReviewResult.rawOutput.length,
+          transcriptPath: finalReviewResult.transcriptPath,
+          proposalSnapshotCount: proposalContext.length,
+          resultTextPreview: buildStageEventTextPreview(finalReviewResolution.text)
+        });
+      } catch (error) {
+        const status = inferBatchStageFailureStatus(error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        finalReviewResult = {
+          sessionId: finalReviewSession.id,
+          kbAccessMode,
+          status,
+          startedAtUtc: finalReviewStartedAtUtc,
+          endedAtUtc: new Date().toISOString(),
+          transcriptPath: '',
+          rawOutput: [],
+          toolCalls: [],
+          durationMs: Math.max(0, Date.now() - Date.parse(finalReviewStartedAtUtc)),
+          message: errorMessage
+        };
+        liveSessionId = finalReviewSession.id;
+        finalReviewResolution = await resolveBatchAnalysisResultText(
+          agentRuntime,
+          input.workspaceId,
+          finalReviewSession.id,
+          undefined,
+          'final_review'
+        );
+        await persistBatchStageRun({
+          stage: 'final_reviewing',
+          role: 'final-reviewer',
+          result: finalReviewResult,
+          promptTemplate: finalReviewPrompt,
+          sessionReusePolicy: 'new_local_session',
+          resolution: finalReviewResolution
+        });
+        await logAnalysisProgress('Final reviewer failed to finish cleanly; escalating with transcript recovery when possible.', {
+          stage: 'final_reviewing',
+          role: 'final-reviewer',
+          sessionId: finalReviewSession.id
+        }, {
+          error: errorMessage,
+          transitionReason: status === 'timeout' ? 'final_review_timeout' : 'final_review_runtime_error',
+          triggerBranch: status === 'timeout'
+            ? 'final review stage exceeded the watchdog'
+            : 'final review stage threw before a clean structured result',
+          textLength: finalReviewResolution.text.length,
+          parseable: finalReviewResolution.parseable,
+          usedTranscriptRecovery: finalReviewResolution.usedTranscript,
+          payloadCandidateCount: finalReviewResolution.initialCandidateCount,
+          transcriptCandidateCount: finalReviewResolution.transcriptCandidateCount,
+          proposalSnapshotCount: proposalContext.length,
+          resultTextPreview: buildStageEventTextPreview(finalReviewResolution.text)
+        });
+      }
       const normalizedFinalReviewText = normalizeRecoveredJsonText(finalReviewResolution.text);
       let finalReview;
       try {
@@ -6128,7 +6607,9 @@ export function registerCoreCommands(
           });
         }
       } catch (error) {
-        const fallbackSummary = 'Final review output was malformed and could not be parsed safely.';
+        const fallbackSummary = finalReviewResult.status === 'ok'
+          ? 'Final review output was malformed and could not be parsed safely.'
+          : `Final review did not complete cleanly: ${finalReviewResult.message ?? 'No structured result returned.'}`;
         finalReview = batchAnalysisOrchestrator.parseFinalReviewResult({
           workspaceId: input.workspaceId,
           batchId: input.batchId,
@@ -6228,12 +6709,31 @@ export function registerCoreCommands(
         triggerVerdict: finalReviewOutcome.finalReview.verdict,
         triggerSummary: finalReviewOutcome.finalReview.summary
       });
-      await workspaceRepository.setPBIBatchStatus(
-        input.workspaceId,
-        input.batchId,
-        PBIBatchStatus.ANALYZED,
-        true
+      const proposalIdsToPromote = Array.from(
+        new Set(
+          latestWorkerReport.executedItems
+            .filter((item) => item.status === 'executed')
+            .flatMap((item) => [
+              item.proposalId?.trim(),
+              ...(item.artifactIds ?? []).map((artifactId) => artifactId.trim())
+            ])
+            .filter((proposalId): proposalId is string => Boolean(proposalId))
+        )
       );
+      const promotionResult = await workspaceRepository.promoteBatchProposalsToPendingReview({
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        proposalIds: proposalIdsToPromote
+      });
+      await logAnalysisProgress('Final approval promoted the latest proposal set into Proposal Review.', {
+        stage: 'approved',
+        role: 'final-reviewer',
+        sessionId: finalReviewOutcome.finalReview.sessionId
+      }, {
+        proposalCount: promotionResult.promotedProposalIds.length,
+        batchStatus: promotionResult.batchStatus,
+        promotedProposalIds: promotionResult.promotedProposalIds
+      });
       completedIteration = await batchAnalysisOrchestrator.completeIteration({
         workspaceId: input.workspaceId,
         iterationId: orchestrationIteration.id,

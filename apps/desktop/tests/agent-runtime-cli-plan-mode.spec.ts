@@ -224,7 +224,7 @@ test.describe('agent runtime CLI planner mode', () => {
     await rm(tempRoot, { recursive: true, force: true });
   });
 
-  test('CLI planner sessions keep local plan semantics but request ACP agent mode', async () => {
+  test('CLI planner sessions request ACP plan mode', async () => {
     const logPath = path.join(tempRoot, 'cli-plan-fallback-log.jsonl');
     const binaryPath = await createFakeAcpBinary(tempRoot, logPath);
     process.env.KBV_CURSOR_BINARY = binaryPath;
@@ -253,7 +253,7 @@ test.describe('agent runtime CLI planner mode', () => {
       const sessionNewRequest = requests.find((entry) => entry.method === 'session/new');
       expect(sessionNewRequest?.params).toMatchObject({
         config: {
-          mode: 'agent'
+          mode: 'plan'
         }
       });
     } finally {

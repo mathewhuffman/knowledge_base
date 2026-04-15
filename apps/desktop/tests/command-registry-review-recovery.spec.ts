@@ -354,6 +354,40 @@ test.describe('command registry review recovery', () => {
     })).toBe(false);
   });
 
+  test('extracts planner transcript-recovery prompt_abort reasons', () => {
+    const lines: AgentTranscriptLine[] = [
+      {
+        atUtc: '2026-04-15T16:04:19.155Z',
+        direction: 'system',
+        event: 'prompt_abort',
+        payload: JSON.stringify({
+          reason: 'Planner exceeded the tool-call budget (9 > 8). Reuse the evidence already gathered and recover the plan from the current transcript.'
+        })
+      }
+    ];
+
+    expect(__commandRegistryTestables.extractStructuredBatchRecoveryAbortReason(lines, 'planner')).toContain(
+      'recover the plan from the current transcript'
+    );
+  });
+
+  test('does not classify recovered planner json as infrastructure failure just because runtime status was error', () => {
+    const narratedPlanner = [
+      'Mapping the batch into topic-level plan items first. ',
+      '{"summary":"Recovered planner draft","coverage":[{"pbiId":"pbi-1","outcome":"covered","planItemIds":["PI-1"]}],',
+      '"items":[{"planItemId":"PI-1","pbiIds":["pbi-1"],"action":"create","targetType":"new_article","targetTitle":"View Food Lists","reason":"No existing match.","evidence":[],"confidence":0.9,"executionStatus":"pending"}],',
+      '"openQuestions":[]}'
+    ].join('');
+
+    expect(
+      __commandRegistryTestables.detectPlannerInfrastructureFailure('error', {
+        text: narratedPlanner,
+        parseable: false,
+        recoveryAbortReason: 'Planner exceeded the tool-call budget (9 > 8). Reuse the evidence already gathered and recover the plan from the current transcript.'
+      })
+    ).toBeNull();
+  });
+
   test('summarizes partial planner drafts for repair instead of passing an empty prior output', () => {
     const partial = [
       '{"summary":"Planner draft","coverage":[{"pbiId":"pbi-1","outcome":"covered","planItemIds":["item-1"]}],',

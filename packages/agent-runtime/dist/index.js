@@ -108,6 +108,46 @@ function extractCliToolCommand(rawInput) {
     }
     return undefined;
 }
+function extractCliToolCommandFromRawOutput(rawOutput) {
+    if (!rawOutput || typeof rawOutput !== 'object') {
+        return undefined;
+    }
+    const record = rawOutput;
+    if (typeof record.command === 'string' && record.command.trim()) {
+        return record.command.trim();
+    }
+    const stdout = typeof record.stdout === 'string' ? record.stdout.trim() : '';
+    if (!stdout) {
+        return undefined;
+    }
+    try {
+        const parsed = JSON.parse(stdout);
+        if (typeof parsed.command === 'string' && parsed.command.trim()) {
+            return parsed.command.trim();
+        }
+    }
+    catch {
+        const inferred = extractKbCliCommandName(stdout);
+        if (inferred) {
+            return inferred;
+        }
+    }
+    return undefined;
+}
+function selectCliToolAuditArgs(rawInput, rawOutput, kind) {
+    if (rawInput && typeof rawInput === 'object') {
+        return Object.keys(rawInput).length > 0
+            ? rawInput
+            : (rawOutput && typeof rawOutput === 'object' ? rawOutput : { kind });
+    }
+    if (rawInput !== undefined) {
+        return rawInput;
+    }
+    if (rawOutput && typeof rawOutput === 'object') {
+        return rawOutput;
+    }
+    return { kind };
+}
 function extractSearchKbQueryFromCliCommand(command) {
     const normalized = command?.trim();
     if (!normalized || !/\bsearch-kb\b/i.test(normalized)) {
@@ -136,7 +176,7 @@ function shouldDeferCliToolPolicyCheck(update) {
     if (!update) {
         return false;
     }
-    const command = extractCliToolCommand(update.rawInput);
+    const command = extractCliToolCommand(update.rawInput) ?? extractCliToolCommandFromRawOutput(update.rawOutput);
     if (command) {
         return false;
     }
@@ -164,15 +204,14 @@ function normalizeAgentModelId(modelId) {
 }
 function resolveProviderSessionMode(mode, sessionMode) {
     const normalizedMode = sessionMode ?? 'agent';
-    if (mode === 'cli' && normalizedMode === 'plan') {
-        return 'agent';
-    }
     return normalizedMode;
 }
 const NON_CHAT_IDLE_SESSION_TTL_MS = 15 * 60 * 1_000;
-const BATCH_PLANNER_MAX_TOOL_CALLS = 8;
+const BATCH_PLANNER_MAX_TOOL_CALLS = 16;
 const BATCH_PLANNER_JSON_STREAM_GRACE_MS = 1_500;
 const BATCH_PLANNER_MALFORMED_JSON_ABORT_MS = 6_000;
+const BATCH_ANALYSIS_AUTO_CONTINUE_LIMIT = 1;
+const BATCH_ANALYSIS_CONTINUATION_MARKER = 'Batch continuation instructions:';
 function isMissingAcpSessionError(error) {
     if (!error) {
         return false;
@@ -585,7 +624,8 @@ function buildCliTaskPrompt(session, taskPayload, extras) {
         '- Do NOT use grep.',
         '- If an exact `kb` command is unavailable, call `kb --help` to confirm current syntax.',
         '- If you need KB evidence, prefer direct `kb` output over local inference.',
-        '- If you need batch context, load batch context first with `kb`.',
+        '- The prompt already includes a preloaded batch context summary. Only call `kb batch-context` if that preloaded context is insufficient or you must re-check the imported rows.',
+        '- If `kb batch-context` fails but the prompt already includes the batch summary you need, continue using the preloaded batch context instead of retrying the same command repeatedly.',
         '- If you need article text, load article variants and related entries with `kb` before proposing edits.',
         '- Batch analysis is not complete until you have created proposal records for every warranted KB create/edit/retire action, or explicitly concluded the batch is no-impact.',
         '- Use `kb --help` and subcommand help to discover the CLI proposal commands for create/edit/retire if they are not already obvious.',
@@ -1310,8 +1350,20 @@ class CursorAcpRuntime {
         this.markSessionActivity(sessionId);
     }
     getPromptStructuredResultContract(session, taskPayload) {
-        if (taskPayload.task === 'analyze_batch' && session.type === 'batch_analysis' && session.role === 'planner' && session.mode === 'plan') {
+        if (taskPayload.task !== 'analyze_batch' || session.type !== 'batch_analysis') {
+            return undefined;
+        }
+        if (session.role === 'planner' && session.mode === 'plan') {
             return 'batch_planner';
+        }
+        if (session.role === 'plan-reviewer' && session.mode === 'plan') {
+            return 'batch_plan_review';
+        }
+        if (session.role === 'worker' && session.mode === 'agent') {
+            return 'batch_worker';
+        }
+        if (session.role === 'final-reviewer' && session.mode === 'plan') {
+            return 'batch_final_review';
         }
         return undefined;
     }
@@ -1353,6 +1405,7 @@ class CursorAcpRuntime {
         if (!state || !state.contract) {
             return;
         }
+        const roleLabel = state.role?.trim() || 'structured batch stage';
         const assembledText = assemblePromptMessageText(this.promptMessageChunks.get(localSessionId)).trim();
         if (!assembledText) {
             return;
@@ -1374,7 +1427,7 @@ class CursorAcpRuntime {
                 content: [{ type: 'text', text: assembledText }]
             });
             if (resolved) {
-                void this.stopActivePrompt(localSessionId, state.acpSessionId, state.transport, 'Structured planner JSON was captured from the stream; stopping the remote prompt to avoid extra token usage.');
+                void this.stopActivePrompt(localSessionId, state.acpSessionId, state.transport, `Structured ${roleLabel} JSON was captured from the stream; stopping the remote prompt to avoid extra token usage.`);
                 this.clearPromptCompletionTimer(localSessionId);
             }
             return;
@@ -1384,7 +1437,7 @@ class CursorAcpRuntime {
             && state.activeToolCalls.size === 0
             && idleForMs >= BATCH_PLANNER_MALFORMED_JSON_ABORT_MS;
         if (malformedJsonWindowExceeded) {
-            void this.stopActivePrompt(localSessionId, state.acpSessionId, state.transport, `Planner entered structured JSON output but did not stabilize into a valid JSON plan after ${state.chunkCount} streamed chunks and ${idleForMs}ms of inactivity. Stop and recover locally.`);
+            void this.stopActivePrompt(localSessionId, state.acpSessionId, state.transport, `${roleLabel} entered structured JSON output but did not stabilize into a valid JSON result after ${state.chunkCount} streamed chunks and ${idleForMs}ms of inactivity. Stop and recover locally.`);
         }
     }
     trackSessionOperation(sessionId, operation) {
@@ -1714,21 +1767,59 @@ class CursorAcpRuntime {
             timeoutMs
         });
         try {
-            const initialResultPayload = await this.transit(session, {
+            const baseTaskPayload = {
                 task: 'analyze_batch',
                 batchId: request.batchId,
-                prompt: request.prompt,
                 locale: request.locale,
                 templatePackId: request.templatePackId
-            }, (event) => {
-                rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
-                emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
-            }, toolCalls, isCancelled, timeoutMs);
-            const settleWindow = getBatchAnalysisPromptSettleWindow(initialResultPayload, assemblePromptMessageText(this.promptMessageChunks.get(session.id)).trim());
-            const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
-            await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
-            const resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
-            const finalText = extractPromptResultText(resultPayload);
+            };
+            const structuredResultContract = this.getPromptStructuredResultContract(session, {
+                ...baseTaskPayload,
+                prompt: request.prompt
+            });
+            const promptSeed = stripBatchAnalysisContinuation(request.prompt);
+            let autoContinueCount = 0;
+            let nextPrompt = request.prompt;
+            let resultPayload = undefined;
+            let finalText = undefined;
+            while (true) {
+                const initialResultPayload = await this.transit(session, {
+                    ...baseTaskPayload,
+                    prompt: nextPrompt
+                }, (event) => {
+                    rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                    emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+                }, toolCalls, isCancelled, timeoutMs);
+                const settleWindow = getBatchAnalysisPromptSettleWindow(initialResultPayload, assemblePromptMessageText(this.promptMessageChunks.get(session.id)).trim());
+                const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
+                await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
+                resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
+                finalText = extractPromptResultText(resultPayload);
+                const canAutoContinue = !isCancelled()
+                    && autoContinueCount < BATCH_ANALYSIS_AUTO_CONTINUE_LIMIT
+                    && remainingWaitMs >= 5_000
+                    && shouldAutoContinueBatchAnalysisTurn({
+                        contract: structuredResultContract,
+                        resultText: finalText,
+                        toolCallCount: toolCalls.length
+                    });
+                if (canAutoContinue) {
+                    autoContinueCount += 1;
+                    rawOutput.push(`[batch-analysis auto-continue ${autoContinueCount}] ${String(finalText ?? '')}`);
+                    this.log('agent.runtime.batch_analysis_auto_continue', {
+                        workspaceId: request.workspaceId,
+                        batchId: request.batchId,
+                        sessionId: session.id,
+                        role: session.role,
+                        autoContinueCount,
+                        resultText: finalText
+                    });
+                    const continuationSeed = promptSeed.trim().length > 0 ? promptSeed : (nextPrompt ?? '');
+                    nextPrompt = buildBatchAnalysisContinuationPrompt(continuationSeed, session.role, finalText);
+                    continue;
+                }
+                break;
+            }
             const endedAt = new Date().toISOString();
             const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
             session.updatedAtUtc = endedAt;
@@ -2095,7 +2186,7 @@ class CursorAcpRuntime {
                 }
                 const cliAuditLabel = typeof update.title === 'string' && update.title.trim()
                     ? update.title
-                    : extractCliToolCommand(update.rawInput);
+                    : extractCliToolCommand(update.rawInput) ?? extractCliToolCommandFromRawOutput(update.rawOutput);
                 if (!cliAuditLabel || shouldDeferCliToolPolicyCheck(update)) {
                     continue;
                 }
@@ -2103,12 +2194,13 @@ class CursorAcpRuntime {
                 const policy = this.evaluateCliToolPolicy(cliAuditLabel, update.kind, update.rawInput);
                 const auditedToolName = extractKbCliCommandName(cliAuditLabel)
                     ?? extractKbCliCommandName(extractCliToolCommand(update.rawInput))
+                    ?? extractKbCliCommandName(extractCliToolCommandFromRawOutput(update.rawOutput))
                     ?? cliAuditLabel;
                 recovered.push({
                     workspaceId,
                     sessionId,
                     toolName: auditedToolName,
-                    args: update.rawInput ?? { kind: update.kind },
+                    args: selectCliToolAuditArgs(update.rawInput, update.rawOutput, update.kind),
                     calledAtUtc: parsedLine.atUtc,
                     allowed: policy.allowed,
                     reason: policy.reason
@@ -2166,12 +2258,18 @@ class CursorAcpRuntime {
         }
         else {
             let needsReset = sessionReusePolicy === 'reset_acp';
+            const previousKbAccessMode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
+            const previousSessionMode = session.mode;
             if (input.kbAccessMode && input.kbAccessMode !== session.kbAccessMode) {
                 session.kbAccessMode = input.kbAccessMode;
-                needsReset = true;
             }
             if (requestedMode !== session.mode) {
                 session.mode = requestedMode;
+            }
+            const nextKbAccessMode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
+            const previousProviderSessionMode = resolveProviderSessionMode(previousKbAccessMode, previousSessionMode);
+            const nextProviderSessionMode = resolveProviderSessionMode(nextKbAccessMode, session.mode);
+            if (previousKbAccessMode !== nextKbAccessMode || previousProviderSessionMode !== nextProviderSessionMode) {
                 needsReset = true;
             }
             session.role = input.agentRole;
@@ -2450,7 +2548,7 @@ class CursorAcpRuntime {
             // Audit and enforce CLI-mode tool calls from ACP session updates so they appear in tool call history
             const cliAuditLabel = typeof params.update?.title === 'string' && params.update.title.trim()
                 ? params.update.title
-                : extractCliToolCommand(params.update?.rawInput);
+                : extractCliToolCommand(params.update?.rawInput) ?? extractCliToolCommandFromRawOutput(params.update?.rawOutput);
             if (sessionInfo.mode === 'cli' && params.update?.toolCallId && cliAuditLabel) {
                 const session = this.sessions.get(localSessionId);
                 const acpToolCallKey = `${params.sessionId ?? 'unknown'}:${params.update.toolCallId}`;
@@ -2461,12 +2559,13 @@ class CursorAcpRuntime {
                     const policy = this.evaluateCliToolPolicy(cliAuditLabel, params.update.kind, params.update.rawInput);
                     const auditedToolName = extractKbCliCommandName(cliAuditLabel)
                         ?? extractKbCliCommandName(extractCliToolCommand(params.update.rawInput))
+                        ?? extractKbCliCommandName(extractCliToolCommandFromRawOutput(params.update.rawOutput))
                         ?? cliAuditLabel;
                     this.toolCallAudit.push({
                         workspaceId: session.workspaceId,
                         sessionId: localSessionId,
                         toolName: auditedToolName,
-                        args: params.update.rawInput ?? { kind: params.update.kind },
+                        args: selectCliToolAuditArgs(params.update.rawInput, params.update.rawOutput, params.update.kind),
                         calledAtUtc: new Date().toISOString(),
                         allowed: policy.allowed,
                         reason: policy.reason
@@ -3472,6 +3571,103 @@ function extractLargestBalancedJsonText(value) {
     const parsed = extractLargestBalancedJsonObject(value);
     return parsed ? JSON.stringify(parsed) : undefined;
 }
+function parsedBatchStructuredResultMatchesContract(parsed, contract) {
+    switch (contract) {
+        case 'batch_planner':
+            return typeof parsed.summary === 'string' && Array.isArray(parsed.coverage) && Array.isArray(parsed.items);
+        case 'batch_plan_review':
+            return typeof parsed.summary === 'string' && typeof parsed.verdict === 'string' && parsed.delta !== null && typeof parsed.delta === 'object';
+        case 'batch_worker':
+            return typeof parsed.summary === 'string' && (Array.isArray(parsed.discoveredWork) || Array.isArray(parsed.executedItems));
+        case 'batch_final_review':
+            return (typeof parsed.summary === 'string'
+                && typeof parsed.verdict === 'string'
+                && parsed.delta !== null
+                && typeof parsed.delta === 'object'
+                && 'allPbisMapped' in parsed);
+        default:
+            return false;
+    }
+}
+function looksLikePromptStructuredResultContractText(value, contract) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return false;
+    }
+    if (promptStreamMatchesContract(trimmed, contract)) {
+        return true;
+    }
+    switch (contract) {
+        case 'batch_planner':
+            return trimmed.includes('"coverage"') || trimmed.includes('"items"') || trimmed.includes('"openQuestions"');
+        case 'batch_plan_review':
+            return trimmed.includes('"verdict"') || trimmed.includes('"delta"') || trimmed.includes('"requestedChanges"');
+        case 'batch_worker':
+            return trimmed.includes('"discoveredWork"') || trimmed.includes('"executedItems"');
+        case 'batch_final_review':
+            return trimmed.includes('"verdict"') || trimmed.includes('"delta"') || trimmed.includes('"allPbisMapped"');
+        default:
+            return false;
+    }
+}
+function summarizeBatchContinuationOutput(value, limit = 1_200) {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+    return trimmed.length > limit ? `${trimmed.slice(0, limit)}...` : trimmed;
+}
+function stripBatchAnalysisContinuation(prompt) {
+    const normalized = prompt?.trim() ?? '';
+    if (!normalized) {
+        return '';
+    }
+    const markerIndex = normalized.indexOf(BATCH_ANALYSIS_CONTINUATION_MARKER);
+    return markerIndex >= 0 ? normalized.slice(0, markerIndex).trim() : normalized;
+}
+function buildBatchAnalysisContinuationPrompt(prompt, role, priorOutput) {
+    const basePrompt = stripBatchAnalysisContinuation(prompt);
+    const roleLabel = role?.trim() ? role.trim() : 'current';
+    const sections = [
+        basePrompt,
+        [
+            BATCH_ANALYSIS_CONTINUATION_MARKER,
+            `You are still in the same ${roleLabel} batch-analysis stage.`,
+            'Continue in the same ACP session.',
+            'Do not restart broad research or repeat the same tool calls unless a failed call must be retried.',
+            'Reuse the evidence and context already gathered.',
+            'Return only the complete final JSON object for this stage.',
+            'Do not send progress prose, partial JSON, or explanatory narration.'
+        ].join('\n')
+    ];
+    const summarizedPriorOutput = summarizeBatchContinuationOutput(priorOutput);
+    if (summarizedPriorOutput) {
+        sections.push(`Incomplete prior output:\n${summarizedPriorOutput}`);
+    }
+    return sections.filter(Boolean).join('\n\n');
+}
+function shouldAutoContinueBatchAnalysisTurn(params) {
+    if (!params.contract) {
+        return false;
+    }
+    const trimmed = params.resultText?.trim() ?? '';
+    if (!trimmed) {
+        return params.toolCallCount > 0;
+    }
+    if (promptStreamMatchesContract(trimmed, params.contract)) {
+        return false;
+    }
+    if (looksLikeBatchProgressText(trimmed)) {
+        return true;
+    }
+    if (streamedTextLikelyStartsJsonObject(trimmed)) {
+        return true;
+    }
+    if (looksLikePromptStructuredResultContractText(trimmed, params.contract)) {
+        return params.toolCallCount > 0 || trimmed.length < 1_500;
+    }
+    return false;
+}
 function scorePromptFinalTextCandidate(value) {
     const trimmed = value.trim();
     if (!trimmed) {
@@ -3498,10 +3694,7 @@ function promptStreamMatchesContract(value, contract) {
     if (!parsed) {
         return false;
     }
-    if (contract === 'batch_planner') {
-        return typeof parsed.summary === 'string' && Array.isArray(parsed.coverage) && Array.isArray(parsed.items);
-    }
-    return false;
+    return parsedBatchStructuredResultMatchesContract(parsed, contract);
 }
 const DEFAULT_PROMPT_SETTLE_WINDOW = {
     idleMs: 350,

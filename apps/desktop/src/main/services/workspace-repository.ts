@@ -195,6 +195,20 @@ const PBIBATCH_STATUS_SEQUENCE: Array<PBIBatchStatus> = [
   PBIBatchStatus.REVIEW_COMPLETE,
   PBIBatchStatus.ARCHIVED
 ];
+const PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX = 'proposal-';
+const REVIEWABLE_PROPOSAL_STATUSES = new Set<ProposalReviewStatus>([
+  ProposalReviewStatus.PENDING_REVIEW,
+  ProposalReviewStatus.ACCEPTED,
+  ProposalReviewStatus.DENIED,
+  ProposalReviewStatus.DEFERRED,
+  ProposalReviewStatus.APPLIED_TO_BRANCH,
+  ProposalReviewStatus.ARCHIVED
+]);
+const OPEN_PROPOSAL_STATUSES = new Set<ProposalReviewStatus>([
+  ProposalReviewStatus.STAGED_ANALYSIS,
+  ProposalReviewStatus.PENDING_REVIEW,
+  ProposalReviewStatus.DEFERRED
+]);
 
 interface RevisionLatestRecord {
   revisionId: string;
@@ -2393,7 +2407,7 @@ export class WorkspaceRepository {
              WHERE retired_at IS NULL
                AND (lower(title) LIKE '%' || @q || '%' OR lower(external_key) LIKE '%' || @q || '%')`,
         familyQueryParams
-      );
+      ).filter((family) => !isProposalScopedExternalKey(family.external_key));
 
       const variants = workspaceDb.all<{
         id: string;
@@ -2686,11 +2700,16 @@ export class WorkspaceRepository {
          WHERE r.workspace_id = @workspaceId
            AND r.status = @activeStatus
            AND r.strength_score >= @minScore
+           AND lower(left_f.external_key) NOT LIKE @proposalScopedPattern
+           AND lower(right_f.external_key) NOT LIKE @proposalScopedPattern
            AND (r.left_family_id IN (${placeholders}) OR r.right_family_id IN (${placeholders}))
          ORDER BY r.strength_score DESC, r.updated_at DESC
          LIMIT ${limit}`
         ,
-        params
+        {
+          ...params,
+          proposalScopedPattern: `${PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX}%`
+        }
       );
 
       const relations = rows.map((row) => this.mapArticleRelationRow(row, workspaceDb, includeEvidence));
@@ -3433,9 +3452,13 @@ export class WorkspaceRepository {
         FROM pbi_batches b
         JOIN proposals p ON p.batch_id = b.id
         WHERE b.workspace_id = @workspaceId
+          AND COALESCE(p.review_status, 'pending_review') != @stagedStatus
         GROUP BY b.id, b.name, b.source_file_name, b.imported_at, b.status
         ORDER BY b.imported_at DESC
-      `, { workspaceId });
+      `, {
+        workspaceId,
+        stagedStatus: ProposalReviewStatus.STAGED_ANALYSIS
+      });
 
       return {
         workspaceId,
@@ -3463,7 +3486,8 @@ export class WorkspaceRepository {
     const workspace = await this.getWorkspace(workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
-      const batch = workspaceDb.get<PBIBatchRecord>(`
+      const normalizedBatchId = batchId.trim();
+      let batch = workspaceDb.get<PBIBatchRecord>(`
         SELECT id, workspace_id as workspaceId, name, source_file_name as sourceFileName,
                source_row_count as sourceRowCount, source_path as sourcePath, source_format as sourceFormat,
                candidate_row_count as candidateRowCount, ignored_row_count as ignoredRowCount,
@@ -3472,8 +3496,30 @@ export class WorkspaceRepository {
                imported_at as importedAtUtc, status
         FROM pbi_batches
         WHERE id = @batchId AND workspace_id = @workspaceId`,
-        { batchId, workspaceId }
+        { batchId: normalizedBatchId, workspaceId }
       );
+      if (!batch && normalizedBatchId.length >= 6) {
+        const prefixMatches = workspaceDb.all<PBIBatchRecord>(`
+          SELECT id, workspace_id as workspaceId, name, source_file_name as sourceFileName,
+                 source_row_count as sourceRowCount, source_path as sourcePath, source_format as sourceFormat,
+                 candidate_row_count as candidateRowCount, ignored_row_count as ignoredRowCount,
+                 malformed_row_count as malformedRowCount, duplicate_row_count as duplicateRowCount,
+                 scoped_row_count as scopedRowCount, scope_mode as scopeMode, scope_payload as scopePayload,
+                 imported_at as importedAtUtc, status
+          FROM pbi_batches
+          WHERE workspace_id = @workspaceId
+            AND id LIKE @batchIdPrefix
+          ORDER BY imported_at DESC
+          LIMIT 2`,
+          {
+            workspaceId,
+            batchIdPrefix: `${normalizedBatchId}%`
+          }
+        );
+        if (prefixMatches.length === 1) {
+          batch = prefixMatches[0];
+        }
+      }
       if (!batch) {
         throw new Error('PBI batch not found');
       }
@@ -4774,6 +4820,7 @@ export class WorkspaceRepository {
     workspaceId: string;
     batchId: string;
     action: ProposalAction;
+    reviewStatus?: ProposalReviewStatus;
     _sessionId?: string;
     idempotencyKey?: string;
     familyId?: string;
@@ -4840,7 +4887,7 @@ export class WorkspaceRepository {
       }
       const suggestedPlacement = params.suggestedPlacement ?? normalizePlacement(metadata.suggestedPlacement);
       const confidenceScore = normalizeConfidenceScore(params.confidenceScore ?? metadata.confidenceScore);
-      const reviewStatus = ProposalReviewStatus.PENDING_REVIEW;
+      const reviewStatus = params.reviewStatus ?? ProposalReviewStatus.PENDING_REVIEW;
       const status: ProposalDecision = ProposalDecision.DEFER;
       const sourceRevisionId = params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null;
 
@@ -5020,9 +5067,17 @@ export class WorkspaceRepository {
     }
   }
 
-  async listProposalReviewQueue(workspaceId: string, batchId: string): Promise<ProposalReviewListResponse> {
+  async listBatchProposalRecords(
+    workspaceId: string,
+    batchId: string,
+    options?: {
+      includeStaged?: boolean;
+      openOnly?: boolean;
+      reviewStatuses?: ProposalReviewStatus[];
+      sessionId?: string;
+    }
+  ): Promise<ProposalReviewRecord[]> {
     const workspace = await this.getWorkspace(workspaceId);
-    const batch = await this.getPBIBatch(workspaceId, batchId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
       const rows = workspaceDb.all<ProposalDbRow>(`
@@ -5057,6 +5112,24 @@ export class WorkspaceRepository {
         ORDER BY p.queue_order ASC, p.generated_at ASC
       `, { workspaceId, batchId });
 
+      const includeStaged = options?.includeStaged === true;
+      const reviewStatusFilter = options?.reviewStatuses ? new Set(options.reviewStatuses) : null;
+      return rows
+        .map((row) => this.hydrateProposalDisplayFields(this.mapProposalRow(row), workspaceDb))
+        .filter((proposal) => includeStaged || proposal.reviewStatus !== ProposalReviewStatus.STAGED_ANALYSIS)
+        .filter((proposal) => !options?.openOnly || OPEN_PROPOSAL_STATUSES.has(proposal.reviewStatus))
+        .filter((proposal) => !reviewStatusFilter || reviewStatusFilter.has(proposal.reviewStatus))
+        .filter((proposal) => !options?.sessionId || proposal.sessionId === options.sessionId);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async listProposalReviewQueue(workspaceId: string, batchId: string): Promise<ProposalReviewListResponse> {
+    const batch = await this.getPBIBatch(workspaceId, batchId);
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
       const relatedCounts = workspaceDb.all<{ proposalId: string; count: number }>(`
         SELECT proposal_id as proposalId, COUNT(*) as count
         FROM proposal_pbi_links
@@ -5065,7 +5138,9 @@ export class WorkspaceRepository {
       `, { batchId });
       const relatedCountMap = new Map(relatedCounts.map((entry) => [entry.proposalId, entry.count]));
 
-      const records = rows.map((row) => this.hydrateProposalDisplayFields(this.mapProposalRow(row), workspaceDb));
+      const records = (await this.listBatchProposalRecords(workspaceId, batchId)).filter((proposal) =>
+        REVIEWABLE_PROPOSAL_STATUSES.has(proposal.reviewStatus)
+      );
       const queue = records.map<ProposalReviewQueueItem>((proposal) => {
         const article = deriveProposalArticleDescriptor(proposal);
         return {
@@ -5110,6 +5185,77 @@ export class WorkspaceRepository {
         summary: summarizeProposalStatuses(records),
         queue,
         groups: Array.from(groupMap.values())
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async promoteBatchProposalsToPendingReview(params: {
+    workspaceId: string;
+    batchId: string;
+    proposalIds?: string[];
+  }): Promise<{
+    promotedProposalIds: string[];
+    batchStatus: PBIBatchStatus;
+  }> {
+    const workspace = await this.getWorkspace(params.workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const proposalIds = Array.from(
+        new Set((params.proposalIds ?? []).map((proposalId) => proposalId.trim()).filter(Boolean))
+      );
+      if (proposalIds.length > 0) {
+        workspaceDb.exec('BEGIN IMMEDIATE');
+        try {
+          for (const proposalId of proposalIds) {
+            workspaceDb.run(
+              `UPDATE proposals
+               SET review_status = @nextStatus,
+                   updated_at = @updatedAt
+               WHERE workspace_id = @workspaceId
+                 AND batch_id = @batchId
+                 AND id = @proposalId
+                 AND review_status = @currentStatus`,
+              {
+                workspaceId: params.workspaceId,
+                batchId: params.batchId,
+                proposalId,
+                currentStatus: ProposalReviewStatus.STAGED_ANALYSIS,
+                nextStatus: ProposalReviewStatus.PENDING_REVIEW,
+                updatedAt: new Date().toISOString()
+              }
+            );
+          }
+          workspaceDb.exec('COMMIT');
+        } catch (error) {
+          workspaceDb.exec('ROLLBACK');
+          throw error;
+        }
+      }
+
+      const promotedRows = proposalIds.length > 0
+        ? workspaceDb.all<{ id: string }>(
+            `SELECT id
+             FROM proposals
+             WHERE workspace_id = @workspaceId
+               AND batch_id = @batchId
+               AND review_status = @reviewStatus
+               AND id IN (${proposalIds.map((_, index) => `@proposalId${index}`).join(', ')})`,
+            proposalIds.reduce<Record<string, string>>((acc, proposalId, index) => {
+              acc[`proposalId${index}`] = proposalId;
+              return acc;
+            }, {
+              workspaceId: params.workspaceId,
+              batchId: params.batchId,
+              reviewStatus: ProposalReviewStatus.PENDING_REVIEW
+            } as Record<string, string>)
+          )
+        : [];
+      const batchStatus = await this.syncBatchReviewStatus(workspaceDb, params.workspaceId, params.batchId);
+      return {
+        promotedProposalIds: promotedRows.map((row) => row.id),
+        batchStatus
       };
     } finally {
       workspaceDb.close();
@@ -7096,7 +7242,10 @@ export class WorkspaceRepository {
       `SELECT id, title, external_key as externalKey, section_id as sectionId, category_id as categoryId
        FROM article_families
        WHERE retired_at IS NULL
+         AND lower(external_key) NOT LIKE @proposalScopedPattern
        ORDER BY title COLLATE NOCASE`
+      ,
+      { proposalScopedPattern: `${PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX}%` }
     );
     const variants = workspaceDb.all<{
       id: string;
@@ -9643,7 +9792,7 @@ export class WorkspaceRepository {
       WHERE workspace_id = @workspaceId
         AND batch_id = @batchId
         AND action = @action
-        AND review_status IN ('pending_review', 'deferred')
+        AND review_status IN ('staged_analysis', 'pending_review', 'deferred')
         AND (
           (@localeVariantId IS NOT NULL AND locale_variant_id = @localeVariantId)
           OR (@localeVariantId IS NULL AND @familyId IS NOT NULL AND family_id = @familyId)
@@ -9686,7 +9835,7 @@ export class WorkspaceRepository {
       FROM proposals
       WHERE workspace_id = @workspaceId
         AND batch_id = @batchId
-        AND review_status IN ('pending_review', 'deferred')
+        AND review_status IN ('staged_analysis', 'pending_review', 'deferred')
       ORDER BY updated_at DESC, generated_at DESC
       LIMIT 50
     `, {
@@ -10471,7 +10620,9 @@ export class WorkspaceRepository {
       { workspaceId, batchId }
     );
 
-    const normalized = rows.map((row) => normalizeReviewStatus(row.reviewStatus));
+    const normalized = rows
+      .map((row) => normalizeReviewStatus(row.reviewStatus))
+      .filter((status) => status !== ProposalReviewStatus.STAGED_ANALYSIS);
     let nextStatus = PBIBatchStatus.ANALYZED;
     if (normalized.length > 0) {
       nextStatus = normalized.some((status) => status === ProposalReviewStatus.PENDING_REVIEW)
@@ -10895,6 +11046,7 @@ function createContentHash(value: string): string {
 
 function normalizeReviewStatus(value: string | null | undefined): ProposalReviewStatus {
   switch (value) {
+    case ProposalReviewStatus.STAGED_ANALYSIS:
     case ProposalReviewStatus.ACCEPTED:
     case ProposalReviewStatus.DENIED:
     case ProposalReviewStatus.DEFERRED:
@@ -10952,6 +11104,8 @@ function summarizeProposalStatuses(records: ProposalReviewRecord[]): ProposalRev
 
   for (const record of records) {
     switch (record.reviewStatus) {
+      case ProposalReviewStatus.STAGED_ANALYSIS:
+        break;
       case ProposalReviewStatus.ACCEPTED:
         summary.accepted += 1;
         break;
@@ -10975,6 +11129,10 @@ function summarizeProposalStatuses(records: ProposalReviewRecord[]): ProposalRev
   }
 
   return summary;
+}
+
+function isProposalScopedExternalKey(value: string | null | undefined): boolean {
+  return (value?.trim().toLowerCase().startsWith(PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX) ?? false);
 }
 
 function deriveProposalArticleDescriptor(proposal: ProposalReviewRecord): {

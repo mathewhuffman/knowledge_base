@@ -44,17 +44,37 @@ class BatchAnalysisOrchestrator {
                 resolvedVariant = null;
             }
             if (resolvedVariant) {
+                const resolvedUniqueLiveFamilyVariant = uniqueLiveFamilyVariant
+                    ?? await this.getUniqueLiveFamilyVariant(params.workspaceId, resolvedVariant.familyId);
                 if (item.targetFamilyId?.trim() && resolvedVariant.familyId !== item.targetFamilyId.trim()) {
-                    if (uniqueLiveFamilyVariant) {
-                        repairs.push(`Corrected target article ID for ${item.targetTitle} from ${item.targetArticleId} to ${uniqueLiveFamilyVariant.id} because the submitted article belonged to the wrong family.`);
-                        textualTargetReplacements.push({ from: item.targetArticleId, to: uniqueLiveFamilyVariant.id });
+                    if (resolvedUniqueLiveFamilyVariant) {
+                        repairs.push(`Corrected target article ID for ${item.targetTitle} from ${item.targetArticleId} to ${resolvedUniqueLiveFamilyVariant.id} because the submitted article belonged to the wrong family.`);
+                        textualTargetReplacements.push({ from: item.targetArticleId, to: resolvedUniqueLiveFamilyVariant.id });
                         return {
                             ...item,
-                            targetArticleId: uniqueLiveFamilyVariant.id,
-                            targetFamilyId: uniqueLiveFamilyVariant.familyId
+                            targetArticleId: resolvedUniqueLiveFamilyVariant.id,
+                            targetFamilyId: resolvedUniqueLiveFamilyVariant.familyId
                         };
                     }
                     unresolvedTargetIssues.push(`Plan item ${item.planItemId} (${item.targetTitle}) points at article ${item.targetArticleId}, but that article belongs to family ${resolvedVariant.familyId} instead of ${item.targetFamilyId}.`);
+                    return item;
+                }
+                if (resolvedVariant.status !== 'live') {
+                    if (resolvedUniqueLiveFamilyVariant && resolvedUniqueLiveFamilyVariant.id !== resolvedVariant.id) {
+                        repairs.push(`Corrected non-live target article ID for ${item.targetTitle} from ${item.targetArticleId} to ${resolvedUniqueLiveFamilyVariant.id} because the submitted locale variant is ${resolvedVariant.status}.`);
+                        textualTargetReplacements.push({ from: item.targetArticleId, to: resolvedUniqueLiveFamilyVariant.id });
+                        return {
+                            ...item,
+                            targetArticleId: resolvedUniqueLiveFamilyVariant.id,
+                            targetFamilyId: resolvedUniqueLiveFamilyVariant.familyId
+                        };
+                    }
+                    unresolvedTargetIssues.push(`Plan item ${item.planItemId} (${item.targetTitle}) points at locale variant ${item.targetArticleId}, but that variant is ${resolvedVariant.status} instead of live.`);
+                    return item;
+                }
+                const resolvedFamilyExternalKey = await this.getFamilyExternalKey(params.workspaceId, resolvedVariant.familyId);
+                if (resolvedFamilyExternalKey?.startsWith('proposal-')) {
+                    unresolvedTargetIssues.push(`Plan item ${item.planItemId} (${item.targetTitle}) points at proposal-scoped draft family ${resolvedFamilyExternalKey}, which is generated draft output rather than live KB coverage.`);
                     return item;
                 }
                 if (!item.targetFamilyId?.trim()) {
@@ -130,13 +150,16 @@ class BatchAnalysisOrchestrator {
             const canonicalRows = normalizedPbiIds
                 .map((pbiId) => rowsById.get(pbiId) ?? null)
                 .filter((row) => Boolean(row));
-            let pbiEvidenceIndex = 0;
+            let fallbackEvidenceIndex = 0;
             const evidence = item.evidence.map((entry) => {
                 if (entry.kind !== 'pbi') {
                     return entry;
                 }
-                const row = canonicalRows[pbiEvidenceIndex] ?? canonicalRows[canonicalRows.length - 1];
-                pbiEvidenceIndex += 1;
+                const explicitRow = resolveUploadedPbiRowFromEvidenceRef(entry.ref, rowsById, rows);
+                const row = explicitRow ?? canonicalRows[fallbackEvidenceIndex] ?? canonicalRows[canonicalRows.length - 1];
+                if (!explicitRow) {
+                    fallbackEvidenceIndex += 1;
+                }
                 if (!row) {
                     return entry;
                 }
@@ -283,8 +306,11 @@ class BatchAnalysisOrchestrator {
         };
     }
     async recordWorkerPass(params) {
-        const proposalQueue = await this.workspaceRepository.listProposalReviewQueue(params.workspaceId, params.batchId);
-        const executedItems = this.buildExecutedItems(params.approvedPlan.items, proposalQueue.queue, params.result);
+        const proposals = await this.workspaceRepository.listBatchProposalRecords(params.workspaceId, params.batchId, {
+            includeStaged: true,
+            openOnly: true
+        });
+        const executedItems = this.buildExecutedItems(params.approvedPlan.items, proposals, params.result);
         await this.workspaceRepository.updateBatchAnalysisPlanItemStatuses({
             workspaceId: params.workspaceId,
             planId: params.approvedPlan.id,
@@ -376,8 +402,18 @@ class BatchAnalysisOrchestrator {
         }
         return counts;
     }
-    buildExecutedItems(planItems, queue, result) {
-        const remainingQueue = [...queue];
+    buildExecutedItems(planItems, proposals, result) {
+        const remainingProposals = [...proposals].sort((left, right) => {
+            const leftCurrentSession = left.sessionId === result.sessionId ? 1 : 0;
+            const rightCurrentSession = right.sessionId === result.sessionId ? 1 : 0;
+            if (leftCurrentSession !== rightCurrentSession) {
+                return rightCurrentSession - leftCurrentSession;
+            }
+            if (left.updatedAtUtc !== right.updatedAtUtc) {
+                return right.updatedAtUtc.localeCompare(left.updatedAtUtc);
+            }
+            return right.queueOrder - left.queueOrder;
+        });
         return planItems.map((item) => {
             if (item.action === 'no_impact') {
                 return {
@@ -397,17 +433,46 @@ class BatchAnalysisOrchestrator {
                     note: result.message ?? `Worker ended with status ${result.status}.`
                 };
             }
-            const matchIndex = remainingQueue.findIndex((proposal) => proposal.action === item.action && this.normalizeTitle(proposal.articleLabel) === this.normalizeTitle(item.targetTitle));
+            const normalizedTargetTitle = this.normalizeTitle(item.targetTitle);
+            const matchIndex = remainingProposals.findIndex((proposal) => proposal.sessionId === result.sessionId
+                && proposal.action === item.action
+                && this.normalizeTitle(proposal.targetTitle ?? '') === normalizedTargetTitle);
             if (matchIndex >= 0) {
-                const match = remainingQueue.splice(matchIndex, 1)[0];
+                const match = remainingProposals.splice(matchIndex, 1)[0];
                 return {
                     planItemId: item.planItemId,
                     action: item.action,
                     targetTitle: item.targetTitle,
                     status: 'executed',
-                    proposalId: match.proposalId,
-                    artifactIds: [match.proposalId],
-                    note: `Matched proposal review item for ${match.articleLabel}.`
+                    proposalId: match.id,
+                    artifactIds: [match.id],
+                    note: `Matched proposal generated in the current worker session for ${match.targetTitle ?? item.targetTitle}.`
+                };
+            }
+            const conflictingCurrentSessionProposals = remainingProposals.filter((proposal) => proposal.sessionId === result.sessionId
+                && this.normalizeTitle(proposal.targetTitle ?? '') === normalizedTargetTitle
+                && proposal.action !== item.action);
+            if (conflictingCurrentSessionProposals.length > 0) {
+                return {
+                    planItemId: item.planItemId,
+                    action: item.action,
+                    targetTitle: item.targetTitle,
+                    status: 'blocked',
+                    artifactIds: conflictingCurrentSessionProposals.map((proposal) => proposal.id),
+                    note: `Current worker session produced ${conflictingCurrentSessionProposals.map((proposal) => proposal.action).join(', ')} proposal output for "${item.targetTitle}", which conflicts with the approved ${item.action} action.`
+                };
+            }
+            const fallbackMatchIndex = remainingProposals.findIndex((proposal) => proposal.action === item.action && this.normalizeTitle(proposal.targetTitle ?? '') === normalizedTargetTitle);
+            if (fallbackMatchIndex >= 0) {
+                const match = remainingProposals.splice(fallbackMatchIndex, 1)[0];
+                return {
+                    planItemId: item.planItemId,
+                    action: item.action,
+                    targetTitle: item.targetTitle,
+                    status: 'executed',
+                    proposalId: match.id,
+                    artifactIds: [match.id],
+                    note: `Matched persisted proposal output for ${match.targetTitle ?? item.targetTitle}.`
                 };
             }
             return {
@@ -749,6 +814,9 @@ class BatchAnalysisOrchestrator {
             'You are the final reviewer for the batch.',
             'Decide whether the resulting outputs fully satisfy the PBIs and approved plan.',
             'If rework is needed, return a structured rework delta and do not approve the batch.',
+            'Proposal-scoped locale variants or article families whose external key starts with `proposal-` are generated draft artifacts, not live KB coverage.',
+            'Do not use proposal-scoped locale variants to claim the live KB already covers a change.',
+            'Use the persisted proposal snapshots below to judge what each proposal actually changes before calling something redundant.',
             'JSON shape:',
             '{"summary":string,"verdict":"approved"|"needs_rework"|"needs_human_review","allPbisMapped":boolean,"planExecutionComplete":boolean,"hasMissingArticleChanges":boolean,"hasUnresolvedDiscoveredWork":boolean,"delta":{"summary":string,"requestedRework":string[],"uncoveredPbiIds":string[],"missingArticleChanges":string[],"duplicateRiskTitles":string[],"unnecessaryChanges":string[],"unresolvedAmbiguities":string[]}}',
             'Batch context summary:',
@@ -759,6 +827,8 @@ class BatchAnalysisOrchestrator {
             JSON.stringify(compactPlanForPrompt(params.approvedPlan), null, 2),
             'Worker report summary:',
             JSON.stringify(compactWorkerReportForPrompt(params.workerReport), null, 2),
+            'Executed proposal snapshots:',
+            JSON.stringify(compactFinalReviewerProposalContextForPrompt(params.proposalContext ?? []), null, 2),
             'Outstanding discovered work summary:',
             JSON.stringify(compactDiscoveredWorkForPrompt(params.discoveredWork), null, 2)
         ].join('\n\n');
@@ -988,6 +1058,22 @@ class BatchAnalysisOrchestrator {
         const variants = await this.workspaceRepository.getLocaleVariantsForFamily(workspaceId, familyId.trim());
         return variants.filter((variant) => variant.status === 'live' && !variant.retiredAtUtc);
     }
+    async getUniqueLiveFamilyVariant(workspaceId, familyId) {
+        const variants = await this.getLiveFamilyVariants(workspaceId, familyId);
+        return variants.length === 1 ? variants[0] : null;
+    }
+    async getFamilyExternalKey(workspaceId, familyId) {
+        if (!familyId?.trim()) {
+            return null;
+        }
+        try {
+            const family = await this.workspaceRepository.getArticleFamily(workspaceId, familyId.trim());
+            return family.externalKey?.trim().toLowerCase() ?? null;
+        }
+        catch {
+            return null;
+        }
+    }
     parseJsonObject(value) {
         const trimmed = value.trim();
         if (!trimmed) {
@@ -1114,6 +1200,41 @@ function buildCanonicalPbiEvidenceRef(row) {
     return row.externalId?.trim()
         ? `pbiId:${row.pbiId}|externalId:${row.externalId}`
         : `pbiId:${row.pbiId}`;
+}
+function parsePbiEvidenceRef(ref) {
+    const trimmed = ref.trim();
+    if (!trimmed) {
+        return null;
+    }
+    const parsed = {};
+    for (const segment of trimmed.split('|')) {
+        const token = segment.trim();
+        if (!token) {
+            continue;
+        }
+        const pbiMatch = token.match(/^(pbi\s*id|pbiId)\s*:\s*(.+)$/i);
+        if (pbiMatch?.[2]) {
+            parsed.pbiId = pbiMatch[2].trim();
+            continue;
+        }
+        const externalMatch = token.match(/^(external\s*id|externalId)\s*:\s*(.+)$/i);
+        if (externalMatch?.[2]) {
+            parsed.externalId = externalMatch[2].trim();
+        }
+    }
+    return parsed.pbiId || parsed.externalId ? parsed : null;
+}
+function resolveUploadedPbiRowFromEvidenceRef(ref, rowsById, rows) {
+    const parsed = parsePbiEvidenceRef(ref);
+    const directCandidates = [parsed?.pbiId, parsed?.externalId, ref]
+        .filter((value) => typeof value === 'string' && value.trim().length > 0);
+    for (const candidate of directCandidates) {
+        const repaired = resolveUploadedPbiId(candidate, rows);
+        if (repaired) {
+            return rowsById.get(repaired) ?? rows.find((row) => row.pbiId === repaired) ?? null;
+        }
+    }
+    return null;
 }
 function resolveUploadedPbiId(value, rows) {
     const trimmed = value.trim();
@@ -1297,6 +1418,27 @@ function compactWorkerReportForPrompt(report) {
         blockerNotes: report.blockerNotes.map((item) => truncatePromptText(item, 180)),
         discoveredWork: compactDiscoveredWorkForPrompt(report.discoveredWork)
     };
+}
+function compactFinalReviewerProposalContextForPrompt(items) {
+    return items.map((item) => ({
+        proposalId: item.proposalId,
+        action: item.action,
+        targetTitle: item.targetTitle,
+        reviewStatus: item.reviewStatus ?? null,
+        familyId: item.familyId ?? null,
+        localeVariantId: item.localeVariantId ?? null,
+        locale: item.locale ?? null,
+        variantStatus: item.variantStatus ?? null,
+        familyExternalKey: item.familyExternalKey ?? null,
+        targetState: item.targetState,
+        targetStateReason: truncatePromptText(item.targetStateReason, 180),
+        relatedPbiIds: item.relatedPbiIds.slice(0, 12),
+        relatedExternalIds: item.relatedExternalIds.slice(0, 12),
+        rationaleSummary: truncatePromptText(item.rationaleSummary, 200),
+        aiNotes: truncatePromptText(item.aiNotes, 200),
+        changeSummary: item.changeSummary.slice(0, 8).map((entry) => truncatePromptText(entry, 180)),
+        proposedContentPreview: truncatePromptText(item.proposedContentPreview, 220)
+    }));
 }
 function compactDiscoveredWorkForPrompt(items) {
     return items.map((item) => ({

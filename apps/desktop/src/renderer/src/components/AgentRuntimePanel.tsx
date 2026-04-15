@@ -980,6 +980,10 @@ export function SessionListPanel({ workspaceId, onSelectSession }: SessionListPa
           <div className="agent-session-list">
             {sessions.map((session) => {
               const chipProps = sessionStatusChip(session.status);
+              const canCloseSession = !(
+                session.type === 'batch_analysis'
+                && (session.status === 'running' || session.status === 'starting')
+              );
               return (
                 <div
                   key={session.id}
@@ -1017,7 +1021,7 @@ export function SessionListPanel({ workspaceId, onSelectSession }: SessionListPa
                     </span>
                   </div>
                   <div className="agent-session-row-actions">
-                    {session.status !== 'closed' && (
+                    {session.status !== 'closed' && canCloseSession && (
                       <button
                         className="btn btn-ghost btn-icon btn-xs"
                         onClick={(e) => { e.stopPropagation(); void handleClose(session.id); }}

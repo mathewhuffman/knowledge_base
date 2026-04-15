@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ProposalReviewDecision = exports.ProposalReviewStatus = void 0;
 var ProposalReviewStatus;
 (function (ProposalReviewStatus) {
+    ProposalReviewStatus["STAGED_ANALYSIS"] = "staged_analysis";
     ProposalReviewStatus["PENDING_REVIEW"] = "pending_review";
     ProposalReviewStatus["ACCEPTED"] = "accepted";
     ProposalReviewStatus["DENIED"] = "denied";

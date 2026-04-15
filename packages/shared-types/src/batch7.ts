@@ -1,6 +1,7 @@
 import type { EntityId, PBIRecord, PBIBatchStatus, ProposalAction } from './batch2';
 
 export enum ProposalReviewStatus {
+  STAGED_ANALYSIS = 'staged_analysis',
   PENDING_REVIEW = 'pending_review',
   ACCEPTED = 'accepted',
   DENIED = 'denied',

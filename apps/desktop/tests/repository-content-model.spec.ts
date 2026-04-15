@@ -446,6 +446,55 @@ test.describe('workspace repository content model', () => {
     expect(eventStream.events.some((event) => event.eventType === 'iteration_completed')).toBeTruthy();
   });
 
+  test('resolves batch context from a unique batch id prefix', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchPrefix-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint Prefix',
+      'sprint-prefix.csv',
+      'imports/sprint-prefix.csv',
+      PBIImportFormat.CSV,
+      2,
+      {
+        candidateRowCount: 2,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 2
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.createPBIRecord({
+      batchId: batch.id,
+      workspaceId: created.id,
+      sourceRowNumber: 1,
+      externalId: 'PI-1',
+      title: 'First row',
+      body: 'Body',
+      validationStatus: 'candidate'
+    });
+    await repository.createPBIRecord({
+      batchId: batch.id,
+      workspaceId: created.id,
+      sourceRowNumber: 2,
+      externalId: 'PI-2',
+      title: 'Second row',
+      body: 'Body',
+      validationStatus: 'candidate'
+    });
+
+    const context = await repository.getBatchContext(created.id, batch.id.slice(0, 8));
+
+    expect(context?.batch.id).toBe(batch.id);
+    expect(context?.candidateRows).toHaveLength(2);
+  });
+
   test('preserves latest approved plan when a newer revision draft exists and returns plans newest-first', async () => {
     const created = await repository.createWorkspace({
       name: `BatchPlanSnapshot-${randomUUID()}`,
@@ -1101,6 +1150,70 @@ test.describe('workspace repository content model', () => {
     const draftRevision = revisions.find((revision) => revision.id === decision.revisionId);
     expect(draftRevision?.branchId).toBe(decision.branchId);
     expect(draftRevision?.revisionType).toBe(RevisionState.DRAFT_BRANCH);
+  });
+
+  test('keeps staged batch-analysis proposals hidden until final approval promotes them', async () => {
+    const created = await repository.createWorkspace({
+      name: `ProposalStaging-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 43',
+      'sprint-43.csv',
+      'imports/sprint-43.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const stagedProposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'create',
+      reviewStatus: ProposalReviewStatus.STAGED_ANALYSIS,
+      targetTitle: 'Duplicate a Food Item',
+      targetLocale: 'en-us',
+      rationaleSummary: 'Drafted by batch worker before final approval.',
+      aiNotes: 'Internal batch draft.',
+      proposedHtml: '<h1>Duplicate a Food Item</h1><p>Draft content.</p>'
+    });
+
+    expect(stagedProposal.reviewStatus).toBe(ProposalReviewStatus.STAGED_ANALYSIS);
+
+    const hiddenQueue = await repository.listProposalReviewQueue(created.id, batch.id);
+    expect(hiddenQueue.summary.total).toBe(0);
+    expect(hiddenQueue.queue).toHaveLength(0);
+
+    const hiddenBatchList = await repository.listProposalReviewBatches(created.id);
+    expect(hiddenBatchList.batches).toHaveLength(0);
+
+    const promotion = await repository.promoteBatchProposalsToPendingReview({
+      workspaceId: created.id,
+      batchId: batch.id,
+      proposalIds: [stagedProposal.id]
+    });
+
+    expect(promotion.promotedProposalIds).toEqual([stagedProposal.id]);
+    expect(promotion.batchStatus).toBe(PBIBatchStatus.REVIEW_IN_PROGRESS);
+
+    const visibleQueue = await repository.listProposalReviewQueue(created.id, batch.id);
+    expect(visibleQueue.summary.total).toBe(1);
+    expect(visibleQueue.summary.pendingReview).toBe(1);
+    expect(visibleQueue.queue[0]?.proposalId).toBe(stagedProposal.id);
+
+    const visibleBatchList = await repository.listProposalReviewBatches(created.id);
+    expect(visibleBatchList.batches).toHaveLength(1);
+    expect(visibleBatchList.batches[0]?.pendingReviewCount).toBe(1);
   });
 
   test('applies proposals to an existing draft branch, archives no-impact proposals, and retires locale variants', async () => {
