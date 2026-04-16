@@ -4,6 +4,7 @@ import { URL } from 'node:url';
 import { ProposalAction, type AppWorkingStatePatchRequest, type AppWorkingStateSchemaRequest, type SearchPayload } from '@kb-vault/shared-types';
 import { WorkspaceRepository } from './workspace-repository';
 import { AppWorkingStateService } from './app-working-state-service';
+import { isProposalReviewWorkingStateTarget, persistProposalReviewWorkingStatePatch } from './proposal-working-state';
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -414,14 +415,40 @@ export class KbCliLoopbackService {
           });
           return;
         }
-        const result = this.appWorkingStateService.patchForm({
+        const patchRequest: AppWorkingStatePatchRequest = {
           workspaceId,
           route: routeValue as AppWorkingStatePatchRequest['route'],
           entityType: entityTypeValue as AppWorkingStatePatchRequest['entityType'],
           entityId: entityIdValue,
           versionToken: typeof body.versionToken === 'string' ? body.versionToken : undefined,
           patch: patchValue as Record<string, unknown>
-        });
+        };
+        const previousSchema = isProposalReviewWorkingStateTarget(patchRequest)
+          ? this.appWorkingStateService.getFormSchema({
+              workspaceId,
+              route: patchRequest.route,
+              entityType: patchRequest.entityType,
+              entityId: patchRequest.entityId
+            })
+          : undefined;
+        const result = this.appWorkingStateService.patchForm(patchRequest);
+        if (result.ok && result.applied) {
+          try {
+            await persistProposalReviewWorkingStatePatch({
+              workspaceRepository: this.workspaceRepository,
+              appWorkingStateService: this.appWorkingStateService,
+              request: patchRequest,
+              response: result,
+              previousSchema
+            });
+          } catch (error) {
+            sendJson(response, 500, {
+              ok: false,
+              error: String((error as Error).message || error)
+            });
+            return;
+          }
+        }
         sendJson(response, result.ok ? 200 : 409, result);
         return;
       }

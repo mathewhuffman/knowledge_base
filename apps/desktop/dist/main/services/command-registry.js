@@ -21,6 +21,7 @@ const kb_cli_runtime_service_1 = require("./kb-cli-runtime-service");
 const ai_assistant_service_1 = require("./ai-assistant-service");
 const app_working_state_service_1 = require("./app-working-state-service");
 const batch_analysis_orchestrator_1 = require("./batch-analysis-orchestrator");
+const proposal_working_state_1 = require("./proposal-working-state");
 const RUNTIME_MODEL_CATALOG = [
     { provider: 'Anthropic', name: 'Claude 4 Sonnet', aliases: ['claude 4 sonnet', 'claude-sonnet-4', 'claude-4-sonnet'], costs: { inputUsdPerMillion: 3, cacheWriteUsdPerMillion: 3.75, cacheReadUsdPerMillion: 0.3, outputUsdPerMillion: 15 } },
     { provider: 'Anthropic', name: 'Claude 4 Sonnet 1M', aliases: ['claude 4 sonnet 1m', 'claude-sonnet-4-1m', 'claude-4-sonnet-1m'], costs: { inputUsdPerMillion: 6, cacheWriteUsdPerMillion: 7.5, cacheReadUsdPerMillion: 0.6, outputUsdPerMillion: 22.5 } },
@@ -3634,7 +3635,25 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (!input?.workspaceId || !input.route || !input.entityType || !input.entityId || !input.patch) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'app.workingState.patchForm requires workspaceId, route, entityType, entityId, and patch');
             }
-            return { ok: true, data: appWorkingStateService.patchForm(input) };
+            const previousSchema = (0, proposal_working_state_1.isProposalReviewWorkingStateTarget)(input)
+                ? appWorkingStateService.getFormSchema({
+                    workspaceId: input.workspaceId,
+                    route: input.route,
+                    entityType: input.entityType,
+                    entityId: input.entityId
+                })
+                : undefined;
+            const result = appWorkingStateService.patchForm(input);
+            if (result.ok && result.applied) {
+                await (0, proposal_working_state_1.persistProposalReviewWorkingStatePatch)({
+                    workspaceRepository,
+                    appWorkingStateService,
+                    request: input,
+                    response: result,
+                    previousSchema
+                });
+            }
+            return { ok: true, data: result };
         }
         catch (error) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));

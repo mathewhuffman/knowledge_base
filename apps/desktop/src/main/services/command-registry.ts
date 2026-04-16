@@ -138,6 +138,7 @@ import { KbCliRuntimeService } from './kb-cli-runtime-service';
 import { AiAssistantService } from './ai-assistant-service';
 import { AppWorkingStateService } from './app-working-state-service';
 import { BatchAnalysisOrchestrator, type BatchFinalReviewerProposalContext } from './batch-analysis-orchestrator';
+import { isProposalReviewWorkingStateTarget, persistProposalReviewWorkingStatePatch } from './proposal-working-state';
 
 interface RuntimeModelCatalogEntry {
   provider: string;
@@ -4162,7 +4163,25 @@ export function registerCoreCommands(
       if (!input?.workspaceId || !input.route || !input.entityType || !input.entityId || !input.patch) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'app.workingState.patchForm requires workspaceId, route, entityType, entityId, and patch');
       }
-      return { ok: true, data: appWorkingStateService.patchForm(input) };
+      const previousSchema = isProposalReviewWorkingStateTarget(input)
+        ? appWorkingStateService.getFormSchema({
+            workspaceId: input.workspaceId,
+            route: input.route,
+            entityType: input.entityType,
+            entityId: input.entityId
+          })
+        : undefined;
+      const result = appWorkingStateService.patchForm(input);
+      if (result.ok && result.applied) {
+        await persistProposalReviewWorkingStatePatch({
+          workspaceRepository,
+          appWorkingStateService,
+          request: input,
+          response: result,
+          previousSchema
+        });
+      }
+      return { ok: true, data: result };
     } catch (error) {
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
     }

@@ -643,6 +643,104 @@ test.describe('kb cli desktop services', () => {
     expect(cliPatch.data.appliedPatch.toneRules).toBe('Lead with the direct answer.');
   });
 
+  test('persists proposal review form patches through loopback and the kb shim', async () => {
+    const created = await repository.createWorkspace({
+      name: 'Proposal Patch Workspace',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us'],
+      path: path.join(workspaceRoot, 'workspace-proposal-patch')
+    });
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Proposal Patch Batch',
+      'proposal-patch.csv',
+      '/tmp/proposal-patch.csv',
+      'csv',
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 0
+      }
+    );
+
+    const proposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      targetTitle: 'Create & Edit Chat Channels',
+      targetLocale: 'en-us',
+      confidenceScore: 0.84,
+      rationaleSummary: 'Update the assignment flow for the dashboard release.',
+      aiNotes: 'Existing proposal notes.',
+      sourceHtml: '<h1>Create & Edit Chat Channels</h1><p>Old assignment flow.</p>',
+      proposedHtml: '<h1>Create & Edit Chat Channels</h1><p>Draft dashboard assignment flow.</p>'
+    });
+    const detail = await repository.getProposalReviewDetail(created.id, proposal.id);
+
+    appWorkingStateService.register({
+      workspaceId: created.id,
+      route: AppRoute.PROPOSAL_REVIEW,
+      entityType: 'proposal',
+      entityId: proposal.id,
+      versionToken: `seed:${proposal.id}`,
+      currentValues: {
+        html: detail.diff.afterHtml,
+        title: detail.proposal.targetTitle ?? '',
+        rationale: '',
+        rationaleSummary: detail.proposal.rationaleSummary ?? '',
+        aiNotes: detail.proposal.aiNotes ?? ''
+      }
+    });
+
+    cliRuntimeService.applyProcessEnv();
+    const env = {
+      ...process.env,
+      ...cliRuntimeService.getEnvironment()
+    };
+
+    const { stdout } = await execFileAsync('kb', [
+      'app',
+      'patch-form',
+      '--workspace-id',
+      created.id,
+      '--route',
+      AppRoute.PROPOSAL_REVIEW,
+      '--entity-type',
+      'proposal',
+      '--entity-id',
+      proposal.id,
+      '--patch',
+      JSON.stringify({
+        title: 'Create & Edit Chat Channels (Dashboard Update)',
+        rationaleSummary: 'Clarified the dashboard-specific assignment changes.',
+        aiNotes: 'Assistant tightened the rationale and refreshed the proposed copy.',
+        html: '<h1>Create & Edit Chat Channels (Dashboard Update)</h1><p>Updated dashboard assignment flow.</p>'
+      }),
+      '--json'
+    ], { env });
+    const cliPatch = JSON.parse(stdout) as {
+      ok: boolean;
+      data: {
+        applied: boolean;
+        currentValues?: { title?: string; rationaleSummary?: string; aiNotes?: string };
+      };
+    };
+
+    expect(cliPatch.ok).toBe(true);
+    expect(cliPatch.data.applied).toBe(true);
+    expect(cliPatch.data.currentValues?.title).toBe('Create & Edit Chat Channels (Dashboard Update)');
+
+    const refreshed = await repository.getProposalReviewDetail(created.id, proposal.id);
+    expect(refreshed.proposal.targetTitle).toBe('Create & Edit Chat Channels (Dashboard Update)');
+    expect(refreshed.proposal.rationaleSummary).toBe('Clarified the dashboard-specific assignment changes.');
+    expect(refreshed.proposal.aiNotes).toBe('Assistant tightened the rationale and refreshed the proposed copy.');
+    expect(refreshed.diff.afterHtml).toContain('Updated dashboard assignment flow.');
+  });
+
   test('rejects stale versions and unknown keys for form patches', async () => {
     const workspaceId = 'workspace-template-validation';
 

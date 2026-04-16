@@ -752,6 +752,7 @@ export const ProposalReview = () => {
     title?: string;
     rationale?: string;
     rationaleSummary?: string;
+    aiNotes?: string;
   } | null>(null);
   const [sourceEditorHtml, setSourceEditorHtml] = useState('');
   const [savedSourceHtml, setSavedSourceHtml] = useState('');
@@ -924,10 +925,11 @@ export const ProposalReview = () => {
       title: result.proposal.targetTitle,
       rationale: proposalWorkingCopy?.rationale,
       rationaleSummary: result.proposal.rationaleSummary,
+      aiNotes: proposalWorkingCopy?.aiNotes ?? result.proposal.aiNotes,
     });
     setSavedSourceHtml(nextHtml);
     setSourceEditorHtml(nextHtml);
-  }, [activeWorkspace, proposal?.id, sourceEditorHtml, mutateSaveWorkingCopy, proposalWorkingCopy?.rationale]);
+  }, [activeWorkspace, proposal?.id, sourceEditorHtml, mutateSaveWorkingCopy, proposalWorkingCopy?.aiNotes, proposalWorkingCopy?.rationale]);
 
   const handleRestoreSource = useCallback(() => {
     setSourceEditorHtml(savedSourceHtml);
@@ -1063,15 +1065,15 @@ export const ProposalReview = () => {
             title: proposalWorkingCopy?.title ?? proposal?.targetTitle ?? '',
             rationale: proposalWorkingCopy?.rationale ?? '',
             rationaleSummary: proposalWorkingCopy?.rationaleSummary ?? proposal?.rationaleSummary ?? '',
-            aiNotes: proposal?.aiNotes ?? ''
+            aiNotes: proposalWorkingCopy?.aiNotes ?? proposal?.aiNotes ?? ''
           }
         }) : 'proposal',
         payload: {
           html: workingHtml,
-          title: proposalWorkingCopy?.title ?? proposal?.targetTitle,
-          rationale: proposalWorkingCopy?.rationale,
-          aiNotes: proposal?.aiNotes,
-          rationaleSummary: proposalWorkingCopy?.rationaleSummary ?? proposal?.rationaleSummary
+          title: proposalWorkingCopy?.title ?? proposal?.targetTitle ?? '',
+          rationale: proposalWorkingCopy?.rationale ?? '',
+          aiNotes: proposalWorkingCopy?.aiNotes ?? proposal?.aiNotes ?? '',
+          rationaleSummary: proposalWorkingCopy?.rationaleSummary ?? proposal?.rationaleSummary ?? ''
         }
       },
       capabilities: {
@@ -1095,10 +1097,13 @@ export const ProposalReview = () => {
       setProposalWorkingCopy((prev) => ({
         html: typeof patch.html === 'string' ? patch.html : (prev?.html ?? workingHtml),
         title: typeof patch.title === 'string' ? patch.title : (prev?.title ?? proposal?.targetTitle),
-        rationale: typeof patch.rationale === 'string' ? patch.rationale : (prev?.rationale ?? proposal?.aiNotes),
+        rationale: typeof patch.rationale === 'string' ? patch.rationale : (prev?.rationale ?? ''),
         rationaleSummary: typeof patch.rationaleSummary === 'string'
           ? patch.rationaleSummary
-          : (prev?.rationaleSummary ?? proposal?.rationaleSummary)
+          : (prev?.rationaleSummary ?? proposal?.rationaleSummary),
+        aiNotes: typeof patch.aiNotes === 'string'
+          ? patch.aiNotes
+          : (prev?.aiNotes ?? proposal?.aiNotes)
       }));
     }
   });
@@ -1526,7 +1531,7 @@ export const ProposalReview = () => {
                   <ConfidenceCard score={proposal.confidenceScore} />
                   <AISummaryCard
                     rationaleSummary={proposalWorkingCopy?.rationaleSummary ?? proposal.rationaleSummary}
-                    aiNotes={proposalWorkingCopy?.rationale ?? proposal.aiNotes}
+                    aiNotes={proposalWorkingCopy?.aiNotes ?? proposalWorkingCopy?.rationale ?? proposal.aiNotes}
                   />
                   <PBIEvidenceCard pbis={relatedPbis} onSelectPBI={setSelectedPBI} />
                   <PlacementCard placement={proposal.suggestedPlacement} />

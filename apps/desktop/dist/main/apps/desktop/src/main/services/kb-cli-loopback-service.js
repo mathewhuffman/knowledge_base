@@ -8,6 +8,7 @@ const node_crypto_1 = require("node:crypto");
 const node_http_1 = __importDefault(require("node:http"));
 const node_url_1 = require("node:url");
 const shared_types_1 = require("@kb-vault/shared-types");
+const proposal_working_state_1 = require("./proposal-working-state");
 function sendJson(response, statusCode, payload) {
     response.writeHead(statusCode, {
         'content-type': 'application/json; charset=utf-8',
@@ -374,14 +375,41 @@ class KbCliLoopbackService {
                     });
                     return;
                 }
-                const result = this.appWorkingStateService.patchForm({
+                const patchRequest = {
                     workspaceId,
                     route: routeValue,
                     entityType: entityTypeValue,
                     entityId: entityIdValue,
                     versionToken: typeof body.versionToken === 'string' ? body.versionToken : undefined,
                     patch: patchValue
-                });
+                };
+                const previousSchema = (0, proposal_working_state_1.isProposalReviewWorkingStateTarget)(patchRequest)
+                    ? this.appWorkingStateService.getFormSchema({
+                        workspaceId,
+                        route: patchRequest.route,
+                        entityType: patchRequest.entityType,
+                        entityId: patchRequest.entityId
+                    })
+                    : undefined;
+                const result = this.appWorkingStateService.patchForm(patchRequest);
+                if (result.ok && result.applied) {
+                    try {
+                        await (0, proposal_working_state_1.persistProposalReviewWorkingStatePatch)({
+                            workspaceRepository: this.workspaceRepository,
+                            appWorkingStateService: this.appWorkingStateService,
+                            request: patchRequest,
+                            response: result,
+                            previousSchema
+                        });
+                    }
+                    catch (error) {
+                        sendJson(response, 500, {
+                            ok: false,
+                            error: String(error.message || error)
+                        });
+                        return;
+                    }
+                }
                 sendJson(response, result.ok ? 200 : 409, result);
                 return;
             }

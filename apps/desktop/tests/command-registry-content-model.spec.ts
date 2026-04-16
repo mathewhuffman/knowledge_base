@@ -1582,6 +1582,111 @@ test.describe('command registry content model transitions', () => {
     expect((decideResp.data as { revisionId?: string }).revisionId).toBeTruthy();
   });
 
+  test('persists proposal review app working state patches through the command bus', async () => {
+    const workspace = await createWorkspace();
+
+    const importResp = await bus.execute({
+      method: 'pbiBatch.import',
+      payload: {
+        workspaceId: workspace.id,
+        sourceFileName: 'proposal-patch.csv',
+        sourceContent: 'Id,Title,Description\n201,Dashboard Assignment,Refresh the dashboard assignment flow'
+      }
+    });
+    expect(importResp.ok).toBe(true);
+    const imported = importResp.data as { batch: { id: string } };
+
+    const ingestResp = await bus.execute({
+      method: 'proposal.ingest',
+      payload: {
+        workspaceId: workspace.id,
+        batchId: imported.batch.id,
+        action: 'edit',
+        targetTitle: 'Create & Edit Chat Channels',
+        targetLocale: 'en-us',
+        confidenceScore: 0.77,
+        rationaleSummary: 'Refresh the assignment steps for the dashboard release.',
+        aiNotes: 'Initial AI notes.',
+        sourceHtml: '<h1>Create & Edit Chat Channels</h1><p>Old assignment flow.</p>',
+        proposedHtml: '<h1>Create & Edit Chat Channels</h1><p>Draft updated assignment flow.</p>'
+      }
+    });
+    expect(ingestResp.ok).toBe(true);
+    const proposal = ingestResp.data as { id: string };
+
+    const detailResp = await bus.execute({
+      method: 'proposal.review.get',
+      payload: {
+        workspaceId: workspace.id,
+        proposalId: proposal.id
+      }
+    });
+    expect(detailResp.ok).toBe(true);
+    const detailData = detailResp.data as {
+      proposal: { targetTitle?: string; rationaleSummary?: string; aiNotes?: string };
+      diff: { afterHtml: string };
+    };
+
+    const registerResp = await bus.execute({
+      method: 'app.workingState.register',
+      payload: {
+        workspaceId: workspace.id,
+        route: AppRoute.PROPOSAL_REVIEW,
+        entityType: 'proposal',
+        entityId: proposal.id,
+        versionToken: `seed:${proposal.id}`,
+        currentValues: {
+          html: detailData.diff.afterHtml,
+          title: detailData.proposal.targetTitle ?? '',
+          rationale: '',
+          rationaleSummary: detailData.proposal.rationaleSummary ?? '',
+          aiNotes: detailData.proposal.aiNotes ?? ''
+        }
+      }
+    });
+    expect(registerResp.ok).toBe(true);
+
+    const patchResp = await bus.execute({
+      method: 'app.workingState.patchForm',
+      payload: {
+        workspaceId: workspace.id,
+        route: AppRoute.PROPOSAL_REVIEW,
+        entityType: 'proposal',
+        entityId: proposal.id,
+        patch: {
+          title: 'Create & Edit Chat Channels (Patched)',
+          rationaleSummary: 'Bus patch persisted the refined rationale.',
+          aiNotes: 'Bus patch refined the proposal copy.',
+          html: '<h1>Create & Edit Chat Channels (Patched)</h1><p>Patched from the proposal review working state.</p>'
+        }
+      }
+    });
+    expect(patchResp.ok).toBe(true);
+    const patchData = patchResp.data as {
+      applied: boolean;
+      currentValues?: { title?: string };
+    };
+    expect(patchData.applied).toBe(true);
+    expect(patchData.currentValues?.title).toBe('Create & Edit Chat Channels (Patched)');
+
+    const refreshedResp = await bus.execute({
+      method: 'proposal.review.get',
+      payload: {
+        workspaceId: workspace.id,
+        proposalId: proposal.id
+      }
+    });
+    expect(refreshedResp.ok).toBe(true);
+    const refreshed = refreshedResp.data as {
+      proposal: { targetTitle?: string; rationaleSummary?: string; aiNotes?: string };
+      diff: { afterHtml: string };
+    };
+    expect(refreshed.proposal.targetTitle).toBe('Create & Edit Chat Channels (Patched)');
+    expect(refreshed.proposal.rationaleSummary).toBe('Bus patch persisted the refined rationale.');
+    expect(refreshed.proposal.aiNotes).toBe('Bus patch refined the proposal copy.');
+    expect(refreshed.diff.afterHtml).toContain('Patched from the proposal review working state.');
+  });
+
   test('supports batch 8 draft branch commands end to end', async () => {
     const workspace = await createWorkspace();
 
