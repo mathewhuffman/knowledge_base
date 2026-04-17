@@ -1,10 +1,30 @@
 import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir } from 'node:fs/promises';
 import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { ChildProcess, spawn } from 'node:child_process';
 import { McpToolServer } from '@kb-vault/mcp-server';
+import {
+  MCP_GET_ARTICLE_FAMILY_INPUT_SCHEMA,
+  MCP_GET_ARTICLE_HISTORY_INPUT_SCHEMA,
+  MCP_GET_ARTICLE_INPUT_SCHEMA,
+  MCP_GET_BATCH_CONTEXT_INPUT_SCHEMA,
+  MCP_GET_LOCALE_VARIANT_INPUT_SCHEMA,
+  MCP_GET_PBI_INPUT_SCHEMA,
+  MCP_GET_PBI_SUBSET_INPUT_SCHEMA,
+  MCP_GET_TEMPLATE_INPUT_SCHEMA,
+  MCP_LIST_ARTICLE_TEMPLATES_INPUT_SCHEMA,
+  MCP_LIST_CATEGORIES_INPUT_SCHEMA,
+  MCP_LIST_SECTIONS_INPUT_SCHEMA,
+  MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA,
+  MCP_SEARCH_KB_INPUT_SCHEMA,
+  MCP_FIND_RELATED_ARTICLES_INPUT_SCHEMA,
+  MCP_APP_GET_FORM_SCHEMA_INPUT_SCHEMA,
+  MCP_APP_PATCH_FORM_INPUT_SCHEMA
+} from '@kb-vault/shared-types';
 import type {
   AgentArticleEditRunRequest,
   AgentAnalysisRunRequest,
@@ -24,6 +44,9 @@ import type {
   AgentRunResult,
   AgentSessionMode,
   KbAccessMode,
+  MCPSearchKbInput,
+  MCPAppGetFormSchemaInput,
+  MCPAppPatchFormInput,
   MCPGetArticleFamilyInput,
   MCPGetArticleInput,
   MCPGetArticleHistoryInput,
@@ -51,9 +74,11 @@ const DEFAULT_CURSOR_ARGS = ['agent', 'acp'];
 const DEFAULT_CLI_BINARY = 'kb';
 const ACP_HEALTH_INIT_TIMEOUT_MS = 15_000;
 const ACP_HEALTH_INIT_ATTEMPTS = 2;
+const MCP_BRIDGE_HEALTH_TIMEOUT_MS = 2_000;
 const ACP_SESSION_READY_WAIT_MS = 1_200;
 const ACP_SESSION_NOT_FOUND_RETRY_LIMIT = 4;
 const ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT = 2;
+const KB_VAULT_MCP_SERVER_NAME = 'kb-vault';
 type AssistantCompletionState = 'completed' | 'researching' | 'needs_user_input' | 'blocked' | 'errored' | 'unknown';
 type AgentRunResultWithAcpSession = AgentRunResult & { acpSessionId?: string };
 type AgentRunRequestWithReusePolicy =
@@ -236,6 +261,101 @@ function isCliTerminalToolName(value: string | undefined): boolean {
   return normalized === 'terminal' || normalized === 'shell';
 }
 
+const ALLOWED_MCP_TOOL_NAMES = new Set([
+  'get_batch_context',
+  'get_pbi_subset',
+  'get_pbi',
+  'get_article',
+  'get_article_family',
+  'get_locale_variant',
+  'get_article_history',
+  'find_related_articles',
+  'search_kb',
+  'list_categories',
+  'list_sections',
+  'list_article_templates',
+  'get_template',
+  'app_get_form_schema',
+  'app_patch_form',
+  'propose_create_kb',
+  'propose_edit_kb',
+  'propose_retire_kb',
+  'record_agent_notes'
+]);
+
+const BLOCKED_MCP_RESOURCE_TOOL_NAMES = new Set([
+  'list_mcp_resources',
+  'fetch_mcp_resource'
+]);
+
+const BLOCKED_GENERIC_TOOL_NAMES = new Set([
+  'read_file',
+  'grep',
+  'glob',
+  'find',
+  'fetch',
+  'task',
+  'codebase_search',
+  'semantic_search',
+  'semanticsearch',
+  'web_search',
+  'websearch'
+]);
+
+function extractAssistantNamedTool(rawValue: unknown): string | undefined {
+  if (!rawValue || typeof rawValue !== 'object') {
+    return undefined;
+  }
+
+  const record = rawValue as Record<string, unknown>;
+  const explicitKeys = ['toolName', 'tool', 'commandName', 'name', 'title'] as const;
+  for (const key of explicitKeys) {
+    const candidate = typeof record[key] === 'string' ? record[key].trim() : '';
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeAssistantToolPolicyName(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  return trimmed
+    .toLowerCase()
+    .replace(/[`"']/g, '')
+    .replace(/^kb[-_]?vault[.:/]/, '')
+    .replace(/^mcp[.:/]/, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^list mcp resources$/, 'list_mcp_resources')
+    .replace(/^fetch mcp resource$/, 'fetch_mcp_resource')
+    .replace(/^read file$/, 'read_file')
+    .replace(/^codebase search$/, 'codebase_search')
+    .replace(/^semantic search$/, 'semantic_search')
+    .replace(/^web search$/, 'web_search')
+    .replace(/^unknown tool$/, 'unknown_tool')
+    .replace(/[ -]+/g, '_');
+}
+
+function selectAssistantToolPolicyLabel(update: {
+  title?: string;
+  kind?: string;
+  rawInput?: unknown;
+  rawOutput?: unknown;
+} | undefined): string | undefined {
+  return update?.title?.trim()
+    || extractAssistantNamedTool(update?.rawInput)
+    || extractAssistantNamedTool(update?.rawOutput)
+    || extractCliToolCommand(update?.rawInput)
+    || extractCliToolCommandFromRawOutput(update?.rawOutput)
+    || update?.kind?.trim()
+    || undefined;
+}
+
 function shouldDeferCliToolPolicyCheck(update: {
   sessionUpdate?: string;
   title?: string;
@@ -262,6 +382,32 @@ function shouldDeferCliToolPolicyCheck(update: {
     || normalizedKind === 'shell';
 
   if (!isPlaceholderTerminal) {
+    return false;
+  }
+
+  return (
+    update.sessionUpdate === 'tool_call'
+    && (!normalizedStatus || normalizedStatus === 'pending')
+  );
+}
+
+function shouldDeferMcpToolPolicyCheck(update: {
+  sessionUpdate?: string;
+  title?: string;
+  kind?: string;
+  status?: string;
+  rawInput?: unknown;
+  rawOutput?: unknown;
+} | undefined): boolean {
+  if (!update) {
+    return false;
+  }
+
+  const normalizedStatus = update.status?.trim().toLowerCase() ?? '';
+  const label = selectAssistantToolPolicyLabel(update);
+  const normalizedLabel = normalizeAssistantToolPolicyName(label);
+
+  if (normalizedLabel && normalizedLabel !== 'unknown_tool') {
     return false;
   }
 
@@ -324,10 +470,24 @@ function isRetriablePromptError(error: { message?: string; data?: unknown } | un
   return message === 'internal error';
 }
 
-function isCliToolPolicyViolationError(error: unknown): boolean {
+function detectAssistantToolPolicyViolationMode(error: unknown): KbAccessMode | null {
   const message = error instanceof Error ? error.message : String(error);
   const normalized = message.trim().toLowerCase();
-  return normalized.includes('cli mode forbids');
+  if (normalized.includes('cli mode blocked illegal tool call') || normalized.includes('cli mode forbids')) {
+    return 'cli';
+  }
+  if (
+    normalized.includes('mcp mode blocked illegal tool call')
+    || normalized.includes('mcp mode forbids')
+    || normalized.includes('mcp mode only allows')
+  ) {
+    return 'mcp';
+  }
+  return null;
+}
+
+function isAssistantToolPolicyViolationError(error: unknown): boolean {
+  return detectAssistantToolPolicyViolationMode(error) !== null;
 }
 
 function looksLikeAssistantProgressText(value: string | undefined): boolean {
@@ -339,6 +499,12 @@ function looksLikeAssistantProgressText(value: string | undefined): boolean {
   return (
     /^(gathering|checking|looking|researching|reviewing|investigating|loading|searching|finding)\b/.test(normalized)
     || /^i(?:'m| am) (gathering|checking|looking|researching|reviewing|investigating|finding)\b/.test(normalized)
+    || /^i need to (fetch|get|load|look up|retrieve|read|inspect|pull|call)\b/.test(normalized)
+    || /^need to (fetch|get|load|look up|retrieve|read|inspect|pull|call)\b/.test(normalized)
+    || /^first[, ]+i need to\b/.test(normalized)
+    || normalized.includes('before i can draft the proposal')
+    || normalized.includes('before drafting the proposal')
+    || normalized.includes('before i can answer')
     || normalized.includes('returning only the structured json')
     || normalized.includes('return the final answer')
     || normalized.includes('using the cli and then returning')
@@ -614,6 +780,7 @@ type MCPToolHandler = (input: unknown, context: ScopedToolContext, log: Transcri
 interface MCPToolImplementation {
   description: string;
   handler: MCPToolHandler;
+  inputSchema?: unknown;
   requiresScope?: true;
 }
 
@@ -683,6 +850,17 @@ function buildBatchAnalysisPhaseGuidance(providerLabel: 'MCP' | 'CLI'): string {
   ].join('\n');
 }
 
+function buildAssistantChatContinuePrompt(mode: KbAccessMode): string {
+  return [
+    'Complete the same user request using the existing session context.',
+    'Return the final user-facing answer now.',
+    'Do not send a progress update.',
+    mode === 'mcp'
+      ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
+      : 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
+  ].join(' ');
+}
+
 function buildMcpTaskPrompt(
   session: AgentSessionRecord,
   taskPayload: Record<string, unknown>,
@@ -698,13 +876,13 @@ function buildMcpTaskPrompt(
   const role = session.role ?? 'worker';
   const mcpGuidance = [
     'KB Vault MCP guidance:',
-    '- Use only these exact KB Vault MCP tool names when needed: get_batch_context, get_pbi_subset, get_pbi, get_article, get_article_family, get_locale_variant, get_article_history, find_related_articles, search_kb, list_article_templates, get_template, propose_create_kb, propose_edit_kb, propose_retire_kb, record_agent_notes.',
-    '- list_mcp_resources may return empty even when KB Vault MCP tools are available. KB Vault may expose tools without exposing MCP resources.',
-    '- Do NOT conclude KB Vault MCP is unavailable just because list_mcp_resources returns no resources.',
-    '- Do not use list_mcp_resources as the availability check for KB Vault. Call KB Vault tools directly.',
+    '- Use only these exact KB Vault MCP tool names when needed: get_batch_context, get_pbi_subset, get_pbi, get_article, get_article_family, get_locale_variant, get_article_history, find_related_articles, search_kb, list_article_templates, get_template, app_get_form_schema, app_patch_form, propose_create_kb, propose_edit_kb, propose_retire_kb, record_agent_notes.',
+    '- Do not use list_mcp_resources or fetch_mcp_resource for KB Vault work in MCP mode.',
+    '- Do not claim KB Vault MCP tools are unavailable because they are not shown in a generic tool picker or tool list. If they are named here, call them directly.',
     '- To inspect the imported batch, call get_batch_context first.',
     '- To read the uploaded PBI rows, call get_pbi_subset for the batch or get_pbi for a single record.',
     '- To read KB article contents, use get_article with a localeVariantId or revisionId from the article directory listing below.',
+    '- If the prompt already gives you a localeVariantId or revisionId for the current article, call get_article directly with that identifier instead of treating the article HTML as unavailable.',
     '- To understand an article family before reading content, use get_article_family and get_locale_variant.',
     '- If the batch implies KB changes, you must persist structured proposals with propose_create_kb, propose_edit_kb, and/or propose_retire_kb instead of only describing them in prose.',
     '- Use propose_create_kb for net-new KB coverage, propose_edit_kb for updates to existing KB content, and propose_retire_kb for content that should be retired or replaced.',
@@ -835,21 +1013,29 @@ function buildMcpTaskPrompt(
       '',
       'Your job:',
       '- Answer the user\'s actual request.',
-      '- When workspace knowledge is needed, use the minimum KB lookups required to answer accurately.',
-      '- For feature, workflow, or terminology questions about the app, default to this sequence: `search-kb` for the topic, `get-article` for the best 1-3 hits, then answer clearly in plain English.',
+      '- When workspace knowledge is needed, use the minimum KB Vault MCP tool lookups required to answer accurately.',
+      '- For feature, workflow, or terminology questions about the app, default to this sequence: `search_kb` for the topic, `get_article` for the best 1-3 hits, then answer clearly in plain English.',
       '',
       'Tool rules:',
       '- Use KB Vault tools and structured article/template data only when they help answer the user.',
-      '- Do NOT use terminal, grep, codebase search, find, or filesystem exploration unless explicitly requested.',
-      '- Do NOT use shell or terminal for anything except running `kb` commands.',
+      '- Do NOT use terminal, shell, grep, codebase search, find, filesystem exploration, list_mcp_resources, or fetch_mcp_resource.',
       '- Do not use tools just to discover what tools exist or to explore the environment.',
-      '- Do not use `batch-context`, `find-related-articles`, proposal commands, or form-editing commands unless the current route or user request clearly requires them.',
-      '- Do not use `kb help` unless a needed KB command is genuinely unclear and you cannot proceed with `search-kb` plus `get-article`.',
+      '- Do not use kb CLI commands in MCP mode.',
+      '- Do not use `get_batch_context`, `find_related_articles`, proposal tools, or app mutation tools unless the current route or user request clearly requires them.',
       '- The preloaded prompt context is for orientation; use KB Vault MCP tools directly when you need to confirm or inspect source records.',
       '- Return only valid JSON in your final answer.',
       '- Do not include preamble, commentary about your reasoning, or markdown fences.',
       '- For informational chat, return only `artifactType` and `response`. Omit `summary`, `html`, `formPatch`, and `payload` unless they are needed.',
-      '- Only return `proposal_candidate` when the user explicitly asks you to make or propose changes.',
+      '- In Proposal Review, prefer returning `command="patch_proposal"` with `artifactType="proposal_patch"` so the current proposal can be updated directly.',
+      '- For narrow Proposal Review changes, prefer targeted `payload.htmlMutations` anchored to exact existing HTML fragments.',
+      '- Use `payload.lineEdits` only when you truly have stable line numbers for the current working copy.',
+      '- For Templates & Prompts and other live form edits, use `app_get_form_schema` first when needed, then use `app_patch_form`.',
+      '- Only return `proposal_candidate` when the user explicitly asks you to make or propose changes outside Proposal Review.',
+      '- When the user asks for an article proposal or article edit outside Proposal Review, fetch the current article with `get_article` before drafting the proposal if the full HTML is not already present.',
+      '- For narrow article proposal changes, prefer targeted `payload.htmlMutations` anchored to exact existing HTML fragments.',
+      '- If you use `payload.htmlMutations`, the app will materialize the final article HTML locally.',
+      '- For broad rewrites, return the full final article HTML in `html` or `payload.proposedHtml`.',
+      '- Do not use line edits for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
       '- Do not stop on a progress update. If you started researching, finish the lookup and answer the user in the same turn whenever possible.',
       '',
       mcpGuidance,
@@ -882,11 +1068,12 @@ function buildCliTaskPrompt(
   const cliGuidance = [
     'KB Vault CLI guidance:',
     '- Use only the `kb` CLI and data returned by its JSON output.',
-    '- Use the terminal only for `kb` commands, except for minimal temporary-file creation needed to pass large proposal metadata via `--metadata-file`.',
+    '- Use the terminal only for exact `kb` commands, except for minimal temporary-file creation needed to pass large proposal metadata via `--metadata-file`.',
     '- Always include `--json` in every `kb` command.',
     '- Use as many `kb` commands as needed to complete the task.',
     '- Do NOT use Read File.',
     '- Do NOT use grep.',
+    '- Do NOT use KB Vault MCP tools, list_mcp_resources, or fetch_mcp_resource in CLI mode.',
     '- If an exact `kb` command is unavailable, call `kb --help` to confirm current syntax.',
     '- If you need KB evidence, prefer direct `kb` output over local inference.',
     '- The prompt already includes a preloaded batch context summary. Only call `kb batch-context` if that preloaded context is insufficient or you must re-check the imported rows.',
@@ -1025,10 +1212,10 @@ function buildCliTaskPrompt(
     const chatCliGuidance = [
       'KB command rules for chat:',
       '- When research or data lookup is needed, use only `kb` commands.',
-      '- Never use terminal commands like grep, Read File, codebase search, or general filesystem exploration.',
-      '- If the runtime exposes direct KB tools such as `search-kb` and `get-article`, prefer those over Shell or Terminal.',
-      '- If the runtime only exposes Shell or Terminal, you may use it only for exact `kb` CLI commands. Generic terminal usage will be blocked.',
-      '- Default research workflow for app-feature questions: use `search-kb`, then `get-article` for the best 1-3 hits, then answer.',
+      '- Never use terminal commands like grep, Read File, codebase search, general filesystem exploration, list_mcp_resources, or fetch_mcp_resource.',
+      '- Do not call direct MCP tool names such as `search_kb` or `get_article` in CLI mode. Use only exact `kb` CLI commands.',
+      '- If the runtime exposes Shell or Terminal, you may use it only for exact `kb` CLI commands. Generic terminal usage will be blocked.',
+      '- Default research workflow for app-feature questions: use `kb search-kb`, then `kb get-article` for the best 1-3 hits, then answer.',
       '- Use `kb get-article-family` only when one article is clearly relevant but you need related variants or family context.',
       '- Use `kb batch-context`, `kb find-related-articles`, `kb app get-form-schema`, and `kb app patch-form` only when the route or the user\'s request clearly calls for batch review, proposal review, or live form editing.',
       '- Use `kb help --json` only if a needed KB command is genuinely unclear. Do not spend the turn exploring command syntax when `search-kb` plus `get-article` will answer the question.',
@@ -1046,12 +1233,18 @@ function buildCliTaskPrompt(
       '- The default lookup path for app questions is: search the topic, open the best 1-3 matching articles, synthesize the answer, stop.',
       '- If the user explicitly asks you to research, investigate, look something up, or answer from workspace data, do that research now and return the final findings in the same turn.',
       '- Never use generic terminal commands. When tool use is needed, use only exact `kb` commands.',
-      '- If direct KB tools are available, prefer those. If the runtime only exposes Shell or Terminal, it may be used only for exact `kb` CLI commands.',
+      '- Do not call direct MCP tool names in CLI mode. Use only exact `kb` CLI commands when tool use is required.',
       '- Do not use tools just to figure out what you should do next.',
       '- Avoid `batch-context`, `find-related-articles`, proposal commands, and form-editing commands unless the route or user request clearly requires them.',
       '- Do not call `kb help` unless command syntax is genuinely blocking progress.',
       '- Do not include preamble, commentary about your reasoning, or markdown fences.',
       '- Follow the output contract in the additional instructions below exactly.',
+      '- In Proposal Review, prefer returning `command="patch_proposal"` with `artifactType="proposal_patch"` so the current proposal can be updated directly.',
+      '- For narrow Proposal Review changes, prefer targeted `payload.htmlMutations` anchored to exact existing HTML fragments.',
+      '- Use `payload.lineEdits` only when you truly have stable line numbers for the current working copy.',
+      '- For article proposal requests outside Proposal Review, prefer targeted `payload.htmlMutations` for narrow changes and full `html` or `payload.proposedHtml` only for broad rewrites.',
+      '- If you use `payload.htmlMutations`, the app will materialize the final article HTML locally.',
+      '- For Templates & Prompts and other live form edits, use `kb app get-form-schema` first when needed, then use `kb app patch-form`.',
       '- Do not stop on a progress update. If you begin researching, finish and answer unless you are truly blocked or need user input.',
       '',
       chatCliGuidance,
@@ -1069,16 +1262,18 @@ function buildCliTaskPrompt(
 }
 
 export interface AgentRuntimeToolContext {
-  searchKb: (input: MCPFindRelatedArticlesInput & { workspaceId: string }) => Promise<unknown>;
+  searchKb: (input: MCPSearchKbInput) => Promise<unknown>;
   getExplorerTree: (workspaceId: string) => Promise<ExplorerNode[]>;
   getArticle: (input: MCPGetArticleInput) => Promise<unknown>;
   getArticleFamily: (input: MCPGetArticleFamilyInput) => Promise<unknown>;
   getLocaleVariant: (input: MCPGetLocaleVariantInput) => Promise<unknown>;
+  getAppFormSchema: (input: MCPAppGetFormSchemaInput) => Promise<unknown>;
+  patchAppForm: (input: MCPAppPatchFormInput) => Promise<unknown>;
   findRelatedArticles: (input: MCPFindRelatedArticlesInput) => Promise<unknown>;
   listCategories: (input: MCPListCategoriesInput) => Promise<unknown>;
   listSections: (input: MCPListSectionsInput) => Promise<unknown>;
   listArticleTemplates: (input: MCPListArticleTemplatesInput) => Promise<unknown>;
-  getTemplate: (input: MCPListArticleTemplatesInput & { templatePackId: string }) => Promise<unknown>;
+  getTemplate: (input: MCPGetTemplateInput) => Promise<unknown>;
   getBatchContext: (input: MCPGetBatchContextInput) => Promise<unknown>;
   getPBI: (input: MCPGetPBIInput) => Promise<unknown>;
   getPBISubset: (input: MCPGetPBISubsetInput) => Promise<unknown>;
@@ -1137,6 +1332,322 @@ function buildBridgeMcpServerConfig(): AcpMcpServerConfig[] {
       ]
     }
   ];
+}
+
+interface ResolvedMcpBridgeConfig {
+  configured: boolean;
+  serverName?: string;
+  command?: string;
+  scriptPath?: string;
+  socketPath?: string;
+}
+
+interface McpBridgeToolProbeResult {
+  reachable: boolean;
+  toolNames: string[];
+  error?: string;
+}
+
+interface AcpMcpAttachmentProbeResult {
+  attached: boolean;
+  touchedMethods: string[];
+  error?: string;
+}
+
+function extractMcpServerEnvValue(config: AcpMcpServerConfig | undefined, name: string): string | undefined {
+  if (!config) {
+    return undefined;
+  }
+
+  const env = config.env;
+  if (Array.isArray(env)) {
+    const entry = env.find((candidate) =>
+      candidate
+      && typeof candidate === 'object'
+      && typeof (candidate as { name?: unknown }).name === 'string'
+      && (candidate as { name: string }).name === name
+    ) as { value?: unknown } | undefined;
+    return typeof entry?.value === 'string' && entry.value.trim() ? entry.value.trim() : undefined;
+  }
+
+  if (env && typeof env === 'object') {
+    const value = (env as Record<string, unknown>)[name];
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  }
+
+  return undefined;
+}
+
+function resolveMcpBridgeConfig(mcpServers: AcpMcpServerConfig[]): ResolvedMcpBridgeConfig {
+  const namedServer = mcpServers.find((entry) => {
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    return name === KB_VAULT_MCP_SERVER_NAME;
+  });
+  const fallbackServer = mcpServers.find((entry) => Boolean(extractMcpServerEnvValue(entry, 'KBV_MCP_BRIDGE_SOCKET_PATH')));
+  const server = namedServer ?? fallbackServer;
+  const command = typeof server?.command === 'string' && server.command.trim() ? server.command.trim() : undefined;
+  const args = Array.isArray(server?.args)
+    ? server.args.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    : [];
+  const scriptPath = args[0] ?? process.env.KBV_MCP_BRIDGE_SCRIPT?.trim();
+  const socketPath =
+    extractMcpServerEnvValue(server, 'KBV_MCP_BRIDGE_SOCKET_PATH')
+    ?? process.env.KBV_MCP_BRIDGE_SOCKET_PATH?.trim();
+  const serverName = typeof server?.name === 'string' && server.name.trim() ? server.name.trim() : undefined;
+
+  return {
+    configured: Boolean(server && command && scriptPath && socketPath),
+    serverName,
+    command,
+    scriptPath,
+    socketPath
+  };
+}
+
+async function probeMcpBridgeToolList(socketPath: string, timeoutMs = MCP_BRIDGE_HEALTH_TIMEOUT_MS): Promise<McpBridgeToolProbeResult> {
+  return new Promise<McpBridgeToolProbeResult>((resolve) => {
+    let settled = false;
+    let buffer = '';
+    const socket = net.createConnection(socketPath);
+
+    const finish = (result: McpBridgeToolProbeResult) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      finish({
+        reachable: false,
+        toolNames: [],
+        error: `Timed out waiting for MCP bridge response after ${timeoutMs}ms`
+      });
+    }, timeoutMs);
+
+    socket.once('connect', () => {
+      socket.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'mcp-health', method: 'tools/list' })}\n`);
+    });
+
+    socket.on('data', (chunk: Buffer | string) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines.map((entry) => entry.trim()).filter(Boolean)) {
+        try {
+          const response = JSON.parse(line) as {
+            result?: { tools?: Array<{ name?: unknown }> };
+            error?: { message?: unknown };
+          };
+          if (response.error) {
+            finish({
+              reachable: false,
+              toolNames: [],
+              error: typeof response.error.message === 'string' ? response.error.message : 'MCP bridge returned an error'
+            });
+            return;
+          }
+          const tools = Array.isArray(response.result?.tools)
+            ? response.result.tools
+                .map((tool) => (typeof tool?.name === 'string' ? tool.name.trim() : ''))
+                .filter(Boolean)
+            : [];
+          finish({ reachable: true, toolNames: tools });
+          return;
+        } catch (error) {
+          finish({
+            reachable: false,
+            toolNames: [],
+            error: error instanceof Error ? error.message : String(error)
+          });
+          return;
+        }
+      }
+    });
+
+    socket.once('error', (error) => {
+      finish({
+        reachable: false,
+        toolNames: [],
+        error: error.message
+      });
+    });
+
+    socket.once('close', () => {
+      if (!settled) {
+        finish({
+          reachable: false,
+          toolNames: [],
+          error: 'MCP bridge connection closed before returning health data'
+        });
+      }
+    });
+  });
+}
+
+function buildTempMcpProbeSocketPath(): string {
+  if (process.platform === 'win32') {
+    return `\\\\.\\pipe\\kb-vault-mcp-health-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  return path.join(
+    os.tmpdir(),
+    `kb-vault-mcp-health-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`
+  );
+}
+
+async function probeAcpMcpAttachment(input: {
+  binary: string;
+  args: string[];
+  cwd: string;
+  bridgeCommand: string;
+  bridgeScriptPath: string;
+  timeoutMs?: number;
+}): Promise<AcpMcpAttachmentProbeResult> {
+  const timeoutMs = Math.max(2_000, input.timeoutMs ?? 6_000);
+  const socketPath = buildTempMcpProbeSocketPath();
+  const touchedMethods: string[] = [];
+  const mcpServer = new McpToolServer();
+  mcpServer.registerTool(
+    'kbv_health_check',
+    'Health check tool for verifying ACP MCP attachment.',
+    async () => ({ ok: true, connected: true }),
+    {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
+  );
+
+  const server = net.createServer((socket) => {
+    let buffer = '';
+    socket.on('data', async (chunk: Buffer | string) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines.map((entry) => entry.trim()).filter(Boolean)) {
+        try {
+          const message = JSON.parse(line) as { method?: unknown };
+          if (typeof message.method === 'string' && message.method.trim()) {
+            touchedMethods.push(message.method.trim());
+          }
+          const response = await mcpServer.handleJsonMessage(message as Record<string, unknown>);
+          if (response) {
+            socket.write(`${response}\n`);
+          }
+        } catch {
+          socket.write(`${JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32700,
+              message: 'Parse error'
+            }
+          })}\n`);
+        }
+      }
+    });
+  });
+
+  const cleanupSocket = async () => {
+    if (process.platform !== 'win32' && fs.existsSync(socketPath)) {
+      try {
+        fs.unlinkSync(socketPath);
+      } catch {
+        // Best effort cleanup for probe sockets.
+      }
+    }
+  };
+
+  const closeServer = async () => {
+    if (!server.listening) {
+      await cleanupSocket();
+      return;
+    }
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await cleanupSocket();
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+
+  const transport = new CursorTransport(
+    input.binary,
+    input.args,
+    input.cwd,
+    false,
+    () => undefined
+  );
+
+  try {
+    const initialized = await transport.ensureInitialized(timeoutMs);
+    if (!initialized) {
+      return {
+        attached: false,
+        touchedMethods: [],
+        error: 'Cursor ACP initialize failed during MCP attachment probe'
+      };
+    }
+
+    const response = await transport.request(
+      'session/new',
+      {
+        cwd: input.cwd,
+        mcpServers: [
+          {
+            type: 'stdio',
+            name: 'kb-vault-health-probe',
+            command: input.bridgeCommand,
+            args: [input.bridgeScriptPath],
+            env: [
+              {
+                name: 'KBV_MCP_BRIDGE_SOCKET_PATH',
+                value: socketPath
+              }
+            ]
+          }
+        ],
+        config: { mode: 'plan' }
+      },
+      timeoutMs,
+      `mcp-health:${Date.now()}`
+    );
+
+    if (response.error) {
+      return {
+        attached: false,
+        touchedMethods: [],
+        error: response.error.message
+      };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, Math.min(1_500, timeoutMs)));
+    const uniqueMethods = Array.from(new Set(touchedMethods));
+    return {
+      attached: uniqueMethods.length > 0,
+      touchedMethods: uniqueMethods,
+      error: uniqueMethods.length > 0 ? undefined : 'Cursor ACP session never contacted the attached MCP server'
+    };
+  } catch (error) {
+    return {
+      attached: false,
+      touchedMethods: [],
+      error: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    await transport.stop().catch(() => undefined);
+    await closeServer().catch(() => undefined);
+  }
 }
 
 class CursorTransport {
@@ -1516,7 +2027,7 @@ export class CursorAcpRuntime {
   private readonly sessionActivityAt = new Map<string, number>();
   private readonly promptTransportActivityAt = new Map<string, number>();
   private readonly transcriptLineSequences = new Map<string, number>();
-  private readonly auditedCliToolCallIds = new Map<string, Set<string>>();
+  private readonly auditedAssistantToolCallIds = new Map<string, Set<string>>();
   private readonly activePromptStates = new Map<string, {
     task: string;
     role?: string;
@@ -1981,7 +2492,7 @@ export class CursorAcpRuntime {
       workspaceId: input.workspaceId,
       kbAccessMode: input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
       type: input.type,
-      mode: input.mode ?? (input.type === 'assistant_chat' ? 'ask' : 'agent'),
+      mode: input.mode ?? 'agent',
       role: input.role,
       status: 'idle',
       batchId: input.batchId,
@@ -2537,11 +3048,12 @@ export class CursorAcpRuntime {
           );
         } catch (error) {
           const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
+          const violationMode = detectAssistantToolPolicyViolationMode(error);
           const canRecoverFromToolPolicy =
             !isCancelled()
             && attempt < ASSISTANT_CHAT_RECOVERY_RETRY_LIMIT
             && remainingWaitMs >= 1_000
-            && isCliToolPolicyViolationError(error);
+            && violationMode !== null;
           if (!canRecoverFromToolPolicy) {
             throw error;
           }
@@ -2550,13 +3062,17 @@ export class CursorAcpRuntime {
           const policyError = error instanceof Error ? error.message : String(error);
           nextPrompt = buildAssistantChatContinuationPrompt(
             promptSeed || nextPrompt,
-            buildAssistantChatKbOnlyRecoveryPrompt(policyError)
+            buildAssistantChatToolRecoveryPrompt(
+              violationMode ?? (session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE),
+              policyError
+            )
           );
-          rawOutput.push(`[assistant-chat kb-only recovery ${attempt}] ${policyError}`);
-          this.log('agent.runtime.assistant_chat_kb_only_retry', {
+          rawOutput.push(`[assistant-chat tool-policy recovery ${attempt}] ${policyError}`);
+          this.log('agent.runtime.assistant_chat_tool_policy_retry', {
             workspaceId: request.workspaceId,
             sessionId: session.id,
             attempt,
+            kbAccessMode: violationMode ?? (session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE),
             reason: policyError
           });
           continue;
@@ -2591,7 +3107,7 @@ export class CursorAcpRuntime {
           autoContinueCount += 1;
           nextPrompt = buildAssistantChatContinuationPrompt(
             promptSeed || nextPrompt,
-            ASSISTANT_CHAT_CONTINUE_PROMPT
+            buildAssistantChatContinuePrompt(session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE)
           );
           rawOutput.push(`[assistant-chat auto-continue ${autoContinueCount}] ${String(resultText ?? '')}`);
           this.log('agent.runtime.assistant_chat_auto_continue', {
@@ -2803,16 +3319,11 @@ export class CursorAcpRuntime {
         }
 
         seenToolCallIds.add(update.toolCallId);
-        const policy = this.evaluateCliToolPolicy(cliAuditLabel, update.kind, update.rawInput);
-        const auditedToolName =
-          extractKbCliCommandName(cliAuditLabel)
-          ?? extractKbCliCommandName(extractCliToolCommand(update.rawInput))
-          ?? extractKbCliCommandName(extractCliToolCommandFromRawOutput(update.rawOutput))
-          ?? cliAuditLabel;
+        const policy = this.evaluateCliToolPolicy(cliAuditLabel, update.kind, update.rawInput, update.rawOutput);
         recovered.push({
           workspaceId,
           sessionId,
-          toolName: auditedToolName,
+          toolName: policy.auditedToolName,
           args: selectCliToolAuditArgs(update.rawInput, update.rawOutput, update.kind),
           calledAtUtc: parsedLine.atUtc,
           allowed: policy.allowed,
@@ -2843,7 +3354,7 @@ export class CursorAcpRuntime {
 
   private async resolveSession(input: AgentRunRequestWithReusePolicy): Promise<AgentSessionRecord> {
     const sessionType = input.sessionType ?? ('localeVariantId' in input ? 'article_edit' : 'batch_analysis');
-    const requestedMode = input.sessionMode ?? (input.sessionType === 'assistant_chat' ? 'ask' : 'agent');
+    const requestedMode = input.sessionMode ?? 'agent';
     const sessionReusePolicy = input.sessionReusePolicy ?? 'reuse';
     if (input.workspaceId && sessionType !== 'assistant_chat') {
       await this.pruneIdleNonChatSessions(input.workspaceId, {
@@ -3242,54 +3753,60 @@ export class CursorAcpRuntime {
         await this.appendTranscriptLine(localSessionId, 'from_agent', 'session_update', payload);
       }
 
-      // Audit and enforce CLI-mode tool calls from ACP session updates so they appear in tool call history
-      const cliAuditLabel =
-        typeof params.update?.title === 'string' && params.update.title.trim()
-          ? params.update.title
-          : extractCliToolCommand(params.update?.rawInput) ?? extractCliToolCommandFromRawOutput(params.update?.rawOutput);
-      if (sessionInfo.mode === 'cli' && params.update?.toolCallId && cliAuditLabel) {
+      const assistantAuditLabel = selectAssistantToolPolicyLabel(params.update);
+      if (params.update?.toolCallId && assistantAuditLabel) {
         const session = this.sessions.get(localSessionId);
         const acpToolCallKey = `${params.sessionId ?? 'unknown'}:${params.update.toolCallId}`;
-        const recordedToolCallIds = this.auditedCliToolCallIds.get(localSessionId) ?? new Set<string>();
-        if (session && !shouldDeferCliToolPolicyCheck(params.update) && !recordedToolCallIds.has(acpToolCallKey)) {
+        const recordedToolCallIds = this.auditedAssistantToolCallIds.get(localSessionId) ?? new Set<string>();
+        const shouldDeferPolicyCheck = sessionInfo.mode === 'cli'
+          ? shouldDeferCliToolPolicyCheck(params.update)
+          : shouldDeferMcpToolPolicyCheck(params.update);
+        if (session && !shouldDeferPolicyCheck && !recordedToolCallIds.has(acpToolCallKey)) {
           recordedToolCallIds.add(acpToolCallKey);
-          this.auditedCliToolCallIds.set(localSessionId, recordedToolCallIds);
-          const policy = this.evaluateCliToolPolicy(cliAuditLabel, params.update.kind, params.update.rawInput);
-          const auditedToolName =
-            extractKbCliCommandName(cliAuditLabel)
-            ?? extractKbCliCommandName(extractCliToolCommand(params.update.rawInput))
-            ?? extractKbCliCommandName(extractCliToolCommandFromRawOutput(params.update.rawOutput))
-            ?? cliAuditLabel;
+          this.auditedAssistantToolCallIds.set(localSessionId, recordedToolCallIds);
+          const policy = sessionInfo.mode === 'cli'
+            ? this.evaluateCliToolPolicy(
+                assistantAuditLabel,
+                params.update.kind,
+                params.update.rawInput,
+                params.update.rawOutput
+              )
+            : this.evaluateMcpToolPolicy(
+                assistantAuditLabel,
+                params.update.kind,
+                params.update.rawInput,
+                params.update.rawOutput
+              );
           this.toolCallAudit.push({
             workspaceId: session.workspaceId,
             sessionId: localSessionId,
-            toolName: auditedToolName,
+            toolName: policy.auditedToolName,
             args: selectCliToolAuditArgs(params.update.rawInput, params.update.rawOutput, params.update.kind),
             calledAtUtc: new Date().toISOString(),
             allowed: policy.allowed,
             reason: policy.reason
           });
           if (!policy.allowed && typeof params.sessionId === 'string') {
-            const violationReason = `CLI mode blocked illegal tool call "${auditedToolName}": ${policy.reason}`;
-            this.log('agent.runtime.cli_tool_policy_violation', {
+            const modeLabel = sessionInfo.mode === 'cli' ? 'CLI mode' : 'MCP mode';
+            const violationReason = `${modeLabel} blocked illegal tool call "${policy.auditedToolName}": ${policy.reason}`;
+            this.log(`agent.runtime.${sessionInfo.mode}_tool_policy_violation`, {
               sessionId: localSessionId,
               acpSessionId: params.sessionId,
-              toolName: params.update.title,
+              toolName: policy.auditedToolName,
               kind: params.update.kind,
               reason: violationReason
             });
             await this.appendTranscriptLine(
               localSessionId,
               'system',
-              'cli_tool_policy_violation',
+              `${sessionInfo.mode}_tool_policy_violation`,
               JSON.stringify({
-                toolName: cliAuditLabel,
+                toolName: policy.auditedToolName,
                 kind: params.update.kind,
                 reason: violationReason
               })
             );
-            const workspaceId = this.sessions.get(localSessionId)?.workspaceId;
-            this.getTransport('cli', workspaceId).abortPromptSession(params.sessionId, violationReason);
+            this.getTransport(sessionInfo.mode, session.workspaceId).abortPromptSession(params.sessionId, violationReason);
           }
         }
       }
@@ -3352,7 +3869,7 @@ export class CursorAcpRuntime {
     this.activeStreamEmitters.delete(sessionId);
     this.promptMessageChunks.delete(sessionId);
     this.promptTransportActivityAt.delete(sessionId);
-    this.auditedCliToolCallIds.delete(sessionId);
+    this.auditedAssistantToolCallIds.delete(sessionId);
     this.activePromptStates.delete(sessionId);
     this.cliPlannerLoopState.delete(sessionId);
   }
@@ -3521,15 +4038,23 @@ export class CursorAcpRuntime {
     return transport;
   }
 
-  private evaluateCliToolPolicy(toolName: string, kind?: string, rawInput?: unknown): { allowed: boolean; reason: string } {
+  private evaluateCliToolPolicy(
+    toolName: string,
+    kind?: string,
+    rawInput?: unknown,
+    rawOutput?: unknown
+  ): { auditedToolName: string; allowed: boolean; reason: string } {
     const normalizedToolName = toolName.trim().toLowerCase();
     const normalizedKind = kind?.trim().toLowerCase() ?? 'unknown';
-    const command = extractCliToolCommand(rawInput);
+    const command = extractCliToolCommand(rawInput) ?? extractCliToolCommandFromRawOutput(rawOutput);
     const commandLikeKbInvocation = looksLikeKbCliShellInvocation(toolName) || looksLikeKbCliShellInvocation(command);
     const kbCommandName = extractKbCliCommandName(toolName) ?? extractKbCliCommandName(command);
+    const normalizedPolicyName = normalizeAssistantToolPolicyName(toolName) ?? normalizeAssistantToolPolicyName(kind);
+    const auditedToolName = kbCommandName ?? toolName;
 
     if (commandLikeKbInvocation) {
       return {
+        auditedToolName,
         allowed: true,
         reason: kbCommandName
           ? `CLI mode allows shell transport for kb command "${kbCommandName}"`
@@ -3544,6 +4069,7 @@ export class CursorAcpRuntime {
       || normalizedKind === 'shell'
     ) {
       return {
+        auditedToolName,
         allowed: false,
         reason: 'CLI mode forbids terminal usage outside of running kb commands'
       };
@@ -3551,6 +4077,7 @@ export class CursorAcpRuntime {
 
     if (normalizedToolName === 'read file') {
       return {
+        auditedToolName,
         allowed: false,
         reason: 'CLI mode forbids Read File; use kb CLI output instead'
       };
@@ -3558,14 +4085,130 @@ export class CursorAcpRuntime {
 
     if (normalizedToolName === 'grep') {
       return {
+        auditedToolName,
         allowed: false,
         reason: 'CLI mode forbids grep; use kb CLI output instead'
       };
     }
 
+    if (
+      (normalizedPolicyName && BLOCKED_MCP_RESOURCE_TOOL_NAMES.has(normalizedPolicyName))
+      || BLOCKED_MCP_RESOURCE_TOOL_NAMES.has(normalizedKind)
+    ) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'CLI mode forbids MCP resource discovery; use exact kb CLI commands instead'
+      };
+    }
+
+    if (
+      (normalizedPolicyName && BLOCKED_GENERIC_TOOL_NAMES.has(normalizedPolicyName))
+      || BLOCKED_GENERIC_TOOL_NAMES.has(normalizedKind)
+    ) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'CLI mode forbids generic ACP tools; use exact kb CLI commands instead'
+      };
+    }
+
+    if (
+      (normalizedPolicyName && ALLOWED_MCP_TOOL_NAMES.has(normalizedPolicyName))
+      || ALLOWED_MCP_TOOL_NAMES.has(normalizedKind)
+    ) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'CLI mode forbids direct KB Vault MCP tools; run exact kb CLI commands instead'
+      };
+    }
+
+    if (kbCommandName) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'CLI mode requires exact kb CLI commands instead of direct tool shortcuts'
+      };
+    }
+
     return {
-      allowed: true,
-      reason: `CLI mode ACP tool call allowed: ${toolName} (${normalizedKind})`
+      auditedToolName,
+      allowed: false,
+      reason: 'CLI mode only allows exact kb CLI commands'
+    };
+  }
+
+  private evaluateMcpToolPolicy(
+    toolName: string,
+    kind?: string,
+    rawInput?: unknown,
+    rawOutput?: unknown
+  ): { auditedToolName: string; allowed: boolean; reason: string } {
+    const normalizedToolName = normalizeAssistantToolPolicyName(toolName);
+    const normalizedKind = normalizeAssistantToolPolicyName(kind) ?? 'unknown';
+    const command = extractCliToolCommand(rawInput) ?? extractCliToolCommandFromRawOutput(rawOutput);
+    const commandLikeKbInvocation = looksLikeKbCliShellInvocation(toolName) || looksLikeKbCliShellInvocation(command);
+    const kbCommandName = extractKbCliCommandName(toolName) ?? extractKbCliCommandName(command);
+    const allowedToolName =
+      (normalizedToolName && ALLOWED_MCP_TOOL_NAMES.has(normalizedToolName) ? normalizedToolName : undefined)
+      ?? (ALLOWED_MCP_TOOL_NAMES.has(normalizedKind) ? normalizedKind : undefined);
+    const auditedToolName = allowedToolName ?? (kbCommandName ? `kb ${kbCommandName}` : toolName);
+
+    if (allowedToolName) {
+      return {
+        auditedToolName,
+        allowed: true,
+        reason: `MCP mode allows KB Vault MCP tool "${allowedToolName}"`
+      };
+    }
+
+    if (commandLikeKbInvocation || kbCommandName) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'MCP mode forbids kb CLI commands; use direct KB Vault MCP tools only'
+      };
+    }
+
+    if (
+      isCliTerminalToolName(normalizedToolName)
+      || isCliTerminalToolName(normalizedKind)
+      || normalizedKind === 'execute'
+    ) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'MCP mode forbids terminal and shell tools; use direct KB Vault MCP tools only'
+      };
+    }
+
+    if (
+      (normalizedToolName && BLOCKED_MCP_RESOURCE_TOOL_NAMES.has(normalizedToolName))
+      || BLOCKED_MCP_RESOURCE_TOOL_NAMES.has(normalizedKind)
+    ) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'MCP mode forbids MCP resource discovery; call KB Vault MCP tools directly'
+      };
+    }
+
+    if (
+      (normalizedToolName && BLOCKED_GENERIC_TOOL_NAMES.has(normalizedToolName))
+      || BLOCKED_GENERIC_TOOL_NAMES.has(normalizedKind)
+    ) {
+      return {
+        auditedToolName,
+        allowed: false,
+        reason: 'MCP mode forbids generic ACP tools; use direct KB Vault MCP tools only'
+      };
+    }
+
+    return {
+      auditedToolName,
+      allowed: false,
+      reason: 'MCP mode only allows direct KB Vault MCP tools'
     };
   }
 
@@ -3779,36 +4422,107 @@ export class CursorAcpRuntime {
   }
 
   private async getMcpHealth(workspaceId?: string): Promise<KbAccessHealth> {
-    const issues: string[] = [];
+    const issues = new Set<string>();
     const cursorInstalled = this.isCursorAvailable('mcp');
     if (!cursorInstalled) {
-      issues.push('Cursor binary not found');
+      issues.add('Cursor binary not found');
     }
     const acpReachable = cursorInstalled ? await this.canReachCursor('mcp', workspaceId) : false;
     if (cursorInstalled && !acpReachable) {
-      issues.push('Cursor ACP command did not initialize');
-    }
-    const mcpServers = this.resolveMcpServerConfigs();
-    if (mcpServers.length === 0) {
-      issues.push('MCP server configuration is unavailable');
-    }
-    if (this.mcpServer.toolCount() === 0) {
-      issues.push('KB Vault MCP tool server has no registered tools');
+      issues.add('Cursor ACP command did not initialize');
     }
 
-    const ok = cursorInstalled && acpReachable && mcpServers.length > 0 && this.mcpServer.toolCount() > 0;
+    const mcpServers = this.resolveMcpServerConfigs();
+    const bridgeConfig = resolveMcpBridgeConfig(mcpServers);
+    const bridgeConfigPresent = mcpServers.length > 0 && bridgeConfig.configured;
+    if (mcpServers.length === 0) {
+      issues.add('KB Vault MCP server configuration is unavailable');
+    } else if (!bridgeConfig.configured) {
+      issues.add('KB Vault MCP bridge configuration is incomplete');
+    }
+
+    const expectedToolNames = Array.from(ALLOWED_MCP_TOOL_NAMES).sort();
+    const internalToolNames = this.mcpServer.listTools()
+      .map((tool) => tool.name.trim())
+      .filter(Boolean)
+      .sort();
+    const internalMissingToolNames = expectedToolNames.filter((toolName) => !internalToolNames.includes(toolName));
+    if (internalMissingToolNames.length > 0) {
+      issues.add(`KB Vault MCP tool server is missing expected tools: ${internalMissingToolNames.join(', ')}`);
+    }
+
+    let bridgeReachable = false;
+    let bridgeToolNames: string[] = [];
+    let bridgeProbeError: string | undefined;
+    if (bridgeConfigPresent && bridgeConfig.socketPath) {
+      const bridgeProbe = await probeMcpBridgeToolList(bridgeConfig.socketPath);
+      bridgeReachable = bridgeProbe.reachable;
+      bridgeToolNames = [...bridgeProbe.toolNames].sort();
+      bridgeProbeError = bridgeProbe.error;
+      if (!bridgeProbe.reachable) {
+        issues.add(`KB Vault MCP bridge is not reachable: ${bridgeProbe.error ?? 'health probe failed'}`);
+      }
+    }
+
+    const bridgeMissingToolNames = bridgeReachable
+      ? expectedToolNames.filter((toolName) => !bridgeToolNames.includes(toolName))
+      : [];
+    if (bridgeMissingToolNames.length > 0) {
+      issues.add(`KB Vault MCP bridge is missing expected tools: ${bridgeMissingToolNames.join(', ')}`);
+    }
+
+    let acpMcpAttached = false;
+    let acpMcpTouchedMethods: string[] = [];
+    let acpMcpProbeError: string | undefined;
+    if (cursorInstalled && acpReachable && bridgeConfigPresent && bridgeConfig.command && bridgeConfig.scriptPath) {
+      const acpProbe = await probeAcpMcpAttachment({
+        binary: this.resolveBinary('mcp'),
+        args: this.config.cursorArgs,
+        cwd: this.config.acpCwd,
+        bridgeCommand: bridgeConfig.command,
+        bridgeScriptPath: bridgeConfig.scriptPath
+      });
+      acpMcpAttached = acpProbe.attached;
+      acpMcpTouchedMethods = acpProbe.touchedMethods;
+      acpMcpProbeError = acpProbe.error;
+      if (!acpProbe.attached) {
+        issues.add(`Cursor ACP session did not attach the configured MCP server: ${acpProbe.error ?? 'probe saw no MCP traffic'}`);
+      }
+    }
+
+    const toolsetReady = bridgeReachable
+      ? internalMissingToolNames.length === 0 && bridgeMissingToolNames.length === 0
+      : false;
+    const ok = cursorInstalled && acpReachable && bridgeConfigPresent && bridgeReachable && toolsetReady && acpMcpAttached;
     const result: KbAccessHealth = {
       mode: 'mcp',
       provider: 'mcp',
       ok,
       acpReachable,
+      bridgeConfigPresent,
+      bridgeSocketPath: bridgeConfig.socketPath,
+      bridgeReachable,
+      toolsetReady,
+      expectedToolNames,
+      registeredToolNames: bridgeReachable ? bridgeToolNames : internalToolNames,
+      missingToolNames: bridgeReachable ? bridgeMissingToolNames : internalMissingToolNames,
       binaryPath: cursorInstalled ? this.resolveBinary('mcp') : undefined,
-      message: ok ? 'MCP access ready' : issues[0] ?? 'MCP access unavailable',
-      issues
+      message: ok ? 'MCP access ready' : Array.from(issues)[0] ?? 'MCP access unavailable',
+      issues: Array.from(issues)
     };
     this.log('agent.runtime.mcp_health_result', {
       ok: result.ok,
       acpReachable: result.acpReachable,
+      bridgeConfigPresent: result.bridgeConfigPresent,
+      bridgeSocketPath: result.bridgeSocketPath,
+      bridgeReachable: result.bridgeReachable,
+      bridgeProbeError,
+      acpMcpAttached,
+      acpMcpTouchedMethods,
+      acpMcpProbeError,
+      toolsetReady: result.toolsetReady,
+      missingToolNames: result.missingToolNames,
+      registeredToolCount: result.registeredToolNames?.length ?? 0,
       binaryPath: result.binaryPath,
       message: result.message,
       issues: result.issues
@@ -3963,12 +4677,13 @@ export class CursorAcpRuntime {
       search_kb: {
         description: 'Search local KB cache for likely article candidates.',
         handler: async (input, context, log) => {
-          const parsed = input as MCPFindRelatedArticlesInput & { workspaceId: string };
+          const parsed = input as MCPSearchKbInput;
           parsed.workspaceId = context.workspaceId;
           const result = await toolContext.searchKb(parsed);
           await log({ direction: 'system', event: 'tool_result', payload: 'search_kb returned' });
           return result;
-        }
+        },
+        inputSchema: MCP_SEARCH_KB_INPUT_SCHEMA
       },
       get_article: {
         description: 'Load a locale variant or revision payload for one article.',
@@ -3978,7 +4693,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.getArticle(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'get_article' });
           return result;
-        }
+        },
+        inputSchema: MCP_GET_ARTICLE_INPUT_SCHEMA
       },
       get_article_family: {
         description: 'Load article family metadata.',
@@ -3988,7 +4704,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.getArticleFamily(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'get_article_family' });
           return result;
-        }
+        },
+        inputSchema: MCP_GET_ARTICLE_FAMILY_INPUT_SCHEMA
       },
       get_locale_variant: {
         description: 'Load a locale variant and metadata.',
@@ -4000,7 +4717,30 @@ export class CursorAcpRuntime {
           await log({ direction: 'system', event: 'tool_result', payload: 'get_locale_variant' });
           return result;
         },
+        inputSchema: MCP_GET_LOCALE_VARIANT_INPUT_SCHEMA,
         requiresScope: true
+      },
+      app_get_form_schema: {
+        description: 'Read a mutable app working-state form schema and current values.',
+        handler: async (input, context, log) => {
+          const payload = input as MCPAppGetFormSchemaInput & { workspaceId: string };
+          payload.workspaceId = context.workspaceId;
+          const result = await toolContext.getAppFormSchema(payload);
+          await log({ direction: 'system', event: 'tool_result', payload: 'app_get_form_schema' });
+          return result;
+        },
+        inputSchema: MCP_APP_GET_FORM_SCHEMA_INPUT_SCHEMA
+      },
+      app_patch_form: {
+        description: 'Apply a validated patch to a mutable app working-state form.',
+        handler: async (input, context, log) => {
+          const payload = input as MCPAppPatchFormInput & { workspaceId: string };
+          payload.workspaceId = context.workspaceId;
+          const result = await toolContext.patchAppForm(payload);
+          await log({ direction: 'system', event: 'tool_result', payload: 'app_patch_form' });
+          return result;
+        },
+        inputSchema: MCP_APP_PATCH_FORM_INPUT_SCHEMA
       },
       find_related_articles: {
         description: 'Load persisted article relationships for an article or a PBI batch.',
@@ -4010,7 +4750,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.findRelatedArticles(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'find_related_articles' });
           return result;
-        }
+        },
+        inputSchema: MCP_FIND_RELATED_ARTICLES_INPUT_SCHEMA
       },
       list_categories: {
         description: 'Get local article categories for locale.',
@@ -4020,7 +4761,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.listCategories(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'list_categories' });
           return result;
-        }
+        },
+        inputSchema: MCP_LIST_CATEGORIES_INPUT_SCHEMA
       },
       list_sections: {
         description: 'Get local article sections.',
@@ -4030,7 +4772,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.listSections(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'list_sections' });
           return result;
-        }
+        },
+        inputSchema: MCP_LIST_SECTIONS_INPUT_SCHEMA
       },
       list_article_templates: {
         description: 'Read template packs in the workspace.',
@@ -4040,7 +4783,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.listArticleTemplates(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'list_article_templates' });
           return result;
-        }
+        },
+        inputSchema: MCP_LIST_ARTICLE_TEMPLATES_INPUT_SCHEMA
       },
       get_template: {
         description: 'Get a single template pack payload.',
@@ -4053,7 +4797,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.getTemplate(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'get_template' });
           return result;
-        }
+        },
+        inputSchema: MCP_GET_TEMPLATE_INPUT_SCHEMA
       },
       get_batch_context: {
         description: 'Load batch metadata and scoped row summary.',
@@ -4063,7 +4808,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.getBatchContext(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'get_batch_context' });
           return result;
-        }
+        },
+        inputSchema: MCP_GET_BATCH_CONTEXT_INPUT_SCHEMA
       },
       get_pbi: {
         description: 'Load one PBI record from batch context.',
@@ -4073,7 +4819,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.getPBI(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'get_pbi' });
           return result;
-        }
+        },
+        inputSchema: MCP_GET_PBI_INPUT_SCHEMA
       },
       get_pbi_subset: {
         description: 'Load PBI subset by row numbers.',
@@ -4083,7 +4830,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.getPBISubset(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'get_pbi_subset' });
           return result;
-        }
+        },
+        inputSchema: MCP_GET_PBI_SUBSET_INPUT_SCHEMA
       },
       get_article_history: {
         description: 'Read revision history for a locale variant.',
@@ -4095,6 +4843,7 @@ export class CursorAcpRuntime {
           await log({ direction: 'system', event: 'tool_result', payload: 'get_article_history' });
           return result;
         },
+        inputSchema: MCP_GET_ARTICLE_HISTORY_INPUT_SCHEMA,
         requiresScope: true
       },
       propose_create_kb: {
@@ -4107,6 +4856,7 @@ export class CursorAcpRuntime {
           await log({ direction: 'system', event: 'tool_result', payload: 'propose_create_kb' });
           return resolved;
         },
+        inputSchema: MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA,
         requiresScope: true
       },
       propose_edit_kb: {
@@ -4119,6 +4869,7 @@ export class CursorAcpRuntime {
           await log({ direction: 'system', event: 'tool_result', payload: 'propose_edit_kb' });
           return resolved;
         },
+        inputSchema: MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA,
         requiresScope: true
       },
       propose_retire_kb: {
@@ -4131,6 +4882,7 @@ export class CursorAcpRuntime {
           await log({ direction: 'system', event: 'tool_result', payload: 'propose_retire_kb' });
           return resolved;
         },
+        inputSchema: MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA,
         requiresScope: true
       },
       record_agent_notes: {
@@ -4141,7 +4893,8 @@ export class CursorAcpRuntime {
           const result = await toolContext.recordAgentNotes(payload);
           await log({ direction: 'system', event: 'tool_result', payload: 'record_agent_notes' });
           return result;
-        }
+        },
+        inputSchema: MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA
       }
     };
 
@@ -4186,7 +4939,7 @@ export class CursorAcpRuntime {
           await audit(name, input, contextData, false, reason);
           throw error;
         }
-      });
+      }, definition.inputSchema);
     }
   }
 
@@ -4591,29 +5344,41 @@ const ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW: PromptSettleWindow = {
 
 const ASSISTANT_CHAT_RECOVERY_RETRY_LIMIT = 2;
 const ASSISTANT_CHAT_CONTINUATION_MARKER = 'Continuation instructions:';
-const ASSISTANT_CHAT_CONTINUE_PROMPT = [
-  'Complete the same user request using the existing session context.',
-  'Return the final user-facing answer now.',
-  'Do not send a progress update.',
-  'Use only kb commands if one final targeted lookup is still truly required.'
-].join(' ');
-function buildAssistantChatKbOnlyRecoveryPrompt(policyError: string | undefined): string {
+function buildAssistantChatToolRecoveryPrompt(mode: KbAccessMode, policyError: string | undefined): string {
+  const providerLabel = mode === 'mcp' ? 'MCP mode' : 'CLI mode';
   const violationText = policyError?.trim()
-    ? `The previous attempt was interrupted because you attempted an illegal operation in CLI mode: ${policyError.trim()}.`
-    : 'The previous attempt was interrupted because you attempted an illegal operation in CLI mode.';
+    ? `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}: ${policyError.trim()}.`
+    : `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}.`;
+
+  if (mode === 'mcp') {
+    return [
+      'Continue the same user request using the existing session context.',
+      violationText,
+      'Do not try that illegal operation again.',
+      'Use only direct KB Vault MCP tools in this recovered turn.',
+      'Do not use Terminal, Shell, kb CLI commands, list_mcp_resources, fetch_mcp_resource, Read File, grep, codebase search, or filesystem exploration.',
+      'If you already gathered enough KB context in this session, answer now.',
+      'If you still need one targeted lookup, call the minimum direct KB Vault MCP tool now and then answer.',
+      'If the current article already has a localeVariantId or revisionId in the prompt context, call get_article directly with that identifier.',
+      'Do not claim that KB Vault MCP tools are unavailable just because they were not shown in a generic tool list.',
+      'Your job is to finish answering the user\'s question, not to explore the environment.',
+      'Do the research now and return the final user-facing answer in this same turn.',
+      'Do not send a progress update.'
+    ].join(' ');
+  }
 
   return [
     'Continue the same user request using the existing session context.',
     violationText,
     'Do not try that illegal operation again.',
-    'The only forbidden action is the illegal Shell or Terminal style operation that triggered the interruption.',
-    'You may still use fresh direct KB tools or exact kb CLI commands in this recovered turn if you do not yet have enough KB context to answer.',
-    'If you already gathered KB context in this session, use it and answer now. If you do not yet have enough context, run the minimum direct KB lookup now and then answer.',
-    'Do not claim that KB commands are forbidden in this turn unless a direct KB command actually failed.',
-    'Use only kb commands for research. Do not use terminal utilities, grep, Read File, codebase search, or filesystem exploration.',
+    'Use only exact kb CLI commands in this recovered turn.',
+    'Do not use direct MCP tool names, list_mcp_resources, fetch_mcp_resource, terminal utilities, grep, Read File, codebase search, or filesystem exploration.',
+    'If you already gathered KB context in this session, use it and answer now.',
+    'If you do not yet have enough context, run the minimum exact kb command now and then answer.',
+    'Do not claim that KB commands are forbidden in this turn unless a direct kb command actually failed.',
     'Do not use Shell or Terminal again in this turn except for exact kb CLI commands.',
     'Your job is to finish answering the user\'s question, not to explore the environment.',
-    'For app-feature and terminology questions, prefer the direct KB tools or this path unless the route clearly requires something else: search-kb, then get-article for the best 1-3 results, then answer.',
+    'For app-feature and terminology questions, prefer this path unless the route clearly requires something else: kb search-kb, then kb get-article for the best 1-3 results, then answer.',
     'Use kb get-article-family only when you need family context from a clearly relevant article.',
     'Do not use kb batch-context, kb find-related-articles, form-editing commands, or kb help unless they are clearly necessary for this specific request.',
     'Do the research now and return the final user-facing answer in this same turn.',

@@ -9,6 +9,7 @@ import {
   ArticleAiPresetAction,
   DraftBranchStatus,
   PBIImportFormat,
+  PBIBatchStatus,
   PBIBatchScopeMode,
   ProposalReviewDecision,
   ProposalReviewStatus,
@@ -1214,6 +1215,121 @@ test.describe('workspace repository content model', () => {
     const visibleBatchList = await repository.listProposalReviewBatches(created.id);
     expect(visibleBatchList.batches).toHaveLength(1);
     expect(visibleBatchList.batches[0]?.pendingReviewCount).toBe(1);
+  });
+
+  test('marks terminal non-approved batch analysis attempts as analyzed instead of leaving the batch submitted', async () => {
+    const created = await repository.createWorkspace({
+      name: `TerminalBatchStatus-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 46',
+      'sprint-46.csv',
+      'imports/sprint-46.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.setPBIBatchStatus(created.id, batch.id, PBIBatchStatus.SUBMITTED);
+
+    const iteration = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'building',
+      role: 'worker',
+      status: 'running',
+      summary: 'Executing worker pass.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-terminal-status'
+    });
+
+    await repository.updateBatchAnalysisIteration({
+      workspaceId: created.id,
+      iterationId: iteration.id,
+      stage: 'needs_human_review',
+      role: 'final-reviewer',
+      status: 'needs_human_review',
+      summary: 'Worker attempted illegal MCP tools before creating proposals.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'session-terminal-status',
+      endedAtUtc: new Date().toISOString()
+    });
+
+    const refreshedBatch = await repository.getPBIBatch(created.id, batch.id);
+    expect(refreshedBatch.status).toBe(PBIBatchStatus.ANALYZED);
+  });
+
+  test('annotates batch-analysis proposal provenance without changing local proposal ownership', async () => {
+    const created = await repository.createWorkspace({
+      name: `ProposalProvenance-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 45',
+      'sprint-45.csv',
+      'imports/sprint-45.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const proposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      reviewStatus: ProposalReviewStatus.STAGED_ANALYSIS,
+      _sessionId: 'batch-runtime-session-1',
+      originPath: 'batch_analysis',
+      targetTitle: 'Proposal Provenance',
+      targetLocale: 'en-us',
+      rationaleSummary: 'Track provider provenance for batch-created proposals.',
+      proposedHtml: '<h1>Proposal Provenance</h1><p>Updated content.</p>'
+    });
+
+    expect((proposal.metadata as Record<string, unknown> | undefined)).toMatchObject({
+      originPath: 'batch_analysis',
+      runtimeSessionId: 'batch-runtime-session-1'
+    });
+
+    const annotation = await repository.annotateProposalProvenanceForSession({
+      workspaceId: created.id,
+      batchId: batch.id,
+      sessionId: 'batch-runtime-session-1',
+      kbAccessMode: 'cli',
+      acpSessionId: 'batch-acp-session-1',
+      originPath: 'batch_analysis'
+    });
+    expect(annotation.updatedProposalIds).toEqual([proposal.id]);
+
+    const detail = await repository.getProposalReviewDetail(created.id, proposal.id);
+    expect(detail.proposal.sessionId).toBe('batch-runtime-session-1');
+    expect(detail.proposal.metadata as Record<string, unknown> | undefined).toMatchObject({
+      originPath: 'batch_analysis',
+      runtimeSessionId: 'batch-runtime-session-1',
+      kbAccessMode: 'cli',
+      acpSessionId: 'batch-acp-session-1'
+    });
   });
 
   test('applies proposals to an existing draft branch, archives no-impact proposals, and retires locale variants', async () => {

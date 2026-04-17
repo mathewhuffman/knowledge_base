@@ -1,4 +1,5 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { test, expect } from '@playwright/test';
@@ -9,6 +10,28 @@ type LoggedRequest = {
   params?: Record<string, unknown>;
 };
 
+const EXPECTED_MCP_TOOL_NAMES = [
+  'app_get_form_schema',
+  'app_patch_form',
+  'find_related_articles',
+  'get_article',
+  'get_article_family',
+  'get_article_history',
+  'get_batch_context',
+  'get_locale_variant',
+  'get_pbi',
+  'get_pbi_subset',
+  'get_template',
+  'list_article_templates',
+  'list_categories',
+  'list_sections',
+  'propose_create_kb',
+  'propose_edit_kb',
+  'propose_retire_kb',
+  'record_agent_notes',
+  'search_kb'
+] as const;
+
 function buildToolContext(): AgentRuntimeToolContext {
   return {
     searchKb: async () => ({ ok: true, results: [] }),
@@ -16,6 +39,8 @@ function buildToolContext(): AgentRuntimeToolContext {
     getArticle: async () => ({ ok: true }),
     getArticleFamily: async () => ({ ok: true }),
     getLocaleVariant: async () => ({ ok: true }),
+    getAppFormSchema: async () => ({ ok: true, fields: [], currentValues: {} }),
+    patchAppForm: async () => ({ ok: true, applied: false, currentValues: {} }),
     findRelatedArticles: async () => ({ ok: true, results: [] }),
     listCategories: async () => ({ ok: true, categories: [] }),
     listSections: async () => ({ ok: true, sections: [] }),
@@ -1209,6 +1234,85 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createAssistantChatCliToolShortcutPolicyRecoveryAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-assistant-chat-cli-tool-shortcut-policy-recovery');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-cli-tool-shortcut-policy-recovery';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+
+    if (promptCount === 1) {
+      const illegalDirectTool = {
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'tool-call-direct-search-kb',
+            title: 'search_kb',
+            kind: 'mcp',
+            rawInput: {
+              toolName: 'search_kb',
+              query: 'checklist'
+            }
+          }
+        }
+      };
+
+      process.stdout.write(JSON.stringify(illegalDirectTool) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: '{"completionState":"completed","isFinal":true,"response":"Checklist guidance recovered after blocking a non-CLI tool shortcut."}'
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
 async function createAssistantChatTerminalPlaceholderThenKbAcpBinary(root: string, logPath: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-agent-assistant-chat-terminal-placeholder-then-kb');
   const source = `#!/usr/bin/env node
@@ -1292,6 +1396,121 @@ rl.on('line', (line) => {
       id: message.id,
       result: {
         text: '{"completionState":"completed","isFinal":true,"response":"Checklist lookup completed through kb terminal command."}'
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createAssistantChatMcpPolicyRecoveryAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-assistant-chat-mcp-policy-recovery');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-mcp-policy-recovery';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+
+    if (promptCount === 1) {
+      const getArticleTool = {
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'tool-call-get-article',
+            title: 'get_article',
+            kind: 'mcp',
+            rawInput: {
+              toolName: 'get_article',
+              localeVariantId: 'variant-checklist'
+            }
+          }
+        }
+      };
+      const getArticleComplete = {
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'tool-call-get-article',
+            title: 'get_article',
+            kind: 'mcp',
+            status: 'completed',
+            rawInput: {
+              toolName: 'get_article',
+              localeVariantId: 'variant-checklist'
+            }
+          }
+        }
+      };
+      const illegalDiscoveryTool = {
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'tool-call-list-mcp-resources',
+            title: 'List MCP Resources',
+            kind: 'mcp',
+            rawInput: {
+              toolName: 'List MCP Resources'
+            }
+          }
+        }
+      };
+
+      process.stdout.write(JSON.stringify(getArticleTool) + '\\n');
+      process.stdout.write(JSON.stringify(getArticleComplete) + '\\n');
+      process.stdout.write(JSON.stringify(illegalDiscoveryTool) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: '{"completionState":"completed","isFinal":true,"response":"Article proposal research recovered after blocking MCP resource discovery."}'
       }
     }) + '\\n');
     return;
@@ -1390,6 +1609,58 @@ async function readLoggedRequests(logPath: string): Promise<LoggedRequest[]> {
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => JSON.parse(line) as LoggedRequest);
+}
+
+async function startFakeMcpBridgeServer(
+  socketPath: string,
+  toolNames: readonly string[]
+): Promise<{ close: () => Promise<void> }> {
+  const server = net.createServer((socket) => {
+    let buffer = '';
+
+    socket.on('data', (chunk: Buffer | string) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines.map((entry) => entry.trim()).filter(Boolean)) {
+        const message = JSON.parse(line) as { id?: string; method?: string };
+        if (message.method === 'tools/list') {
+          socket.write(`${JSON.stringify({
+            jsonrpc: '2.0',
+            id: message.id ?? 'bridge-tools-list',
+            result: {
+              tools: toolNames.map((name) => ({ name, description: `${name} description` }))
+            }
+          })}\n`);
+          continue;
+        }
+
+        socket.write(`${JSON.stringify({
+          jsonrpc: '2.0',
+          id: message.id ?? 'bridge-error',
+          error: {
+            code: -32601,
+            message: `Unsupported MCP method: ${message.method ?? 'unknown'}`
+          }
+        })}\n`);
+      }
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+
+  return {
+    close: async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  };
 }
 
 test.describe('agent runtime provider modes', () => {
@@ -1493,11 +1764,11 @@ test.describe('agent runtime provider modes', () => {
 
       const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
       expect(promptText).toContain('Use only the `kb` CLI');
-      expect(promptText).not.toContain('MCP');
+      expect(promptText).toContain('Do NOT use KB Vault MCP tools');
       expect(promptText).toContain('Use as many `kb` commands as needed to complete the task.');
       expect(promptText).not.toContain('KB Vault MCP guidance');
       expect(promptText).not.toContain('get_batch_context');
-      expect(promptText).not.toContain('list_mcp_resources');
+      expect(promptText).toContain('Do NOT use KB Vault MCP tools, list_mcp_resources, or fetch_mcp_resource in CLI mode.');
       expect(promptText).not.toContain('mcpServers');
     } finally {
       await runtime.stop();
@@ -1560,7 +1831,8 @@ test.describe('agent runtime provider modes', () => {
       const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
       expect(promptText).toContain('KB Vault MCP guidance');
       expect(promptText).toContain('get_batch_context');
-      expect(promptText).toContain('list_mcp_resources');
+      expect(promptText).toContain('Do not use list_mcp_resources or fetch_mcp_resource for KB Vault work in MCP mode.');
+      expect(promptText).not.toContain('list_mcp_resources may return empty');
       expect(promptText).not.toContain('Use only the `kb` CLI');
     } finally {
       await runtime.stop();
@@ -1606,6 +1878,375 @@ test.describe('agent runtime provider modes', () => {
       expect(promptText).toContain('get_batch_context');
       expect(promptText).toContain('get_pbi_subset');
       expect(promptText).not.toContain('`kb` CLI and data returned by its JSON output');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('health check verifies MCP bridge readiness and expected tool availability', async () => {
+    const logPath = path.join(tempRoot, 'mcp-health-ok-log.jsonl');
+    const binaryPath = await createFakeAcpBinary(tempRoot, logPath);
+    const socketPath = path.join(tempRoot, 'mcp-health-ok.sock');
+    const bridge = await startFakeMcpBridgeServer(socketPath, EXPECTED_MCP_TOOL_NAMES);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+    runtime.setMcpServerConfigs([
+      {
+        type: 'stdio',
+        name: 'kb-vault',
+        command: 'node',
+        args: ['bridge.js'],
+        env: [{ name: 'KBV_MCP_BRIDGE_SOCKET_PATH', value: socketPath }]
+      }
+    ]);
+
+    try {
+      const health = await runtime.checkHealth('workspace-1', 'mcp', 'mcp');
+
+      expect(health.providers.mcp.ok).toBe(true);
+      expect(health.providers.mcp.bridgeConfigPresent).toBe(true);
+      expect(health.providers.mcp.bridgeReachable).toBe(true);
+      expect(health.providers.mcp.toolsetReady).toBe(true);
+      expect(health.providers.mcp.missingToolNames).toEqual([]);
+      expect(health.providers.mcp.registeredToolNames).toEqual([...EXPECTED_MCP_TOOL_NAMES].sort());
+      expect(health.availableModes).toContain('mcp');
+    } finally {
+      await runtime.stop();
+      await bridge.close();
+    }
+  });
+
+  test('health check fails MCP preflight when the bridge is unreachable or missing required tools', async () => {
+    const logPath = path.join(tempRoot, 'mcp-health-failure-log.jsonl');
+    const binaryPath = await createFakeAcpBinary(tempRoot, logPath);
+    const missingToolsSocketPath = path.join(tempRoot, 'mcp-health-missing-tools.sock');
+    const bridge = await startFakeMcpBridgeServer(
+      missingToolsSocketPath,
+      EXPECTED_MCP_TOOL_NAMES.filter((toolName) => toolName !== 'record_agent_notes')
+    );
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      runtime.setMcpServerConfigs([
+        {
+          type: 'stdio',
+          name: 'kb-vault',
+          command: 'node',
+          args: ['bridge.js'],
+          env: [{ name: 'KBV_MCP_BRIDGE_SOCKET_PATH', value: path.join(tempRoot, 'missing-bridge.sock') }]
+        }
+      ]);
+
+      const unreachableHealth = await runtime.checkHealth('workspace-1', 'mcp', 'mcp');
+      expect(unreachableHealth.providers.mcp.ok).toBe(false);
+      expect(unreachableHealth.providers.mcp.bridgeConfigPresent).toBe(true);
+      expect(unreachableHealth.providers.mcp.bridgeReachable).toBe(false);
+      expect(unreachableHealth.providers.mcp.toolsetReady).toBe(false);
+      expect(unreachableHealth.providers.mcp.message).toContain('bridge is not reachable');
+
+      runtime.setMcpServerConfigs([
+        {
+          type: 'stdio',
+          name: 'kb-vault',
+          command: 'node',
+          args: ['bridge.js'],
+          env: [{ name: 'KBV_MCP_BRIDGE_SOCKET_PATH', value: missingToolsSocketPath }]
+        }
+      ]);
+
+      const missingToolsHealth = await runtime.checkHealth('workspace-1', 'mcp', 'mcp');
+      expect(missingToolsHealth.providers.mcp.ok).toBe(false);
+      expect(missingToolsHealth.providers.mcp.bridgeReachable).toBe(true);
+      expect(missingToolsHealth.providers.mcp.toolsetReady).toBe(false);
+      expect(missingToolsHealth.providers.mcp.missingToolNames).toEqual(['record_agent_notes']);
+      expect(missingToolsHealth.providers.mcp.issues).toContain(
+        'KB Vault MCP bridge is missing expected tools: record_agent_notes'
+      );
+      expect(missingToolsHealth.availableModes).not.toContain('mcp');
+    } finally {
+      await runtime.stop();
+      await bridge.close();
+    }
+  });
+
+  test('assistant chat CLI mode prompt excludes MCP-only tool names', async () => {
+    const logPath = path.join(tempRoot, 'assistant-cli-provider-purity-log.jsonl');
+    const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'cli',
+          prompt: 'Route: templates_and_prompts\nPlease update the template pack.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequest = requests.find((entry) => entry.method === 'session/prompt');
+      const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+
+      expect(promptText).toContain('`kb app get-form-schema`');
+      expect(promptText).toContain('`kb app patch-form`');
+      expect(promptText).toContain('`command="patch_proposal"` with `artifactType="proposal_patch"`');
+      expect(promptText).not.toContain('`app_get_form_schema`');
+      expect(promptText).not.toContain('`app_patch_form`');
+      expect(promptText).toContain('Do not call direct MCP tool names such as `search_kb` or `get_article` in CLI mode.');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat MCP mode prompt excludes CLI syntax', async () => {
+    const logPath = path.join(tempRoot, 'assistant-mcp-provider-purity-log.jsonl');
+    const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_MCP_TOOLS = JSON.stringify([
+      {
+        type: 'stdio',
+        name: 'kb-vault',
+        command: 'node',
+        args: ['bridge.js']
+      }
+    ]);
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'mcp',
+          prompt: 'Route: templates_and_prompts\nPlease update the template pack.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequest = requests.find((entry) => entry.method === 'session/prompt');
+      const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+
+      expect(promptText).toContain('`app_get_form_schema`');
+      expect(promptText).toContain('`app_patch_form`');
+      expect(promptText).toContain('`search_kb`');
+      expect(promptText).toContain('`command="patch_proposal"` with `artifactType="proposal_patch"`');
+      expect(promptText).not.toContain('`kb app get-form-schema`');
+      expect(promptText).not.toContain('`kb app patch-form`');
+      expect(promptText).not.toContain('kb search-kb');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat CLI mode article proposal prompt excludes MCP tool names', async () => {
+    const logPath = path.join(tempRoot, 'assistant-cli-article-proposal-log.jsonl');
+    const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'cli',
+          prompt: 'Route: article_explorer\nPlease draft a proposal for this article.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequest = requests.find((entry) => entry.method === 'session/prompt');
+      const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+
+      expect(promptText).toContain('`kb get-article`');
+      expect(promptText).toContain('`payload.htmlMutations`');
+      expect(promptText).toContain('Do not call direct MCP tool names such as `search_kb` or `get_article` in CLI mode.');
+      expect(promptText).not.toContain('fetch the current article with `get_article`');
+      expect(promptText).not.toContain('`app_get_form_schema`');
+      expect(promptText).not.toContain('`app_patch_form`');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat MCP mode article proposal prompt excludes CLI syntax', async () => {
+    const logPath = path.join(tempRoot, 'assistant-mcp-article-proposal-log.jsonl');
+    const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_MCP_TOOLS = JSON.stringify([
+      {
+        type: 'stdio',
+        name: 'kb-vault',
+        command: 'node',
+        args: ['bridge.js']
+      }
+    ]);
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'mcp',
+          prompt: 'Route: article_explorer\nPlease draft a proposal for this article.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequest = requests.find((entry) => entry.method === 'session/prompt');
+      const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+
+      expect(promptText).toContain('fetch the current article with `get_article`');
+      expect(promptText).toContain('`payload.htmlMutations`');
+      expect(promptText).not.toContain('`kb get-article`');
+      expect(promptText).not.toContain('kb search-kb');
+      expect(promptText).not.toContain('`kb app get-form-schema`');
+      expect(promptText).not.toContain('`kb app patch-form`');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat CLI mode Proposal Review prompt excludes MCP tool names', async () => {
+    const logPath = path.join(tempRoot, 'assistant-cli-proposal-review-log.jsonl');
+    const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'cli',
+          prompt: 'Route: proposal_review\nPlease refine this proposal.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequest = requests.find((entry) => entry.method === 'session/prompt');
+      const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+
+      expect(promptText).toContain('`command="patch_proposal"` with `artifactType="proposal_patch"`');
+      expect(promptText).toContain('Do not call direct MCP tool names such as `search_kb` or `get_article` in CLI mode.');
+      expect(promptText).not.toContain('`app_get_form_schema`');
+      expect(promptText).not.toContain('`app_patch_form`');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat MCP mode Proposal Review prompt excludes CLI syntax', async () => {
+    const logPath = path.join(tempRoot, 'assistant-mcp-proposal-review-log.jsonl');
+    const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_MCP_TOOLS = JSON.stringify([
+      {
+        type: 'stdio',
+        name: 'kb-vault',
+        command: 'node',
+        args: ['bridge.js']
+      }
+    ]);
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'mcp',
+          prompt: 'Route: proposal_review\nPlease refine this proposal.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequest = requests.find((entry) => entry.method === 'session/prompt');
+      const promptText = ((promptRequest?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+
+      expect(promptText).toContain('`command="patch_proposal"` with `artifactType="proposal_patch"`');
+      expect(promptText).not.toContain('kb search-kb');
+      expect(promptText).not.toContain('`kb app get-form-schema`');
+      expect(promptText).not.toContain('`kb app patch-form`');
     } finally {
       await runtime.stop();
     }
@@ -1945,17 +2586,67 @@ test.describe('agent runtime provider modes', () => {
       const requests = await readLoggedRequests(logPath);
       const sessionNewRequests = requests.filter((entry) => entry.method === 'session/new');
       const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
 
       expect(sessionNewRequests).toHaveLength(1);
       expect(promptRequests).toHaveLength(2);
       expect(promptRequests.every((entry) => entry.params?.sessionId === 'acp-session-assistant-progress')).toBeTruthy();
+      expect(secondPromptText).toContain('Use only exact kb CLI commands if one final targeted lookup is still truly required.');
+      expect(secondPromptText).not.toContain('Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.');
     } finally {
       await runtime.stop();
     }
   });
 
-  test('assistant chat sessions continue to request ACP ask mode', async () => {
-    const logPath = path.join(tempRoot, 'assistant-ask-mode-log.jsonl');
+  test('assistant chat MCP auto-continue stays free of CLI syntax', async () => {
+    const logPath = path.join(tempRoot, 'assistant-mcp-progress-then-final-log.jsonl');
+    const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_MCP_TOOLS = JSON.stringify([
+      {
+        type: 'stdio',
+        name: 'kb-vault',
+        command: 'node',
+        args: ['bridge.js']
+      }
+    ]);
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'mcp',
+          prompt: 'can you explain waste to me',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+
+      expect(promptRequests).toHaveLength(2);
+      expect(secondPromptText).toContain('Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.');
+      expect(secondPromptText).not.toContain('exact kb commands');
+      expect(secondPromptText).not.toContain('kb search-kb');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat sessions request ACP agent mode', async () => {
+    const logPath = path.join(tempRoot, 'assistant-agent-mode-log.jsonl');
     const binaryPath = await createAssistantChatProgressThenFinalAcpBinary(tempRoot, logPath);
     process.env.KBV_CURSOR_BINARY = binaryPath;
     process.env.KBV_ACP_CWD = tempRoot;
@@ -1985,7 +2676,7 @@ test.describe('agent runtime provider modes', () => {
       const sessionNewRequest = requests.find((entry) => entry.method === 'session/new');
       expect(sessionNewRequest?.params).toMatchObject({
         config: {
-          mode: 'ask'
+          mode: 'agent'
         }
       });
     } finally {
@@ -2152,9 +2843,65 @@ test.describe('agent runtime provider modes', () => {
       expect(secondPromptText).toContain('attempted an illegal operation in CLI mode');
       expect(secondPromptText).toContain('CLI mode blocked illegal tool call "Terminal"');
       expect(secondPromptText).toContain('Do not try that illegal operation again.');
-      expect(secondPromptText).toContain('You may still use fresh direct KB tools or exact kb CLI commands in this recovered turn');
-      expect(secondPromptText).toContain('Do not claim that KB commands are forbidden in this turn unless a direct KB command actually failed.');
+      expect(secondPromptText).toContain('Use only exact kb CLI commands in this recovered turn.');
+      expect(secondPromptText).toContain('Do not claim that KB commands are forbidden in this turn unless a direct kb command actually failed.');
       expect(secondPromptText).toContain('please go do research on our checklist feature and tell me how to use it');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat blocks direct MCP tool shortcuts in CLI mode and recovers with CLI-only guidance', async () => {
+    const logPath = path.join(tempRoot, 'assistant-cli-tool-shortcut-policy-recovery-log.jsonl');
+    const binaryPath = await createAssistantChatCliToolShortcutPolicyRecoveryAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'workspace-1',
+          kbAccessMode: 'cli',
+          prompt: 'please explain checklist to me',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.resultPayload).toMatchObject({
+        text: '{"completionState":"completed","isFinal":true,"response":"Checklist guidance recovered after blocking a non-CLI tool shortcut."}'
+      });
+      expect(result.toolCalls).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            toolName: 'search_kb',
+            allowed: false,
+            reason: 'CLI mode forbids direct KB Vault MCP tools; run exact kb CLI commands instead'
+          })
+        ])
+      );
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      const secondPromptText = Array.isArray(promptRequests[1]?.params?.prompt)
+        ? promptRequests[1]?.params?.prompt
+            .map((entry) => (entry && typeof entry === 'object' && 'text' in entry ? String((entry as { text?: unknown }).text ?? '') : ''))
+            .join('\n')
+        : '';
+
+      expect(promptRequests).toHaveLength(2);
+      expect(secondPromptText).toContain('CLI mode blocked illegal tool call "search_kb"');
+      expect(secondPromptText).toContain('Use only exact kb CLI commands in this recovered turn.');
+      expect(secondPromptText).toContain('Do not use direct MCP tool names');
     } finally {
       await runtime.stop();
     }
@@ -2209,6 +2956,74 @@ test.describe('agent runtime provider modes', () => {
       const requests = await readLoggedRequests(logPath);
       const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
       expect(promptRequests).toHaveLength(1);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('assistant chat blocks MCP resource discovery fallback and recovers with MCP-only guidance', async () => {
+    const logPath = path.join(tempRoot, 'assistant-mcp-policy-recovery-log.jsonl');
+    const binaryPath = await createAssistantChatMcpPolicyRecoveryAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_MCP_TOOLS = JSON.stringify([
+      {
+        type: 'stdio',
+        name: 'kb-vault',
+        command: 'node',
+        args: ['bridge.js']
+      }
+    ]);
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext());
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'variant-checklist',
+          kbAccessMode: 'mcp',
+          prompt: 'please add hello world to the bottom of this article',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.resultPayload).toMatchObject({
+        text: '{"completionState":"completed","isFinal":true,"response":"Article proposal research recovered after blocking MCP resource discovery."}'
+      });
+      expect(result.toolCalls).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            toolName: 'get_article',
+            allowed: true
+          }),
+          expect.objectContaining({
+            toolName: 'List MCP Resources',
+            allowed: false,
+            reason: 'MCP mode forbids MCP resource discovery; call KB Vault MCP tools directly'
+          })
+        ])
+      );
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      const secondPromptText = Array.isArray(promptRequests[1]?.params?.prompt)
+        ? promptRequests[1]?.params?.prompt
+            .map((entry) => (entry && typeof entry === 'object' && 'text' in entry ? String((entry as { text?: unknown }).text ?? '') : ''))
+            .join('\n')
+        : '';
+
+      expect(promptRequests).toHaveLength(2);
+      expect(secondPromptText).toContain('MCP mode blocked illegal tool call "List MCP Resources"');
+      expect(secondPromptText).toContain('Use only direct KB Vault MCP tools in this recovered turn.');
+      expect(secondPromptText).toContain('Do not use Terminal, Shell, kb CLI commands, list_mcp_resources, fetch_mcp_resource');
+      expect(secondPromptText).toContain('please add hello world to the bottom of this article');
     } finally {
       await runtime.stop();
     }

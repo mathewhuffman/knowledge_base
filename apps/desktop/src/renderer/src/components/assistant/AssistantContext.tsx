@@ -13,17 +13,34 @@ import {
   type AiViewContext,
   type AppWorkingStatePatchAppliedEvent
 } from '@kb-vault/shared-types';
+import { extractStreamedAssistantEnvelope, looksLikeStructuredAssistantStream } from './assistant-streaming';
+import { unwrapAssistantDisplayText } from './assistant-streaming';
 
 const OPTIMISTIC_MESSAGE_PREFIX = 'optimistic:';
+const ASSISTANT_CONSOLE_PREFIX = '[assistant.chat]';
+
+function logAssistantConsole(label: string, payload: unknown, level: 'log' | 'warn' = 'log') {
+  if (level === 'warn') {
+    console.warn(`${ASSISTANT_CONSOLE_PREFIX} ${label}`, payload);
+    return;
+  }
+  console.log(`${ASSISTANT_CONSOLE_PREFIX} ${label}`, payload);
+}
 
 function normalizeMessages(messages: AiMessageRecord[]): AiMessageRecord[] {
   const seen = new Set<string>();
   const deduped: AiMessageRecord[] = [];
   for (const message of messages) {
-    const key = message.id || `${message.role}:${message.createdAtUtc}:${message.content}`;
+    const normalizedMessage = message.role === 'assistant'
+      ? {
+          ...message,
+          content: unwrapAssistantDisplayText(message.content) ?? message.content
+        }
+      : message;
+    const key = normalizedMessage.id || `${normalizedMessage.role}:${normalizedMessage.createdAtUtc}:${normalizedMessage.content}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    deduped.push(message);
+    deduped.push(normalizedMessage);
   }
   return deduped;
 }
@@ -44,9 +61,11 @@ export interface PendingAssistantTurn {
   turnId: string;
   sessionId: string;
   startedAtUtc: string;
+  rawResponseText: string;
   responseText: string;
   thoughtText: string;
   toolEvents: PendingAssistantToolEvent[];
+  hasRenderableFinalResponse: boolean;
   error?: string;
 }
 
@@ -195,6 +214,7 @@ export function AiAssistantProvider({
   const applyActionsRef = useRef<RouteRegistration['applyUiActions']>();
   const applyWorkingStatePatchRef = useRef<RouteRegistration['applyWorkingStatePatch']>();
   const sessionRef = useRef<AiSessionRecord | null>(null);
+  const pendingTurnRef = useRef<PendingAssistantTurn | null>(null);
 
   useEffect(() => {
     applyActionsRef.current = registration?.applyUiActions;
@@ -207,6 +227,10 @@ export function AiAssistantProvider({
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  useEffect(() => {
+    pendingTurnRef.current = pendingTurn;
+  }, [pendingTurn]);
 
   const fallbackContext = useMemo<AiViewContext | null>(() => {
     if (!workspaceId) return null;
@@ -326,9 +350,11 @@ export function AiAssistantProvider({
             turnId: event.turnId,
             sessionId: event.sessionId,
             startedAtUtc: event.atUtc,
+            rawResponseText: '',
             responseText: '',
             thoughtText: '',
-            toolEvents: []
+            toolEvents: [],
+            hasRenderableFinalResponse: false
           };
         }
 
@@ -337,9 +363,14 @@ export function AiAssistantProvider({
         }
 
         if (event.kind === 'response_chunk' && event.text) {
+          const rawResponseText = appendStreamingText(current.rawResponseText, event.text);
+          const streamed = extractStreamedAssistantEnvelope(rawResponseText);
           return {
             ...current,
-            responseText: appendStreamingText(current.responseText, event.text)
+            rawResponseText,
+            responseText: streamed.responseText,
+            hasRenderableFinalResponse: streamed.hasRenderableFinalResponse,
+            error: streamed.hasRenderableFinalResponse ? undefined : current.error
           };
         }
 
@@ -366,6 +397,25 @@ export function AiAssistantProvider({
         }
 
         if (event.kind === 'turn_error') {
+          logAssistantConsole('turn_error', {
+            workspaceId,
+            turnId: event.turnId,
+            sessionId: current.sessionId,
+            error: event.error ?? event.message ?? 'Assistant run failed.',
+            rawResponseText: current.rawResponseText,
+            responseText: current.responseText,
+            thoughtText: current.thoughtText,
+            toolEvents: current.toolEvents
+          }, 'warn');
+          if (
+            current.hasRenderableFinalResponse
+            || (
+              current.responseText.trim().length > 0
+              && looksLikeStructuredAssistantStream(current.rawResponseText)
+            )
+          ) {
+            return current;
+          }
           return {
             ...current,
             error: event.error ?? event.message ?? 'Assistant run failed.'
@@ -561,6 +611,11 @@ export function AiAssistantProvider({
     if (!routeContext || !trimmedMessage || sending) return;
 
     const targetSessionId = session?.id ?? null;
+    const existingAssistantMessageIds = new Set(
+      messages
+        .filter((messageItem) => messageItem.role === 'assistant')
+        .map((messageItem) => messageItem.id)
+    );
 
     const optimisticMessage: AiMessageRecord = {
       id: `${OPTIMISTIC_MESSAGE_PREFIX}${Date.now()}`,
@@ -576,6 +631,13 @@ export function AiAssistantProvider({
     setPendingTurn(null);
     setSending(true);
     setError(null);
+    logAssistantConsole('user_message', {
+      workspaceId: routeContext.workspaceId,
+      sessionId: targetSessionId,
+      route: routeContext.route,
+      subject: routeContext.subject,
+      message: trimmedMessage
+    });
     try {
       const response = await window.kbv.invoke<AiAssistantTurnResponse>('ai.assistant.message.send', {
         workspaceId: routeContext.workspaceId,
@@ -584,8 +646,49 @@ export function AiAssistantProvider({
         message: trimmedMessage
       });
       if (!response.ok || !response.data) {
+        logAssistantConsole('send_error', {
+          workspaceId: routeContext.workspaceId,
+          sessionId: targetSessionId,
+          message: trimmedMessage,
+          error: response.error?.message ?? 'Failed to send assistant message.',
+          pendingTurn: pendingTurnRef.current
+        }, 'warn');
         setError(response.error?.message ?? 'Failed to send assistant message.');
         return;
+      }
+      const normalizedReturnedMessages = normalizeMessages(response.data.messages ?? []);
+      const latestPendingTurn = pendingTurnRef.current;
+      if (latestPendingTurn) {
+        logAssistantConsole('llm_turn_raw', {
+          workspaceId: routeContext.workspaceId,
+          sessionId: response.data.session.id,
+          turnId: latestPendingTurn.turnId,
+          rawResponseText: latestPendingTurn.rawResponseText,
+          responseText: latestPendingTurn.responseText,
+          thoughtText: latestPendingTurn.thoughtText,
+          toolEvents: latestPendingTurn.toolEvents,
+          error: latestPendingTurn.error
+        });
+      }
+      for (const assistantMessage of normalizedReturnedMessages.filter((messageItem) => (
+        messageItem.role === 'assistant' && !existingAssistantMessageIds.has(messageItem.id)
+      ))) {
+        logAssistantConsole('assistant_message', {
+          workspaceId: routeContext.workspaceId,
+          sessionId: response.data.session.id,
+          messageId: assistantMessage.id,
+          messageKind: assistantMessage.messageKind,
+          createdAtUtc: assistantMessage.createdAtUtc,
+          content: assistantMessage.content,
+          metadata: assistantMessage.metadata
+        });
+      }
+      if (response.data.artifact) {
+        logAssistantConsole('assistant_artifact', {
+          workspaceId: routeContext.workspaceId,
+          sessionId: response.data.session.id,
+          artifact: response.data.artifact
+        });
       }
       upsertSession(response.data.session);
       await loadSessionList(routeContext.workspaceId);
@@ -596,12 +699,19 @@ export function AiAssistantProvider({
         || currentSession?.id === targetSessionId;
       if (shouldHydrateCurrent) {
         setSession(response.data.session);
-        setMessages(normalizeMessages(response.data.messages ?? []));
+        setMessages(normalizedReturnedMessages);
         setArtifact(response.data.artifact ?? null);
         setPendingTurn(null);
         runUiActions(response.data.uiActions ?? []);
       }
     } catch (err) {
+      logAssistantConsole('send_exception', {
+        workspaceId: routeContext.workspaceId,
+        sessionId: targetSessionId,
+        message: trimmedMessage,
+        error: err instanceof Error ? err.message : String(err),
+        pendingTurn: pendingTurnRef.current
+      }, 'warn');
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);

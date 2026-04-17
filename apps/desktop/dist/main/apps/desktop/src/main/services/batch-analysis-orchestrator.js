@@ -506,7 +506,7 @@ class BatchAnalysisOrchestrator {
             'Prefer create work when a topic cluster has deterministic search coverage but no meaningful existing article match; do not force unrelated edits just to avoid net-new articles.',
             'Do not execute proposals or mutate KB content in this stage.',
             'Use the deterministic planner prefetch as your primary evidence base for planning decisions; in most cases it already contains the evidence you need.',
-            'Only issue new KB CLI discovery when you still have a concrete unresolved ambiguity after reviewing the prefetch, or when a cluster is genuinely missing the evidence required to choose create versus edit versus no-impact.',
+            'Only issue new KB lookups when you still have a concrete unresolved ambiguity after reviewing the prefetch, or when a cluster is genuinely missing the evidence required to choose create versus edit versus no-impact.',
             'If the prefetch already gives you enough evidence for a cluster, reuse it directly instead of re-proving the same point with more searches.',
             'If a deterministic prefetch query already returned zero meaningful matches, treat that zero-result evidence as final unless you have a materially different query.',
             'JSON shape:',

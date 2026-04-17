@@ -145,6 +145,9 @@ async function bootstrapApp() {
   const bridgeSocketPath = mcpBridge.getSocketPath();
   const bridgeScriptPath = path.join(appRoot, 'dist', 'main', 'mcp-bridge-client.js');
   const nodeBinary = process.env.KBV_NODE_BINARY ?? 'node';
+  process.env.KBV_MCP_BRIDGE_SOCKET_PATH = bridgeSocketPath;
+  process.env.KBV_MCP_BRIDGE_SCRIPT = bridgeScriptPath;
+  process.env.KBV_NODE_BINARY = nodeBinary;
   agentRuntime.setMcpServerConfigs([
     {
       type: 'stdio',

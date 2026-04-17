@@ -1,7 +1,7 @@
 # KB Vault — Project Breakdown
-**Version:** 1.0  
-**Date:** 2026-03-23  
-**Status:** Planning baseline with initial app-command mutation slice implemented  
+**Version:** 1.1  
+**Date:** 2026-04-16  
+**Status:** Implemented CLI/MCP parity baseline with strict KB access mode selection  
 **Product module:** KB Vault  
 **App shell:** Modular desktop app with KB Vault as the first module
 
@@ -316,7 +316,7 @@ Depending on proposal type:
    - from a live article, AI creates a proposal candidate that the user can `Create Proposal` or `Dismiss`
    - from a draft, AI returns a draft patch that updates the working copy
    - from Proposal Review, AI returns a proposal patch that updates the review working copy
-   - from Templates & Prompts, AI executes an app working-state command that patches the current form state through the desktop app
+   - from Templates & Prompts, AI uses the currently selected KB access mode to execute an app working-state mutation against the desktop app
 6. User remains the explicit decision-maker for any persisted change.
 
 ## 7.8 Publish selected drafts
@@ -494,6 +494,8 @@ Minimum MCP tool set:
 - `get_pbi`
 - `get_pbi_subset`
 - `get_article_history`
+- `app_get_form_schema`
+- `app_patch_form`
 - `propose_create_kb`
 - `propose_edit_kb`
 - `propose_retire_kb`
@@ -501,6 +503,14 @@ Minimum MCP tool set:
 
 ### Tooling rule
 The model may gather context and return proposal payloads, but it may not directly publish, delete live content, or mutate Zendesk without explicit user action.
+
+### KB access mode rule
+KB Vault now supports both CLI and MCP as first-class KB access transports.
+
+- The workspace-selected `KB access Mode` is authoritative for assistant chat, batch analysis, article edit, and proposal-creation AI work.
+- The app must not silently switch between CLI and MCP mid-run.
+- If the selected mode is unhealthy, the run fails clearly before execution begins.
+- MCP readiness should validate bridge configuration, bridge reachability, and the expected registered tool set.
 
 ## 8.8 Proposal schema and review model
 Every AI batch result must be normalized into structured proposals.
@@ -637,7 +647,7 @@ When the user asks the AI to make article changes, the resulting artifact should
 - live article context -> proposal candidate
 - draft context -> draft patch
 - proposal review context -> proposal patch
-- template context -> app working-state command (`kb app get-form-schema` / `kb app patch-form`) with confirmed UI mutation
+- template context -> app working-state mutation through the selected transport with confirmed UI mutation
 
 Live article requests for changes should not silently mutate the article view. They should create a proposal candidate first, and only after user confirmation should the app create a proposal record.
 
@@ -658,12 +668,16 @@ Users should be able to:
 - assign template preferences by article type
 
 Template editing should use the generic app working-state mutation system rather than field-specific assistant JSON parsing.
-The initial implemented transport is:
+The implemented transports are:
 
-- `kb app get-form-schema --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --json`
-- `kb app patch-form --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --version-token ... --patch '{...}' --json`
+- CLI:
+  - `kb app get-form-schema --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --json`
+  - `kb app patch-form --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --version-token ... --patch '{...}' --json`
+- MCP:
+  - `app_get_form_schema`
+  - `app_patch_form`
 
-This contract is intentionally generic so additional editable screens can adopt the same pattern later.
+These contracts are intentionally generic so additional editable screens can adopt the same pattern later while reusing the same desktop mutation layer.
 - maintain tone/style guidance inside the workspace
 
 Initial template types:
@@ -1290,7 +1304,9 @@ A context packet may contain:
 - previously returned notes if resuming
 
 ## 14.4 MCP tool philosophy
-MCP tools should expose read-heavy context retrieval and proposal-intent operations.  
+KB Vault supports two KB access transports: CLI and MCP. The selected workspace mode is authoritative for the run, and the app does not silently fall back to the other provider.
+
+MCP tools should expose read-heavy context retrieval, proposal-intent operations, and parity app working-state mutation primitives.  
 The LLM should have access to:
 - discover relevant articles,
 - inspect live and draft versions,
@@ -1305,8 +1321,9 @@ It should **not** have permission to:
 - modify OS-level secrets,
 - execute unrestricted local commands.
 
-For desktop-local mutable working states, the assistant may also use the scoped KB CLI app commands exposed by the desktop loopback service.
-Those commands are allowed only to mutate the currently registered route/entity working state inside the app, not durable external systems.
+For desktop-local mutable working states, both CLI and MCP now reach the same scoped desktop mutation layer.
+Those operations are allowed only to mutate the currently registered route/entity working state inside the app, not durable external systems.
+Proposal Review remains a separate assistant contract: the preferred mutation path there is `proposal_patch`, not generic form mutation commands.
 
 ## 14.5 Output contract
 ACP responses for proposal and draft flows should still be normalized against a strict JSON schema before any proposal is stored.
@@ -1317,19 +1334,27 @@ If the agent returns malformed data:
 3. do not silently coerce ambiguous outputs into accepted proposals.
 
 For live form mutations, the source of truth is not the JSON response body by itself.  
-The source of truth is the result of a real KB app command executed during the assistant turn.
+The source of truth is the result of a real app mutation operation executed during the assistant turn.
 
-The implemented first-slice command contract is:
+The implemented command/tool contract is:
 
-- `kb app get-form-schema`
-  - returns editable fields, types, current values, and a version token for the active working state
-- `kb app patch-form`
-  - sends a structured patch to the desktop app loopback service
-  - validates route, entity type, entity id, allowed keys, and value types
-  - supports stale-state protection through `versionToken`
-  - returns `applied`, `appliedPatch`, `ignoredKeys`, `validationErrors`, and `nextVersionToken`
+- CLI:
+  - `kb app get-form-schema`
+    - returns editable fields, types, current values, and a version token for the active working state
+  - `kb app patch-form`
+    - sends a structured patch to the desktop app loopback service
+- MCP:
+  - `app_get_form_schema`
+    - returns the same editable field schema and version token contract
+  - `app_patch_form`
+    - sends the same structured patch shape through the MCP runtime
 
-The assistant must not claim a field changed unless `kb app patch-form` succeeded.
+Shared semantics for both transports:
+- validate route, entity type, entity id, allowed keys, and value types
+- support stale-state protection through `versionToken`
+- return `applied`, `appliedPatch`, `ignoredKeys`, `validationErrors`, and `nextVersionToken`
+
+The assistant must not claim a field changed unless the selected transport's real mutation call succeeded.
 
 ## 14.6 Agent notes
 The agent must be allowed to return notes at:
@@ -1338,11 +1363,14 @@ The agent must be allowed to return notes at:
 - per-proposal level
 
 These notes are stored and shown to the user as supporting context, not hidden system reasoning.
+`record_agent_notes` now persists those notes in local workspace storage.
 
 ## 14.7 App working-state mutation model
 KB Vault should use one generic desktop mutation primitive for live editable forms:
 
-- transport: `kb app get-form-schema` and `kb app patch-form`
+- transport:
+  - CLI: `kb app get-form-schema` and `kb app patch-form`
+  - MCP: `app_get_form_schema` and `app_patch_form`
 - target identity: `workspaceId`, `route`, `entityType`, `entityId`
 - concurrency control: `versionToken`
 - patch payload: `Record<string, unknown>`
@@ -1358,7 +1386,7 @@ Each registered screen provides:
 - allowed field schema
 - page/entity-specific validator
 
-The first implemented vertical slice is:
+The first implemented vertical slice was:
 
 - route: `templates_and_prompts`
 - entity type: `template_pack`
@@ -1373,23 +1401,27 @@ The first implemented vertical slice is:
   - `active`
 
 This replaces the earlier template-specific approach where assistant prose or returned JSON was parsed after the fact and treated as if a mutation had already happened.
+Proposal Review continues to use `proposal_patch` as the primary assistant-facing mutation contract, even though the same desktop mutation service can support low-level working-state persistence behind the scenes.
 
 ## 14.8 Current implementation status
-Implemented as of March 23, 2026:
+Implemented as of April 16, 2026:
 
-- shared generic app working-state request/response types
-- desktop main-process working-state mutation service
-- loopback routes for form schema lookup and patch application
-- KB CLI shim support for `kb app get-form-schema` and `kb app patch-form`
-- template-pack validator and apply flow
-- renderer registration for template working state
-- assistant runtime guidance updated to require real KB app commands for live template edits
+- strict KB access mode resolution with no silent CLI/MCP fallback
+- shared KB access mode preflight helpers for assistant chat, batch analysis, and article-edit runs
+- shared generic app working-state request/response types plus MCP input schemas
+- desktop main-process working-state mutation service reused by both the CLI loopback and MCP runtime tools
+- KB CLI support for `kb app get-form-schema` and `kb app patch-form`
+- MCP support for `app_get_form_schema` and `app_patch_form`
+- template-pack validator and apply flow through the shared mutation layer
+- provider-specific prompt guidance so MCP sessions use MCP tools and CLI sessions use KB CLI commands
+- Proposal Review guidance standardized on `proposal_patch`
+- local proposal persistence with provider provenance metadata
+- `record_agent_notes` persistence in workspace storage
+- corrected `get_locale_variant` contract using `localeVariantId`
+- richer MCP health checks covering bridge config, reachability, and expected tool registration
+- paired tests covering strict mode behavior, provider-pure prompts, MCP form mutation parity, and proposal provenance
 
-Still to implement:
-
-- assistant end-to-end tests proving the model executes the new commands during live template edits
-- full removal of legacy template-patch artifact behavior
-- expansion of the same system to drafts, proposal review, settings, and future editable forms
+Follow-on hardening is now incremental rather than foundational. Future work can continue to expand additional editable screens onto the same mutation layer and broaden smoke coverage, but the core CLI/MCP parity refactor is in place.
 
 ---
 

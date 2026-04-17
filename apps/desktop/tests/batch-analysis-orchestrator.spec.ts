@@ -116,6 +116,18 @@ function createPlannerPrefetch(overrides?: Partial<BatchPlannerPrefetch>): Batch
 }
 
 test.describe('batch analysis orchestrator deterministic review guard', () => {
+  test('planner prompt removes CLI-discovery wording and keeps lookup guidance provider-neutral', () => {
+    const orchestrator = createOrchestrator();
+    const prompt = orchestrator.buildPlannerPrompt({
+      batchContext: { batchId: 'batch-1', workspaceId: 'workspace-1' },
+      uploadedPbis: { rows: [{ id: 'pbi-1', title: 'Add checklist reminders' }] },
+      plannerPrefetch: createPlannerPrefetch()
+    });
+
+    expect(prompt).toContain('Only issue new KB lookups when you still have a concrete unresolved ambiguity');
+    expect(prompt).not.toContain('KB CLI discovery');
+  });
+
   test('planner retry prompts carry the original planner context into fresh ACP sessions', () => {
     const orchestrator = createOrchestrator();
     const originalPrompt = 'Create a complete structured batch analysis plan.\n\nDeterministic planner prefetch:\n{"topicClusters":[{"clusterId":"cluster-1"}]}';

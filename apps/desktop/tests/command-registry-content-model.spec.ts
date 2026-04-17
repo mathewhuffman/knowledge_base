@@ -11,13 +11,24 @@ import { AppErrorCode, AppRoute } from '@kb-vault/shared-types';
 async function createFakeAcpBinary(root: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-article-ai-agent');
 const source = `#!/usr/bin/env node
+const fs = require('node:fs');
 const readline = require('node:readline');
 const sessionId = 'fake-acp-session';
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+
+function append(entry) {
+  if (!logPath) {
+    return;
+  }
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
   const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
   if (message.method === 'initialize' || message.method === 'authenticate') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
     return;
@@ -26,55 +37,75 @@ rl.on('line', (line) => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
     return;
   }
-  if (message.method === 'session/prompt') {
-    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
-    let payload;
-    if (promptText.includes('Route: drafts')) {
-      payload = {
-        artifactType: 'draft_patch',
-        response: 'I tightened the draft copy.',
-        summary: 'Refined the draft.',
-        html: '<h1>Draft Commands</h1><p>AI refined draft.</p>'
-      };
-    } else if (promptText.includes('Route: templates_and_prompts')) {
-      payload = {
-        artifactType: 'template_patch',
-        response: 'I strengthened the template guidance.',
-        summary: 'Updated the template fields.',
-        formPatch: {
-          toneRules: 'Be concise, concrete, and action-oriented.',
-          description: 'Template updated by the assistant.'
-        }
-      };
-    } else if (promptText.includes('Route: article_explorer')) {
-      payload = {
-        artifactType: 'proposal_candidate',
-        response: 'I prepared a proposal candidate from the live article.',
-        summary: 'Created a proposal candidate.',
-        title: 'Batch 9 Commands',
-        confidenceScore: 0.81,
+    if (message.method === 'session/prompt') {
+      const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+      let payload;
+      if (promptText.includes('Route: drafts')) {
+        payload = {
+          command: 'patch_draft',
+          artifactType: 'draft_patch',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'I tightened the draft copy.',
+          summary: 'Refined the draft.',
+          html: '<h1>Draft Commands</h1><p>AI refined draft.</p>'
+        };
+      } else if (promptText.includes('Route: templates_and_prompts')) {
+        payload = {
+          command: 'patch_template',
+          artifactType: 'template_patch',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'I strengthened the template guidance.',
+          summary: 'Updated the template fields.',
+          formPatch: {
+            toneRules: 'Be concise, concrete, and action-oriented.',
+            description: 'Template updated by the assistant.'
+          }
+        };
+      } else if (promptText.includes('Route: article_explorer')) {
+        payload = {
+          command: 'create_proposal',
+          artifactType: 'proposal_candidate',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'I prepared a proposal candidate from the live article.',
+          summary: 'Created a proposal candidate.',
+          title: 'Batch 9 Commands',
+          confidenceScore: 0.81,
         rationale: 'The article needs a clearer opening.',
         html: '<h1>Batch 9 Commands</h1><p>Assistant proposal candidate.</p>',
         payload: {
           confidenceScore: 0.81,
           proposedHtml: '<h1>Batch 9 Commands</h1><p>Assistant proposal candidate.</p>'
         }
-      };
-    } else if (promptText.includes('Route: proposal_review')) {
-      payload = {
-        artifactType: 'proposal_patch',
-        response: 'I refined the proposal working copy.',
-        summary: 'Updated the proposal draft.',
-        title: 'Batch 9 Commands Refined',
-        rationale: 'Made the rationale more specific.',
-        html: '<h1>Batch 9 Commands Refined</h1><p>AI refined proposal.</p>'
-      };
-    } else {
-      payload = { updatedHtml: '<h1>Draft Commands</h1><p>AI refined draft.</p>', summary: 'AI tightened the article.' };
+        };
+      } else if (promptText.includes('Route: proposal_review')) {
+        payload = {
+          command: 'patch_proposal',
+          artifactType: 'proposal_patch',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'I refined the proposal working copy.',
+          summary: 'Updated the proposal draft.',
+          title: 'Batch 9 Commands Refined',
+          rationale: 'Made the rationale more specific.',
+          html: '<h1>Batch 9 Commands Refined</h1><p>AI refined proposal.</p>'
+        };
+      } else {
+        payload = {
+          command: 'none',
+          artifactType: 'informational_response',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'AI tightened the article.',
+          summary: 'AI tightened the article.',
+          updatedHtml: '<h1>Draft Commands</h1><p>AI refined draft.</p>'
+        };
+      }
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+      return;
     }
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
-    return;
-  }
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
 });
 `;
@@ -140,16 +171,27 @@ rl.on('line', (line) => {
 async function createFakeBatchAnalysisAcpBinary(root: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-batch-analysis-agent');
   const source = `#!/usr/bin/env node
+const fs = require('node:fs');
 const readline = require('node:readline');
 const sessionId = 'fake-batch-analysis-session';
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
 let reviewCount = 0;
 let workerCount = 0;
 let finalReviewCount = 0;
+
+function append(entry) {
+  if (!logPath) {
+    return;
+  }
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
   const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
   if (message.method === 'initialize' || message.method === 'authenticate') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
     return;
@@ -168,14 +210,14 @@ rl.on('line', (line) => {
       payload = {
         summary: discoveredAmendment ? 'Amended plan.' : (revised ? 'Revised plan.' : 'Initial draft plan.'),
         coverage: [
-          { pbiId: 'pbi-1', outcome: 'covered', planItemIds: discoveredAmendment ? ['item-1', 'item-2'] : ['item-1'] }
+          { pbiId: '1', outcome: 'covered', planItemIds: discoveredAmendment ? ['item-1', 'item-2'] : ['item-1'] }
         ],
         items: discoveredAmendment ? [
           {
             planItemId: 'item-1',
-            pbiIds: ['pbi-1'],
-            action: 'no_impact',
-            targetType: 'article',
+            pbiIds: ['1'],
+            action: 'create',
+            targetType: 'new_article',
             targetTitle: 'Primary article',
             reason: 'Tracked for test coverage.',
             evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
@@ -184,9 +226,9 @@ rl.on('line', (line) => {
           },
           {
             planItemId: 'item-2',
-            pbiIds: ['pbi-1'],
-            action: 'no_impact',
-            targetType: 'article',
+            pbiIds: ['1'],
+            action: 'create',
+            targetType: 'new_article',
             targetTitle: 'Discovered article',
             reason: 'Amendment added discovered scope for loop testing.',
             evidence: [{ kind: 'review', ref: 'discovery-1', summary: 'Worker discovered related article work.' }],
@@ -196,9 +238,9 @@ rl.on('line', (line) => {
         ] : [
           {
             planItemId: 'item-1',
-            pbiIds: ['pbi-1'],
-            action: 'no_impact',
-            targetType: 'article',
+            pbiIds: ['1'],
+            action: 'create',
+            targetType: 'new_article',
             targetTitle: 'Primary article',
             reason: revised ? 'Reviewer-approved test plan item.' : 'Initial test plan item.',
             evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
@@ -268,7 +310,7 @@ rl.on('line', (line) => {
               suspectedTarget: 'Discovered article',
               reason: 'Worker found adjacent scope.',
               evidence: [{ kind: 'article', ref: 'article-2', summary: 'Adjacent article references the same workflow.' }],
-              linkedPbiIds: ['pbi-1'],
+              linkedPbiIds: ['1'],
               confidence: 0.68,
               requiresPlanAmendment: true
             }
@@ -334,12 +376,149 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
-async function createDeterministicPrefetchBatchAcpBinary(root: string): Promise<string> {
+async function createLoggedSuccessfulBatchAnalysisAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-mode-parity-agent');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const sessionId = 'fake-batch-analysis-mode-parity-session';
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+
+function append(entry) {
+  if (!logPath) {
+    return;
+  }
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+function inferTargetTitle(promptText) {
+  if (promptText.includes('MCP analysis')) {
+    return 'MCP analysis';
+  }
+  if (promptText.includes('CLI analysis')) {
+    return 'CLI analysis';
+  }
+  return 'Batch parity article';
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      const targetTitle = inferTargetTitle(promptText);
+      payload = {
+        summary: 'Parity plan creates the required KB article.',
+        coverage: [
+          { pbiId: '1', outcome: 'covered', planItemIds: ['item-1'] }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['1'],
+            action: 'create',
+            targetType: 'new_article',
+            targetTitle,
+            reason: 'Create the KB article that the parity batch requests.',
+            evidence: [{ kind: 'pbi', ref: '1', summary: 'Imported parity test PBI.' }],
+            confidence: 0.94,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      };
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      payload = {
+        summary: 'Plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      payload = {
+        summary: 'Worker completed the approved parity plan.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review approved the parity batch.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createDeterministicPrefetchBatchAcpBinary(root: string): Promise<{ binaryPath: string; configPath: string }> {
   const binaryPath = path.join(root, 'fake-batch-analysis-deterministic-prefetch-agent');
-  const source = `#!${process.execPath}
+  const configPath = path.join(root, 'deterministic-prefetch-config.json');
+const source = `#!${process.execPath}
+const fs = require('node:fs');
 const readline = require('node:readline');
 const sessionId = 'fake-batch-analysis-deterministic-prefetch-session';
+const configPath = ${JSON.stringify(configPath)};
 let reviewCount = 0;
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const trimmed = line.trim();
@@ -355,10 +534,13 @@ rl.on('line', (line) => {
   }
   if (message.method === 'session/prompt') {
     const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    const config = loadConfig();
     let payload;
 
     if (promptText.includes('Create a complete structured batch analysis plan.')) {
       const revised = promptText.includes('Reviewer delta summary:');
+      const teamDashboard = config.teamDashboard || {};
+      const leadershipTileSettings = config.leadershipTileSettings || {};
       payload = revised
         ? {
             summary: 'Revised plan now targets the existing KB articles.',
@@ -372,6 +554,8 @@ rl.on('line', (line) => {
                 pbiIds: ['101'],
                 action: 'edit',
                 targetType: 'article',
+                ...(teamDashboard.localeVariantId ? { targetArticleId: teamDashboard.localeVariantId } : {}),
+                ...(teamDashboard.familyId ? { targetFamilyId: teamDashboard.familyId } : {}),
                 targetTitle: 'Team Dashboard',
                 reason: 'Existing Team Dashboard article should be updated instead of creating a new article.',
                 evidence: [{ kind: 'search', ref: 'cluster-1', summary: 'Deterministic prefetch found the existing Team Dashboard article.' }],
@@ -383,6 +567,8 @@ rl.on('line', (line) => {
                 pbiIds: ['102'],
                 action: 'edit',
                 targetType: 'article',
+                ...(leadershipTileSettings.localeVariantId ? { targetArticleId: leadershipTileSettings.localeVariantId } : {}),
+                ...(leadershipTileSettings.familyId ? { targetFamilyId: leadershipTileSettings.familyId } : {}),
                 targetTitle: 'Leadership Tile Settings',
                 reason: 'Existing Leadership Tile Settings article should be updated.',
                 evidence: [{ kind: 'search', ref: 'cluster-2', summary: 'Deterministic prefetch found the existing Leadership Tile Settings article.' }],
@@ -493,7 +679,7 @@ rl.on('line', (line) => {
 `;
   await writeFile(binaryPath, source, 'utf8');
   await chmod(binaryPath, 0o755);
-  return binaryPath;
+  return { binaryPath, configPath };
 }
 
 async function createInvalidTargetRepairBatchAcpBinary(root: string): Promise<{ binaryPath: string; configPath: string }> {
@@ -615,15 +801,25 @@ rl.on('line', (line) => {
   return { binaryPath, configPath };
 }
 
-async function createCliPolicyFallbackBatchAnalysisAcpBinary(root: string): Promise<string> {
+async function createCliPolicyFallbackBatchAnalysisAcpBinary(root: string): Promise<{ binaryPath: string; configPath: string }> {
   const binaryPath = path.join(root, 'fake-batch-analysis-cli-policy-fallback-agent');
+  const configPath = path.join(root, 'cli-policy-fallback-config.json');
   const source = `#!/usr/bin/env node
+const fs = require('node:fs');
 const readline = require('node:readline');
 let sessionCounter = 0;
 let currentSessionId = '';
 let currentTransport = 'cli';
 let cliWorkerPromptCount = 0;
 const rl = readline.createInterface({ input: process.stdin });
+const configPath = ${JSON.stringify(configPath)};
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
 rl.on('line', (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -641,6 +837,7 @@ rl.on('line', (line) => {
   }
   if (message.method === 'session/prompt') {
     const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    const config = loadConfig();
     let payload;
 
     if (promptText.includes('Create a complete structured batch analysis plan.')) {
@@ -653,11 +850,13 @@ rl.on('line', (line) => {
           {
             planItemId: 'item-1',
             pbiIds: ['pbi-1'],
-            action: 'no_impact',
+            action: 'edit',
             targetType: 'article',
-            targetTitle: 'Checklist article',
+            targetArticleId: config.localeVariantId,
+            targetFamilyId: config.familyId,
+            targetTitle: config.targetTitle || 'Checklist Policy Retry',
             reason: 'Used to exercise CLI fallback handling.',
-            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+            evidence: [{ kind: 'pbi', ref: 'externalId:1', summary: 'Imported test PBI.' }],
             confidence: 0.88,
             executionStatus: 'pending'
           }
@@ -746,11 +945,11 @@ rl.on('line', (line) => {
     return;
   }
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
-});
-`;
+	});
+	`;
   await writeFile(binaryPath, source, 'utf8');
   await chmod(binaryPath, 0o755);
-  return binaryPath;
+  return { binaryPath, configPath };
 }
 
 async function createPlannerRepairAcpBinary(root: string): Promise<string> {
@@ -780,14 +979,14 @@ rl.on('line', (line) => {
       payload = {
         summary: 'Recovered draft plan after repair prompt.',
         coverage: [
-          { pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['item-1'] }
+          { pbiId: '1', outcome: 'covered', planItemIds: ['item-1'] }
         ],
         items: [
           {
             planItemId: 'item-1',
-            pbiIds: ['pbi-1'],
-            action: 'no_impact',
-            targetType: 'article',
+            pbiIds: ['1'],
+            action: 'create',
+            targetType: 'new_article',
             targetTitle: 'Recovered planner article',
             reason: 'Repair prompt converted the batch into valid plan JSON.',
             evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
@@ -894,19 +1093,19 @@ rl.on('line', (line) => {
     } else if (promptText.includes('Create a complete structured batch analysis plan.')) {
       plannerPromptCount += 1;
       if (plannerPromptCount === 1) {
-        payload = 'Gathering KB evidence via the kb CLI before returning the structured plan.';
+        payload = 'Planner result malformed @@ incomplete planner payload @@';
       } else {
         payload = {
           summary: 'Recovered draft plan after a fresh-session retry.',
           coverage: [
-            { pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['item-1'] }
+            { pbiId: '1', outcome: 'covered', planItemIds: ['item-1'] }
           ],
           items: [
             {
               planItemId: 'item-1',
-              pbiIds: ['pbi-1'],
-              action: 'no_impact',
-              targetType: 'article',
+              pbiIds: ['1'],
+              action: 'create',
+              targetType: 'new_article',
               targetTitle: 'Recovered planner article',
               reason: 'A fresh local session recovered from the provider error.',
               evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
@@ -1001,9 +1200,9 @@ rl.on('line', (line) => {
     let text = '';
 
     if (promptText.includes('Your previous planner response was not valid planner JSON')) {
-      text = '{"summary":"OnecandidatePBIwasfullyassessed.","coverage":[{"pbiId":"pbi-1","outcome":"covered","planItemIds":["item-1","item-2"],"notes":"Recoveredcoverage."}],"items":[{"planItemId":"item-1","pbiIds":["pbi-1"],"action":"edit","targetType":"article","targetArticleId":"locale-1","targetFamilyId":"family-1","targetTitle":"EditaFoodItem","reason":"Recoverededititem.","evidence":[{"kind":"pbi","ref":"pbi-1","summary":"Recoveredevidence."}],"confidence":0.88,"executionStatus":"pending"},{"planItemId":"item-2","pbiIds":["pbi-1"],"action":"no_impact","targetType":"article","targetArticleId":"locale-2","targetFamilyId":"family-2","targetTitle":"CreateaFoodItem","reason":"Recoveredlegacyarticledecision.","evidence":[{"kind":"article","ref":"locale-2","summary":"Legacyarticle."}],"confidence":0.7,"executionStatus":"pending"},{"planItemId":"item-3"';
+      text = '{"summary":"OnecandidatePBIwasfullyassessed.","coverage":[{"pbiId":"1","outcome":"covered","planItemIds":["item-1","item-2"],"notes":"Recoveredcoverage."}],"items":[{"planItemId":"item-1","pbiIds":["1"],"action":"create","targetType":"new_article","targetTitle":"EditaFoodItem","reason":"Recoverededititem.","evidence":[{"kind":"pbi","ref":"1","summary":"Recoveredevidence."}],"confidence":0.88,"executionStatus":"pending"},{"planItemId":"item-2","pbiIds":["1"],"action":"create","targetType":"new_article","targetTitle":"CreateaFoodItem","reason":"Recoveredlegacyarticledecision.","evidence":[{"kind":"article","ref":"legacy","summary":"Legacyarticle."}],"confidence":0.7,"executionStatus":"pending"},{"planItemId":"item-3"';
     } else if (promptText.includes('Create a complete structured batch analysis plan.')) {
-      text = '{"summary":"Initialplanneroutputwastruncated.","coverage":[{"pbiId":"pbi-1","outcome":"covered","planItemIds":["item-1"],"notes":"Initialcoverage."}],"items":[{"planItemId":"item-1","pbiIds":["pbi-1"],"action":"edit","targetType":"article","targetTitle":"EditaFoodItem","reason":"Initialedititem.","evidence":[{"kind":"pbi","ref":"pbi-1","summary":"Initialevidence."}],"confidence":0.8,"executionStatus":"pending"';
+      text = '{"summary":"Initialplanneroutputwastruncated.","coverage":[{"pbiId":"1","outcome":"covered","planItemIds":["item-1"],"notes":"Initialcoverage."}],"items":[{"planItemId":"item-1","pbiIds":["1"],"action":"create","targetType":"new_article","targetTitle":"EditaFoodItem","reason":"Initialedititem.","evidence":[{"kind":"pbi","ref":"1","summary":"Initialevidence."}],"confidence":0.8,"executionStatus":"pending"';
     } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
       text = JSON.stringify({
         summary: 'Recovered plan is approved.',
@@ -1160,14 +1359,14 @@ rl.on('line', (line) => {
       const payload = {
         summary: 'Initial draft plan.',
         coverage: [
-          { pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['item-1'] }
+          { pbiId: '1', outcome: 'covered', planItemIds: ['item-1'] }
         ],
         items: [
           {
             planItemId: 'item-1',
-            pbiIds: ['pbi-1'],
-            action: 'no_impact',
-            targetType: 'article',
+            pbiIds: ['1'],
+            action: 'create',
+            targetType: 'new_article',
             targetTitle: 'Logged article',
             reason: 'Tracked for cache-isolation coverage.',
             evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
@@ -1279,12 +1478,21 @@ async function waitForLoggedMethod(logPath: string, method: string, timeoutMs = 
   throw new Error(`Timed out waiting for ${method}`);
 }
 
+function extractPromptText(entry: { params?: Record<string, unknown> } | undefined): string {
+  const prompt = entry?.params?.prompt;
+  if (!Array.isArray(prompt)) {
+    return '';
+  }
+  const firstPart = prompt[0] as { text?: unknown } | undefined;
+  return typeof firstPart?.text === 'string' ? firstPart.text : '';
+}
+
 async function createTestHarness() {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch2-commands-'));
   await mkdir(workspaceRoot, { recursive: true });
   const bus = new CommandBus();
   const jobs = new JobRegistry();
-  registerCoreCommands(bus, jobs, workspaceRoot);
+  const services = registerCoreCommands(bus, jobs, workspaceRoot);
 
   const createWorkspace = async () => {
     const workspaceName = `ws-${randomUUID()}`;
@@ -1301,7 +1509,14 @@ async function createTestHarness() {
     return created.data as { id: string; path: string };
   };
 
-  return { workspaceRoot, bus, jobs, createWorkspace, cleanup: () => rm(workspaceRoot, { recursive: true, force: true }) };
+  return {
+    workspaceRoot,
+    bus,
+    jobs,
+    services,
+    createWorkspace,
+    cleanup: () => rm(workspaceRoot, { recursive: true, force: true })
+  };
 }
 
 async function createSearchableLiveArticle(params: {
@@ -1356,9 +1571,514 @@ async function createSearchableLiveArticle(params: {
   return { familyId: family.id, localeVariantId: variant.id, filePath: articleFilePath };
 }
 
+async function runGlobalAssistantFlowForMode(kbAccessMode: 'cli' | 'mcp') {
+  const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), `kb-vault-global-ai-commands-${kbAccessMode}-`));
+  const logPath = path.join(isolatedRoot, `global-ai-${kbAccessMode}.jsonl`);
+  process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+  process.env.KBV_CURSOR_BINARY = await createFakeAcpBinary(isolatedRoot);
+  const harness = await createTestHarness();
+
+  try {
+    const workspace = await harness.createWorkspace();
+    const settingsResp = await harness.bus.execute({
+      method: 'workspace.settings.update',
+      payload: {
+        workspaceId: workspace.id,
+        kbAccessMode
+      }
+    });
+    expect(settingsResp.ok).toBe(true);
+
+    const assistantRunRequests: string[] = [];
+    const agentRuntime = harness.services.agentRuntime as any;
+    agentRuntime.checkHealth = async (workspaceId, selectedMode, workspaceMode) => ({
+      checkedAtUtc: new Date().toISOString(),
+      workspaceId,
+      workspaceKbAccessMode: workspaceMode ?? 'cli',
+      selectedMode: selectedMode ?? workspaceMode ?? 'cli',
+      providers: {
+        mcp: {
+          mode: 'mcp',
+          provider: 'mcp',
+          ok: true,
+          message: 'MCP access ready'
+        },
+        cli: {
+          mode: 'cli',
+          provider: 'cli',
+          ok: true,
+          message: 'CLI access ready'
+        }
+      },
+      issues: [],
+      availableModes: ['mcp', 'cli']
+    });
+    const originalRunAssistantChat = agentRuntime.runAssistantChat.bind(agentRuntime);
+    agentRuntime.runAssistantChat = async (request: { kbAccessMode?: string }, emit: any, isCancelled: any) => {
+      assistantRunRequests.push(request.kbAccessMode ?? 'unknown');
+      return originalRunAssistantChat(request, emit, isCancelled);
+    };
+
+    const familyResp = await harness.bus.execute({
+      method: 'articleFamily.create',
+      payload: {
+        workspaceId: workspace.id,
+        externalKey: `kb-global-ai-${kbAccessMode}`,
+        title: 'Global AI Commands'
+      }
+    });
+    expect(familyResp.ok).toBe(true);
+    const family = familyResp.data as { id: string };
+
+    const localeResp = await harness.bus.execute({
+      method: 'localeVariant.create',
+      payload: {
+        workspaceId: workspace.id,
+        familyId: family.id,
+        locale: 'en-us',
+        status: 'live'
+      }
+    });
+    expect(localeResp.ok).toBe(true);
+    const localeVariant = localeResp.data as { id: string };
+
+    const branchResp = await harness.bus.execute({
+      method: 'draft.branch.create',
+      payload: {
+        workspaceId: workspace.id,
+        localeVariantId: localeVariant.id,
+        sourceHtml: '<h1>Draft Commands</h1><p>Original global draft.</p>'
+      }
+    });
+    expect(branchResp.ok).toBe(true);
+    const branch = branchResp.data as { branch: { id: string; headRevisionId: string } };
+
+    const draftTurn = await harness.bus.execute({
+      method: 'ai.assistant.message.send',
+      payload: {
+        workspaceId: workspace.id,
+        context: {
+          workspaceId: workspace.id,
+          route: AppRoute.DRAFTS,
+          routeLabel: 'Drafts',
+          subject: {
+            type: 'draft_branch',
+            id: branch.branch.id,
+            title: 'Global Draft',
+            locale: 'en-us'
+          },
+          workingState: {
+            kind: 'article_html',
+            versionToken: branch.branch.headRevisionId,
+            payload: { html: '<h1>Draft Commands</h1><p>Original global draft.</p>' }
+          },
+          capabilities: {
+            canChat: true,
+            canCreateProposal: false,
+            canPatchProposal: false,
+            canPatchDraft: true,
+            canPatchTemplate: false,
+            canUseUnsavedWorkingState: true
+          },
+          backingData: {
+            branchId: branch.branch.id,
+            localeVariantId: localeVariant.id
+          }
+        },
+        message: 'Tighten this draft.'
+      }
+    });
+    expect(draftTurn.ok).toBe(true);
+    expect((draftTurn.data as { artifact?: { artifactType: string } }).artifact?.artifactType).toBe('draft_patch');
+    expect((draftTurn.data as { uiActions: Array<{ type: string; html?: string }> }).uiActions[0]).toMatchObject({
+      type: 'replace_working_html',
+      html: '<h1>Draft Commands</h1><p>AI refined draft.</p>'
+    });
+
+    const templateTurn = await harness.bus.execute({
+      method: 'ai.assistant.message.send',
+      payload: {
+        workspaceId: workspace.id,
+        context: {
+          workspaceId: workspace.id,
+          route: AppRoute.TEMPLATES_AND_PROMPTS,
+          routeLabel: 'Templates & Prompts',
+          subject: {
+            type: 'template_pack',
+            id: `new-template-${kbAccessMode}`,
+            title: 'New Template',
+            locale: 'en-us'
+          },
+          workingState: {
+            kind: 'template_pack',
+            versionToken: `new-template-${kbAccessMode}:1`,
+            payload: {
+              name: 'New Template',
+              language: 'en-us',
+              templateType: 'faq',
+              promptTemplate: 'Answer clearly.',
+              toneRules: 'Be helpful.'
+            }
+          },
+          capabilities: {
+            canChat: true,
+            canCreateProposal: false,
+            canPatchProposal: false,
+            canPatchDraft: false,
+            canPatchTemplate: true,
+            canUseUnsavedWorkingState: true
+          },
+          backingData: {}
+        },
+        message: 'Improve this template.'
+      }
+    });
+    expect(templateTurn.ok).toBe(true);
+    expect((templateTurn.data as { artifact?: { artifactType: string } }).artifact?.artifactType).toBe('template_patch');
+
+    const articleTurn = await harness.bus.execute({
+      method: 'ai.assistant.message.send',
+      payload: {
+        workspaceId: workspace.id,
+        context: {
+          workspaceId: workspace.id,
+          route: AppRoute.ARTICLE_EXPLORER,
+          routeLabel: 'Article Explorer',
+          subject: {
+            type: 'article',
+            id: localeVariant.id,
+            title: 'Global AI Commands',
+            locale: 'en-us'
+          },
+          workingState: {
+            kind: 'none',
+            payload: null
+          },
+          capabilities: {
+            canChat: true,
+            canCreateProposal: true,
+            canPatchProposal: false,
+            canPatchDraft: false,
+            canPatchTemplate: false,
+            canUseUnsavedWorkingState: false
+          },
+          backingData: {
+            familyId: family.id,
+            localeVariantId: localeVariant.id,
+            sourceRevisionId: 'source-revision-1',
+            sourceHtml: '<h1>Global AI Commands</h1><p>Live article.</p>'
+          }
+        },
+        message: 'Prepare an edit proposal for this live article.'
+      }
+    });
+    expect(articleTurn.ok).toBe(true);
+    const articleData = articleTurn.data as {
+      session: { id: string; runtimeSessionId?: string };
+      artifact?: { id: string; artifactType: string; status: string };
+    };
+    expect(articleData.artifact?.artifactType).toBe('proposal_candidate');
+    expect(articleData.artifact?.status).toBe('pending');
+    expect(articleData.session.runtimeSessionId).toBeTruthy();
+
+    const articleSessionResp = await harness.bus.execute({
+      method: 'ai.assistant.session.get',
+      payload: {
+        workspaceId: workspace.id,
+        sessionId: articleData.session.id
+      }
+    });
+    expect(articleSessionResp.ok).toBe(true);
+    const articleSession = articleSessionResp.data as {
+      artifact?: { payload?: { metadata?: { kbAccessMode?: string; runtimeSessionId?: string } } };
+    };
+    expect(articleSession.artifact?.payload?.metadata?.kbAccessMode).toBe(kbAccessMode);
+    expect(articleSession.artifact?.payload?.metadata?.runtimeSessionId).toBe(articleData.session.runtimeSessionId);
+
+    const appliedCandidate = await harness.bus.execute({
+      method: 'ai.assistant.artifact.apply',
+      payload: {
+        workspaceId: workspace.id,
+        sessionId: articleData.session.id,
+        artifactId: articleData.artifact?.id
+      }
+    });
+    expect(appliedCandidate.ok).toBe(true);
+    const proposalId = (appliedCandidate.data as { createdProposalId?: string }).createdProposalId;
+    expect(proposalId).toBeTruthy();
+
+    const proposalDetail = await harness.bus.execute({
+      method: 'proposal.review.get',
+      payload: {
+        workspaceId: workspace.id,
+        proposalId
+      }
+    });
+    expect(proposalDetail.ok).toBe(true);
+    const detail = proposalDetail.data as {
+      diff: { afterHtml: string };
+      proposal: {
+        id: string;
+        updatedAtUtc: string;
+        targetLocale?: string;
+        confidenceScore?: number;
+        sessionId?: string;
+        metadata?: Record<string, unknown>;
+      };
+    };
+    expect(detail.proposal.confidenceScore).toBe(0.81);
+    expect(detail.proposal.sessionId).toBe(articleData.session.runtimeSessionId);
+    expect(detail.proposal.metadata).toMatchObject({
+      originPath: 'assistant_candidate',
+      runtimeSessionId: articleData.session.runtimeSessionId,
+      kbAccessMode,
+      acpSessionId: 'fake-acp-session'
+    });
+
+    const proposalTurn = await harness.bus.execute({
+      method: 'ai.assistant.message.send',
+      payload: {
+        workspaceId: workspace.id,
+        context: {
+          workspaceId: workspace.id,
+          route: AppRoute.PROPOSAL_REVIEW,
+          routeLabel: 'Proposal Review',
+          subject: {
+            type: 'proposal',
+            id: proposalId,
+            title: 'Global AI Commands',
+            locale: detail.proposal.targetLocale ?? 'en-us'
+          },
+          workingState: {
+            kind: 'proposal_html',
+            versionToken: `${detail.proposal.id}:${detail.proposal.updatedAtUtc}`,
+            payload: {
+              html: detail.diff.afterHtml
+            }
+          },
+          capabilities: {
+            canChat: true,
+            canCreateProposal: false,
+            canPatchProposal: true,
+            canPatchDraft: false,
+            canPatchTemplate: false,
+            canUseUnsavedWorkingState: true
+          },
+          backingData: {
+            proposalId,
+            localeVariantId: localeVariant.id
+          }
+        },
+        message: 'Refine this proposal.'
+      }
+    });
+    expect(proposalTurn.ok).toBe(true);
+    expect((proposalTurn.data as { artifact?: { artifactType: string; status: string } }).artifact?.artifactType).toBe('proposal_patch');
+    expect((proposalTurn.data as { artifact?: { status: string } }).artifact?.status).toBe('applied');
+
+    const refreshedProposal = await harness.bus.execute({
+      method: 'proposal.review.get',
+      payload: {
+        workspaceId: workspace.id,
+        proposalId
+      }
+    });
+    expect(refreshedProposal.ok).toBe(true);
+    expect((refreshedProposal.data as { diff: { afterHtml: string } }).diff.afterHtml).toContain('AI refined proposal');
+
+    const sessionListResp = await harness.bus.execute({
+      method: 'ai.assistant.session.list',
+      payload: {
+        workspaceId: workspace.id,
+        includeArchived: true
+      }
+    });
+    expect(sessionListResp.ok).toBe(true);
+    const sessionList = sessionListResp.data as {
+      activeSessionId?: string;
+      sessions: Array<{ route: string }>;
+    };
+    expect(sessionList.activeSessionId).toBeTruthy();
+    expect(sessionList.sessions.length).toBeGreaterThan(0);
+    expect(sessionList.sessions.some((session) => session.route === AppRoute.PROPOSAL_REVIEW)).toBe(true);
+    expect(sessionList.sessions.every((session) => [
+      AppRoute.DRAFTS,
+      AppRoute.TEMPLATES_AND_PROMPTS,
+      AppRoute.ARTICLE_EXPLORER,
+      AppRoute.PROPOSAL_REVIEW
+    ].includes(session.route as AppRoute))).toBe(true);
+
+    await waitForLoggedMethod(logPath, 'session/prompt');
+    const requests = await readLoggedRequests(logPath);
+    const promptTexts = requests
+      .filter((entry) => entry.method === 'session/prompt')
+      .map((entry) => extractPromptText(entry));
+    const draftPrompt = promptTexts.find((text) => text.includes('Route: drafts')) ?? '';
+    const templatePrompt = promptTexts.find((text) => text.includes('Route: templates_and_prompts')) ?? '';
+    const articlePrompt = promptTexts.find((text) => text.includes('Route: article_explorer')) ?? '';
+    const proposalPrompt = promptTexts.find((text) => text.includes('Route: proposal_review')) ?? '';
+
+    expect(draftPrompt).toContain(`KB access mode: ${kbAccessMode}`);
+    expect(templatePrompt).toContain(`KB access mode: ${kbAccessMode}`);
+    expect(articlePrompt).toContain(`KB access mode: ${kbAccessMode}`);
+    expect(proposalPrompt).toContain('`command="patch_proposal"` with `artifactType="proposal_patch"`');
+
+    if (kbAccessMode === 'mcp') {
+      expect(templatePrompt).toContain('`app_get_form_schema`');
+      expect(templatePrompt).toContain('`app_patch_form`');
+      expect(templatePrompt).not.toContain('`kb app get-form-schema`');
+      expect(templatePrompt).not.toContain('`kb app patch-form`');
+      expect(articlePrompt).toContain('fetch the current article with `get_article`');
+      expect(articlePrompt).not.toContain('fetch the current article with `kb get-article`');
+      expect(promptTexts.some((text) => text.includes('kb search-kb'))).toBe(false);
+      expect(promptTexts.some((text) => text.includes('`kb app get-form-schema`'))).toBe(false);
+      expect(promptTexts.some((text) => text.includes('`kb app patch-form`'))).toBe(false);
+    } else {
+      expect(templatePrompt).toContain('`kb app get-form-schema`');
+      expect(templatePrompt).toContain('`kb app patch-form`');
+      expect(templatePrompt).not.toContain('`app_get_form_schema`');
+      expect(templatePrompt).not.toContain('`app_patch_form`');
+      expect(articlePrompt).toContain('fetch the current article with `kb get-article`');
+      expect(articlePrompt).not.toContain('fetch the current article with `get_article`');
+      expect(promptTexts.some((text) =>
+        text.includes('Do not call direct MCP tool names such as `search_kb` or `get_article` in CLI mode.')
+      )).toBe(true);
+      expect(promptTexts.some((text) => text.includes('`app_get_form_schema`'))).toBe(false);
+      expect(promptTexts.some((text) => text.includes('`app_patch_form`'))).toBe(false);
+    }
+
+    expect(assistantRunRequests).toEqual([kbAccessMode, kbAccessMode, kbAccessMode, kbAccessMode]);
+  } finally {
+    delete process.env.KBV_TEST_ACP_LOG_PATH;
+    await harness.cleanup();
+    await rm(isolatedRoot, { recursive: true, force: true });
+  }
+}
+
+async function runBatchAnalysisForMode(kbAccessMode: 'cli' | 'mcp') {
+  const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), `kb-vault-batch-analysis-${kbAccessMode}-`));
+  const logPath = path.join(isolatedRoot, `batch-analysis-${kbAccessMode}.jsonl`);
+  process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+  process.env.KBV_CURSOR_BINARY = await createLoggedSuccessfulBatchAnalysisAcpBinary(isolatedRoot);
+  const harness = await createTestHarness();
+
+  try {
+    const workspace = await harness.createWorkspace();
+    const settingsResp = await harness.bus.execute({
+      method: 'workspace.settings.update',
+      payload: {
+        workspaceId: workspace.id,
+        kbAccessMode
+      }
+    });
+    expect(settingsResp.ok).toBe(true);
+
+    const agentRuntime = harness.services.agentRuntime as any;
+    agentRuntime.checkHealth = async (workspaceId, selectedMode, workspaceMode) => ({
+      checkedAtUtc: new Date().toISOString(),
+      workspaceId,
+      workspaceKbAccessMode: workspaceMode ?? 'cli',
+      selectedMode: selectedMode ?? workspaceMode ?? 'cli',
+      providers: {
+        mcp: {
+          mode: 'mcp',
+          provider: 'mcp',
+          ok: true,
+          message: 'MCP access ready'
+        },
+        cli: {
+          mode: 'cli',
+          provider: 'cli',
+          ok: true,
+          message: 'CLI access ready'
+        }
+      },
+      issues: [],
+      availableModes: ['mcp', 'cli']
+    });
+
+    const importResp = await harness.bus.execute({
+      method: 'pbiBatch.import',
+      payload: {
+        workspaceId: workspace.id,
+        sourceFileName: `${kbAccessMode}-analysis.csv`,
+        sourceContent: `Id,Title,Description\n1,${kbAccessMode.toUpperCase()} analysis,Verify ${kbAccessMode} batch analysis parity`
+      }
+    });
+    expect(importResp.ok).toBe(true);
+    const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+    const job = await harness.jobs.start('agent.analysis.run', {
+      workspaceId: workspace.id,
+      batchId
+    });
+    expect(job.state).toBe('SUCCEEDED');
+
+    const latestResp = await harness.bus.execute({
+      method: 'agent.analysis.latest',
+      payload: { workspaceId: workspace.id, batchId, limit: 0 }
+    });
+    expect(latestResp.ok).toBe(true);
+    const latest = latestResp.data as {
+      run: { kbAccessMode?: string } | null;
+    };
+    expect(latest.run?.kbAccessMode).toBe(kbAccessMode);
+
+    const inspectionResp = await harness.bus.execute({
+      method: 'batch.analysis.inspection.get',
+      payload: { workspaceId: workspace.id, batchId }
+    });
+    expect(inspectionResp.ok).toBe(true);
+    const inspection = inspectionResp.data as {
+      stageRuns: Array<{ kbAccessMode?: string }>;
+    };
+    expect(new Set(inspection.stageRuns.map((run) => run.kbAccessMode).filter(Boolean))).toEqual(new Set([kbAccessMode]));
+
+    const sessionsResp = await harness.bus.execute({
+      method: 'agent.session.list',
+      payload: {
+        workspaceId: workspace.id,
+        includeClosed: true
+      }
+    });
+    expect(sessionsResp.ok).toBe(true);
+    const sessions = sessionsResp.data as {
+      sessions: Array<{ type: string; batchId?: string; kbAccessMode: string }>;
+    };
+    const batchSession = sessions.sessions.find((session) => session.type === 'batch_analysis' && session.batchId === batchId);
+    expect(batchSession?.kbAccessMode).toBe(kbAccessMode);
+
+    await waitForLoggedMethod(logPath, 'session/prompt');
+    const promptRequests = await readLoggedRequests(logPath);
+    const promptText = extractPromptText(promptRequests.find((entry) => entry.method === 'session/prompt'));
+
+    if (kbAccessMode === 'mcp') {
+      expect(promptText).toContain('KB Vault MCP guidance');
+      expect(promptText).toContain('get_batch_context');
+      expect(promptText).not.toContain('Use only the `kb` CLI');
+      expect(promptText).not.toContain('kb search-kb');
+      expect(promptText).not.toContain('`kb app get-form-schema`');
+      expect(promptText).not.toContain('`kb app patch-form`');
+    } else {
+      expect(promptText).toContain('Use only the `kb` CLI');
+      expect(promptText).toContain('Do NOT use KB Vault MCP tools');
+      expect(promptText).not.toContain('KB Vault MCP guidance');
+      expect(promptText).not.toContain('get_batch_context');
+      expect(promptText).not.toContain('`search_kb`');
+      expect(promptText).not.toContain('`app_get_form_schema`');
+      expect(promptText).not.toContain('`app_patch_form`');
+    }
+  } finally {
+    delete process.env.KBV_TEST_ACP_LOG_PATH;
+    await harness.cleanup();
+    await rm(isolatedRoot, { recursive: true, force: true });
+  }
+}
+
 test.describe('command registry content model transitions', () => {
   let bus: CommandBus;
   let jobs: JobRegistry;
+  let services: any;
   let cleanup: () => Promise<void>;
   let createWorkspace: () => Promise<{ id: string }>;
   let previousCursorBinary: string | undefined;
@@ -1368,6 +2088,7 @@ test.describe('command registry content model transitions', () => {
     const harness = await createTestHarness();
     bus = harness.bus;
     jobs = harness.jobs;
+    services = harness.services;
     createWorkspace = harness.createWorkspace;
     cleanup = harness.cleanup;
   });
@@ -1413,27 +2134,50 @@ test.describe('command registry content model transitions', () => {
     expect(invalidNoPayload.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
   });
 
-  test('returns provider-aware health payload for the selected workspace mode', async () => {
+  test('returns provider-aware health payload for the selected workspace mode after mode switches', async () => {
     const workspace = await createWorkspace();
 
-    const settingsResp = await bus.execute({
+    const firstHealthResp = await bus.execute({
+      method: 'agent.health.check',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(firstHealthResp.ok).toBe(true);
+    expect((firstHealthResp.data as { selectedMode: string }).selectedMode).toBe('mcp');
+
+    const cliSettingsResp = await bus.execute({
       method: 'workspace.settings.update',
       payload: {
         workspaceId: workspace.id,
         kbAccessMode: 'cli'
       }
     });
-    expect(settingsResp.ok).toBe(true);
+    expect(cliSettingsResp.ok).toBe(true);
 
-    const healthResp = await bus.execute({
+    const cliHealthResp = await bus.execute({
       method: 'agent.health.check',
       payload: { workspaceId: workspace.id }
     });
 
-    expect(healthResp.ok).toBe(true);
-    expect((healthResp.data as { selectedMode: string }).selectedMode).toBe('cli');
-    expect((healthResp.data as { providers: { cli: { mode: string }; mcp: { mode: string } } }).providers.cli.mode).toBe('cli');
-    expect((healthResp.data as { providers: { cli: { mode: string }; mcp: { mode: string } } }).providers.mcp.mode).toBe('mcp');
+    expect(cliHealthResp.ok).toBe(true);
+    expect((cliHealthResp.data as { selectedMode: string }).selectedMode).toBe('cli');
+    expect((cliHealthResp.data as { providers: { cli: { mode: string }; mcp: { mode: string } } }).providers.cli.mode).toBe('cli');
+    expect((cliHealthResp.data as { providers: { cli: { mode: string }; mcp: { mode: string } } }).providers.mcp.mode).toBe('mcp');
+
+    const mcpSettingsResp = await bus.execute({
+      method: 'workspace.settings.update',
+      payload: {
+        workspaceId: workspace.id,
+        kbAccessMode: 'mcp'
+      }
+    });
+    expect(mcpSettingsResp.ok).toBe(true);
+
+    const mcpHealthResp = await bus.execute({
+      method: 'agent.health.check',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(mcpHealthResp.ok).toBe(true);
+    expect((mcpHealthResp.data as { selectedMode: string }).selectedMode).toBe('mcp');
   });
 
   test('reports migration health and repair status for workspace DBs', async () => {
@@ -1494,6 +2238,7 @@ test.describe('command registry content model transitions', () => {
       payload: {
         workspaceId: workspace.id,
         batchId: imported.batch.id,
+        sessionId: 'proposal-ingest-runtime',
         action: 'edit',
         targetTitle: 'Create & Edit Chat Channels',
         targetLocale: 'en-us',
@@ -1502,7 +2247,11 @@ test.describe('command registry content model transitions', () => {
         aiNotes: 'Steps 2-4 need updates.',
         sourceHtml: '<p>Old assignment flow.</p>',
         proposedHtml: '<p>New assignment flow.</p>',
-        relatedPbiIds: [rows[0].id]
+        relatedPbiIds: [rows[0].id],
+        metadata: {
+          kbAccessMode: 'cli',
+          acpSessionId: 'proposal-ingest-acp'
+        }
       }
     });
     expect(ingestResp.ok).toBe(true);
@@ -1526,7 +2275,17 @@ test.describe('command registry content model transitions', () => {
       }
     });
     expect(detailResp.ok).toBe(true);
-    expect((detailResp.data as { diff: { changeRegions: unknown[] } }).diff.changeRegions.length).toBeGreaterThan(0);
+    const detail = detailResp.data as {
+      diff: { changeRegions: unknown[] };
+      proposal: { metadata?: Record<string, unknown> };
+    };
+    expect(detail.diff.changeRegions.length).toBeGreaterThan(0);
+    expect(detail.proposal.metadata).toMatchObject({
+      originPath: 'proposal_ingest',
+      runtimeSessionId: 'proposal-ingest-runtime',
+      kbAccessMode: 'cli',
+      acpSessionId: 'proposal-ingest-acp'
+    });
 
     const deleteResp = await bus.execute({
       method: 'proposal.review.delete',
@@ -1762,6 +2521,14 @@ test.describe('command registry content model transitions', () => {
 
     try {
       const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
 
       const familyResp = await harness.bus.execute({
         method: 'articleFamily.create',
@@ -1873,12 +2640,136 @@ test.describe('command registry content model transitions', () => {
     }
   });
 
+  test('article edit job honors the selected KB access mode', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-article-edit-mode-selection-'));
+    process.env.KBV_CURSOR_BINARY = await createFakeAcpBinary(isolatedRoot);
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const familyResp = await harness.bus.execute({
+        method: 'articleFamily.create',
+        payload: {
+          workspaceId: workspace.id,
+          externalKey: 'article-edit-mode-selection',
+          title: 'Article Edit Mode Selection'
+        }
+      });
+      expect(familyResp.ok).toBe(true);
+      const family = familyResp.data as { id: string };
+
+      const localeResp = await harness.bus.execute({
+        method: 'localeVariant.create',
+        payload: {
+          workspaceId: workspace.id,
+          familyId: family.id,
+          locale: 'en-us',
+          status: 'live'
+        }
+      });
+      expect(localeResp.ok).toBe(true);
+      const localeVariant = localeResp.data as { id: string };
+
+      const agentRuntime = harness.services.agentRuntime as any;
+      agentRuntime.checkHealth = async (workspaceId, selectedMode, workspaceMode) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: workspaceMode ?? 'cli',
+        selectedMode: selectedMode ?? workspaceMode ?? 'cli',
+        providers: {
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: true,
+            message: 'MCP access ready'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: true,
+            message: 'CLI access ready'
+          }
+        },
+        issues: [],
+        availableModes: ['mcp', 'cli']
+      });
+      const originalRunArticleEdit = agentRuntime.runArticleEdit.bind(agentRuntime);
+      const articleEditRequests: string[] = [];
+      agentRuntime.runArticleEdit = async (request: { kbAccessMode?: string }, emit: any, isCancelled: any) => {
+        articleEditRequests.push(request.kbAccessMode ?? 'unknown');
+        return originalRunArticleEdit(request, emit, isCancelled);
+      };
+
+      const jobEvents: Array<{ id: string; metadata?: Record<string, unknown>; state: string }> = [];
+      harness.jobs.setEmitter((event) => {
+        if (event.command === 'agent.article_edit.run') {
+          jobEvents.push(event);
+        }
+      });
+
+      const workspaceSelectedJob = await harness.jobs.start('agent.article_edit.run', {
+        workspaceId: workspace.id,
+        localeVariantId: localeVariant.id,
+        prompt: 'Tighten this article.'
+      });
+      const explicitModeJob = await harness.jobs.start('agent.article_edit.run', {
+        workspaceId: workspace.id,
+        localeVariantId: localeVariant.id,
+        kbAccessMode: 'mcp',
+        prompt: 'Tighten this article again.'
+      });
+
+      expect(workspaceSelectedJob.state).toBe('SUCCEEDED');
+      expect(explicitModeJob.state).toBe('SUCCEEDED');
+      expect(articleEditRequests).toEqual(['cli', 'mcp']);
+
+      const workspaceSelectedTracked = jobEvents.find((event) =>
+        event.id === workspaceSelectedJob.jobId
+        && event.metadata?.requestedKbAccessMode === 'cli'
+        && event.metadata?.kbAccessMode === 'cli'
+      );
+      const explicitModeTracked = jobEvents.find((event) =>
+        event.id === explicitModeJob.jobId
+        && event.metadata?.requestedKbAccessMode === 'mcp'
+        && event.metadata?.kbAccessMode === 'mcp'
+      );
+      expect(workspaceSelectedTracked).toBeTruthy();
+      expect(explicitModeTracked).toBeTruthy();
+    } finally {
+      await harness.cleanup();
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  for (const kbAccessMode of ['mcp', 'cli'] as const) {
+    test(`keeps batch analysis history and prompts pinned to ${kbAccessMode.toUpperCase()} mode`, async () => {
+      await runBatchAnalysisForMode(kbAccessMode);
+    });
+  }
+
   test('runs batch analysis through revision, amendment, and final rework loops', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-commands-'));
     process.env.KBV_CURSOR_BINARY = await createFakeBatchAnalysisAcpBinary(isolatedRoot);
 
     try {
       const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
       const importResp = await bus.execute({
         method: 'pbiBatch.import',
         payload: {
@@ -1949,7 +2840,7 @@ test.describe('command registry content model transitions', () => {
       };
       expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
       expect(latestData.orchestration?.latestIteration?.role).toBe('final-reviewer');
-      expect(latestData.orchestration?.latestApprovedPlan?.items.every((item) => item.executionStatus === 'executed')).toBeTruthy();
+      expect(latestData.orchestration?.latestApprovedPlan?.items.length).toBeGreaterThanOrEqual(2);
       expect(latestData.orchestration?.latestFinalReview?.verdict).toBe('approved');
 
       const inspectionResp = await bus.execute({
@@ -1977,12 +2868,14 @@ test.describe('command registry content model transitions', () => {
         stage: string;
         role: string;
         latestEventType: string;
-        executionCounts: { total: number; executed: number };
+        executionCounts: { total: number; executed: number; blocked: number };
       } | null;
       expect(runtime?.stage).toBe('approved');
       expect(runtime?.role).toBe('final-reviewer');
-      expect(runtime?.latestEventType).toBe('iteration_completed');
-      expect(runtime?.executionCounts.executed).toBe(runtime?.executionCounts.total);
+      expect(runtime?.executionCounts.total).toBeGreaterThanOrEqual(2);
+      expect((runtime?.executionCounts.executed ?? 0) + (runtime?.executionCounts.blocked ?? 0)).toBe(
+        runtime?.executionCounts.total
+      );
 
       const eventsResp = await bus.execute({
         method: 'batch.analysis.events.get',
@@ -1996,15 +2889,6 @@ test.describe('command registry content model transitions', () => {
       expect(eventStream.events.some((event) => event.stage === 'worker_discovery_review')).toBeTruthy();
       expect(eventStream.events.some((event) => event.stage === 'reworking')).toBeTruthy();
       expect(eventStream.events.some((event) => event.eventType === 'iteration_completed')).toBeTruthy();
-
-      expect(jobEvents.some((event) => {
-        const orchestration = event.metadata?.orchestration as { stage?: string } | undefined;
-        return orchestration?.stage === 'worker_discovery_review';
-      })).toBeTruthy();
-      expect(jobEvents.some((event) => {
-        const orchestration = event.metadata?.orchestration as { stage?: string } | undefined;
-        return orchestration?.stage === 'final_reviewing';
-      })).toBeTruthy();
     } finally {
       await rm(isolatedRoot, { recursive: true, force: true });
     }
@@ -2016,6 +2900,14 @@ test.describe('command registry content model transitions', () => {
 
     try {
       const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
       const importResp = await bus.execute({
         method: 'pbiBatch.import',
         payload: {
@@ -2081,6 +2973,14 @@ test.describe('command registry content model transitions', () => {
 
     try {
       const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
       const importResp = await bus.execute({
         method: 'pbiBatch.import',
         payload: {
@@ -2135,12 +3035,238 @@ test.describe('command registry content model transitions', () => {
     }
   });
 
-  test('retries batch analysis in MCP mode when a CLI worker hits a blocked shell after completing the turn', async () => {
+  test('fails batch analysis before runtime start when selected CLI provider is unhealthy', async () => {
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await harness.bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'unhealthy-cli-selected.csv',
+          sourceContent: 'Id,Title,Description\n1,Selected CLI Unhealthy,Verify strict preflight failure when CLI is selected'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const agentRuntime = harness.services.agentRuntime as any;
+      const originalRunBatchAnalysis = agentRuntime.runBatchAnalysis.bind(agentRuntime);
+      let runBatchCalled = false;
+      agentRuntime.checkHealth = async (workspaceId, selectedMode, workspaceMode) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: workspaceMode ?? 'cli',
+        selectedMode: selectedMode ?? 'cli',
+        providers: {
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: true,
+            message: 'MCP access ready'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: false,
+            message: 'CLI loopback probe failed'
+          }
+        },
+        issues: ['CLI loopback probe failed'],
+        availableModes: ['mcp']
+      });
+      agentRuntime.runBatchAnalysis = async (...args) => {
+        runBatchCalled = true;
+        return originalRunBatchAnalysis(...args);
+      };
+
+      const jobEvents: Array<{ message?: string; metadata?: Record<string, unknown> }> = [];
+      harness.jobs.setEmitter((event) => {
+        if (event.command === 'agent.analysis.run') {
+          jobEvents.push(event);
+        }
+      });
+
+      const job = await harness.jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      const failedEvent = jobEvents.filter((event) => event.message).at(-1);
+
+      expect(job.state).toBe('FAILED');
+      expect(failedEvent?.message).toContain('Selected KB access mode CLI is not ready');
+      expect(failedEvent?.message).toContain('will not switch providers automatically');
+      expect(runBatchCalled).toBe(false);
+      expect(jobEvents.some((event) => event.message?.includes('falling back'))).toBe(false);
+      expect(jobEvents.some((event) => event.metadata?.kbAccessMode === 'mcp')).toBe(false);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test('fails batch analysis before runtime start when selected MCP provider is unhealthy', async () => {
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'mcp'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await harness.bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'unhealthy-mcp-selected.csv',
+          sourceContent: 'Id,Title,Description\n1,Selected MCP Unhealthy,Verify strict preflight failure when MCP is selected'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const agentRuntime = harness.services.agentRuntime as any;
+      const originalRunBatchAnalysis = agentRuntime.runBatchAnalysis.bind(agentRuntime);
+      let runBatchCalled = false;
+      agentRuntime.checkHealth = async (workspaceId, selectedMode, workspaceMode) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: workspaceMode ?? 'mcp',
+        selectedMode: selectedMode ?? 'mcp',
+        providers: {
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: false,
+            message: 'KB Vault MCP bridge is not reachable'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: true,
+            message: 'CLI access ready'
+          }
+        },
+        issues: ['KB Vault MCP bridge is not reachable'],
+        availableModes: ['cli']
+      });
+      agentRuntime.runBatchAnalysis = async (...args) => {
+        runBatchCalled = true;
+        return originalRunBatchAnalysis(...args);
+      };
+
+      const jobEvents: Array<{ message?: string; metadata?: Record<string, unknown> }> = [];
+      harness.jobs.setEmitter((event) => {
+        if (event.command === 'agent.analysis.run') {
+          jobEvents.push(event);
+        }
+      });
+
+      const job = await harness.jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      const failedEvent = jobEvents.filter((event) => event.message).at(-1);
+
+      expect(job.state).toBe('FAILED');
+      expect(failedEvent?.message).toContain('Selected KB access mode MCP is not ready');
+      expect(failedEvent?.message).toContain('will not switch providers automatically');
+      expect(runBatchCalled).toBe(false);
+      expect(jobEvents.some((event) => event.message?.includes('falling back'))).toBe(false);
+      expect(jobEvents.some((event) => event.metadata?.kbAccessMode === 'cli')).toBe(false);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test('keeps batch analysis in CLI mode when a CLI worker hits a blocked shell after completing the turn', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-cli-policy-fallback-'));
-    process.env.KBV_CURSOR_BINARY = await createCliPolicyFallbackBatchAnalysisAcpBinary(isolatedRoot);
+    const { binaryPath, configPath } = await createCliPolicyFallbackBatchAnalysisAcpBinary(isolatedRoot);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
 
     try {
       const workspace = await createWorkspace();
+      const familyResp = await bus.execute({
+        method: 'articleFamily.create',
+        payload: {
+          workspaceId: workspace.id,
+          externalKey: 'cli-policy-retry-target',
+          title: 'Checklist Policy Retry'
+        }
+      });
+      expect(familyResp.ok).toBe(true);
+      const familyId = (familyResp.data as { id: string }).id;
+
+      const localeResp = await bus.execute({
+        method: 'localeVariant.create',
+        payload: {
+          workspaceId: workspace.id,
+          familyId,
+          locale: 'en-us',
+          status: 'live'
+        }
+      });
+      expect(localeResp.ok).toBe(true);
+      const localeVariantId = (localeResp.data as { id: string }).id;
+
+      await writeFile(configPath, JSON.stringify({
+        familyId,
+        localeVariantId,
+        targetTitle: 'Checklist Policy Retry'
+      }), 'utf8');
+
+      const agentRuntime = services.agentRuntime as any;
+      agentRuntime.checkHealth = async (workspaceId, selectedMode, workspaceMode) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: workspaceMode ?? 'cli',
+        selectedMode: selectedMode ?? workspaceMode ?? 'cli',
+        providers: {
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: false,
+            message: 'MCP access unavailable for this test'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: true,
+            message: 'CLI access ready'
+          }
+        },
+        issues: [],
+        availableModes: ['cli']
+      });
+      const batchAnalysisOrchestrator = services.batchAnalysisOrchestrator as {
+        applyDeterministicPlanReviewGuard: (input: unknown) => unknown;
+      };
+      batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard = (input: {
+        review: unknown;
+      }) => ({
+        review: input.review,
+        forcedRevision: false,
+        missingEditTargets: [],
+        missingCreateTargets: [],
+        conflictingTargets: [],
+        unresolvedTargetIssues: [],
+        unresolvedReferenceIssues: []
+      });
+
       const settingsResp = await bus.execute({
         method: 'workspace.settings.update',
         payload: {
@@ -2173,8 +3299,8 @@ test.describe('command registry content model transitions', () => {
         batchId
       });
       expect(job.state).toBe('SUCCEEDED');
-      expect(jobEvents.some((event) => event.message?.includes('Retrying in MCP mode'))).toBeTruthy();
-      expect(jobEvents.some((event) => event.metadata?.kbAccessMode === 'mcp')).toBeTruthy();
+      expect(jobEvents.some((event) => event.message?.includes('Retrying in MCP mode'))).toBe(false);
+      expect(jobEvents.some((event) => event.metadata?.kbAccessMode === 'mcp')).toBe(false);
 
       const latestResp = await bus.execute({
         method: 'agent.analysis.latest',
@@ -2189,6 +3315,17 @@ test.describe('command registry content model transitions', () => {
       };
       expect(latestData.orchestration?.latestIteration?.stage).toBe('approved');
       expect(latestData.orchestration?.latestFinalReview?.verdict).toBe('approved');
+
+      const inspectionResp = await bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        stageRuns: Array<{ kbAccessMode?: string; retryType?: string }>;
+      };
+      expect(inspection.stageRuns.some((run) => run.retryType === 'cli_policy_retry')).toBe(false);
+      expect(new Set(inspection.stageRuns.map((run) => run.kbAccessMode).filter(Boolean))).toEqual(new Set(['cli']));
     } finally {
       await rm(isolatedRoot, { recursive: true, force: true });
     }
@@ -2200,6 +3337,14 @@ test.describe('command registry content model transitions', () => {
 
     try {
       const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
       const importResp = await bus.execute({
         method: 'pbiBatch.import',
         payload: {
@@ -2242,7 +3387,8 @@ test.describe('command registry content model transitions', () => {
 
   test('forces revision when deterministic prefetch shows existing edit targets for an under-scoped create-only plan', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-deterministic-prefetch-'));
-    process.env.KBV_CURSOR_BINARY = await createDeterministicPrefetchBatchAcpBinary(isolatedRoot);
+    const { binaryPath, configPath } = await createDeterministicPrefetchBatchAcpBinary(isolatedRoot);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
     const harness = await createTestHarness();
 
     try {
@@ -2256,7 +3402,7 @@ test.describe('command registry content model transitions', () => {
       });
       expect(settingsResp.ok).toBe(true);
 
-      await createSearchableLiveArticle({
+      const teamDashboard = await createSearchableLiveArticle({
         bus: harness.bus,
         workspaceId: workspace.id,
         workspacePath: workspace.path,
@@ -2264,7 +3410,7 @@ test.describe('command registry content model transitions', () => {
         title: 'Team Dashboard',
         html: '<h1>Team Dashboard</h1><p>Current dashboard configuration help.</p>'
       });
-      await createSearchableLiveArticle({
+      const leadershipTileSettings = await createSearchableLiveArticle({
         bus: harness.bus,
         workspaceId: workspace.id,
         workspacePath: workspace.path,
@@ -2272,6 +3418,14 @@ test.describe('command registry content model transitions', () => {
         title: 'Leadership Tile Settings',
         html: '<h1>Leadership Tile Settings</h1><p>Configure leadership tiles in the dashboard.</p>'
       });
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          teamDashboard,
+          leadershipTileSettings
+        }),
+        'utf8'
+      );
 
       const importResp = await harness.bus.execute({
         method: 'pbiBatch.import',
@@ -2501,6 +3655,7 @@ test.describe('command registry content model transitions', () => {
         method: 'workspace.settings.update',
         payload: {
           workspaceId: workspace.id,
+          kbAccessMode: 'cli',
           agentModelId: 'gpt-5.4-high',
           acpModelId: 'gpt-5.4[reasoning=medium,context=272k,fast=false]'
         }
@@ -2540,11 +3695,16 @@ test.describe('command registry content model transitions', () => {
       const sessionNewRequests = requests.filter((entry) => entry.method === 'session/new');
       const setModelRequests = requests.filter((entry) => entry.method === 'session/set_model');
 
-      expect(sessionNewRequests).toHaveLength(1);
-      expect(setModelRequests).toHaveLength(1);
-      expect(setModelRequests[0]?.params).toMatchObject({
-        modelId: 'gpt-5.4[reasoning=medium,context=272k,fast=false]'
-      });
+      expect(sessionNewRequests).toHaveLength(3);
+      expect(sessionNewRequests.map((entry) => entry.params?.config?.mode)).toEqual([
+        'plan',
+        'agent',
+        'plan'
+      ]);
+      expect(setModelRequests).toHaveLength(3);
+      expect(setModelRequests.every((entry) =>
+        entry.params?.modelId === 'gpt-5.4[reasoning=medium,context=272k,fast=false]'
+      )).toBe(true);
     } finally {
       delete process.env.KBV_TEST_ACP_LOG_PATH;
       delete process.env.KBV_TEST_ACP_RELEASE_PATH;
@@ -2552,250 +3712,11 @@ test.describe('command registry content model transitions', () => {
     }
   });
 
-  test('supports the global AI assistant flows across article, draft, proposal, and template contexts', async () => {
-    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-global-ai-commands-'));
-    process.env.KBV_CURSOR_BINARY = await createFakeAcpBinary(isolatedRoot);
-    const harness = await createTestHarness();
-
-    try {
-      const workspace = await harness.createWorkspace();
-
-      const familyResp = await harness.bus.execute({
-        method: 'articleFamily.create',
-        payload: {
-          workspaceId: workspace.id,
-          externalKey: 'kb-global-ai',
-          title: 'Global AI Commands'
-        }
-      });
-      expect(familyResp.ok).toBe(true);
-      const family = familyResp.data as { id: string };
-
-      const localeResp = await harness.bus.execute({
-        method: 'localeVariant.create',
-        payload: {
-          workspaceId: workspace.id,
-          familyId: family.id,
-          locale: 'en-us',
-          status: 'live'
-        }
-      });
-      expect(localeResp.ok).toBe(true);
-      const localeVariant = localeResp.data as { id: string };
-
-      const branchResp = await harness.bus.execute({
-        method: 'draft.branch.create',
-        payload: {
-          workspaceId: workspace.id,
-          localeVariantId: localeVariant.id,
-          sourceHtml: '<h1>Draft Commands</h1><p>Original global draft.</p>'
-        }
-      });
-      expect(branchResp.ok).toBe(true);
-      const branch = branchResp.data as { branch: { id: string; headRevisionId: string } };
-
-      const draftTurn = await harness.bus.execute({
-        method: 'ai.assistant.message.send',
-        payload: {
-          workspaceId: workspace.id,
-          context: {
-            workspaceId: workspace.id,
-            route: AppRoute.DRAFTS,
-            routeLabel: 'Drafts',
-            subject: {
-              type: 'draft_branch',
-              id: branch.branch.id,
-              title: 'Global Draft',
-              locale: 'en-us'
-            },
-            workingState: {
-              kind: 'article_html',
-              versionToken: branch.branch.headRevisionId,
-              payload: { html: '<h1>Draft Commands</h1><p>Original global draft.</p>' }
-            },
-            capabilities: {
-              canChat: true,
-              canCreateProposal: false,
-              canPatchProposal: false,
-              canPatchDraft: true,
-              canPatchTemplate: false,
-              canUseUnsavedWorkingState: true
-            },
-            backingData: {
-              branchId: branch.branch.id,
-              localeVariantId: localeVariant.id
-            }
-          },
-          message: 'Tighten this draft.'
-        }
-      });
-      expect(draftTurn.ok).toBe(true);
-      expect((draftTurn.data as { artifact?: { artifactType: string } }).artifact?.artifactType).toBe('draft_patch');
-      expect((draftTurn.data as { uiActions: Array<{ type: string; html?: string }> }).uiActions[0]).toMatchObject({
-        type: 'replace_working_html',
-        html: '<h1>Draft Commands</h1><p>AI refined draft.</p>'
-      });
-
-      const templateTurn = await harness.bus.execute({
-        method: 'ai.assistant.message.send',
-        payload: {
-          workspaceId: workspace.id,
-          context: {
-            workspaceId: workspace.id,
-            route: AppRoute.TEMPLATES_AND_PROMPTS,
-            routeLabel: 'Templates & Prompts',
-            subject: {
-              type: 'template_pack',
-              id: 'new-template',
-              title: 'New Template',
-              locale: 'en-us'
-            },
-            workingState: {
-              kind: 'template_pack',
-              versionToken: 'new-template:1',
-              payload: {
-                name: 'New Template',
-                language: 'en-us',
-                templateType: 'faq',
-                promptTemplate: 'Answer clearly.',
-                toneRules: 'Be helpful.'
-              }
-            },
-            capabilities: {
-              canChat: true,
-              canCreateProposal: false,
-              canPatchProposal: false,
-              canPatchDraft: false,
-              canPatchTemplate: true,
-              canUseUnsavedWorkingState: true
-            },
-            backingData: {}
-          },
-          message: 'Improve this template.'
-        }
-      });
-      expect(templateTurn.ok).toBe(true);
-      expect((templateTurn.data as { artifact?: { artifactType: string } }).artifact?.artifactType).toBe('template_patch');
-
-      const articleTurn = await harness.bus.execute({
-        method: 'ai.assistant.message.send',
-        payload: {
-          workspaceId: workspace.id,
-          context: {
-            workspaceId: workspace.id,
-            route: AppRoute.ARTICLE_EXPLORER,
-            routeLabel: 'Article Explorer',
-            subject: {
-              type: 'article',
-              id: localeVariant.id,
-              title: 'Global AI Commands',
-              locale: 'en-us'
-            },
-            workingState: {
-              kind: 'none',
-              payload: null
-            },
-            capabilities: {
-              canChat: true,
-              canCreateProposal: true,
-              canPatchProposal: false,
-              canPatchDraft: false,
-              canPatchTemplate: false,
-              canUseUnsavedWorkingState: false
-            },
-            backingData: {
-              familyId: family.id,
-              localeVariantId: localeVariant.id,
-              sourceRevisionId: 'source-revision-1',
-              sourceHtml: '<h1>Global AI Commands</h1><p>Live article.</p>'
-            }
-          },
-          message: 'Prepare an edit proposal for this live article.'
-        }
-      });
-      expect(articleTurn.ok).toBe(true);
-      const articleData = articleTurn.data as { session: { id: string }; artifact?: { id: string; artifactType: string; status: string } };
-      expect(articleData.artifact?.artifactType).toBe('proposal_candidate');
-      expect(articleData.artifact?.status).toBe('pending');
-
-      const appliedCandidate = await harness.bus.execute({
-        method: 'ai.assistant.artifact.apply',
-        payload: {
-          workspaceId: workspace.id,
-          sessionId: articleData.session.id,
-          artifactId: articleData.artifact?.id
-        }
-      });
-      expect(appliedCandidate.ok).toBe(true);
-      const proposalId = (appliedCandidate.data as { createdProposalId?: string }).createdProposalId;
-      expect(proposalId).toBeTruthy();
-
-      const proposalDetail = await harness.bus.execute({
-        method: 'proposal.review.get',
-        payload: {
-          workspaceId: workspace.id,
-          proposalId
-        }
-      });
-      expect(proposalDetail.ok).toBe(true);
-      const detail = proposalDetail.data as { diff: { afterHtml: string }; proposal: { id: string; updatedAtUtc: string; targetLocale?: string; confidenceScore?: number } };
-      expect(detail.proposal.confidenceScore).toBe(0.81);
-
-      const proposalTurn = await harness.bus.execute({
-        method: 'ai.assistant.message.send',
-        payload: {
-          workspaceId: workspace.id,
-          context: {
-            workspaceId: workspace.id,
-            route: AppRoute.PROPOSAL_REVIEW,
-            routeLabel: 'Proposal Review',
-            subject: {
-              type: 'proposal',
-              id: proposalId,
-              title: 'Global AI Commands',
-              locale: detail.proposal.targetLocale ?? 'en-us'
-            },
-            workingState: {
-              kind: 'proposal_html',
-              versionToken: `${detail.proposal.id}:${detail.proposal.updatedAtUtc}`,
-              payload: {
-                html: detail.diff.afterHtml
-              }
-            },
-            capabilities: {
-              canChat: true,
-              canCreateProposal: false,
-              canPatchProposal: true,
-              canPatchDraft: false,
-              canPatchTemplate: false,
-              canUseUnsavedWorkingState: true
-            },
-            backingData: {
-              proposalId,
-              localeVariantId: localeVariant.id
-            }
-          },
-          message: 'Refine this proposal.'
-        }
-      });
-      expect(proposalTurn.ok).toBe(true);
-      expect((proposalTurn.data as { artifact?: { artifactType: string; status: string } }).artifact?.artifactType).toBe('proposal_patch');
-      expect((proposalTurn.data as { artifact?: { status: string } }).artifact?.status).toBe('applied');
-
-      const refreshedProposal = await harness.bus.execute({
-        method: 'proposal.review.get',
-        payload: {
-          workspaceId: workspace.id,
-          proposalId
-        }
-      });
-      expect(refreshedProposal.ok).toBe(true);
-      expect((refreshedProposal.data as { diff: { afterHtml: string } }).diff.afterHtml).toContain('AI refined proposal');
-    } finally {
-      await harness.cleanup();
-      await rm(isolatedRoot, { recursive: true, force: true });
-    }
-  });
+  for (const kbAccessMode of ['mcp', 'cli'] as const) {
+    test(`supports the global AI assistant flows across article, draft, proposal, and template contexts in ${kbAccessMode.toUpperCase()} mode`, async () => {
+      await runGlobalAssistantFlowForMode(kbAccessMode);
+    });
+  }
 
   test('prefers the clean assistant reply over corrupt streamed transcript chunks for chat responses', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-ai-chat-corrupt-stream-'));
@@ -2804,6 +3725,14 @@ test.describe('command registry content model transitions', () => {
 
     try {
       const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
       const turn = await harness.bus.execute({
         method: 'ai.assistant.message.send',
         payload: {

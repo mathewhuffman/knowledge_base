@@ -143,7 +143,8 @@ import {
   type TemplatePackListResponse,
   type TemplatePackSummary,
   type TemplatePackUpsertRequest,
-  type ProposalPatchPayload
+  type ProposalPatchPayload,
+  type MCPRecordAgentNotesInput
 } from '@kb-vault/shared-types';
 import { diffHtml } from '@kb-vault/diff-engine';
 import {
@@ -184,7 +185,8 @@ const WORKSPACE_SCOPED_DB_TABLES = [
   'batch_analysis_discovered_work',
   'batch_analysis_final_reviews',
   'batch_analysis_amendments',
-  'batch_analysis_stage_events'
+  'batch_analysis_stage_events',
+  'agent_notes'
 ] as const;
 const PBIBATCH_STATUS_SEQUENCE: Array<PBIBatchStatus> = [
   PBIBatchStatus.IMPORTED,
@@ -4070,6 +4072,14 @@ export class WorkspaceRepository {
           updatedAtUtc
         }
       );
+      const nextIterationStatus = params.status ?? existing.status;
+      if (
+        nextIterationStatus === 'completed'
+        || nextIterationStatus === 'failed'
+        || nextIterationStatus === 'needs_human_review'
+      ) {
+        await this.syncTerminalBatchAnalysisStatus(workspaceDb, params.workspaceId, existing.batchId);
+      }
       return {
         id: existing.id,
         workspaceId: existing.workspaceId,
@@ -4816,12 +4826,90 @@ export class WorkspaceRepository {
     }
   }
 
+  async recordAgentNotes(input: MCPRecordAgentNotesInput): Promise<{
+    ok: true;
+    workspaceId: string;
+    noteId: string;
+    recorded: true;
+    sessionId?: string;
+    batchId?: string;
+    localeVariantId?: string;
+    familyId?: string;
+    note: string;
+    rationale?: string;
+    pbiIds: string[];
+    metadata?: unknown;
+    createdAtUtc: string;
+  }> {
+    const workspace = await this.getWorkspace(input.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const note = extractString(input.note);
+      if (!note) {
+        throw new Error('note is required');
+      }
+
+      const noteId = randomUUID();
+      const createdAtUtc = new Date().toISOString();
+      const sessionId = extractString(input.sessionId);
+      const batchId = extractString(input.batchId);
+      const localeVariantId = extractString(input.localeVariantId);
+      const familyId = extractString(input.familyId);
+      const rationale = extractString(input.rationale);
+      const pbiIds = normalizeSearchIdList(input.pbiIds);
+      const metadata = input.metadata;
+
+      workspaceDb.run(
+        `INSERT INTO agent_notes (
+          id, workspace_id, session_id, batch_id, locale_variant_id, family_id, note, rationale, metadata_json, pbi_ids_json, created_at
+        ) VALUES (
+          @id, @workspaceId, @sessionId, @batchId, @localeVariantId, @familyId, @note, @rationale, @metadataJson, @pbiIdsJson, @createdAt
+        )`,
+        {
+          id: noteId,
+          workspaceId: input.workspaceId,
+          sessionId: sessionId ?? null,
+          batchId: batchId ?? null,
+          localeVariantId: localeVariantId ?? null,
+          familyId: familyId ?? null,
+          note,
+          rationale: rationale ?? null,
+          metadataJson: metadata === undefined ? null : JSON.stringify(metadata),
+          pbiIdsJson: pbiIds.length > 0 ? JSON.stringify(pbiIds) : null,
+          createdAt: createdAtUtc
+        }
+      );
+
+      return {
+        ok: true,
+        workspaceId: input.workspaceId,
+        noteId,
+        recorded: true,
+        sessionId,
+        batchId,
+        localeVariantId,
+        familyId,
+        note,
+        rationale,
+        pbiIds,
+        metadata,
+        createdAtUtc
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async createAgentProposal(params: {
     workspaceId: string;
     batchId: string;
     action: ProposalAction;
     reviewStatus?: ProposalReviewStatus;
     _sessionId?: string;
+    kbAccessMode?: KbAccessMode;
+    acpSessionId?: string;
+    originPath?: string;
     idempotencyKey?: string;
     familyId?: string;
     localeVariantId?: string;
@@ -4844,22 +4932,22 @@ export class WorkspaceRepository {
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
       const now = new Date().toISOString();
-      const metadata = normalizeProposalMetadata(params.metadata);
-      if (params.idempotencyKey?.trim() && !extractString(metadata._agentCommandKey)) {
-        metadata._agentCommandKey = params.idempotencyKey.trim();
+      const inputMetadata = normalizeProposalMetadata(params.metadata);
+      if (params.idempotencyKey?.trim() && !extractString(inputMetadata._agentCommandKey)) {
+        inputMetadata._agentCommandKey = params.idempotencyKey.trim();
       }
       const hasStructuredContent = Boolean(
         params.sourceHtml?.trim()
         || params.proposedHtml?.trim()
-        || extractString(metadata.sourceHtml)
-        || extractString(metadata.proposedHtml)
+        || extractString(inputMetadata.sourceHtml)
+        || extractString(inputMetadata.proposedHtml)
       );
       const hasMeaningfulContext = Boolean(
         params.note?.trim()
         || params.rationale?.trim()
         || params.rationaleSummary?.trim()
         || params.aiNotes?.trim()
-        || Object.keys(metadata).length > 0
+        || Object.keys(inputMetadata).length > 0
         || params.relatedPbiIds?.length
         || hasStructuredContent
       );
@@ -4875,22 +4963,10 @@ export class WorkspaceRepository {
         targetLocale: params.targetLocale,
         note: params.note,
         rationale: params.rationale,
-        metadata
+        metadata: inputMetadata
       });
-      const rationale = params.rationale ?? params.note ?? undefined;
-      const rationaleSummary = params.rationaleSummary ?? extractString(metadata.rationaleSummary) ?? rationale;
-      const aiNotes = params.aiNotes ?? params.note ?? extractString(metadata.aiNotes) ?? undefined;
       const targetTitle = identity.targetTitle;
       const targetLocale = identity.targetLocale;
-      if (params.action === ProposalAction.CREATE && !targetTitle) {
-        throw new Error('Create proposals must include a targetTitle or note/rationale text that clearly names the article');
-      }
-      const suggestedPlacement = params.suggestedPlacement ?? normalizePlacement(metadata.suggestedPlacement);
-      const confidenceScore = normalizeConfidenceScore(params.confidenceScore ?? metadata.confidenceScore);
-      const reviewStatus = params.reviewStatus ?? ProposalReviewStatus.PENDING_REVIEW;
-      const status: ProposalDecision = ProposalDecision.DEFER;
-      const sourceRevisionId = params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null;
-
       const existingProposal =
         (params.idempotencyKey?.trim()
           ? this.findOpenProposalByIdempotencyKey(workspaceDb, {
@@ -4908,6 +4984,30 @@ export class WorkspaceRepository {
           targetTitle,
           targetLocale
         });
+
+      const metadata = mergePersistedProposalMetadata(
+        existingProposal
+          ? this.getStoredProposalMetadata(workspaceDb, params.workspaceId, existingProposal.id)
+          : undefined,
+        inputMetadata,
+        {
+          runtimeSessionId: params._sessionId,
+          kbAccessMode: params.kbAccessMode,
+          acpSessionId: params.acpSessionId,
+          originPath: params.originPath
+        }
+      );
+      const rationale = params.rationale ?? params.note ?? undefined;
+      const rationaleSummary = params.rationaleSummary ?? extractString(metadata.rationaleSummary) ?? rationale;
+      const aiNotes = params.aiNotes ?? params.note ?? extractString(metadata.aiNotes) ?? undefined;
+      if (params.action === ProposalAction.CREATE && !targetTitle) {
+        throw new Error('Create proposals must include a targetTitle or note/rationale text that clearly names the article');
+      }
+      const suggestedPlacement = params.suggestedPlacement ?? normalizePlacement(metadata.suggestedPlacement);
+      const confidenceScore = normalizeConfidenceScore(params.confidenceScore ?? metadata.confidenceScore);
+      const reviewStatus = params.reviewStatus ?? ProposalReviewStatus.PENDING_REVIEW;
+      const status: ProposalDecision = ProposalDecision.DEFER;
+      const sourceRevisionId = params.sourceRevisionId ?? extractString(metadata.sourceRevisionId) ?? null;
 
       const proposalId = existingProposal?.id ?? randomUUID();
       const queueOrder = existingProposal?.queueOrder ?? (
@@ -5062,6 +5162,71 @@ export class WorkspaceRepository {
       }
 
       return this.mapProposalRow(row);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async annotateProposalProvenanceForSession(params: {
+    workspaceId: string;
+    batchId: string;
+    sessionId: string;
+    kbAccessMode?: KbAccessMode;
+    acpSessionId?: string;
+    originPath?: string;
+  }): Promise<{ updatedProposalIds: string[] }> {
+    const sessionId = params.sessionId.trim();
+    if (!sessionId) {
+      return { updatedProposalIds: [] };
+    }
+
+    const workspace = await this.getWorkspace(params.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const rows = workspaceDb.all<{ id: string; metadataJson: string | null }>(
+        `SELECT id,
+                metadata_json as metadataJson
+           FROM proposals
+          WHERE workspace_id = @workspaceId
+            AND batch_id = @batchId
+            AND agent_session_id = @sessionId`,
+        {
+          workspaceId: params.workspaceId,
+          batchId: params.batchId,
+          sessionId
+        }
+      );
+
+      const updatedProposalIds: string[] = [];
+      for (const row of rows) {
+        const existingMetadata = safeParseJson<Record<string, unknown>>(row.metadataJson) ?? {};
+        const nextMetadata = mergePersistedProposalMetadata(existingMetadata, undefined, {
+          runtimeSessionId: sessionId,
+          kbAccessMode: params.kbAccessMode,
+          acpSessionId: params.acpSessionId,
+          originPath: params.originPath
+        });
+        if (JSON.stringify(existingMetadata) === JSON.stringify(nextMetadata)) {
+          continue;
+        }
+        await this.persistProposalArtifacts(workspace.path, row.id, {
+          metadata: nextMetadata
+        });
+        workspaceDb.run(
+          `UPDATE proposals
+           SET metadata_json = @metadataJson
+           WHERE workspace_id = @workspaceId AND id = @proposalId`,
+          {
+            workspaceId: params.workspaceId,
+            proposalId: row.id,
+            metadataJson: Object.keys(nextMetadata).length > 0 ? JSON.stringify(nextMetadata) : null
+          }
+        );
+        updatedProposalIds.push(row.id);
+      }
+
+      return { updatedProposalIds };
     } finally {
       workspaceDb.close();
     }
@@ -9863,6 +10028,25 @@ export class WorkspaceRepository {
     return null;
   }
 
+  private getStoredProposalMetadata(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    proposalId: string
+  ): Record<string, unknown> {
+    const row = workspaceDb.get<{ metadataJson: string | null }>(
+      `SELECT metadata_json as metadataJson
+         FROM proposals
+        WHERE workspace_id = @workspaceId
+          AND id = @proposalId
+        LIMIT 1`,
+      {
+        workspaceId,
+        proposalId
+      }
+    );
+    return safeParseJson<Record<string, unknown>>(row?.metadataJson) ?? {};
+  }
+
   private buildFallbackProposalHtml(
     proposal: ProposalReviewRecord,
     relatedPbis: PBIRecord[],
@@ -10115,6 +10299,8 @@ export class WorkspaceRepository {
         )`,
         {
           ...template,
+          examples: template.examples ?? null,
+          description: template.description ?? null,
           active: template.active ? 1 : 0,
           updatedAt: now
         }
@@ -10638,6 +10824,34 @@ export class WorkspaceRepository {
     );
 
     return nextStatus;
+  }
+
+  private async syncTerminalBatchAnalysisStatus(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    batchId: string
+  ): Promise<PBIBatchStatus | null> {
+    const batch = workspaceDb.get<{ status: PBIBatchStatus | 'proposed' }>(
+      `SELECT status
+       FROM pbi_batches
+       WHERE id = @batchId AND workspace_id = @workspaceId
+       LIMIT 1`,
+      { workspaceId, batchId }
+    );
+
+    if (!batch) {
+      return null;
+    }
+
+    if (
+      batch.status === PBIBatchStatus.IMPORTED
+      || batch.status === PBIBatchStatus.SCOPED
+      || batch.status === PBIBatchStatus.ARCHIVED
+    ) {
+      return batch.status;
+    }
+
+    return this.syncBatchReviewStatus(workspaceDb, workspaceId, batchId);
   }
 }
 
@@ -11236,6 +11450,63 @@ function normalizeProposalMetadata(value: unknown): Record<string, unknown> {
     return {};
   }
   return value as Record<string, unknown>;
+}
+
+function normalizeProposalMetadataKbAccessMode(value: unknown): KbAccessMode | undefined {
+  return value === 'mcp' || value === 'cli'
+    ? value
+    : undefined;
+}
+
+function normalizeProposalOriginPath(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim()
+    ? value.trim().toLowerCase()
+    : undefined;
+}
+
+function mergePersistedProposalMetadata(
+  existing: unknown,
+  incoming: unknown,
+  provenance?: {
+    runtimeSessionId?: string;
+    kbAccessMode?: KbAccessMode;
+    acpSessionId?: string;
+    originPath?: string;
+  }
+): Record<string, unknown> {
+  const merged = {
+    ...normalizeProposalMetadata(existing),
+    ...normalizeProposalMetadata(incoming)
+  };
+
+  const runtimeSessionId =
+    extractString(provenance?.runtimeSessionId)
+    ?? extractString(merged.runtimeSessionId)
+    ?? extractString(merged.sessionId)
+    ?? extractString(merged.agentSessionId);
+  const kbAccessMode = normalizeProposalMetadataKbAccessMode(
+    provenance?.kbAccessMode
+    ?? merged.kbAccessMode
+  );
+  const acpSessionId =
+    extractString(provenance?.acpSessionId)
+    ?? extractString(merged.acpSessionId);
+  const originPath = normalizeProposalOriginPath(provenance?.originPath ?? merged.originPath);
+
+  if (runtimeSessionId) {
+    merged.runtimeSessionId = runtimeSessionId;
+  }
+  if (kbAccessMode) {
+    merged.kbAccessMode = kbAccessMode;
+  }
+  if (acpSessionId) {
+    merged.acpSessionId = acpSessionId;
+  }
+  if (originPath) {
+    merged.originPath = originPath;
+  }
+
+  return merged;
 }
 
 function extractString(value: unknown): string | undefined {

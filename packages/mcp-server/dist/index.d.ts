@@ -1,7 +1,15 @@
 export interface McpToolDescriptor {
     name: string;
+    title?: string;
     description: string;
     inputSchema?: unknown;
+    annotations?: {
+        title?: string;
+        readOnlyHint?: boolean;
+        destructiveHint?: boolean;
+        idempotentHint?: boolean;
+        openWorldHint?: boolean;
+    };
 }
 export interface McpToolCallMeta {
     requestId?: string;

@@ -35,6 +35,34 @@ export async function persistProposalReviewWorkingStatePatch(input: {
   }
 }
 
+export async function applyAppWorkingStatePatch(input: {
+  workspaceRepository: WorkspaceRepository;
+  appWorkingStateService: AppWorkingStateService;
+  request: AppWorkingStatePatchRequest;
+}): Promise<AppWorkingStatePatchResponse> {
+  const previousSchema = isProposalReviewWorkingStateTarget(input.request)
+    ? input.appWorkingStateService.getFormSchema({
+        workspaceId: input.request.workspaceId,
+        route: input.request.route,
+        entityType: input.request.entityType,
+        entityId: input.request.entityId
+      })
+    : undefined;
+
+  const response = input.appWorkingStateService.patchForm(input.request);
+  if (response.ok && response.applied) {
+    await persistProposalReviewWorkingStatePatch({
+      workspaceRepository: input.workspaceRepository,
+      appWorkingStateService: input.appWorkingStateService,
+      request: input.request,
+      response,
+      previousSchema
+    });
+  }
+
+  return response;
+}
+
 function rollbackProposalWorkingState(
   appWorkingStateService: AppWorkingStateService,
   request: AppWorkingStatePatchRequest,

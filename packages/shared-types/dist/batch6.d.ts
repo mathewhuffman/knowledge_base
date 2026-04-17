@@ -1,4 +1,6 @@
 import type { KbAccessMode } from './batch2';
+import type { AppWorkingStateEntityType } from './app-working-state';
+import type { AppRoute } from './routes';
 export type AgentSessionType = 'batch_analysis' | 'article_edit' | 'assistant_chat';
 export type AgentSessionMode = 'plan' | 'agent' | 'ask';
 export type BatchAnalysisAgentRole = 'planner' | 'plan-reviewer' | 'worker' | 'final-reviewer';
@@ -144,6 +146,13 @@ export interface KbAccessHealth {
     binaryPath?: string;
     baseUrl?: string;
     acpReachable?: boolean;
+    bridgeConfigPresent?: boolean;
+    bridgeSocketPath?: string;
+    bridgeReachable?: boolean;
+    toolsetReady?: boolean;
+    expectedToolNames?: string[];
+    registeredToolNames?: string[];
+    missingToolNames?: string[];
     issues?: string[];
     failureCode?: CliHealthFailure;
 }
@@ -656,6 +665,13 @@ export interface AgentPromptContextRequest {
 export interface MCPToolInput {
     workspaceId: string;
 }
+export interface MCPSearchKbInput extends MCPToolInput {
+    query?: string;
+    localeVariantIds?: string[];
+    familyIds?: string[];
+    revisionIds?: string[];
+    includeArchived?: boolean;
+}
 export interface MCPGetArticleInput extends MCPToolInput {
     revisionId?: string;
     localeVariantId?: string;
@@ -664,7 +680,19 @@ export interface MCPGetArticleFamilyInput extends MCPToolInput {
     familyId: string;
 }
 export interface MCPGetLocaleVariantInput extends MCPToolInput {
-    familyId: string;
+    localeVariantId: string;
+}
+export interface MCPAppGetFormSchemaInput extends MCPToolInput {
+    route: AppRoute;
+    entityType: AppWorkingStateEntityType;
+    entityId: string;
+}
+export interface MCPAppPatchFormInput extends MCPToolInput {
+    route: AppRoute;
+    entityType: AppWorkingStateEntityType;
+    entityId: string;
+    versionToken?: string;
+    patch: Record<string, unknown>;
 }
 export interface MCPFindRelatedArticlesInput extends MCPToolInput {
     query?: string;
@@ -713,3 +741,339 @@ export interface MCPRecordAgentNotesInput extends MCPToolInput {
     pbiIds?: string[];
     rationale?: string;
 }
+export declare const MCP_SEARCH_KB_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId"];
+    readonly anyOf: readonly [{
+        readonly required: readonly ["query"];
+    }, {
+        readonly required: readonly ["localeVariantIds"];
+    }, {
+        readonly required: readonly ["familyIds"];
+    }, {
+        readonly required: readonly ["revisionIds"];
+    }];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly query: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly localeVariantIds: {
+            readonly type: "array";
+            readonly minItems: 1;
+            readonly items: {
+                readonly type: "string";
+                readonly minLength: 1;
+            };
+        };
+        readonly familyIds: {
+            readonly type: "array";
+            readonly minItems: 1;
+            readonly items: {
+                readonly type: "string";
+                readonly minLength: 1;
+            };
+        };
+        readonly revisionIds: {
+            readonly type: "array";
+            readonly minItems: 1;
+            readonly items: {
+                readonly type: "string";
+                readonly minLength: 1;
+            };
+        };
+        readonly includeArchived: {
+            readonly type: "boolean";
+        };
+    };
+};
+export declare const MCP_GET_ARTICLE_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId"];
+    readonly anyOf: readonly [{
+        readonly required: readonly ["revisionId"];
+    }, {
+        readonly required: readonly ["localeVariantId"];
+    }];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly revisionId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly localeVariantId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_GET_ARTICLE_FAMILY_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "familyId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly familyId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_GET_LOCALE_VARIANT_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "localeVariantId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly localeVariantId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_FIND_RELATED_ARTICLES_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId"];
+    readonly anyOf: readonly [{
+        readonly required: readonly ["query"];
+    }, {
+        readonly required: readonly ["articleId"];
+    }, {
+        readonly required: readonly ["familyId"];
+    }, {
+        readonly required: readonly ["batchId"];
+    }];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly query: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly articleId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly familyId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly batchId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly locale: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly max: {
+            readonly type: "integer";
+            readonly minimum: 1;
+            readonly maximum: 100;
+        };
+        readonly minScore: {
+            readonly type: "number";
+            readonly minimum: 0;
+            readonly maximum: 1;
+        };
+        readonly includeEvidence: {
+            readonly type: "boolean";
+        };
+    };
+};
+export declare const MCP_LIST_CATEGORIES_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "locale"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly locale: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_LIST_SECTIONS_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "locale", "categoryId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly locale: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly categoryId: {
+            readonly type: "integer";
+            readonly minimum: 1;
+        };
+    };
+};
+export declare const MCP_LIST_ARTICLE_TEMPLATES_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly locale: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly includeInactive: {
+            readonly type: "boolean";
+        };
+    };
+};
+export declare const MCP_GET_TEMPLATE_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "templatePackId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly templatePackId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_GET_BATCH_CONTEXT_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "batchId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly batchId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_GET_PBI_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "pbiId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly pbiId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_GET_PBI_SUBSET_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "batchId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly batchId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly rowNumbers: {
+            readonly type: "array";
+            readonly items: {
+                readonly type: "integer";
+                readonly minimum: 1;
+            };
+        };
+    };
+};
+export declare const MCP_GET_ARTICLE_HISTORY_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "localeVariantId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly localeVariantId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "note"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly sessionId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly note: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly metadata: {};
+        readonly batchId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly localeVariantId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly familyId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly pbiIds: {
+            readonly type: "array";
+            readonly minItems: 1;
+            readonly items: {
+                readonly type: "string";
+                readonly minLength: 1;
+            };
+        };
+        readonly rationale: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};

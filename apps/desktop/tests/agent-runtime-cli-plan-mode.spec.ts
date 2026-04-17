@@ -16,6 +16,8 @@ function buildToolContext(): AgentRuntimeToolContext {
     getArticle: async () => ({ ok: true }),
     getArticleFamily: async () => ({ ok: true }),
     getLocaleVariant: async () => ({ ok: true }),
+    getAppFormSchema: async () => ({ ok: true, fields: [], currentValues: {} }),
+    patchAppForm: async () => ({ ok: true, applied: false, currentValues: {} }),
     findRelatedArticles: async () => ({ ok: true, results: [] }),
     listCategories: async () => ({ ok: true, categories: [] }),
     listSections: async () => ({ ok: true, sections: [] }),

@@ -81,6 +81,39 @@ export interface AppWorkingStatePatchAppliedEvent {
   nextVersionToken: string;
 }
 
+const APP_WORKING_STATE_ROUTE_ENUM = Object.values(AppRoute);
+const APP_WORKING_STATE_ENTITY_TYPE_ENUM = ['template_pack', 'proposal', 'draft_branch', 'settings'] as const;
+
+export const MCP_APP_GET_FORM_SCHEMA_INPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['workspaceId', 'route', 'entityType', 'entityId'],
+  properties: {
+    workspaceId: { type: 'string', minLength: 1 },
+    route: { type: 'string', enum: APP_WORKING_STATE_ROUTE_ENUM },
+    entityType: { type: 'string', enum: [...APP_WORKING_STATE_ENTITY_TYPE_ENUM] },
+    entityId: { type: 'string', minLength: 1 }
+  }
+} as const;
+
+export const MCP_APP_PATCH_FORM_INPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['workspaceId', 'route', 'entityType', 'entityId', 'patch'],
+  properties: {
+    workspaceId: { type: 'string', minLength: 1 },
+    route: { type: 'string', enum: APP_WORKING_STATE_ROUTE_ENUM },
+    entityType: { type: 'string', enum: [...APP_WORKING_STATE_ENTITY_TYPE_ENUM] },
+    entityId: { type: 'string', minLength: 1 },
+    versionToken: { type: 'string', minLength: 1 },
+    patch: {
+      type: 'object',
+      minProperties: 1,
+      additionalProperties: true
+    }
+  }
+} as const;
+
 function sortValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((item) => sortValue(item));

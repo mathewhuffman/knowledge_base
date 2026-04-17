@@ -21,6 +21,7 @@ const kb_cli_runtime_service_1 = require("./kb-cli-runtime-service");
 const ai_assistant_service_1 = require("./ai-assistant-service");
 const app_working_state_service_1 = require("./app-working-state-service");
 const batch_analysis_orchestrator_1 = require("./batch-analysis-orchestrator");
+const kb_access_mode_resolver_1 = require("./kb-access-mode-resolver");
 const proposal_working_state_1 = require("./proposal-working-state");
 const RUNTIME_MODEL_CATALOG = [
     { provider: 'Anthropic', name: 'Claude 4 Sonnet', aliases: ['claude 4 sonnet', 'claude-sonnet-4', 'claude-4-sonnet'], costs: { inputUsdPerMillion: 3, cacheWriteUsdPerMillion: 3.75, cacheReadUsdPerMillion: 0.3, outputUsdPerMillion: 15 } },
@@ -97,6 +98,15 @@ const buildRuntimeModelCatalog = (availableModels, currentModelId) => {
     }
     return Array.from(deduped.values());
 };
+const extractOptionalString = (value) => typeof value === 'string' && value.trim()
+    ? value.trim()
+    : undefined;
+const extractOptionalKbAccessMode = (value) => value === 'mcp' || value === 'cli'
+    ? value
+    : undefined;
+const asRecord = (value) => value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : undefined;
 const ZENDESK_PREVIEW_STYLE_TOKENS = {
     base_font_size: '16px',
     bg_color: '#ffffff',
@@ -1826,9 +1836,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         searchKb: async (input) => {
             return workspaceRepository.searchArticles(input.workspaceId, {
                 workspaceId: input.workspaceId,
-                query: input.query ?? '',
+                query: input.query,
+                localeVariantIds: input.localeVariantIds,
+                familyIds: input.familyIds,
+                revisionIds: input.revisionIds,
                 scope: 'all',
-                includeArchived: true
+                includeArchived: input.includeArchived ?? true
             });
         },
         getExplorerTree: async (workspaceId) => {
@@ -1847,7 +1860,17 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             return workspaceRepository.getArticleFamily(input.workspaceId, input.familyId);
         },
         getLocaleVariant: async (input) => {
-            return workspaceRepository.getLocaleVariant(input.workspaceId, input.familyId);
+            return workspaceRepository.getLocaleVariant(input.workspaceId, input.localeVariantId);
+        },
+        getAppFormSchema: async (input) => {
+            return appWorkingStateService.getFormSchema(input);
+        },
+        patchAppForm: async (input) => {
+            return (0, proposal_working_state_1.applyAppWorkingStatePatch)({
+                workspaceRepository,
+                appWorkingStateService,
+                request: input
+            });
         },
         findRelatedArticles: async (input) => {
             if (input.articleId || input.familyId || input.batchId) {
@@ -1940,13 +1963,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         getArticleHistory: async (input) => {
             return workspaceRepository.getHistory(input.workspaceId, input.localeVariantId);
         },
-        recordAgentNotes: async (input) => ({
-            ok: true,
-            workspaceId: input.workspaceId,
-            sessionId: input.sessionId,
-            recorded: true,
-            note: input.note
-        }),
+        recordAgentNotes: async (input) => workspaceRepository.recordAgentNotes(input),
         proposeCreateKb: async (input, context) => {
             if (!context.workspaceId) {
                 throw new Error('workspaceId is required');
@@ -1963,6 +1980,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 action: shared_types_1.ProposalAction.CREATE,
                 reviewStatus,
                 _sessionId: sessionId,
+                originPath: 'batch_analysis',
                 localeVariantId: input.localeVariantId,
                 note: input.note,
                 rationale: input.rationale,
@@ -1987,6 +2005,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 action: shared_types_1.ProposalAction.EDIT,
                 reviewStatus,
                 _sessionId: sessionId,
+                originPath: 'batch_analysis',
                 localeVariantId: input.localeVariantId,
                 note: input.note,
                 rationale: input.rationale,
@@ -2011,6 +2030,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 action: shared_types_1.ProposalAction.RETIRE,
                 reviewStatus,
                 _sessionId: sessionId,
+                originPath: 'batch_analysis',
                 localeVariantId: input.localeVariantId,
                 note: input.note,
                 rationale: input.rationale,
@@ -2063,6 +2083,18 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
         return settings.kbAccessMode || defaultKbAccessMode;
     };
+    const inspectKbAccessMode = (workspaceId, requestedMode) => (0, kb_access_mode_resolver_1.resolveKbAccessModeSelection)({
+        workspaceId,
+        requestedMode,
+        resolveWorkspaceKbAccessMode,
+        agentRuntime
+    });
+    const requireHealthyKbAccessMode = (workspaceId, requestedMode) => (0, kb_access_mode_resolver_1.requireHealthyKbAccessModeSelection)({
+        workspaceId,
+        requestedMode,
+        resolveWorkspaceKbAccessMode,
+        agentRuntime
+    });
     const aiAssistantService = new ai_assistant_service_1.AiAssistantService(workspaceRepository, agentRuntime, resolveWorkspaceKbAccessMode, appWorkingStateService, emitAiAssistantEvent);
     const buildZendeskClient = async (workspaceId) => {
         const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
@@ -2100,8 +2132,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         if (!workspaceId) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agent.health.check requires workspaceId');
         }
-        const workspaceMode = await resolveWorkspaceKbAccessMode(workspaceId);
-        const selectedMode = requestedMode === 'mcp' || requestedMode === 'cli' ? requestedMode : workspaceMode;
+        const selection = await inspectKbAccessMode(workspaceId, requestedMode);
+        const { workspaceMode, selectedMode, health } = selection;
         logger_1.logger.info('agent.health.check', {
             requestId,
             workspaceId,
@@ -2109,7 +2141,6 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             workspaceMode,
             selectedMode
         });
-        const health = await agentRuntime.checkHealth(workspaceId, selectedMode, workspaceMode);
         logger_1.logger.info('agent.health.check.result', {
             requestId,
             workspaceId,
@@ -2120,7 +2151,11 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 mcp: {
                     ok: health.providers.mcp.ok,
                     failureCode: health.providers.mcp.failureCode,
-                    message: health.providers.mcp.message
+                    message: health.providers.mcp.message,
+                    bridgeConfigPresent: health.providers.mcp.bridgeConfigPresent,
+                    bridgeReachable: health.providers.mcp.bridgeReachable,
+                    toolsetReady: health.providers.mcp.toolsetReady,
+                    missingToolNames: health.providers.mcp.missingToolNames
                 },
                 cli: {
                     ok: health.providers.cli.ok,
@@ -2142,7 +2177,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (!input.type) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agent.session.create requires type');
             }
-            const kbAccessMode = input.kbAccessMode ?? (await resolveWorkspaceKbAccessMode(workspaceId));
+            const kbAccessMode = (0, kb_access_mode_resolver_1.selectKbAccessMode)(input.kbAccessMode, await resolveWorkspaceKbAccessMode(workspaceId));
             const session = agentRuntime.createSession({ ...input, kbAccessMode });
             logger_1.logger.info('agent.session.create', { requestId, sessionId: session.id });
             return { ok: true, data: session };
@@ -3315,11 +3350,15 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (!input?.workspaceId || !input.batchId || !input.action) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'proposal.ingest requires workspaceId, batchId, and action');
             }
+            const metadata = asRecord(input.metadata);
             const proposal = await workspaceRepository.createAgentProposal({
                 workspaceId: input.workspaceId,
                 batchId: input.batchId,
                 action: input.action,
                 _sessionId: input.sessionId,
+                kbAccessMode: extractOptionalKbAccessMode(input.kbAccessMode) ?? extractOptionalKbAccessMode(metadata?.kbAccessMode),
+                acpSessionId: extractOptionalString(input.acpSessionId) ?? extractOptionalString(metadata?.acpSessionId),
+                originPath: extractOptionalString(input.originPath) ?? extractOptionalString(metadata?.originPath) ?? 'proposal_ingest',
                 familyId: input.familyId,
                 localeVariantId: input.localeVariantId,
                 sourceRevisionId: input.sourceRevisionId,
@@ -3635,24 +3674,11 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (!input?.workspaceId || !input.route || !input.entityType || !input.entityId || !input.patch) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'app.workingState.patchForm requires workspaceId, route, entityType, entityId, and patch');
             }
-            const previousSchema = (0, proposal_working_state_1.isProposalReviewWorkingStateTarget)(input)
-                ? appWorkingStateService.getFormSchema({
-                    workspaceId: input.workspaceId,
-                    route: input.route,
-                    entityType: input.entityType,
-                    entityId: input.entityId
-                })
-                : undefined;
-            const result = appWorkingStateService.patchForm(input);
-            if (result.ok && result.applied) {
-                await (0, proposal_working_state_1.persistProposalReviewWorkingStatePatch)({
-                    workspaceRepository,
-                    appWorkingStateService,
-                    request: input,
-                    response: result,
-                    previousSchema
-                });
-            }
+            const result = await (0, proposal_working_state_1.applyAppWorkingStatePatch)({
+                workspaceRepository,
+                appWorkingStateService,
+                request: input
+            });
             return { ok: true, data: result };
         }
         catch (error) {
@@ -3696,7 +3722,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             const selectedTemplate = input.templatePackId
                 ? await workspaceRepository.getTemplatePackDetail({ workspaceId: input.workspaceId, templatePackId: input.templatePackId })
                 : undefined;
-            const kbAccessMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
+            const kbAccessSelection = await requireHealthyKbAccessMode(input.workspaceId);
+            const kbAccessMode = kbAccessSelection.selectedMode;
             const run = await agentRuntime.runArticleEdit({
                 workspaceId: input.workspaceId,
                 localeVariantId: session.session.localeVariantId,
@@ -4025,42 +4052,30 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             });
             return;
         }
-        const workspaceMode = await resolveWorkspaceKbAccessMode(input.workspaceId);
         const workspaceSettings = await workspaceRepository.getWorkspaceSettings(input.workspaceId);
         const agentModelId = workspaceSettings.acpModelId;
         await agentRuntime.setWorkspaceAgentModel(input.workspaceId, agentModelId);
-        const requestedKbAccessMode = input.kbAccessMode;
-        let kbAccessMode = requestedKbAccessMode ?? workspaceMode;
-        const providerHealth = await agentRuntime.checkHealth(input.workspaceId, kbAccessMode, workspaceMode);
-        let selectedProvider = providerHealth.providers[kbAccessMode];
-        if (!selectedProvider.ok && !requestedKbAccessMode) {
-            const fallbackMode = kbAccessMode === 'mcp' ? 'cli' : 'mcp';
-            const fallbackProvider = providerHealth.providers[fallbackMode];
-            if (fallbackProvider.ok) {
-                emit({
-                    id: payload.jobId,
-                    command: payload.command,
-                    state: shared_types_2.JobState.RUNNING,
-                    progress: 12,
-                    message: `Preferred runtime ${kbAccessMode.toUpperCase()} is not ready; falling back to ${fallbackMode.toUpperCase()}.`,
-                    metadata: {
-                        batchId: input.batchId,
-                        requestedKbAccessMode: kbAccessMode,
-                        kbAccessMode: fallbackMode,
-                        agentModelId
-                    }
-                });
-                kbAccessMode = fallbackMode;
-                selectedProvider = fallbackProvider;
-            }
+        let kbAccessMode;
+        try {
+            const kbAccessSelection = await requireHealthyKbAccessMode(input.workspaceId, input.kbAccessMode);
+            kbAccessMode = kbAccessSelection.selectedMode;
         }
-        if (!selectedProvider.ok) {
+        catch (error) {
+            const selectedMode = error instanceof kb_access_mode_resolver_1.KbAccessModePreflightError
+                ? error.selection.selectedMode
+                : (0, kb_access_mode_resolver_1.selectKbAccessMode)(input.kbAccessMode, await resolveWorkspaceKbAccessMode(input.workspaceId));
             emit({
                 id: payload.jobId,
                 command: payload.command,
                 state: shared_types_2.JobState.FAILED,
                 progress: 100,
-                message: `Selected runtime ${kbAccessMode.toUpperCase()} is not ready: ${selectedProvider.message || 'not ready'}`
+                message: error instanceof Error ? error.message : String(error),
+                metadata: {
+                    batchId: input.batchId,
+                    requestedKbAccessMode: selectedMode,
+                    kbAccessMode: selectedMode,
+                    agentModelId
+                }
             });
             return;
         }
@@ -4072,6 +4087,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             message: `Starting analysis session for batch ${input.batchId}`,
             metadata: {
                 batchId: input.batchId,
+                requestedKbAccessMode: kbAccessMode,
                 kbAccessMode,
                 agentModelId
             }
@@ -4211,7 +4227,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 sessionReusePolicy: params.sessionReusePolicy,
                 localSessionId: params.result.sessionId,
                 acpSessionId: params.result.acpSessionId,
-                kbAccessMode: params.result.kbAccessMode ?? kbAccessMode,
+                kbAccessMode,
                 agentModelId,
                 status: params.result.status === 'ok' || params.resolution?.parseable
                     ? 'complete'
@@ -4232,6 +4248,16 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 textLength: params.resolution?.text.length,
                 resultTextPreview: params.resolution ? buildStageEventTextPreview(params.resolution.text) : undefined
             });
+            if (params.result.sessionId) {
+                await workspaceRepository.annotateProposalProvenanceForSession({
+                    workspaceId: input.workspaceId,
+                    batchId: input.batchId,
+                    sessionId: params.result.sessionId,
+                    kbAccessMode,
+                    acpSessionId: params.result.acpSessionId,
+                    originPath: 'batch_analysis'
+                });
+            }
         };
         try {
             streamMetadata.iterationId = orchestrationIteration.id;
@@ -4991,13 +5017,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 });
                 return;
             }
-            const runAnalysis = async (mode, plan, extraInstructions) => {
-                streamMetadata.kbAccessMode = mode;
+            const runAnalysis = async (plan, extraInstructions) => {
                 const promptTemplate = batchAnalysisOrchestrator.buildWorkerPrompt(plan, extraInstructions ?? input.prompt);
                 const result = await agentRuntime.runBatchAnalysis({
                     ...input,
                     sessionId: liveSessionId,
-                    kbAccessMode: mode,
+                    kbAccessMode,
                     agentRole: 'worker',
                     sessionMode: 'agent',
                     prompt: promptTemplate
@@ -5015,47 +5040,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             };
             const executeWorkerPass = async (approvedPlan, extraInstructions) => {
                 const workerStage = (streamMetadata.stage ?? liveIteration.stage);
-                let workerAttempt = await runAnalysis(kbAccessMode, approvedPlan, extraInstructions);
+                const workerAttempt = await runAnalysis(approvedPlan, extraInstructions);
                 let workerResult = workerAttempt.result;
                 let workerPromptTemplate = workerAttempt.promptTemplate;
-                if (workerResult.status === 'ok' && kbAccessMode === 'cli') {
-                    const proposalRecords = await workspaceRepository.listBatchProposalRecords(input.workspaceId, input.batchId, {
-                        includeStaged: true,
-                        openOnly: true
-                    });
-                    const cliPolicyViolations = workerResult.toolCalls.filter((toolCall) => toolCall.allowed === false
-                        && typeof toolCall.reason === 'string'
-                        && toolCall.reason.includes('CLI mode forbids'));
-                    if (proposalRecords.length === 0 && cliPolicyViolations.length > 0 && providerHealth.providers.mcp.ok) {
-                        logger_1.logger.warn('[agent.analysis.run] cli analysis created no proposals after policy violations; retrying in mcp', {
-                            jobId: payload.jobId,
-                            batchId: input.batchId,
-                            workspaceId: input.workspaceId,
-                            violationCount: cliPolicyViolations.length
-                        });
-                        emit({
-                            id: payload.jobId,
-                            command: payload.command,
-                            state: shared_types_2.JobState.RUNNING,
-                            progress: 55,
-                            message: 'CLI analysis hit blocked tool usage and created no proposals. Retrying in MCP mode.',
-                            metadata: buildStreamMetadata({ kbAccessMode: 'mcp' })
-                        });
-                        const cliWorkerResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, workerResult.sessionId, workerResult.resultPayload, 'worker');
-                        await persistBatchStageRun({
-                            stage: workerStage,
-                            role: 'worker',
-                            result: workerResult,
-                            promptTemplate: workerPromptTemplate,
-                            retryType: 'cli_policy_retry',
-                            resolution: cliWorkerResolution
-                        });
-                        kbAccessMode = 'mcp';
-                        workerAttempt = await runAnalysis('mcp', approvedPlan, extraInstructions);
-                        workerResult = workerAttempt.result;
-                        workerPromptTemplate = workerAttempt.promptTemplate;
-                    }
-                }
                 const workerResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, workerResult.sessionId, workerResult.resultPayload, 'worker');
                 await persistBatchStageRun({
                     stage: workerStage,
@@ -5076,7 +5063,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     usedTranscriptRecovery: workerResolution.usedTranscript,
                     payloadCandidateCount: workerResolution.initialCandidateCount,
                     transcriptCandidateCount: workerResolution.transcriptCandidateCount,
-                    kbAccessMode: workerResult.kbAccessMode,
+                    kbAccessMode,
                     status: workerResult.status
                 });
                 const workerFallbackSummary = workerResult.message ?? 'Worker pass completed.';
@@ -5091,7 +5078,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                             sessionId: workerResult.sessionId
                         }, {
                             textLength: workerResolution.text.length,
-                            kbAccessMode: workerResult.kbAccessMode
+                            kbAccessMode
                         });
                     }
                 }
@@ -5128,7 +5115,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         error: error instanceof Error ? error.message : String(error),
                         textLength: workerResolution.text.length,
                         proposalCount: proposalRecords.length,
-                        kbAccessMode: workerResult.kbAccessMode
+                        kbAccessMode
                     });
                 }
                 liveSessionId = workerResult.sessionId;
@@ -6146,21 +6133,50 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             });
             return;
         }
+        let kbAccessMode;
+        try {
+            const kbAccessSelection = await requireHealthyKbAccessMode(input.workspaceId, input.kbAccessMode);
+            kbAccessMode = kbAccessSelection.selectedMode;
+        }
+        catch (error) {
+            const selectedMode = error instanceof kb_access_mode_resolver_1.KbAccessModePreflightError
+                ? error.selection.selectedMode
+                : (0, kb_access_mode_resolver_1.selectKbAccessMode)(input.kbAccessMode, await resolveWorkspaceKbAccessMode(input.workspaceId));
+            emit({
+                id: payload.jobId,
+                command: payload.command,
+                state: shared_types_2.JobState.FAILED,
+                progress: 100,
+                message: error instanceof Error ? error.message : String(error),
+                metadata: {
+                    requestedKbAccessMode: selectedMode,
+                    kbAccessMode: selectedMode
+                }
+            });
+            return;
+        }
         emit({
             id: payload.jobId,
             command: payload.command,
             state: shared_types_2.JobState.RUNNING,
             progress: 20,
-            message: `Starting article edit session for variant ${input.localeVariantId}`
+            message: `Starting article edit session for variant ${input.localeVariantId}`,
+            metadata: {
+                requestedKbAccessMode: kbAccessMode,
+                kbAccessMode
+            }
         });
-        const kbAccessMode = input.kbAccessMode ?? (await resolveWorkspaceKbAccessMode(input.workspaceId));
         const result = await agentRuntime.runArticleEdit({ ...input, kbAccessMode }, (stream) => {
             emit({
                 id: payload.jobId,
                 command: payload.command,
                 state: shared_types_2.JobState.RUNNING,
                 progress: stream.kind === 'result' ? 100 : 45,
-                message: JSON.stringify(stream)
+                message: JSON.stringify(stream),
+                metadata: {
+                    requestedKbAccessMode: kbAccessMode,
+                    kbAccessMode
+                }
             });
         }, isCancelled);
         emit({
@@ -6172,7 +6188,11 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     ? shared_types_2.JobState.CANCELED
                     : shared_types_2.JobState.SUCCEEDED,
             progress: 100,
-            message: result.message ?? 'article edit command complete'
+            message: result.message ?? 'article edit command complete',
+            metadata: {
+                requestedKbAccessMode: kbAccessMode,
+                kbAccessMode
+            }
         });
     });
     jobs.registerRunner('article.relations.refresh', async (payload, emit, isCancelled) => {
@@ -6471,6 +6491,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
     return {
         agentRuntime,
         kbCliLoopback,
-        kbCliRuntime
+        kbCliRuntime,
+        batchAnalysisOrchestrator
     };
 }

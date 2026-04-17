@@ -383,35 +383,22 @@ class KbCliLoopbackService {
                     versionToken: typeof body.versionToken === 'string' ? body.versionToken : undefined,
                     patch: patchValue
                 };
-                const previousSchema = (0, proposal_working_state_1.isProposalReviewWorkingStateTarget)(patchRequest)
-                    ? this.appWorkingStateService.getFormSchema({
-                        workspaceId,
-                        route: patchRequest.route,
-                        entityType: patchRequest.entityType,
-                        entityId: patchRequest.entityId
-                    })
-                    : undefined;
-                const result = this.appWorkingStateService.patchForm(patchRequest);
-                if (result.ok && result.applied) {
-                    try {
-                        await (0, proposal_working_state_1.persistProposalReviewWorkingStatePatch)({
-                            workspaceRepository: this.workspaceRepository,
-                            appWorkingStateService: this.appWorkingStateService,
-                            request: patchRequest,
-                            response: result,
-                            previousSchema
-                        });
-                    }
-                    catch (error) {
-                        sendJson(response, 500, {
-                            ok: false,
-                            error: String(error.message || error)
-                        });
-                        return;
-                    }
+                try {
+                    const result = await (0, proposal_working_state_1.applyAppWorkingStatePatch)({
+                        workspaceRepository: this.workspaceRepository,
+                        appWorkingStateService: this.appWorkingStateService,
+                        request: patchRequest
+                    });
+                    sendJson(response, result.ok ? 200 : 409, result);
+                    return;
                 }
-                sendJson(response, result.ok ? 200 : 409, result);
-                return;
+                catch (error) {
+                    sendJson(response, 500, {
+                        ok: false,
+                        error: String(error.message || error)
+                    });
+                    return;
+                }
             }
             if (request.method === 'POST' && segments[2] === 'proposals' && segments[3]) {
                 const actionMap = {
@@ -447,12 +434,24 @@ class KbCliLoopbackService {
             }
             if (request.method === 'POST' && segments[2] === 'agent-notes' && !segments[3]) {
                 const body = await readJsonBody(request);
-                sendJson(response, 200, {
-                    ok: true,
+                if (typeof body.note !== 'string' || !body.note.trim()) {
+                    sendJson(response, 400, { ok: false, error: 'note is required' });
+                    return;
+                }
+                const recorded = await this.workspaceRepository.recordAgentNotes({
                     workspaceId,
-                    recorded: true,
-                    note: typeof body.note === 'string' ? body.note : ''
+                    sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+                    note: body.note,
+                    metadata: body.metadata,
+                    batchId: typeof body.batchId === 'string' ? body.batchId : undefined,
+                    localeVariantId: typeof body.localeVariantId === 'string' ? body.localeVariantId : undefined,
+                    familyId: typeof body.familyId === 'string' ? body.familyId : undefined,
+                    pbiIds: Array.isArray(body.pbiIds)
+                        ? body.pbiIds.filter((entry) => typeof entry === 'string')
+                        : undefined,
+                    rationale: typeof body.rationale === 'string' ? body.rationale : undefined
                 });
+                sendJson(response, 200, recorded);
                 return;
             }
             sendJson(response, 404, { ok: false, error: `No CLI route for ${route}` });

@@ -949,6 +949,35 @@ export const migrations: Migration[] = [
       CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_analysis_stage_runs_attempt
         ON batch_analysis_stage_runs(iteration_id, stage, role, attempt);
     `
+  },
+  {
+    version: 21,
+    name: '0021_agent_notes',
+    description: 'Persist structured agent notes emitted through MCP or CLI note capture.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS agent_notes (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        session_id TEXT,
+        batch_id TEXT,
+        locale_variant_id TEXT,
+        family_id TEXT,
+        note TEXT NOT NULL,
+        rationale TEXT,
+        metadata_json TEXT,
+        pbi_ids_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_agent_notes_workspace_created
+        ON agent_notes(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_notes_session_created
+        ON agent_notes(session_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_notes_batch_created
+        ON agent_notes(batch_id, created_at DESC);
+    `
   }
 ];
 

@@ -6193,7 +6193,7 @@ code.agent-meta-value {
   top: 0;
   z-index: 2;
   padding-top: var(--space-3);
-  background: linear-gradient(180deg, var(--color-surface) 0%, var(--color-surface) 80%, transparent 100%);
+  background: linear-gradient(180deg, var(--color-bg) 0%, var(--color-bg) 82%, rgba(255, 255, 255, 0) 100%);
 }
 
 /* ==========================================================================
@@ -6796,6 +6796,16 @@ code.agent-meta-value {
   font-size: 12px;
 }
 
+.ai-msg__processing {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  margin-top: var(--space-2);
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.05);
+}
+
 /* Typing indicator */
 .ai-typing {
   display: inline-flex;
@@ -6825,6 +6835,17 @@ code.agent-meta-value {
   height: 8px;
 }
 
+.ai-typing--compact {
+  gap: 3px;
+  padding: 0;
+}
+
+.ai-typing--compact span {
+  width: 4px;
+  height: 4px;
+  opacity: 0.75;
+}
+
 /* ==========================================================================
    Global AI Assistant — Artifact Cards
    ========================================================================== */
@@ -6836,17 +6857,30 @@ code.agent-meta-value {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+  background: var(--color-bg);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08), 0 2px 6px rgba(15, 23, 42, 0.04);
   animation: ai-msg-in 0.25s ease-out;
 }
 
 .ai-artifact--proposal {
   border-color: var(--color-primary);
-  background: linear-gradient(180deg, rgba(34, 139, 230, 0.04), rgba(34, 139, 230, 0.01));
+  background: linear-gradient(180deg, rgba(34, 139, 230, 0.08), rgba(34, 139, 230, 0.03)), var(--color-bg);
 }
 
 .ai-artifact--patch {
   border-color: var(--color-success);
-  background: linear-gradient(180deg, rgba(43, 138, 62, 0.04), rgba(43, 138, 62, 0.01));
+  background: linear-gradient(180deg, rgba(43, 138, 62, 0.08), rgba(43, 138, 62, 0.03)), var(--color-bg);
+}
+
+.ai-artifact--candidate {
+  max-height: min(34vh, 320px);
+  overflow: hidden;
+}
+
+.ai-artifact--candidate .ai-artifact__summary {
+  max-height: min(18vh, 150px);
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .ai-artifact--pending {
@@ -6944,6 +6978,7 @@ code.agent-meta-value {
   font-weight: var(--weight-medium);
   color: var(--color-text);
   line-height: 1.45;
+  word-break: break-word;
 }
 
 .ai-artifact__stale-warning {

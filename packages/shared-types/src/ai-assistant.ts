@@ -144,6 +144,45 @@ export interface ProposalCandidatePayload {
 
 export type ProposalPatchScope = 'current' | 'article' | 'batch';
 
+export type ProposalHtmlMutationOccurrence = 'first' | 'last' | 'all';
+
+export type ProposalHtmlMutationOperation =
+  | {
+      type: 'append_html';
+      html: string;
+    }
+  | {
+      type: 'prepend_html';
+      html: string;
+    }
+  | {
+      type: 'replace_text';
+      target: string;
+      replacement: string;
+      occurrence?: ProposalHtmlMutationOccurrence;
+      expectedCount?: number;
+    }
+  | {
+      type: 'insert_before_text';
+      target: string;
+      html: string;
+      occurrence?: ProposalHtmlMutationOccurrence;
+      expectedCount?: number;
+    }
+  | {
+      type: 'insert_after_text';
+      target: string;
+      html: string;
+      occurrence?: ProposalHtmlMutationOccurrence;
+      expectedCount?: number;
+    }
+  | {
+      type: 'remove_text';
+      target: string;
+      occurrence?: ProposalHtmlMutationOccurrence;
+      expectedCount?: number;
+    };
+
 export type ProposalLineEditOperation =
   | {
       type: 'replace_lines';
@@ -173,6 +212,7 @@ export interface ProposalPatchPayload {
   rationaleSummary?: string;
   aiNotes?: string;
   html?: string;
+  htmlMutations?: ProposalHtmlMutationOperation[];
   lineEdits?: ProposalLineEditOperation[];
 }
 

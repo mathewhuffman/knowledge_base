@@ -229,6 +229,60 @@ function acpTransportSummary(health: KbAccessHealth): { ok: boolean; detail: str
   };
 }
 
+function mcpBridgeSummary(health: KbAccessHealth): { ok: boolean; detail: string } {
+  if (health.mode !== 'mcp') {
+    return { ok: true, detail: 'Not applicable' };
+  }
+  if (!health.bridgeConfigPresent) {
+    return {
+      ok: false,
+      detail: 'Bridge configuration is incomplete or missing'
+    };
+  }
+  if (health.bridgeReachable) {
+    return {
+      ok: true,
+      detail: health.bridgeSocketPath
+        ? `Bridge reachable via ${health.bridgeSocketPath}`
+        : 'Bridge is reachable'
+    };
+  }
+  return {
+    ok: false,
+    detail: health.bridgeSocketPath
+      ? `Bridge not reachable at ${health.bridgeSocketPath}`
+      : 'Bridge is not reachable'
+  };
+}
+
+function mcpToolsetSummary(health: KbAccessHealth): { ok: boolean; detail: string } {
+  if (health.mode !== 'mcp') {
+    return { ok: true, detail: 'Not applicable' };
+  }
+  if (health.toolsetReady) {
+    return {
+      ok: true,
+      detail: `${health.registeredToolNames?.length ?? 0} MCP tools registered and verified`
+    };
+  }
+  if (health.bridgeConfigPresent && health.bridgeReachable === false) {
+    return {
+      ok: false,
+      detail: 'Tool availability cannot be verified until the bridge responds'
+    };
+  }
+  if (health.missingToolNames && health.missingToolNames.length > 0) {
+    return {
+      ok: false,
+      detail: `Missing tools: ${health.missingToolNames.join(', ')}`
+    };
+  }
+  return {
+    ok: false,
+    detail: 'Toolset verification did not complete'
+  };
+}
+
 function streamingKindBadge(kind: AgentStreamingPayload['kind']): 'primary' | 'success' | 'warning' | 'danger' | 'neutral' {
   switch (kind) {
     case 'session_started': return 'primary';
@@ -573,9 +627,14 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
                   availableModes={providerHealth.availableModes}
                   onModeChanged={runCheck}
                 />
+                <HealthCheckItem
+                  label="Provider Selection"
+                  ok
+                  detail={`Strict mode: KB Vault will only use ${providerHealth.selectedMode.toUpperCase()} until you switch providers manually.`}
+                />
                 {activeProvider && (
                   <HealthCheckItem
-                    label={`${providerHealth.selectedMode.toUpperCase()} Provider (active)`}
+                    label={`${providerHealth.selectedMode.toUpperCase()} Provider (selected)`}
                     ok={activeProvider.ok}
                     detail={providerStatusSummary(activeProvider)}
                     failureCode={activeProvider.failureCode}
@@ -584,7 +643,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
                 )}
                 {activeProvider && activeProvider.mode === 'cli' && (
                   <HealthCheckItem
-                    label="ACP Transport (active)"
+                    label="ACP Transport (selected)"
                     ok={acpTransportSummary(activeProvider).ok}
                     detail={acpTransportSummary(activeProvider).detail}
                     failureCode={acpTransportSummary(activeProvider).ok ? undefined : activeProvider.failureCode}
@@ -595,9 +654,23 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
                     }
                   />
                 )}
+                {activeProvider && activeProvider.mode === 'mcp' && (
+                  <HealthCheckItem
+                    label="MCP Bridge (selected)"
+                    ok={mcpBridgeSummary(activeProvider).ok}
+                    detail={mcpBridgeSummary(activeProvider).detail}
+                  />
+                )}
+                {activeProvider && activeProvider.mode === 'mcp' && (
+                  <HealthCheckItem
+                    label="MCP Toolset (selected)"
+                    ok={mcpToolsetSummary(activeProvider).ok}
+                    detail={mcpToolsetSummary(activeProvider).detail}
+                  />
+                )}
                 {inactiveProvider && (
                   <HealthCheckItem
-                    label={`${inactiveProvider.mode.toUpperCase()} Provider (standby)`}
+                    label={`${inactiveProvider.mode.toUpperCase()} Provider (manual switch only)`}
                     ok={inactiveProvider.ok}
                     detail={providerStatusSummary(inactiveProvider)}
                     failureCode={inactiveProvider.failureCode}
@@ -606,7 +679,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
                 )}
                 {inactiveProvider && inactiveProvider.mode === 'cli' && inactiveProvider !== activeProvider && (
                   <HealthCheckItem
-                    label="ACP Transport (standby)"
+                    label="ACP Transport (manual switch only)"
                     ok={acpTransportSummary(inactiveProvider).ok}
                     detail={acpTransportSummary(inactiveProvider).detail}
                     failureCode={acpTransportSummary(inactiveProvider).ok ? undefined : inactiveProvider.failureCode}
@@ -671,7 +744,7 @@ interface KbAccessModeToggleProps {
   workspaceId: string;
   currentMode: KbAccessMode;
   availableModes: KbAccessMode[];
-  onModeChanged: () => void;
+  onModeChanged: () => Promise<void> | void;
 }
 
 type ModeSwitchPhase = 'idle' | 'confirming' | 'switching' | 'verifying' | 'success' | 'failed';
@@ -685,12 +758,12 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
   const modeDescriptions: Record<KbAccessMode, { label: string; helper: string; icon: string }> = {
     mcp: {
       label: 'MCP (Model Context Protocol)',
-      helper: 'Connects the AI agent directly to KB tools via the MCP server. Best for most workflows.',
+      helper: 'Connects the AI agent directly to KB tools via the MCP server. KB Vault will not auto-switch providers.',
       icon: 'server',
     },
     cli: {
       label: 'CLI (Command Line)',
-      helper: 'Routes KB access through the local CLI loopback service. Use when MCP is unavailable.',
+      helper: 'Routes KB access through the local CLI loopback service. KB Vault will use CLI only when you select it.',
       icon: 'terminal',
     },
   };
@@ -699,7 +772,7 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
     idle: '',
     confirming: 'Confirm mode change',
     switching: 'Saving new mode...',
-    verifying: 'Verifying provider health...',
+    verifying: 'Refreshing provider health...',
     success: 'Mode switched successfully',
     failed: 'Mode switch failed',
   };
@@ -718,10 +791,8 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
     try {
       await updateSettings.mutate({ workspaceId, kbAccessMode: pendingMode });
       setSwitchPhase('verifying');
-      // Brief pause to let the health check re-run
-      await new Promise((r) => setTimeout(r, 600));
+      await Promise.resolve(onModeChanged());
       setSwitchPhase('success');
-      onModeChanged();
       // Auto-dismiss success after a moment
       setTimeout(() => {
         setSwitchPhase('idle');
@@ -806,16 +877,16 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
                 </span>
               </div>
               <p className="agent-mode-switch-body">
-                Future agent sessions will use the {pendingMode.toUpperCase()} provider.
-                Any running sessions will keep their current mode until they finish.
+                Future agent sessions will use the {pendingMode.toUpperCase()} provider exactly as selected.
+                Any running sessions will keep their current mode until they finish, and KB Vault will not auto-switch providers.
               </p>
               {!availableModes.includes(pendingMode) && (
                 <div className="agent-mode-switch-warning" role="alert">
                   <span aria-hidden="true"><IconAlertCircle size={12} /></span>
                   <span>
                     The {pendingMode.toUpperCase()} provider is currently offline.
-                    Sessions may fail until it becomes healthy. You can switch now and
-                    re-check health afterward, or wait until the provider is available.
+                    New sessions will fail preflight until it becomes healthy.
+                    KB Vault will not auto-switch to the other provider.
                   </span>
                 </div>
               )}
@@ -834,7 +905,7 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
               <div className="spinner" aria-hidden="true" />
               <div className="agent-mode-switch-progress-text">
                 <span className="agent-mode-switch-progress-label">
-                  {switchPhase === 'switching' ? 'Saving mode preference...' : 'Verifying provider health...'}
+                  {switchPhase === 'switching' ? 'Saving mode preference...' : 'Refreshing provider health...'}
                 </span>
                 <span className="agent-mode-switch-progress-sub">
                   Switching to {pendingMode.toUpperCase()}
@@ -847,7 +918,7 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
           {switchPhase === 'success' && (
             <div className="agent-mode-switch-result agent-mode-switch-result--success">
               <span aria-hidden="true"><IconCheckCircle size={16} /></span>
-              <span>Switched to {pendingMode.toUpperCase()} mode. New sessions will use this provider.</span>
+              <span>Switched to {pendingMode.toUpperCase()} mode. New sessions will use this provider only.</span>
             </div>
           )}
 

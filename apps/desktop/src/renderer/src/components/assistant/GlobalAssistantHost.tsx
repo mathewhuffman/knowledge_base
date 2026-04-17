@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
+import type { AiArtifactType, AiMessageRecord } from '@kb-vault/shared-types';
 import { useAiAssistant } from './AssistantContext';
 import { AssistantLauncher } from './AssistantLauncher';
 import { AssistantHeader } from './AssistantHeader';
@@ -17,6 +18,7 @@ const AI_PANEL_WIDTH_CLOSED = 420;
 const AI_PANEL_WIDTH_HISTORY = 700;
 const AI_PANEL_MAX_HEIGHT = 740;
 const AI_LAUNCHER_POSITION_KEY = 'kbv:ai-launcher-position';
+const AI_PROPOSAL_DISMISS_DELAY_MS = 10_000;
 
 type LauncherPosition = {
   left: number;
@@ -53,6 +55,22 @@ function loadLauncherPosition(): LauncherPosition {
   } catch {
     return getDefaultLauncherPosition();
   }
+}
+
+function extractMessageArtifactMeta(message: AiMessageRecord): {
+  artifactId?: string;
+  artifactType?: AiArtifactType;
+} {
+  const metadata = message.metadata;
+  if (!metadata || typeof metadata !== 'object') {
+    return {};
+  }
+
+  const artifactId = typeof metadata.artifactId === 'string' ? metadata.artifactId : undefined;
+  const artifactType = typeof metadata.artifactType === 'string'
+    ? metadata.artifactType as AiArtifactType
+    : undefined;
+  return { artifactId, artifactType };
 }
 
 export function AssistantPanelContent({
@@ -97,10 +115,59 @@ export function AssistantPanelContent({
     return artifact.baseVersionToken !== routeContext.workingState.versionToken;
   }, [artifact, routeContext]);
 
+  const [dismissedArtifactIds, setDismissedArtifactIds] = useState<string[]>([]);
+
+  const dismissArtifactCard = useCallback((artifactId: string) => {
+    setDismissedArtifactIds((current) => (
+      current.includes(artifactId) ? current : [...current, artifactId]
+    ));
+  }, []);
+
+  useEffect(() => {
+    if (!artifact) {
+      return;
+    }
+    const shouldAutoDismiss =
+      (artifact.artifactType === 'proposal_candidate' && (artifact.status === 'applied' || artifact.status === 'rejected'))
+      || (artifact.artifactType === 'proposal_patch' && artifact.status === 'applied');
+    if (!shouldAutoDismiss) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      dismissArtifactCard(artifact.id);
+    }, AI_PROPOSAL_DISMISS_DELAY_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [artifact, dismissArtifactCard]);
+
   const showArtifact = artifact
     && artifact.artifactType !== 'informational_response'
-    && (artifact.status === 'pending' || artifact.status === 'applied');
-  const showTranscript = messages.length > 0 || Boolean(pendingTurn);
+    && !dismissedArtifactIds.includes(artifact.id)
+    && (
+      artifact.artifactType === 'proposal_candidate'
+        ? artifact.status !== 'superseded'
+        : (artifact.status === 'pending' || artifact.status === 'applied')
+    );
+  const transcriptMessages = useMemo(() => {
+    if (!artifact) {
+      return messages;
+    }
+
+    return messages.filter((message) => {
+      if (message.messageKind !== 'artifact') {
+        return true;
+      }
+
+      const { artifactId, artifactType } = extractMessageArtifactMeta(message);
+      if (!artifactId || artifactId !== artifact.id) {
+        return true;
+      }
+
+      return artifactType === 'informational_response';
+    });
+  }, [artifact, messages]);
+  const showTranscript = transcriptMessages.length > 0 || Boolean(pendingTurn);
 
   return (
     <aside
@@ -151,6 +218,7 @@ export function AssistantPanelContent({
                 artifact={artifact}
                 stale={isStale}
                 loading={loading}
+                onDismiss={() => dismissArtifactCard(artifact.id)}
                 onApply={() => void applyArtifact()}
                 onReject={() => void rejectArtifact()}
                 onRerun={() => void rerunLastMessage()}
@@ -159,7 +227,7 @@ export function AssistantPanelContent({
           )}
 
           {showTranscript ? (
-            <AssistantTranscript messages={messages} pendingTurn={pendingTurn} loading={sending} />
+            <AssistantTranscript messages={transcriptMessages} pendingTurn={pendingTurn} loading={sending} />
           ) : (
             !(loading || pendingTurn) && <AssistantEmptyState context={routeContext} />
           )}

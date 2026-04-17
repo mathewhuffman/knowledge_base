@@ -8,6 +8,7 @@ import {
   type PBIBatchScopePayload,
   type PBIBatchDeleteRequest,
   type AgentSessionRecord,
+  type PersistedAgentAnalysisRunResponse,
 } from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
@@ -341,6 +342,7 @@ export const PBI = () => {
   const [activeAnalysisBatchIds, setActiveAnalysisBatchIds] = useState<string[]>([]);
   const [cachedBatches, setCachedBatches] = useState<PBIBatchRecord[]>([]);
   const [cachedSessions, setCachedSessions] = useState<AgentSessionRecord[]>([]);
+  const [persistedAnalysisBatchIds, setPersistedAnalysisBatchIds] = useState<string[]>([]);
   const batches = useMemo(() => {
     const data = batchListQuery.data;
     if (data && Array.isArray(data.batches)) {
@@ -371,8 +373,61 @@ export const PBI = () => {
       setCachedBatches([]);
       setCachedSessions([]);
       setActiveAnalysisBatchIds([]);
+      setPersistedAnalysisBatchIds([]);
     }
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!activeWorkspace) {
+      setPersistedAnalysisBatchIds([]);
+      return;
+    }
+
+    const candidateBatchIds = batches
+      .filter((batch) =>
+        batch.status !== PBIBatchStatus.ANALYZED
+        && batch.status !== PBIBatchStatus.REVIEW_IN_PROGRESS
+        && batch.status !== PBIBatchStatus.REVIEW_COMPLETE
+      )
+      .map((batch) => batch.id);
+
+    if (candidateBatchIds.length === 0) {
+      setPersistedAnalysisBatchIds([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      const results = await Promise.all(
+        candidateBatchIds.map(async (batchId) => {
+          try {
+            const response = await window.kbv.invoke<PersistedAgentAnalysisRunResponse>('agent.analysis.latest', {
+              workspaceId: activeWorkspace.id,
+              batchId,
+              limit: 0,
+            });
+            if (!response.ok || !response.data) {
+              return null;
+            }
+            return response.data.run || response.data.orchestration?.latestIteration ? batchId : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      if (cancelled) {
+        return;
+      }
+
+      setPersistedAnalysisBatchIds(results.filter((batchId): batchId is string => Boolean(batchId)));
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace?.id, batches]);
 
   useEffect(() => {
     if (!activeWorkspace) {
@@ -440,8 +495,11 @@ export const PBI = () => {
         analyzedBatchIds.add(session.batchId);
       }
     }
+    for (const batchId of persistedAnalysisBatchIds) {
+      analyzedBatchIds.add(batchId);
+    }
     return analyzedBatchIds;
-  }, [sessionListQuery.data?.sessions, cachedSessions]);
+  }, [sessionListQuery.data?.sessions, cachedSessions, persistedAnalysisBatchIds]);
 
   const runningAnalysisBatchIds = useMemo(() => {
     const sessions = sessionListQuery.data?.sessions ?? cachedSessions;
@@ -462,13 +520,47 @@ export const PBI = () => {
     if (runningAnalysisBatchIds.has(batch.id)) {
       return 'analyzing';
     }
+    if (
+      persistedAnalysisBatchIds.includes(batch.id)
+      && batch.status !== PBIBatchStatus.ANALYZED
+      && batch.status !== PBIBatchStatus.REVIEW_IN_PROGRESS
+      && batch.status !== PBIBatchStatus.REVIEW_COMPLETE
+    ) {
+      return PBIBatchStatus.ANALYZED;
+    }
     return batch.status;
-  }, [runningAnalysisBatchIds]);
+  }, [persistedAnalysisBatchIds, runningAnalysisBatchIds]);
 
   const openAnalysis = useCallback((batch: PBIBatchRecord, shouldAutoRun = false) => {
     setAnalysisBatch(batch);
     setAnalysisAutoRun(shouldAutoRun);
   }, []);
+
+  const resolvePersistedAnalysisOutcome = useCallback(async (batchId: string) => {
+    if (!activeWorkspace) {
+      return false;
+    }
+    try {
+      const response = await window.kbv.invoke<PersistedAgentAnalysisRunResponse>('agent.analysis.latest', {
+        workspaceId: activeWorkspace.id,
+        batchId,
+        limit: 0,
+      });
+      const hasPersistedOutcome = Boolean(
+        response.ok
+        && response.data
+        && (response.data.run || response.data.orchestration?.latestIteration)
+      );
+      if (hasPersistedOutcome) {
+        setPersistedAnalysisBatchIds((current) => (
+          current.includes(batchId) ? current : [...current, batchId]
+        ));
+      }
+      return hasPersistedOutcome;
+    } catch {
+      return false;
+    }
+  }, [activeWorkspace]);
 
   const hasAnalysisHistory = useCallback((batch: PBIBatchRecord) => batchHasHistory.has(batch.id), [batchHasHistory]);
   const hasAnyAnalysisOutcome = useCallback((batch: PBIBatchRecord) => {
@@ -492,18 +584,25 @@ export const PBI = () => {
     return !hasAnyAnalysisOutcome(batch);
   }, [hasAnyAnalysisOutcome, runningAnalysisBatchIds]);
 
-  const openAnalysisFromRow = useCallback((batch: PBIBatchRecord) => {
-    if (!hasAnyAnalysisOutcome(batch)) {
+  const openAnalysisFromRow = useCallback(async (batch: PBIBatchRecord) => {
+    if (hasAnyAnalysisOutcome(batch) || await resolvePersistedAnalysisOutcome(batch.id)) {
+      openAnalysis(batch, false);
+    }
+  }, [hasAnyAnalysisOutcome, openAnalysis, resolvePersistedAnalysisOutcome]);
+
+  const handleAnalyzeAction = useCallback(async (batch: PBIBatchRecord) => {
+    if (await resolvePersistedAnalysisOutcome(batch.id)) {
+      openAnalysis(batch, false);
       return;
     }
-    openAnalysis(batch, false);
-  }, [hasAnyAnalysisOutcome, openAnalysis]);
+    openAnalysis(batch, true);
+  }, [openAnalysis, resolvePersistedAnalysisOutcome]);
 
   const handleRowKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTableRowElement>, batch: PBIBatchRecord) => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
-        openAnalysisFromRow(batch);
+        void openAnalysisFromRow(batch);
       }
     },
     [openAnalysisFromRow]
@@ -965,7 +1064,7 @@ export const PBI = () => {
                   <tr
                     key={b.id}
                     className="pbi-batch-table-row"
-                    onClick={() => openAnalysisFromRow(b)}
+                    onClick={() => { void openAnalysisFromRow(b); }}
                     onKeyDown={(event) => handleRowKeyDown(event, b)}
                     role="button"
                     tabIndex={0}
@@ -989,7 +1088,7 @@ export const PBI = () => {
                   className="btn btn-primary btn-xs"
                   onClick={(event) => {
                     event.stopPropagation();
-                    openAnalysis(b, true);
+                    void handleAnalyzeAction(b);
                   }}
                   title="Run AI analysis"
                   aria-label={`Run analysis on ${b.name}`}

@@ -1,4 +1,4 @@
-import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentAssistantChatRunRequest, AgentHealthCheckResponse, AgentRuntimeOptionsResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRunResult, KbAccessMode, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode, KbAccessHealth } from '@kb-vault/shared-types';
+import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentAssistantChatRunRequest, AgentHealthCheckResponse, AgentRuntimeOptionsResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRunResult, KbAccessMode, MCPSearchKbInput, MCPAppGetFormSchemaInput, MCPAppPatchFormInput, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPGetTemplateInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode, KbAccessHealth } from '@kb-vault/shared-types';
 interface ScopedToolContext {
     workspaceId: string;
     allowedLocaleVariantIds?: string[];
@@ -14,20 +14,18 @@ interface KbRuntimeOptions {
     prepareCliEnvironment?: (workspaceId?: string) => Promise<void>;
 }
 export interface AgentRuntimeToolContext {
-    searchKb: (input: MCPFindRelatedArticlesInput & {
-        workspaceId: string;
-    }) => Promise<unknown>;
+    searchKb: (input: MCPSearchKbInput) => Promise<unknown>;
     getExplorerTree: (workspaceId: string) => Promise<ExplorerNode[]>;
     getArticle: (input: MCPGetArticleInput) => Promise<unknown>;
     getArticleFamily: (input: MCPGetArticleFamilyInput) => Promise<unknown>;
     getLocaleVariant: (input: MCPGetLocaleVariantInput) => Promise<unknown>;
+    getAppFormSchema: (input: MCPAppGetFormSchemaInput) => Promise<unknown>;
+    patchAppForm: (input: MCPAppPatchFormInput) => Promise<unknown>;
     findRelatedArticles: (input: MCPFindRelatedArticlesInput) => Promise<unknown>;
     listCategories: (input: MCPListCategoriesInput) => Promise<unknown>;
     listSections: (input: MCPListSectionsInput) => Promise<unknown>;
     listArticleTemplates: (input: MCPListArticleTemplatesInput) => Promise<unknown>;
-    getTemplate: (input: MCPListArticleTemplatesInput & {
-        templatePackId: string;
-    }) => Promise<unknown>;
+    getTemplate: (input: MCPGetTemplateInput) => Promise<unknown>;
     getBatchContext: (input: MCPGetBatchContextInput) => Promise<unknown>;
     getPBI: (input: MCPGetPBIInput) => Promise<unknown>;
     getPBISubset: (input: MCPGetPBISubsetInput) => Promise<unknown>;
@@ -56,7 +54,7 @@ export declare class CursorAcpRuntime {
     private readonly sessionActivityAt;
     private readonly promptTransportActivityAt;
     private readonly transcriptLineSequences;
-    private readonly auditedCliToolCallIds;
+    private readonly auditedAssistantToolCallIds;
     private readonly activePromptStates;
     private readonly cliPlannerLoopState;
     private readonly workspaceAgentModels;
@@ -129,6 +127,7 @@ export declare class CursorAcpRuntime {
     private canReachCursor;
     private getTransport;
     private evaluateCliToolPolicy;
+    private evaluateMcpToolPolicy;
     private parseCliLoopbackToolResult;
     private maybeAbortCliPlannerLoop;
     private resolveMcpServerConfigs;

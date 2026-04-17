@@ -9,6 +9,7 @@ const node_crypto_1 = require("node:crypto");
 const node_path_1 = __importDefault(require("node:path"));
 const shared_types_1 = require("@kb-vault/shared-types");
 const db_1 = require("@kb-vault/db");
+const kb_access_mode_resolver_1 = require("./kb-access-mode-resolver");
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
 const ASSISTANT_BATCH_NAME = 'AI Assistant Proposals';
 const ASSISTANT_CHAT_RUNTIME_RETRY_LIMIT = 1;
@@ -18,12 +19,16 @@ const ASSISTANT_CHAT_TRANSCRIPT_MAX_WAIT_MS = 5_000;
 const ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_IDLE_MS = 2_500;
 const ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_MAX_WAIT_MS = 60_000;
 const ASSISTANT_CHAT_TRANSCRIPT_POLL_MS = 250;
-const ASSISTANT_CHAT_COMPLETION_FOLLOWUP_PROMPT = [
-    'Complete the same user request using the research already gathered in this session.',
-    'Return the final user-facing answer now.',
-    'Do not send a progress update.',
-    'Use only kb commands if one final targeted lookup is still truly required.'
-].join(' ');
+function buildAssistantChatCompletionFollowupPrompt(kbAccessMode) {
+    return [
+        'Complete the same user request using the research already gathered in this session.',
+        'Return the final user-facing answer now.',
+        'Do not send a progress update.',
+        kbAccessMode === 'mcp'
+            ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
+            : 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
+    ].join(' ');
+}
 class AiAssistantService {
     workspaceRepository;
     agentRuntime;
@@ -204,6 +209,12 @@ class AiAssistantService {
                 metadata: this.buildContextMetadata(context),
                 createdAtUtc: userMessageTimestamp
             });
+            const kbAccessSelection = await (0, kb_access_mode_resolver_1.requireHealthyKbAccessModeSelection)({
+                workspaceId: input.workspaceId,
+                resolveWorkspaceKbAccessMode: this.resolveWorkspaceKbAccessMode,
+                agentRuntime: this.agentRuntime
+            });
+            const kbAccessMode = kbAccessSelection.selectedMode;
             this.updateSessionStatus(db, session.id, input.workspaceId, 'running', context, userMessageTimestamp, input.message.trim());
             this.publishAssistantEvent({
                 workspaceId: input.workspaceId,
@@ -213,11 +224,9 @@ class AiAssistantService {
                 atUtc: userMessageTimestamp,
                 message: input.message.trim()
             });
-            const workspaceKbAccessMode = await this.resolveWorkspaceKbAccessMode(input.workspaceId);
-            const kbAccessMode = context.capabilities.canUseUnsavedWorkingState ? 'cli' : workspaceKbAccessMode;
             const localeVariantId = this.resolveRuntimeLocaleVariantId(context);
             let runtimeSessionId = session.runtimeSessionId ?? undefined;
-            let runtimePrompt = this.buildAskPrompt(context, input.message, this.listMessages(db, session.id), runtimeSessionId == null);
+            let runtimePrompt = this.buildAskPrompt(context, input.message, this.listMessages(db, session.id), runtimeSessionId == null, kbAccessMode);
             let runtimeAttempt = 0;
             let completionAttempt = 0;
             let runtimeResult;
@@ -246,7 +255,7 @@ class AiAssistantService {
                     && isRetriableAssistantRuntimeFailure(runtimeResult.message)) {
                     runtimeAttempt += 1;
                     runtimeSessionId = undefined;
-                    runtimePrompt = this.buildAskPrompt(context, input.message, this.listMessages(db, session.id), true);
+                    runtimePrompt = this.buildAskPrompt(context, input.message, this.listMessages(db, session.id), true, kbAccessMode);
                     continue;
                 }
                 await this.waitForTranscriptToQuiesce(runtimeResult.transcriptPath, ASSISTANT_CHAT_TRANSCRIPT_IDLE_MS, ASSISTANT_CHAT_TRANSCRIPT_MAX_WAIT_MS);
@@ -266,7 +275,28 @@ class AiAssistantService {
                 if (needsContinuationFromContract || needsContinuationFromLegacyFallback) {
                     completionAttempt += 1;
                     runtimeSessionId = runtimeResult.sessionId;
-                    runtimePrompt = this.buildAssistantContinuationPrompt(context, input.message, this.listMessages(db, session.id));
+                    runtimePrompt = this.buildAssistantContinuationPrompt(context, input.message, this.listMessages(db, session.id), kbAccessMode);
+                    continue;
+                }
+                const preferredReply = selectPreferredAssistantReply(runtimeResult.resultPayload, transcriptInspection.preferredText);
+                const parsedPreview = this.parseRuntimeResult(runtimeResult.resultPayload, context, input.message, false, transcriptInspection.preferredText, runtimeResult.message);
+                const needsContinuationFromProgressFallback = runtimeResult.status !== 'error'
+                    && completionAttempt < ASSISTANT_CHAT_COMPLETION_RETRY_LIMIT
+                    && looksLikeAssistantProgressMessage(preferredReply ?? '');
+                const needsArticleProposalRetry = runtimeResult.status !== 'error'
+                    && completionAttempt < ASSISTANT_CHAT_COMPLETION_RETRY_LIMIT
+                    && context.subject?.type === 'article'
+                    && context.capabilities.canCreateProposal
+                    && looksLikeArticleChangeRequest(input.message)
+                    && parsedPreview.artifactType !== 'proposal_candidate'
+                    && (parsedPreview.completionState === 'unknown'
+                        || parsedPreview.completionState === 'researching'
+                        || looksLikeAssistantProgressMessage(preferredReply ?? '')
+                        || looksLikeProposalDraftingDeferral(preferredReply ?? ''));
+                if (needsContinuationFromProgressFallback || needsArticleProposalRetry) {
+                    completionAttempt += 1;
+                    runtimeSessionId = runtimeResult.sessionId;
+                    runtimePrompt = this.buildAssistantContinuationPrompt(context, input.message, this.listMessages(db, session.id), kbAccessMode);
                     continue;
                 }
                 break;
@@ -293,7 +323,12 @@ class AiAssistantService {
                 baseVersionToken: context.workingState?.versionToken,
                 artifactType: parsed.artifactType,
                 summary: parsed.summary,
-                payload: this.buildArtifactPayload(parsed, context),
+                payload: this.buildArtifactPayload(parsed, context, {
+                    kbAccessMode,
+                    runtimeSessionId: runtimeResult.sessionId,
+                    acpSessionId: runtimeResult.acpSessionId,
+                    originPath: 'assistant_candidate'
+                }),
                 status: 'pending'
             });
             const uiActions = this.buildUiActions(context, artifact);
@@ -365,7 +400,7 @@ class AiAssistantService {
             let createdProposalId;
             let uiActions = this.buildUiActionsFromArtifact(artifact);
             if (artifact.artifactType === 'proposal_candidate') {
-                createdProposalId = await this.promoteProposalCandidate(input.workspaceId, artifact);
+                createdProposalId = await this.promoteProposalCandidate(input.workspaceId, artifact, session);
                 uiActions = [{ type: 'show_proposal_created', proposalId: createdProposalId }];
             }
             else {
@@ -425,7 +460,7 @@ class AiAssistantService {
             db.close();
         }
     }
-    async promoteProposalCandidate(workspaceId, artifact) {
+    async promoteProposalCandidate(workspaceId, artifact, session) {
         const payload = (artifact.payload ?? {});
         const batchId = await this.ensureAssistantBatch(workspaceId);
         const action = this.normalizeProposalAction(payload.action);
@@ -434,6 +469,10 @@ class AiAssistantService {
             workspaceId,
             batchId,
             action,
+            _sessionId: session?.runtimeSessionId ?? undefined,
+            kbAccessMode: extractKbAccessMode(subjectMeta.kbAccessMode),
+            acpSessionId: extractString(subjectMeta.acpSessionId),
+            originPath: 'assistant_candidate',
             familyId: extractString(subjectMeta.familyId),
             localeVariantId: extractString(subjectMeta.localeVariantId),
             sourceRevisionId: extractString(subjectMeta.sourceRevisionId),
@@ -467,6 +506,9 @@ class AiAssistantService {
         for (const proposalId of targetProposalIds) {
             const detail = await this.workspaceRepository.getProposalReviewDetail(artifact.workspaceId, proposalId);
             const nextHtml = applyProposalPatchToHtml(detail.diff.afterHtml ?? '', payload);
+            if (nextHtml === (detail.diff.afterHtml ?? '')) {
+                throw new Error('Proposal patch did not change the current proposal HTML.');
+            }
             const persistedPatch = {
                 ...payload,
                 html: nextHtml
@@ -540,8 +582,12 @@ class AiAssistantService {
             ...(audit.isFinal !== undefined ? { isFinal: audit.isFinal } : {})
         };
     }
-    buildAskPrompt(context, message, messages, includeTranscript) {
+    buildAskPrompt(context, message, messages, includeTranscript, kbAccessMode) {
         const allowedArtifacts = this.allowedArtifactTypes(context);
+        const isArticleChangeRequest = context.subject?.type === 'article'
+            && context.capabilities.canCreateProposal
+            && looksLikeArticleChangeRequest(message);
+        const articleSourceHtml = isArticleChangeRequest ? extractHtmlFromContext(context) : undefined;
         const transcript = includeTranscript
             ? messages
                 .slice(-8)
@@ -550,6 +596,71 @@ class AiAssistantService {
             : '';
         const workingStateSummary = summarizePromptData(context.workingState);
         const backingDataSummary = summarizePromptData(context.backingData);
+        const providerRules = kbAccessMode === 'mcp'
+            ? [
+                '- If the answer is already clear from the provided context, answer immediately without using tools.',
+                '- If workspace knowledge is needed, use the minimum KB Vault MCP tool path required to answer accurately.',
+                '- For app-feature, workflow, or terminology questions, default to this sequence: `search_kb`, `get_article` for the best 1-3 matches, then answer the user clearly.',
+                '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
+                '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply. If the runtime supports separate thought updates, use those instead of status messages.',
+                '- When research or data lookup is needed, use only the direct KB Vault MCP tools needed for the answer. Do not use terminal commands, kb CLI commands, list_mcp_resources, fetch_mcp_resource, grep, Read File, codebase search, or filesystem exploration.',
+                '- Prefer `search_kb` first and `get_article` second for ordinary user questions about the app.',
+                '- Use `get_article_family` only when one clearly relevant article needs family or locale context.',
+                '- Use `get_batch_context`, `find_related_articles`, proposal tools, and app mutation tools only when the route or user request clearly requires them.',
+                '- Do not use tools just to decide what to do next.'
+            ]
+            : [
+                '- If the answer is already clear from the provided context, answer immediately without using tools.',
+                '- If workspace knowledge is needed, use the minimum KB lookup path required to answer accurately.',
+                '- For app-feature, workflow, or terminology questions, default to this sequence: `kb search-kb --workspace-id <workspace-id> --query "<topic>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json` for the best 1-3 matches, then answer the user clearly.',
+                '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
+                '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply. If the runtime supports separate thought updates, use those instead of status messages.',
+                '- When research or data lookup is needed, use only exact kb CLI commands needed for the answer. Never use direct MCP tool names, terminal commands like grep, Read File, codebase search, filesystem exploration, list_mcp_resources, or fetch_mcp_resource.',
+                '- If the runtime exposes Shell or Terminal, it may be used only for exact `kb` CLI commands.',
+                '- Prefer `search-kb` first and `get-article` second for ordinary user questions about the app.',
+                '- Use `kb get-article-family` only when one clearly relevant article needs family or locale context.',
+                '- Use `kb batch-context`, `kb find-related-articles`, proposal commands, and form-editing commands only when the route or user request clearly requires them.',
+                '- Use `kb help --json` only if a needed KB command is genuinely unclear. Do not spend the turn exploring command syntax when the answer can be produced from `search-kb` plus `get-article`.',
+                '- Do not use tools just to decide what to do next.'
+            ];
+        const proposalReviewRules = [
+            '- In Proposal Review, prefer returning `command="patch_proposal"` with `artifactType="proposal_patch"` so the current proposal can be updated directly.',
+            '- In Proposal Review, do not create or edit a separate proposal record. Patch the currently open proposal instead.',
+            '- If you are returning a proposal patch, prefer targeted `payload.htmlMutations` when the change is narrow and anchored to exact existing HTML fragments.',
+            '- Use `payload.lineEdits` only when you truly have stable line numbers for the current working copy.',
+            '- Use `html` only when the whole proposal needs rewriting.',
+            '- In Proposal Review JSON patches, use payload.scope="current" for the selected proposal, payload.scope="article" for the article currently being reviewed, and payload.scope="batch" only when the user clearly asks to update every proposal in the open review batch.'
+        ];
+        const articleProposalRules = kbAccessMode === 'mcp'
+            ? [
+                '- On article view, when the user asks to change the article or draft a proposal outside Proposal Review, create a `proposal_candidate` rather than a chat-only answer.',
+                '- For an article `proposal_candidate`, fetch the current article with `get_article` if the full HTML is not already present in the prompt context.',
+                '- For an article `proposal_candidate`, prefer targeted `payload.htmlMutations` when the requested change is narrow and you can anchor it to exact existing HTML fragments.',
+                '- If you use `payload.htmlMutations`, the app will materialize the final HTML locally from the current article HTML.',
+                '- For broad rewrites, return the full final article HTML in `html` or `payload.proposedHtml`.',
+                '- Do not use `payload.lineEdits` for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
+                '- Do not claim KB Vault MCP tools are unavailable because they are not shown in a generic tool list. In MCP mode, call the KB Vault MCP tools named in this prompt directly when needed.'
+            ]
+            : [
+                '- On article view, when the user asks to change the article or draft a proposal outside Proposal Review, create a `proposal_candidate` rather than a chat-only answer.',
+                '- For an article `proposal_candidate`, fetch the current article with `kb get-article` if the full HTML is not already present in the prompt context.',
+                '- For an article `proposal_candidate`, prefer targeted `payload.htmlMutations` when the requested change is narrow and you can anchor it to exact existing HTML fragments.',
+                '- If you use `payload.htmlMutations`, the app will materialize the final HTML locally from the current article HTML.',
+                '- For broad rewrites, return the full final article HTML in `html` or `payload.proposedHtml`.',
+                '- Do not use `payload.lineEdits` for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
+                '- Do not claim direct KB access is unavailable because it is not shown in a generic tool list. In CLI mode, use only the exact `kb` commands named in this prompt when needed.'
+            ];
+        const templateRules = kbAccessMode === 'mcp'
+            ? [
+                '- For live form edits such as Templates & Prompts, use `app_get_form_schema` first when needed, then use `app_patch_form`.',
+                '- After a successful `app_patch_form`, respond with informational_response that accurately summarizes the applied change.',
+                '- If the app mutation tool call does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.'
+            ]
+            : [
+                '- For live form edits such as Templates & Prompts, use the kb CLI app commands as the source of truth: call `kb app get-form-schema` first when needed, then call `kb app patch-form`.',
+                '- After a successful `kb app patch-form`, respond with informational_response that accurately summarizes the applied change.',
+                '- If the kb command does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.'
+            ];
         return [
             'You are the KB Vault global AI assistant.',
             'For every assistant-chat reply, return JSON. The `response` field is the only user-visible text.',
@@ -567,15 +678,17 @@ class AiAssistantService {
             '  "confidenceScore": "optional number from 0 to 1 for proposal candidates",',
             '  "html": "full replacement HTML for proposal_patch or draft_patch when returning the whole document",',
             '  "formPatch": { "name"?: "...", "language"?: "...", "templateType"?: "...", "promptTemplate"?: "...", "toneRules"?: "...", "description"?: "...", "examples"?: "...", "active"?: true },',
-            '  "payload": { "targetTitle"?: "...", "targetLocale"?: "...", "sourceHtml"?: "...", "proposedHtml"?: "...", "confidenceScore"?: 0.0, "scope"?: "current|article|batch", "targetArticleKey"?: "...", "lineEdits"?: [{ "type": "replace_lines|insert_after|delete_lines", "startLine"?: 1, "endLine"?: 1, "line"?: 1, "lines"?: ["..."], "expectedText"?: "..." }], "metadata"?: {} }',
+            '  "payload": { "targetTitle"?: "...", "targetLocale"?: "...", "sourceHtml"?: "...", "proposedHtml"?: "...", "confidenceScore"?: 0.0, "scope"?: "current|article|batch", "targetArticleKey"?: "...", "htmlMutations"?: [{ "type": "append_html|prepend_html|replace_text|insert_before_text|insert_after_text|remove_text", "html"?: "...", "target"?: "...", "replacement"?: "...", "occurrence"?: "first|last|all", "expectedCount"?: 1 }], "lineEdits"?: [{ "type": "replace_lines|insert_after|delete_lines", "startLine"?: 1, "endLine"?: 1, "line"?: 1, "lines"?: ["..."], "expectedText"?: "..." }], "metadata"?: {} }',
             '}',
             `Route: ${context.route}`,
             `Route label: ${context.routeLabel}`,
+            `KB access mode: ${kbAccessMode}`,
             context.subject ? `Subject: ${JSON.stringify(context.subject)}` : 'Subject: none',
             `Capabilities: ${JSON.stringify(context.capabilities)}`,
             `Allowed artifact types: ${allowedArtifacts.join(', ')}`,
             context.workingState ? `Working state: ${JSON.stringify(workingStateSummary)}` : 'Working state: none',
             `Backing data: ${JSON.stringify(backingDataSummary)}`,
+            articleSourceHtml ? `Current article HTML (full source for proposal drafting):\n${articleSourceHtml}` : '',
             includeTranscript ? 'Recent messages are included below because this runtime session is new or was recovered.' : '',
             transcript ? `Recent messages:\n${transcript}` : '',
             `User message: ${message.trim()}`,
@@ -590,32 +703,15 @@ class AiAssistantService {
             '- If you are blocked or hit a hard failure, set `completionState="blocked"` or `completionState="errored"` and `isFinal=true`.',
             '- Do not send a progress update with `isFinal=true`.',
             '- Any mutating result must include an explicit command and valid JSON. Without a valid command, the result will be treated as informational_response.',
-            '- If the answer is already clear from the provided context, answer immediately without using tools.',
-            '- If workspace knowledge is needed, use the minimum KB lookup path required to answer accurately.',
-            '- For app-feature, workflow, or terminology questions, default to this sequence: `kb search-kb --workspace-id <workspace-id> --query "<topic>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json` for the best 1-3 matches, then answer the user clearly.',
-            '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
-            '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply. If the runtime supports separate thought updates, use those instead of status messages.',
-            '- When research or data lookup is needed, use only the direct KB tools or kb commands needed for the answer. Never use terminal commands like grep, Read File, codebase search, or filesystem exploration.',
-            '- If direct KB tools are available, prefer those. If the runtime only exposes Shell or Terminal, it may be used only for exact `kb` CLI commands.',
-            '- Prefer `search-kb` first and `get-article` second for ordinary user questions about the app.',
-            '- Use `kb get-article-family` only when one clearly relevant article needs family or locale context.',
-            '- Use `kb batch-context`, `kb find-related-articles`, proposal commands, and form-editing commands only when the route or user request clearly requires them.',
-            '- Use `kb help --json` only if a needed KB command is genuinely unclear. Do not spend the turn exploring command syntax when the answer can be produced from `search-kb` plus `get-article`.',
-            '- Do not use tools just to decide what to do next.',
+            ...providerRules,
             '- For informational_response, put only the user-facing reply in `response`. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
             '- On the first meaningful reply in a new chat, include a short human-readable title in "title" based on the user request.',
             '- For informational_response, omit summary unless it is genuinely needed for internal bookkeeping.',
             '- For draft edits, return the full replacement HTML in "html".',
-            '- For proposal review edits, the preferred path is to directly mutate the current proposal working state with `kb app get-form-schema` and `kb app patch-form --route proposal_review --entity-type proposal --entity-id <current proposal id>` using the registered version token.',
-            '- In Proposal Review, do not create or edit a separate proposal record. Edit the currently open proposal directly.',
-            '- Never call `kb proposal create`, `kb proposal edit`, or `kb proposal retire` when the current route is Proposal Review.',
-            '- If you use `kb app patch-form` successfully in Proposal Review, respond with informational_response summarizing the applied change.',
-            '- If you are returning a JSON proposal patch instead of using app commands, prefer targeted "payload.lineEdits" when the change is narrow. Use "html" only when the whole proposal needs rewriting.',
-            '- In Proposal Review JSON patches, use payload.scope="current" for the selected proposal, payload.scope="article" for the article currently being reviewed, and payload.scope="batch" only when the user clearly asks to update every proposal in the open review batch.',
-            '- For live form edits such as Templates & Prompts, use the kb CLI commands as the source of truth: call `kb app get-form-schema` first when needed, then call `kb app patch-form`.',
-            '- After a successful `kb app patch-form`, respond with informational_response that accurately summarizes the applied change.',
-            '- If the kb command does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.',
-            '- Do not use command=patch_template for live form edits. The app now updates those forms from successful kb commands, not from parsed assistant JSON.',
+            ...proposalReviewRules,
+            ...articleProposalRules,
+            ...templateRules,
+            '- Do not use command=patch_template for live form edits. The app now updates those forms from successful form-mutation tool calls, not from parsed assistant JSON.',
             '- Only use proposal_candidate on article view when the user clearly asks to change, rewrite, update, or create a proposal for the article.',
             '- Use command=create_proposal only when you are explicitly creating a proposal candidate.',
             '- Every proposal_candidate must include confidenceScore as a number between 0 and 1 based on the strength of the evidence.',
@@ -624,11 +720,11 @@ class AiAssistantService {
             '- For normal questions like "what page am I on", "can you see my inputs", explanations, summaries, navigation help, or workflow advice, use command=none and artifactType=informational_response.'
         ].filter(Boolean).join('\n\n');
     }
-    buildAssistantContinuationPrompt(context, message, messages) {
+    buildAssistantContinuationPrompt(context, message, messages, kbAccessMode) {
         return [
-            this.buildAskPrompt(context, message, messages, true),
+            this.buildAskPrompt(context, message, messages, true, kbAccessMode),
             'Continuation instructions:',
-            ASSISTANT_CHAT_COMPLETION_FOLLOWUP_PROMPT
+            buildAssistantChatCompletionFollowupPrompt(kbAccessMode)
         ].join('\n\n');
     }
     parseRuntimeResult(resultPayload, context, userMessage, directWorkingStateMutationApplied = false, transcriptFallbackText, runtimeFailureMessage) {
@@ -662,6 +758,15 @@ class AiAssistantService {
         const isChangeRequest = looksLikeArticleChangeRequest(userMessage);
         if (artifactType === 'informational_response'
             && isChangeRequest
+            && context.capabilities.canCreateProposal
+            && (completionState === 'unknown'
+                || completionState === 'researching'
+                || looksLikeAssistantProgressMessage(response)
+                || looksLikeProposalDraftingDeferral(response))) {
+            artifactType = 'clarification_request';
+        }
+        if (artifactType === 'informational_response'
+            && isChangeRequest
             && (context.capabilities.canPatchProposal || context.capabilities.canPatchDraft)
             && !directWorkingStateMutationApplied
             && looksLikeSuccessfulMutationClaim(response)) {
@@ -686,7 +791,7 @@ class AiAssistantService {
             payload: normalizedPayload
         };
     }
-    buildArtifactPayload(parsed, context) {
+    buildArtifactPayload(parsed, context, provenance) {
         if (parsed.artifactType === 'draft_patch') {
             return { html: parsed.html ?? '' };
         }
@@ -699,6 +804,7 @@ class AiAssistantService {
                 rationaleSummary: parsed.summary,
                 aiNotes: parsed.payload?.aiNotes ? extractString(parsed.payload.aiNotes) : undefined,
                 html: parsed.html,
+                htmlMutations: normalizeProposalHtmlMutations(parsed.payload?.htmlMutations),
                 lineEdits: normalizeProposalLineEdits(parsed.payload?.lineEdits)
             };
         }
@@ -707,6 +813,12 @@ class AiAssistantService {
         }
         if (parsed.artifactType === 'proposal_candidate') {
             const backing = (context.backingData && typeof context.backingData === 'object') ? context.backingData : {};
+            const sourceHtml = extractString(parsed.payload?.sourceHtml)
+                ?? extractHtmlFromContext(context);
+            const htmlMutations = normalizeProposalHtmlMutations(parsed.payload?.htmlMutations);
+            const proposedHtml = extractString(parsed.payload?.proposedHtml)
+                ?? parsed.html
+                ?? materializeProposalCandidateHtml(sourceHtml, htmlMutations);
             return {
                 action: this.resolveProposalCandidateAction(context),
                 targetTitle: parsed.title ?? context.subject?.title,
@@ -715,13 +827,18 @@ class AiAssistantService {
                 rationale: parsed.rationale ?? parsed.summary,
                 rationaleSummary: parsed.summary,
                 aiNotes: parsed.response,
-                sourceHtml: extractHtmlFromContext(context),
-                proposedHtml: parsed.payload?.proposedHtml ? extractString(parsed.payload.proposedHtml) : parsed.html,
+                sourceHtml,
+                proposedHtml,
                 metadata: {
                     ...parsed.payload,
+                    ...(htmlMutations.length > 0 ? { htmlMutations } : {}),
                     familyId: extractString(backing.familyId),
                     localeVariantId: extractString(backing.localeVariantId ?? context.subject?.id),
-                    sourceRevisionId: extractString(backing.sourceRevisionId)
+                    sourceRevisionId: extractString(backing.sourceRevisionId),
+                    kbAccessMode: provenance?.kbAccessMode,
+                    runtimeSessionId: provenance?.runtimeSessionId,
+                    acpSessionId: provenance?.acpSessionId,
+                    originPath: provenance?.originPath
                 }
             };
         }
@@ -787,11 +904,13 @@ class AiAssistantService {
     }
     resolveFinalArtifactType(input) {
         const { command, requestedArtifactType, context, html, formPatch, payload } = input;
+        const proposalScope = normalizeProposalPatchScope(payload?.scope);
+        const proposalHtmlMutations = normalizeProposalHtmlMutations(payload?.htmlMutations);
         const proposalLineEdits = normalizeProposalLineEdits(payload?.lineEdits);
         if (command === 'create_proposal') {
             if (requestedArtifactType === 'proposal_candidate'
                 && context.capabilities.canCreateProposal
-                && (extractString(payload?.proposedHtml) || html)) {
+                && Boolean(resolveProposalCandidatePreviewHtml(context, html, payload))) {
                 return 'proposal_candidate';
             }
             return 'informational_response';
@@ -799,7 +918,12 @@ class AiAssistantService {
         if (command === 'patch_proposal') {
             if (requestedArtifactType === 'proposal_patch'
                 && context.capabilities.canPatchProposal
-                && (html || proposalLineEdits.length > 0)) {
+                && (html
+                    || proposalHtmlMutations.length > 0
+                    || proposalLineEdits.length > 0)
+                && (proposalScope === 'article'
+                    || proposalScope === 'batch'
+                    || Boolean(resolveProposalPatchPreviewHtml(context, html, payload)))) {
                 return 'proposal_patch';
             }
             return 'informational_response';
@@ -1540,6 +1664,11 @@ function safeParseJson(value) {
         return null;
     }
 }
+function extractKbAccessMode(value) {
+    return value === 'mcp' || value === 'cli'
+        ? value
+        : undefined;
+}
 function extractString(value) {
     return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
@@ -1565,6 +1694,7 @@ function extractLastJsonObjectFromText(value) {
         // Fall through to substring extraction.
     }
     let best = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
     for (let start = 0; start < trimmed.length; start += 1) {
         if (trimmed[start] !== '{') {
             continue;
@@ -1573,8 +1703,13 @@ function extractLastJsonObjectFromText(value) {
             try {
                 const candidate = JSON.parse(trimmed.slice(start, end + 1));
                 if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
-                    best = candidate;
-                    break;
+                    const record = candidate;
+                    const score = trimmed.slice(start, end + 1).length
+                        + (looksLikeAssistantEnvelope(record) ? 10_000 + scoreAssistantEnvelope(record) * 100 : 0);
+                    if (score > bestScore) {
+                        best = record;
+                        bestScore = score;
+                    }
                 }
             }
             catch {
@@ -2084,10 +2219,28 @@ function looksLikeAssistantProgressMessage(value) {
     }
     return (/^(gathering|checking|looking|researching|reviewing|investigating|loading|searching)\b/.test(normalized)
         || /^i(?:'m| am) (gathering|checking|looking|researching|reviewing|investigating)\b/.test(normalized)
+        || /^i need to (fetch|get|load|look up|retrieve|read|inspect|pull|call)\b/.test(normalized)
+        || /^need to (fetch|get|load|look up|retrieve|read|inspect|pull|call)\b/.test(normalized)
+        || /^first[, ]+i need to\b/.test(normalized)
+        || normalized.includes('before i can draft the proposal')
+        || normalized.includes('before drafting the proposal')
+        || normalized.includes('before i can answer')
         || normalized.includes('returning only the structured json')
         || normalized.includes('return the final answer')
         || normalized.includes('using the cli and then returning')
         || normalized.includes('do not send a progress update'));
+}
+function looksLikeProposalDraftingDeferral(value) {
+    const normalized = value.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!normalized) {
+        return false;
+    }
+    return (normalized.includes('draft the proposal')
+        || normalized.includes('create the proposal')
+        || normalized.includes('proposal candidate')
+        || normalized.includes('current article content')
+        || normalized.includes('current article html')
+        || normalized.includes('fetch the article'));
 }
 function selectPreferredAssistantReply(resultPayload, transcriptFallbackText) {
     const preferredEnvelope = selectPreferredAssistantEnvelope(resultPayload, transcriptFallbackText);
@@ -2185,7 +2338,7 @@ function parseAssistantTranscriptEntries(text) {
         if (parsedLine.event === 'response' && typeof parsedLine.payload === 'string') {
             try {
                 const payload = JSON.parse(parsedLine.payload);
-                const candidate = unwrapAssistantDisplayText(extractAssistantExplicitText(payload.result) ?? extractAssistantStreamedText(payload.result));
+                const candidate = extractAssistantExplicitText(payload.result) ?? extractAssistantStreamedText(payload.result);
                 if (candidate) {
                     entries.push({ type: 'response', atUtc, index, text: candidate });
                 }
@@ -2279,6 +2432,11 @@ function looksLikeArticleChangeRequest(userMessage) {
         return false;
     }
     const changePatterns = [
+        /\badd\b/,
+        /\bappend\b/,
+        /\binsert\b/,
+        /\bremove\b/,
+        /\bdelete\b/,
         /\bchange\b/,
         /\bupdate\b/,
         /\bedit\b/,
@@ -2335,6 +2493,54 @@ function normalizeProposalPatchScope(value) {
     }
     return undefined;
 }
+function normalizeProposalHtmlMutations(value) {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+    const operations = [];
+    for (const item of value) {
+        if (!item || typeof item !== 'object') {
+            continue;
+        }
+        const record = item;
+        const occurrence = normalizeProposalHtmlMutationOccurrence(record.occurrence);
+        const expectedCount = normalizeNonNegativeInt(record.expectedCount);
+        const target = extractString(record.target)
+            ?? extractString(record.targetHtml)
+            ?? extractString(record.expectedText)
+            ?? extractString(record.text);
+        const html = extractString(record.html)
+            ?? extractString(record.content)
+            ?? extractString(record.fragment);
+        const replacement = extractString(record.replacement)
+            ?? extractString(record.replacementHtml)
+            ?? extractString(record.replaceWith);
+        if (record.type === 'append_html' && html) {
+            operations.push({ type: 'append_html', html });
+            continue;
+        }
+        if (record.type === 'prepend_html' && html) {
+            operations.push({ type: 'prepend_html', html });
+            continue;
+        }
+        if (record.type === 'replace_text' && target && replacement !== undefined) {
+            operations.push({ type: 'replace_text', target, replacement, occurrence, expectedCount });
+            continue;
+        }
+        if (record.type === 'insert_before_text' && target && html) {
+            operations.push({ type: 'insert_before_text', target, html, occurrence, expectedCount });
+            continue;
+        }
+        if (record.type === 'insert_after_text' && target && html) {
+            operations.push({ type: 'insert_after_text', target, html, occurrence, expectedCount });
+            continue;
+        }
+        if (record.type === 'remove_text' && target) {
+            operations.push({ type: 'remove_text', target, occurrence, expectedCount });
+        }
+    }
+    return operations;
+}
 function normalizeProposalLineEdits(value) {
     if (!Array.isArray(value)) {
         return [];
@@ -2385,9 +2591,57 @@ function inferProposalPatchScope(userMessage) {
     }
     return 'current';
 }
+function resolveProposalCandidatePreviewHtml(context, html, payload) {
+    const directHtml = extractString(payload?.proposedHtml) ?? html;
+    const sourceHtml = extractString(payload?.sourceHtml) ?? extractHtmlFromContext(context);
+    if (directHtml?.trim()) {
+        return directHtml !== sourceHtml ? directHtml : undefined;
+    }
+    return materializeProposalCandidateHtml(sourceHtml, normalizeProposalHtmlMutations(payload?.htmlMutations));
+}
+function materializeProposalCandidateHtml(sourceHtml, htmlMutations) {
+    if (!sourceHtml?.trim() || htmlMutations.length === 0) {
+        return undefined;
+    }
+    try {
+        const nextHtml = applyProposalHtmlMutations(sourceHtml, htmlMutations);
+        return nextHtml !== sourceHtml ? nextHtml : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function resolveProposalPatchPreviewHtml(context, html, payload) {
+    const currentHtml = extractHtmlFromContext(context);
+    if (!currentHtml?.trim()) {
+        return html?.trim() ? html : undefined;
+    }
+    const patch = {
+        scope: normalizeProposalPatchScope(payload?.scope),
+        targetArticleKey: extractString(payload?.targetArticleKey),
+        title: extractString(payload?.title),
+        rationale: extractString(payload?.rationale),
+        rationaleSummary: extractString(payload?.rationaleSummary),
+        aiNotes: extractString(payload?.aiNotes),
+        html,
+        htmlMutations: normalizeProposalHtmlMutations(payload?.htmlMutations),
+        lineEdits: normalizeProposalLineEdits(payload?.lineEdits)
+    };
+    try {
+        const nextHtml = applyProposalPatchToHtml(currentHtml, patch);
+        return nextHtml !== currentHtml ? nextHtml : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
 function applyProposalPatchToHtml(currentHtml, patch) {
     if (patch.html && patch.html.trim()) {
         return patch.html;
+    }
+    const htmlMutations = patch.htmlMutations ?? [];
+    if (htmlMutations.length > 0) {
+        return applyProposalHtmlMutations(currentHtml, htmlMutations);
     }
     const lineEdits = patch.lineEdits ?? [];
     if (lineEdits.length === 0) {
@@ -2433,6 +2687,40 @@ function applyProposalPatchToHtml(currentHtml, patch) {
     const result = lines.join('\n');
     return hadTrailingNewline && result && !result.endsWith('\n') ? `${result}\n` : result;
 }
+function applyProposalHtmlMutations(currentHtml, mutations) {
+    let nextHtml = currentHtml;
+    for (const mutation of mutations) {
+        if (mutation.type === 'append_html') {
+            nextHtml = `${nextHtml}${mutation.html}`;
+            continue;
+        }
+        if (mutation.type === 'prepend_html') {
+            nextHtml = `${mutation.html}${nextHtml}`;
+            continue;
+        }
+        const matches = countHtmlMutationMatches(nextHtml, mutation.target);
+        if (mutation.expectedCount !== undefined && matches !== mutation.expectedCount) {
+            throw new Error(`Proposal HTML mutation expected ${mutation.expectedCount} match(es) for target text but found ${matches}.`);
+        }
+        if (matches === 0) {
+            throw new Error('Proposal HTML mutation target text was not found.');
+        }
+        if (mutation.type === 'replace_text') {
+            nextHtml = applyTargetedHtmlReplacement(nextHtml, mutation.target, mutation.replacement, mutation.occurrence, matches);
+            continue;
+        }
+        if (mutation.type === 'remove_text') {
+            nextHtml = applyTargetedHtmlReplacement(nextHtml, mutation.target, '', mutation.occurrence, matches);
+            continue;
+        }
+        if (mutation.type === 'insert_before_text') {
+            nextHtml = applyTargetedHtmlInsertion(nextHtml, mutation.target, mutation.html, 'before', mutation.occurrence, matches);
+            continue;
+        }
+        nextHtml = applyTargetedHtmlInsertion(nextHtml, mutation.target, mutation.html, 'after', mutation.occurrence, matches);
+    }
+    return nextHtml;
+}
 function buildProposalWorkingStatePatch(patch) {
     const workingPatch = {};
     if (typeof patch.html === 'string')
@@ -2465,18 +2753,86 @@ function normalizeNonNegativeInt(value) {
     }
     return value;
 }
+function normalizeProposalHtmlMutationOccurrence(value) {
+    return value === 'first' || value === 'last' || value === 'all' ? value : undefined;
+}
+function countHtmlMutationMatches(haystack, needle) {
+    if (!needle) {
+        return 0;
+    }
+    let count = 0;
+    let startIndex = 0;
+    while (startIndex <= haystack.length) {
+        const matchIndex = haystack.indexOf(needle, startIndex);
+        if (matchIndex < 0) {
+            break;
+        }
+        count += 1;
+        startIndex = matchIndex + needle.length;
+    }
+    return count;
+}
+function applyTargetedHtmlReplacement(html, target, replacement, occurrence, matches) {
+    const selectedOccurrence = occurrence ?? (matches === 1 ? 'first' : undefined);
+    if (!selectedOccurrence) {
+        throw new Error('Proposal HTML mutation target matched more than once. Specify occurrence.');
+    }
+    if (selectedOccurrence === 'all') {
+        return html.split(target).join(replacement);
+    }
+    const matchIndex = selectedOccurrence === 'last'
+        ? html.lastIndexOf(target)
+        : html.indexOf(target);
+    if (matchIndex < 0) {
+        throw new Error('Proposal HTML mutation target text was not found.');
+    }
+    return `${html.slice(0, matchIndex)}${replacement}${html.slice(matchIndex + target.length)}`;
+}
+function applyTargetedHtmlInsertion(html, target, fragment, position, occurrence, matches) {
+    const selectedOccurrence = occurrence ?? (matches === 1 ? 'first' : undefined);
+    if (!selectedOccurrence) {
+        throw new Error('Proposal HTML mutation target matched more than once. Specify occurrence.');
+    }
+    if (selectedOccurrence === 'all') {
+        const replacement = position === 'before'
+            ? `${fragment}${target}`
+            : `${target}${fragment}`;
+        return html.split(target).join(replacement);
+    }
+    const matchIndex = selectedOccurrence === 'last'
+        ? html.lastIndexOf(target)
+        : html.indexOf(target);
+    if (matchIndex < 0) {
+        throw new Error('Proposal HTML mutation target text was not found.');
+    }
+    const insertionIndex = position === 'before'
+        ? matchIndex
+        : matchIndex + target.length;
+    return `${html.slice(0, insertionIndex)}${fragment}${html.slice(insertionIndex)}`;
+}
 function looksLikeSuccessfulMutationClaim(response) {
     const normalized = response.trim().toLowerCase();
     if (!normalized) {
         return false;
     }
     return [
+        /\bdone\b/,
         /\bi updated\b/,
         /\bi changed\b/,
         /\bi fixed\b/,
+        /\bi removed\b/,
+        /\bi deleted\b/,
+        /\bi added\b/,
+        /\bi appended\b/,
+        /\bi inserted\b/,
         /\bi converted\b/,
         /\bupdated the\b/,
         /\bchanged the\b/,
+        /\bremoved the\b/,
+        /\bdeleted the\b/,
+        /\badded the\b/,
+        /\bappended\b/,
+        /\binserted\b/,
         /\bconverted the\b/,
         /\bapplied the\b/
     ].some((pattern) => pattern.test(normalized));

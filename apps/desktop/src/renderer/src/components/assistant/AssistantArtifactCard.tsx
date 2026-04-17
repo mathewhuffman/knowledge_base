@@ -1,14 +1,15 @@
 import type { AiArtifactRecord, AiArtifactType } from '@kb-vault/shared-types';
 import {
   IconCheckCircle,
-  IconXCircle,
   IconAlertCircle,
   IconFileText,
   IconGitBranch,
   IconEye,
   IconTool,
   IconArrowUpRight,
-  IconRefreshCw
+  IconRefreshCw,
+  IconX,
+  IconXCircle
 } from '../icons';
 
 const TYPE_META: Record<AiArtifactType, { label: string; icon: React.ReactNode; family: 'proposal' | 'patch' | 'info' }> = {
@@ -32,16 +33,20 @@ interface AssistantArtifactCardProps {
   artifact: AiArtifactRecord;
   stale?: boolean;
   loading: boolean;
+  onDismiss?: () => void;
   onApply: () => void;
   onReject: () => void;
   onRerun: () => void;
 }
 
-export function AssistantArtifactCard({ artifact, stale, loading, onApply, onReject, onRerun }: AssistantArtifactCardProps) {
+export function AssistantArtifactCard({ artifact, stale, loading, onDismiss, onApply, onReject, onRerun }: AssistantArtifactCardProps) {
   const meta = TYPE_META[artifact.artifactType] ?? TYPE_META.informational_response;
   const isPending = artifact.status === 'pending';
   const isProposalCandidate = artifact.artifactType === 'proposal_candidate';
   const isPatch = meta.family === 'patch';
+  const isProposalRefinement = artifact.artifactType === 'proposal_patch';
+  const isClarification = artifact.artifactType === 'clarification_request';
+  const showDismissButton = (isProposalCandidate || isProposalRefinement || isClarification) && Boolean(onDismiss);
 
   return (
     <div
@@ -49,6 +54,7 @@ export function AssistantArtifactCard({ artifact, stale, loading, onApply, onRej
         'ai-artifact',
         `ai-artifact--${artifact.status}`,
         `ai-artifact--${meta.family}`,
+        (isProposalCandidate || isProposalRefinement || isClarification) && 'ai-artifact--candidate',
         stale && 'ai-artifact--stale'
       ]
         .filter(Boolean)
@@ -66,16 +72,16 @@ export function AssistantArtifactCard({ artifact, stale, loading, onApply, onRej
           <span className={`ai-artifact__status ai-artifact__status--${artifact.status}`}>
             {stale ? 'Stale — version changed' : STATUS_LABELS[artifact.status] ?? artifact.status}
           </span>
-          {stale && isPending && (
+          {showDismissButton && (
             <button
               type="button"
               className="ai-artifact__dismiss"
-              onClick={onReject}
+              onClick={onDismiss}
               disabled={loading}
-              aria-label="Close clarification alert"
-              title="Close"
+              aria-label={`Dismiss ${meta.label.toLowerCase()}`}
+              title="Dismiss"
             >
-              <IconXCircle size={14} />
+              <IconX size={14} />
             </button>
           )}
         </div>

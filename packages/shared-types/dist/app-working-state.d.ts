@@ -69,6 +69,61 @@ export interface AppWorkingStatePatchAppliedEvent {
     appliedPatch: Record<string, unknown>;
     nextVersionToken: string;
 }
+export declare const MCP_APP_GET_FORM_SCHEMA_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "route", "entityType", "entityId"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly route: {
+            readonly type: "string";
+            readonly enum: AppRoute[];
+        };
+        readonly entityType: {
+            readonly type: "string";
+            readonly enum: readonly ["template_pack", "proposal", "draft_branch", "settings"];
+        };
+        readonly entityId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+    };
+};
+export declare const MCP_APP_PATCH_FORM_INPUT_SCHEMA: {
+    readonly type: "object";
+    readonly additionalProperties: false;
+    readonly required: readonly ["workspaceId", "route", "entityType", "entityId", "patch"];
+    readonly properties: {
+        readonly workspaceId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly route: {
+            readonly type: "string";
+            readonly enum: AppRoute[];
+        };
+        readonly entityType: {
+            readonly type: "string";
+            readonly enum: readonly ["template_pack", "proposal", "draft_branch", "settings"];
+        };
+        readonly entityId: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly versionToken: {
+            readonly type: "string";
+            readonly minLength: 1;
+        };
+        readonly patch: {
+            readonly type: "object";
+            readonly minProperties: 1;
+            readonly additionalProperties: true;
+        };
+    };
+};
 export declare function stableStringifyAppWorkingState(value: unknown): string;
 export declare function buildAppWorkingStateVersionToken(input: {
     route: AppRoute;

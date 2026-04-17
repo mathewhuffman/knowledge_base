@@ -6,6 +6,7 @@ import type {
   AiMessageRecord
 } from '@kb-vault/shared-types';
 import type { PendingAssistantTurn } from './AssistantContext';
+import { extractStreamedAssistantEnvelope } from './assistant-streaming';
 import { IconZap } from '../icons';
 
 interface AssistantTranscriptProps {
@@ -201,8 +202,16 @@ function MessageBubble({ message }: { message: AiMessageRecord }) {
   );
 }
 
-function PendingAssistantBubble({ pendingTurn }: { pendingTurn: PendingAssistantTurn }) {
+function PendingAssistantBubble({
+  pendingTurn,
+  processingCommand
+}: {
+  pendingTurn: PendingAssistantTurn;
+  processingCommand: boolean;
+}) {
   const hasThoughts = pendingTurn.thoughtText.trim().length > 0 || pendingTurn.toolEvents.length > 0;
+  const displayResponse = extractStreamedAssistantEnvelope(pendingTurn.rawResponseText).responseText || pendingTurn.responseText;
+  const showProcessingIndicator = processingCommand && pendingTurn.hasRenderableFinalResponse && displayResponse.trim().length > 0;
 
   return (
     <div className="ai-msg ai-msg--assistant ai-msg--streaming">
@@ -211,14 +220,21 @@ function PendingAssistantBubble({ pendingTurn }: { pendingTurn: PendingAssistant
       </div>
       <div className="ai-msg__body">
         <div className="ai-msg__content ai-msg__content--rich">
-          {pendingTurn.responseText ? (
-            <div dangerouslySetInnerHTML={{ __html: formatAssistantHtml(pendingTurn.responseText) }} />
+          {displayResponse ? (
+            <div dangerouslySetInnerHTML={{ __html: formatAssistantHtml(displayResponse) }} />
           ) : (
             <div className="ai-typing">
               <span /><span /><span />
             </div>
           )}
         </div>
+        {showProcessingIndicator && (
+          <div className="ai-msg__processing" aria-label="Processing assistant action" role="status">
+            <div className="ai-typing ai-typing--compact" aria-hidden="true">
+              <span /><span /><span />
+            </div>
+          </div>
+        )}
         {hasThoughts ? (
           <ThoughtsBlock thoughtText={pendingTurn.thoughtText} toolEvents={pendingTurn.toolEvents} />
         ) : null}
@@ -243,7 +259,7 @@ export function AssistantTranscript({ messages, pendingTurn, loading }: Assistan
       {messages.map((msg) => (
         <MessageBubble key={msg.id} message={msg} />
       ))}
-      {pendingTurn && <PendingAssistantBubble pendingTurn={pendingTurn} />}
+      {pendingTurn && <PendingAssistantBubble pendingTurn={pendingTurn} processingCommand={loading} />}
       {loading && !pendingTurn && (
         <div className="ai-msg ai-msg--assistant ai-msg--typing">
           <div className="ai-msg__avatar">
