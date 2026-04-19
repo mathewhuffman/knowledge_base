@@ -2646,6 +2646,104 @@ test.describe('command registry content model transitions', () => {
     expect((decideResp.data as { revisionId?: string }).revisionId).toBeTruthy();
   });
 
+  test('validates and returns PBI library list responses', async () => {
+    const workspace = await createWorkspace();
+
+    const invalidResp = await bus.execute({
+      method: 'pbiLibrary.list',
+      payload: {}
+    });
+    expect(invalidResp.ok).toBe(false);
+    expect(invalidResp.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+
+    const importResp = await bus.execute({
+      method: 'pbiBatch.import',
+      payload: {
+        workspaceId: workspace.id,
+        sourceFileName: 'library-list.csv',
+        sourceContent: 'Id,Title,Description\n301,Library Search,Search this PBI from the library'
+      }
+    });
+    expect(importResp.ok).toBe(true);
+
+    const listResp = await bus.execute({
+      method: 'pbiLibrary.list',
+      payload: {
+        workspaceId: workspace.id,
+        sortBy: 'externalId',
+        sortDirection: 'asc'
+      }
+    });
+    expect(listResp.ok).toBe(true);
+    const listData = listResp.data as {
+      workspaceId: string;
+      items: Array<{ pbiId: string; externalId: string; batchName: string; proposalCount: number }>;
+    };
+    expect(listData.workspaceId).toBe(workspace.id);
+    expect(listData.items).toHaveLength(1);
+    expect(listData.items[0]?.externalId).toBe('301');
+    expect(listData.items[0]?.proposalCount).toBe(0);
+  });
+
+  test('validates PBI library get requests and reports not-found items', async () => {
+    const workspace = await createWorkspace();
+
+    const invalidResp = await bus.execute({
+      method: 'pbiLibrary.get',
+      payload: { workspaceId: workspace.id }
+    });
+    expect(invalidResp.ok).toBe(false);
+    expect(invalidResp.error?.code).toBe(AppErrorCode.INVALID_REQUEST);
+
+    const importResp = await bus.execute({
+      method: 'pbiBatch.import',
+      payload: {
+        workspaceId: workspace.id,
+        sourceFileName: 'library-detail.csv',
+        sourceContent: 'Id,Title,Description\n401,Viewer Detail,Open this record from the library viewer'
+      }
+    });
+    expect(importResp.ok).toBe(true);
+
+    const listResp = await bus.execute({
+      method: 'pbiLibrary.list',
+      payload: {
+        workspaceId: workspace.id
+      }
+    });
+    expect(listResp.ok).toBe(true);
+    const pbiId = (listResp.data as { items: Array<{ pbiId: string }> }).items[0]?.pbiId;
+    expect(pbiId).toBeTruthy();
+
+    const getResp = await bus.execute({
+      method: 'pbiLibrary.get',
+      payload: {
+        workspaceId: workspace.id,
+        pbiId
+      }
+    });
+    expect(getResp.ok).toBe(true);
+    const detailData = getResp.data as {
+      item: { pbiId: string; externalId: string };
+      batch: { sourceFileName: string };
+      linkedProposals: unknown[];
+    };
+    expect(detailData.item.pbiId).toBe(pbiId);
+    expect(detailData.item.externalId).toBe('401');
+    expect(detailData.batch.sourceFileName).toBe('library-detail.csv');
+    expect(detailData.linkedProposals).toHaveLength(0);
+
+    const missingResp = await bus.execute({
+      method: 'pbiLibrary.get',
+      payload: {
+        workspaceId: workspace.id,
+        pbiId: 'missing-pbi'
+      }
+    });
+    expect(missingResp.ok).toBe(false);
+    expect(missingResp.error?.code).toBe(AppErrorCode.NOT_FOUND);
+  });
+
   test('persists proposal review app working state patches through the command bus', async () => {
     const workspace = await createWorkspace();
 

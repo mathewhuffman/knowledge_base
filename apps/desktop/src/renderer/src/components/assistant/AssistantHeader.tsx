@@ -1,12 +1,13 @@
 import { useCallback, useRef, useState, type ReactNode, type PointerEvent as ReactPointerEvent } from 'react';
 import type { AiArtifactRecord, AiSessionRecord, AiViewContext } from '@kb-vault/shared-types';
 import { AppRoute } from '@kb-vault/shared-types';
-import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconClock, IconPlus, IconX } from '../icons';
+import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconArchive, IconClock, IconPlus, IconX } from '../icons';
 
 const WINDOW_DRAG_THRESHOLD_PX = 8;
 
 const ROUTE_ICONS: Partial<Record<AppRoute, ReactNode>> = {
   [AppRoute.ARTICLE_EXPLORER]: <IconFileText size={14} />,
+  [AppRoute.PBI_LIBRARY]: <IconArchive size={14} />,
   [AppRoute.DRAFTS]: <IconGitBranch size={14} />,
   [AppRoute.PROPOSAL_REVIEW]: <IconEye size={14} />,
   [AppRoute.TEMPLATES_AND_PROMPTS]: <IconTool size={14} />

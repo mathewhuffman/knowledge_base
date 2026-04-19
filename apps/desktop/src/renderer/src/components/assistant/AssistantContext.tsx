@@ -196,6 +196,7 @@ const ROUTE_LABELS: Record<AppRoute, string> = {
   [AppRoute.KB_VAULT_HOME]: 'KB Vault Home',
   [AppRoute.ARTICLE_EXPLORER]: 'Article Explorer',
   [AppRoute.PBI_BATCHES]: 'PBI Batches',
+  [AppRoute.PBI_LIBRARY]: 'PBI Library',
   [AppRoute.PROPOSAL_REVIEW]: 'Proposal Review',
   [AppRoute.DRAFTS]: 'Drafts',
   [AppRoute.PUBLISH_QUEUE]: 'Publish Queue',

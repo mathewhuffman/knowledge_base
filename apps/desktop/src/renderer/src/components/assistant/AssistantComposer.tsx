@@ -24,6 +24,11 @@ const ROUTE_QUICK_ACTIONS: Partial<Record<AppRoute, QuickAction[]>> = {
     { label: 'Strengthen rationale', prompt: 'Strengthen the rationale for this proposed change.' },
     { label: 'Simplify', prompt: 'Simplify this proposal while keeping all essential information.' }
   ],
+  [AppRoute.PBI_LIBRARY]: [
+    { label: 'Summarize PBI', prompt: 'Summarize the PBI I am looking at and call out the key documentation impact.' },
+    { label: 'Doc impact', prompt: 'What knowledge base impact does this PBI suggest, and why?' },
+    { label: 'Review links', prompt: 'Explain how this PBI connects to any linked proposals or existing documentation work.' }
+  ],
   [AppRoute.TEMPLATES_AND_PROMPTS]: [
     { label: 'Improve template', prompt: 'Improve this template for clearer, more consistent article generation.' },
     { label: 'Add tone rules', prompt: 'Suggest tone rules appropriate for this template type.' },
@@ -33,6 +38,7 @@ const ROUTE_QUICK_ACTIONS: Partial<Record<AppRoute, QuickAction[]>> = {
 
 const ROUTE_PLACEHOLDERS: Partial<Record<AppRoute, string>> = {
   [AppRoute.ARTICLE_EXPLORER]: 'Ask about this article or request a proposal...',
+  [AppRoute.PBI_LIBRARY]: 'Ask about the selected PBI and its documentation impact...',
   [AppRoute.DRAFTS]: 'Ask to revise this draft...',
   [AppRoute.PROPOSAL_REVIEW]: 'Ask to refine this proposal...',
   [AppRoute.TEMPLATES_AND_PROMPTS]: 'Ask to improve this template...'

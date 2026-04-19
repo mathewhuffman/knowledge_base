@@ -15,7 +15,15 @@ import { DiscoveredWorkList } from './DiscoveredWorkList';
 import { OpenQuestionsList } from './OpenQuestionsList';
 import { TimelineView } from './TimelineView';
 import { ArtifactTranscriptLink } from './ArtifactTranscriptLink';
-import { deriveCompletedStages, getVisibleStage, getVisibleStageLabel, STAGE_LABELS, ROLE_LABELS } from './helpers';
+import {
+  buildTimelineEntriesWithSkippedStages,
+  deriveCompletedStages,
+  deriveSkippedStages,
+  getVisibleStage,
+  getVisibleStageLabel,
+  STAGE_LABELS,
+  ROLE_LABELS,
+} from './helpers';
 
 type InspectorTab = 'overview' | 'questions' | 'plan' | 'reviews' | 'execution' | 'timeline' | 'transcripts';
 
@@ -79,10 +87,19 @@ export function BatchAnalysisInspector({
   const pausedForUserInput = runtimeStatus?.pausedForUserInput ?? snapshot.pausedForUserInput;
   const unansweredRequiredQuestions = runtimeStatus?.unansweredRequiredQuestionCount ?? snapshot.unansweredRequiredQuestionCount ?? 0;
   const questionCount = inspection.questions.length;
+  const stageEvents = eventStream?.events;
 
   const completedStages = useMemo(
     () => deriveCompletedStages(inspection.timeline),
     [inspection.timeline],
+  );
+  const skippedStages = useMemo(
+    () => deriveSkippedStages(inspection.timeline, stageEvents ?? []),
+    [inspection.timeline, stageEvents],
+  );
+  const renderableTimelineCount = useMemo(
+    () => buildTimelineEntriesWithSkippedStages(inspection.timeline, stageEvents ?? []).length,
+    [inspection.timeline, stageEvents],
   );
 
   const latestPlanReview = inspection.reviews[0] ?? null;
@@ -153,7 +170,7 @@ export function BatchAnalysisInspector({
     { key: 'plan', label: 'Plan', count: inspection.plans.length },
     { key: 'reviews', label: 'Reviews', count: inspection.reviews.length + inspection.finalReviews.length },
     { key: 'execution', label: 'Execution', count: inspection.workerReports.length },
-    { key: 'timeline', label: 'Timeline', count: inspection.timeline.length },
+    { key: 'timeline', label: 'Timeline', count: renderableTimelineCount },
     { key: 'transcripts', label: 'Transcripts', count: inspection.transcriptLinks.length },
   ];
 
@@ -165,6 +182,7 @@ export function BatchAnalysisInspector({
           currentStage={currentStage}
           iteration={currentIteration}
           completedStages={completedStages}
+          skippedStages={skippedStages}
           failedStage={failedStage}
           isRunning={isRunning}
         />

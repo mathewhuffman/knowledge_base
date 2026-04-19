@@ -3,6 +3,7 @@ export declare enum AppRoute {
     KB_VAULT_HOME = "kb_vault_home",
     ARTICLE_EXPLORER = "article_explorer",
     PBI_BATCHES = "pbi_batches",
+    PBI_LIBRARY = "pbi_library",
     PROPOSAL_REVIEW = "proposal_review",
     DRAFTS = "drafts",
     PUBLISH_QUEUE = "publish_queue",

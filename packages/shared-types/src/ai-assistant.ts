@@ -5,6 +5,7 @@ export type AiSubjectType =
   | 'article'
   | 'draft_branch'
   | 'proposal'
+  | 'pbi'
   | 'template_pack'
   | 'pbi_batch';
 

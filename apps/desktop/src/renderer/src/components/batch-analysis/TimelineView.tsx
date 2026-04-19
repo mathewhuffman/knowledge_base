@@ -115,7 +115,7 @@ export function TimelineView({ entries, stageEvents = [] }: TimelineViewProps) {
                 </Badge>
               )}
               {isSkippedStage && (
-                <Badge variant="neutral">
+                <Badge variant="warning">
                   skipped
                 </Badge>
               )}

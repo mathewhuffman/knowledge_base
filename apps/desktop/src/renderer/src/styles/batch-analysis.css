@@ -118,6 +118,7 @@
 .ba-pipeline-node--skipped .ba-pipeline-circle {
   border-style: dashed;
   border-color: var(--gray-300);
+  background: var(--gray-50);
 }
 
 /* Connector line between steps */
@@ -153,6 +154,20 @@
 .ba-pipeline-label--terminal {
   font-weight: var(--weight-semibold);
   color: var(--color-text);
+}
+
+.ba-pipeline-label--skipped {
+  color: var(--color-text);
+}
+
+.ba-pipeline-status {
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
 }
 
 /* Iteration badge */

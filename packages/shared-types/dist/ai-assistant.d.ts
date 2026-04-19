@@ -1,5 +1,5 @@
 import type { AppRoute } from './routes';
-export type AiSubjectType = 'workspace' | 'article' | 'draft_branch' | 'proposal' | 'template_pack' | 'pbi_batch';
+export type AiSubjectType = 'workspace' | 'article' | 'draft_branch' | 'proposal' | 'pbi' | 'template_pack' | 'pbi_batch';
 export type AiWorkingStateKind = 'article_html' | 'proposal_html' | 'template_pack' | 'none';
 export type AiArtifactType = 'informational_response' | 'proposal_candidate' | 'proposal_patch' | 'draft_patch' | 'template_patch' | 'navigation_suggestion' | 'clarification_request';
 export type AiScopeType = 'global' | 'page' | 'entity';

@@ -902,6 +902,7 @@ export class AiAssistantService {
       : '';
     const workingStateSummary = summarizePromptData(context.workingState);
     const backingDataSummary = summarizePromptData(context.backingData);
+    const focusedPbiContext = buildFocusedPbiContextBlock(context);
 
     const providerRules = kbAccessMode === 'mcp'
       ? [
@@ -997,6 +998,24 @@ export class AiAssistantService {
             '- After a successful `kb app patch-form`, respond with informational_response that accurately summarizes the applied change.',
             '- If the kb command does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.'
           ];
+    const pbiLibraryRules = context.route === AppRoute.PBI_LIBRARY
+      ? kbAccessMode === 'mcp'
+        ? [
+            '- In PBI Library, treat the focused PBI in the prompt as the current source of truth for the user\'s question.',
+            '- If the user asks for more detail about the focused PBI than the prompt already provides, use `get_pbi` with that pbiId.',
+            '- If the user asks about the broader import batch, neighboring rows, or batch-level scope decisions, use `get_batch_context` or `get_pbi_subset` for the active batch.'
+          ]
+        : kbAccessMode === 'direct'
+          ? [
+              '- In PBI Library, treat the focused PBI in the prompt as the current source of truth for the user\'s question.',
+              '- If the user asks for more detail about the focused PBI than the prompt already provides, request `get_pbi` with that pbiId.',
+              '- If the user asks about the broader import batch, neighboring rows, or batch-level scope decisions, request `get_batch_context` or `get_pbi_subset` for the active batch.'
+            ]
+          : [
+              '- In PBI Library, treat the focused PBI in the prompt as the current source of truth for the user\'s question.',
+              '- In CLI mode, rely on the focused PBI context already provided in the prompt unless the user explicitly asks for wider batch context that requires `kb batch-context`.'
+            ]
+      : [];
 
     return [
       'You are the KB Vault global AI assistant.',
@@ -1026,6 +1045,7 @@ export class AiAssistantService {
       context.workingState ? `Working state: ${JSON.stringify(workingStateSummary)}` : 'Working state: none',
       `Backing data: ${JSON.stringify(backingDataSummary)}`,
       articleSourceHtml ? `Current article HTML (full source for proposal drafting):\n${articleSourceHtml}` : '',
+      focusedPbiContext ? `Focused PBI context:\n${focusedPbiContext}` : '',
       includeTranscript ? 'Recent messages are included below because this runtime session is new or was recovered.' : '',
       transcript ? `Recent messages:\n${transcript}` : '',
       `User message: ${message.trim()}`,
@@ -1054,6 +1074,7 @@ export class AiAssistantService {
       ...proposalReviewRules,
       ...articleProposalRules,
       ...templateRules,
+      ...pbiLibraryRules,
       '- Do not use command=patch_template for live form edits. The app now updates those forms from successful form-mutation tool calls, not from parsed assistant JSON.',
       '- Only use proposal_candidate on article view when the user clearly asks to change, rewrite, update, or create a proposal for the article.',
       '- Use command=create_proposal only when you are explicitly creating a proposal candidate.',
@@ -3374,6 +3395,102 @@ function extractHtmlFromContext(context: AiViewContext): string | undefined {
       ?? extractString((backing as Record<string, unknown>).proposedHtml);
   }
   return undefined;
+}
+
+function buildFocusedPbiContextBlock(context: AiViewContext): string | undefined {
+  if (context.route !== AppRoute.PBI_LIBRARY && context.subject?.type !== 'pbi') {
+    return undefined;
+  }
+
+  const backing = context.backingData;
+  if (!backing || typeof backing !== 'object') {
+    return undefined;
+  }
+
+  const backingRecord = backing as Record<string, unknown>;
+  const selection = backingRecord.selection && typeof backingRecord.selection === 'object'
+    ? backingRecord.selection as Record<string, unknown>
+    : undefined;
+  const pbi = backingRecord.pbi && typeof backingRecord.pbi === 'object'
+    ? backingRecord.pbi as Record<string, unknown>
+    : undefined;
+  const item = pbi?.item && typeof pbi.item === 'object'
+    ? pbi.item as Record<string, unknown>
+    : undefined;
+  const record = pbi?.record && typeof pbi.record === 'object'
+    ? pbi.record as Record<string, unknown>
+    : undefined;
+  const batch = pbi?.batch && typeof pbi.batch === 'object'
+    ? pbi.batch as Record<string, unknown>
+    : undefined;
+  const parent = pbi?.parent && typeof pbi.parent === 'object'
+    ? pbi.parent as Record<string, unknown>
+    : undefined;
+  const children = Array.isArray(pbi?.children) ? pbi.children as Record<string, unknown>[] : [];
+  const linkedProposals = Array.isArray(pbi?.linkedProposals) ? pbi.linkedProposals as Record<string, unknown>[] : [];
+
+  const pbiId = extractString(selection?.pbiId) ?? extractString(item?.pbiId) ?? context.subject?.id;
+  const externalId = extractString(selection?.externalId) ?? extractString(item?.externalId);
+  const title = extractString(selection?.title) ?? extractString(item?.title) ?? context.subject?.title;
+  const workItemType = extractString(selection?.workItemType) ?? extractString(item?.workItemType) ?? extractString(record?.workItemType);
+  const priority = extractString(selection?.priority) ?? extractString(item?.priority) ?? extractString(record?.priority);
+  const validationStatus = extractString(selection?.validationStatus) ?? extractString(item?.validationStatus) ?? extractString(record?.validationStatus);
+  const scopeState = extractString(selection?.scopeState) ?? extractString(item?.scopeState);
+  const sourceRowNumberValue = selection?.sourceRowNumber ?? record?.sourceRowNumber;
+  const sourceRowNumber = typeof sourceRowNumberValue === 'number'
+    ? String(sourceRowNumberValue)
+    : extractString(sourceRowNumberValue);
+  const batchName = extractString(selection?.batchName) ?? extractString(batch?.name);
+  const batchId = extractString(selection?.batchId) ?? extractString(batch?.id);
+  const importedAtUtc = extractString(selection?.importedAtUtc) ?? extractString(batch?.importedAtUtc);
+  const titlePath = Array.isArray(pbi?.titlePath)
+    ? (pbi.titlePath as unknown[])
+        .map((value) => extractString(value))
+        .filter((value): value is string => Boolean(value))
+    : [];
+  const description = extractString(record?.descriptionText) ?? extractString(record?.description);
+  const acceptanceCriteria = extractString(record?.acceptanceCriteriaText);
+  const validationReason = extractString(record?.validationReason);
+  const parentLabel = parent
+    ? [extractString(parent.externalId), extractString(parent.title)].filter(Boolean).join(': ')
+    : '';
+  const childLabels = children
+    .map((child) => [extractString(child.externalId), extractString(child.title)].filter(Boolean).join(': '))
+    .filter(Boolean)
+    .slice(0, 12);
+  const linkedProposalLabels = linkedProposals
+    .map((proposal) => {
+      const proposalId = extractString(proposal.proposalId);
+      const action = extractString(proposal.action);
+      const reviewStatus = extractString(proposal.reviewStatus);
+      return [proposalId, action, reviewStatus].filter(Boolean).join(' | ');
+    })
+    .filter(Boolean)
+    .slice(0, 12);
+
+  if (!pbiId && !externalId && !title) {
+    return undefined;
+  }
+
+  return [
+    pbiId ? `PBI ID: ${pbiId}` : '',
+    externalId ? `External ID: ${externalId}` : '',
+    title ? `Title: ${title}` : '',
+    titlePath.length > 0 ? `Title hierarchy: ${titlePath.join(' / ')}` : '',
+    workItemType ? `Work item type: ${workItemType}` : '',
+    priority ? `Priority: ${priority}` : '',
+    validationStatus ? `Validation status: ${validationStatus}` : '',
+    scopeState ? `Scope state: ${scopeState}` : '',
+    sourceRowNumber ? `Source row number: ${sourceRowNumber}` : '',
+    batchName ? `Batch: ${batchName}${batchId ? ` (${batchId})` : ''}` : '',
+    importedAtUtc ? `Imported at: ${importedAtUtc}` : '',
+    validationReason ? `Validation reason: ${summarizePromptText(validationReason, 500)}` : '',
+    parentLabel ? `Parent row: ${parentLabel}` : '',
+    childLabels.length > 0 ? `Child rows: ${childLabels.join('; ')}` : '',
+    linkedProposalLabels.length > 0 ? `Linked proposals: ${linkedProposalLabels.join('; ')}` : '',
+    description ? `Description: ${summarizePromptText(description, 1400)}` : '',
+    acceptanceCriteria ? `Acceptance criteria: ${summarizePromptText(acceptanceCriteria, 1400)}` : ''
+  ].filter(Boolean).join('\n');
 }
 
 function normalizeAssistantConfidenceScore(value: unknown): number | undefined {

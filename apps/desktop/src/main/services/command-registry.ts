@@ -23,6 +23,9 @@ import {
   PBIBatchScopeMode,
   PBIBatchStatus,
   PBIValidationStatus,
+  type PBILibraryGetRequest,
+  type PBILibraryListRequest,
+  type PBILibraryScopeState,
   type PBIBatchImportRequest,
   type PBIBatchRowsRequest,
   type PBIBatchStatusUpdateRequest,
@@ -2434,6 +2437,18 @@ export function registerCoreCommands(
   const validPBIScopeModes = new Set([PBIBatchScopeMode.ALL, PBIBatchScopeMode.SELECTED_ONLY]);
   const validPBIBatchStatuses = new Set(Object.values(PBIBatchStatus));
   const validPBIValidationStatuses = new Set(Object.values(PBIValidationStatus));
+  const validPBILibraryScopeStates = new Set<PBILibraryScopeState>(['in_scope', 'out_of_scope', 'not_eligible']);
+  const validPBILibrarySortFields = new Set([
+    'importedAtUtc',
+    'externalId',
+    'title',
+    'workItemType',
+    'priority',
+    'validationStatus',
+    'scopeState',
+    'batchName',
+    'proposalCount'
+  ]);
   const validDraftBranchStatuses = new Set(Object.values(DraftBranchStatus));
   const appWorkingStateService = new AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
   const buildZendeskClient = async (workspaceId: string): Promise<ZendeskClient> => {
@@ -3855,6 +3870,52 @@ export function registerCoreCommands(
       return { ok: true, data: { workspaceId: input.workspaceId, batchId: input.batchId, rows } };
     } catch (error) {
       if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiLibrary.list', async (payload) => {
+    try {
+      const input = payload as PBILibraryListRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list requires workspaceId');
+      }
+      if (input.validationStatuses?.length && !input.validationStatuses.every((status) => validPBIValidationStatuses.has(status))) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list requires validationStatuses to be candidate|malformed|duplicate|ignored');
+      }
+      if (input.scopeStates?.length && !input.scopeStates.every((state) => validPBILibraryScopeStates.has(state))) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list requires scopeStates to be in_scope|out_of_scope|not_eligible');
+      }
+      if (input.sortBy && !validPBILibrarySortFields.has(input.sortBy)) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list sortBy must be importedAtUtc|externalId|title|workItemType|priority|validationStatus|scopeState|batchName|proposalCount');
+      }
+      if (input.sortDirection && input.sortDirection !== 'asc' && input.sortDirection !== 'desc') {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list sortDirection must be asc|desc');
+      }
+
+      const list = await workspaceRepository.listPBILibrary(input.workspaceId, input);
+      return { ok: true, data: list };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiLibrary.get', async (payload) => {
+    try {
+      const input = payload as PBILibraryGetRequest | undefined;
+      if (!input?.workspaceId || !input?.pbiId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiLibrary.get requires workspaceId and pbiId');
+      }
+
+      const detail = await workspaceRepository.getPBILibraryDetail(input.workspaceId, input.pbiId);
+      return { ok: true, data: detail };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI library record not found') {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
       }
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));

@@ -12,6 +12,7 @@ import {
   ArticleAiPresetAction,
   DraftBranchStatus,
   PBIImportFormat,
+  PBIValidationStatus,
   PBIBatchStatus,
   PBIBatchScopeMode,
   ProposalReviewDecision,
@@ -20,6 +21,229 @@ import {
   RevisionStatus,
   TemplatePackType
 } from '@kb-vault/shared-types';
+
+async function seedPBILibraryFixture(repository: WorkspaceRepository, workspaceId: string) {
+  const batchAlpha = await repository.createPBIBatch(
+    workspaceId,
+    'Alpha Planning Batch',
+    'alpha-planning.csv',
+    'imports/alpha-planning.csv',
+    PBIImportFormat.CSV,
+    7,
+    {
+      candidateRowCount: 4,
+      malformedRowCount: 1,
+      duplicateRowCount: 1,
+      ignoredRowCount: 1,
+      scopedRowCount: 3
+    },
+    PBIBatchScopeMode.ALL
+  );
+
+  await repository.insertPBIRecords(workspaceId, batchAlpha.id, [
+    {
+      batchId: batchAlpha.id,
+      sourceRowNumber: 1,
+      externalId: '100',
+      title: 'Billing',
+      description: 'Billing overview',
+      state: PBIValidationStatus.CANDIDATE,
+      validationStatus: PBIValidationStatus.CANDIDATE,
+      workItemType: 'feature',
+      priority: 'high',
+      title1: 'Billing',
+      descriptionText: 'Billing workspace overview',
+      acceptanceCriteriaText: 'Users can find billing help.'
+    },
+    {
+      batchId: batchAlpha.id,
+      sourceRowNumber: 2,
+      externalId: '101',
+      title: 'Billing Dashboard',
+      description: 'Billing dashboard changes',
+      state: PBIValidationStatus.CANDIDATE,
+      validationStatus: PBIValidationStatus.CANDIDATE,
+      workItemType: 'story',
+      priority: 'urgent',
+      title1: 'Billing',
+      title2: 'Dashboard',
+      rawDescription: '<p>Roadmap dashboard raw source</p>',
+      rawAcceptanceCriteria: '<ul><li>Show assignment details</li></ul>',
+      descriptionText: 'Dashboard workflow details for billing assignments',
+      acceptanceCriteriaText: 'Show assignment details',
+      parentExternalId: '100'
+    },
+    {
+      batchId: batchAlpha.id,
+      sourceRowNumber: 3,
+      externalId: '102',
+      title: 'Billing Dashboard Export',
+      description: 'Billing dashboard export details',
+      state: PBIValidationStatus.CANDIDATE,
+      validationStatus: PBIValidationStatus.CANDIDATE,
+      workItemType: 'task',
+      priority: 'medium',
+      title1: 'Billing',
+      title2: 'Dashboard',
+      title3: 'Export',
+      descriptionText: 'Export workflow details',
+      acceptanceCriteriaText: 'Exports include the correct data',
+      parentExternalId: '101'
+    },
+    {
+      batchId: batchAlpha.id,
+      sourceRowNumber: 4,
+      externalId: '103',
+      title: 'Experimental Billing Toggle',
+      description: 'This row was scoped out.',
+      state: PBIValidationStatus.IGNORED,
+      validationStatus: PBIValidationStatus.CANDIDATE,
+      workItemType: 'story',
+      priority: 'low',
+      title1: 'Billing',
+      title2: 'Experiments',
+      descriptionText: 'Scoped out from analysis',
+      acceptanceCriteriaText: 'Not part of the current rollout'
+    },
+    {
+      batchId: batchAlpha.id,
+      sourceRowNumber: 5,
+      externalId: '104',
+      title: 'Repeated Billing Import',
+      description: 'Duplicate row',
+      state: PBIValidationStatus.DUPLICATE,
+      validationStatus: PBIValidationStatus.DUPLICATE,
+      workItemType: 'story',
+      descriptionText: 'Duplicate billing import row'
+    },
+    {
+      batchId: batchAlpha.id,
+      sourceRowNumber: 6,
+      externalId: '105',
+      title: 'Malformed Billing Row',
+      description: 'Malformed row',
+      state: PBIValidationStatus.MALFORMED,
+      validationStatus: PBIValidationStatus.MALFORMED,
+      workItemType: 'story',
+      descriptionText: 'Malformed billing row'
+    },
+    {
+      batchId: batchAlpha.id,
+      sourceRowNumber: 7,
+      externalId: '106',
+      title: 'Build Pipeline Cleanup',
+      description: 'Ignored technical row',
+      state: PBIValidationStatus.IGNORED,
+      validationStatus: PBIValidationStatus.IGNORED,
+      workItemType: 'task',
+      descriptionText: 'Ignored technical cleanup'
+    }
+  ]);
+  await repository.linkPBIRecordParents(workspaceId, batchAlpha.id);
+
+  const batchBeta = await repository.createPBIBatch(
+    workspaceId,
+    'Roadmap Batch',
+    'roadmap-library.csv',
+    'imports/roadmap-library.csv',
+    PBIImportFormat.CSV,
+    2,
+    {
+      candidateRowCount: 2,
+      malformedRowCount: 0,
+      duplicateRowCount: 0,
+      ignoredRowCount: 0,
+      scopedRowCount: 2
+    },
+    PBIBatchScopeMode.ALL
+  );
+
+  await repository.insertPBIRecords(workspaceId, batchBeta.id, [
+    {
+      batchId: batchBeta.id,
+      sourceRowNumber: 1,
+      externalId: '200',
+      title: 'Planner Overview',
+      description: 'Planner overview',
+      state: PBIValidationStatus.CANDIDATE,
+      validationStatus: PBIValidationStatus.CANDIDATE,
+      workItemType: 'feature',
+      priority: 'medium',
+      title1: 'Planner',
+      descriptionText: 'Planner overview details',
+      acceptanceCriteriaText: 'Planner overview is documented'
+    },
+    {
+      batchId: batchBeta.id,
+      sourceRowNumber: 2,
+      externalId: '201',
+      title: 'Notification Rollup',
+      description: 'Notification rollup',
+      state: PBIValidationStatus.CANDIDATE,
+      validationStatus: PBIValidationStatus.CANDIDATE,
+      workItemType: 'story',
+      priority: 'high',
+      title1: 'Notifications',
+      descriptionText: 'Notification rollup details',
+      acceptanceCriteriaText: 'Notifications are rolled up correctly'
+    }
+  ]);
+  await repository.linkPBIRecordParents(workspaceId, batchBeta.id);
+
+  const alphaRows = await repository.getPBIRecords(workspaceId, batchAlpha.id);
+  const root = alphaRows.find((row) => row.externalId === '100');
+  const middle = alphaRows.find((row) => row.externalId === '101');
+  const leaf = alphaRows.find((row) => row.externalId === '102');
+  const outOfScope = alphaRows.find((row) => row.externalId === '103');
+  const duplicate = alphaRows.find((row) => row.externalId === '104');
+  const malformed = alphaRows.find((row) => row.externalId === '105');
+  const ignored = alphaRows.find((row) => row.externalId === '106');
+
+  expect(root?.id).toBeTruthy();
+  expect(middle?.id).toBeTruthy();
+  expect(leaf?.id).toBeTruthy();
+  expect(outOfScope?.id).toBeTruthy();
+  expect(duplicate?.id).toBeTruthy();
+  expect(malformed?.id).toBeTruthy();
+  expect(ignored?.id).toBeTruthy();
+
+  await repository.createAgentProposal({
+    workspaceId,
+    batchId: batchAlpha.id,
+    action: 'edit',
+    reviewStatus: ProposalReviewStatus.PENDING_REVIEW,
+    _sessionId: 'pbi-library-session-1',
+    targetTitle: 'Billing Dashboard',
+    targetLocale: 'en-us',
+    rationaleSummary: 'Update the billing dashboard article.',
+    proposedHtml: '<h1>Billing Dashboard</h1><p>Updated instructions.</p>',
+    relatedPbiIds: [middle!.id]
+  });
+  await repository.createAgentProposal({
+    workspaceId,
+    batchId: batchAlpha.id,
+    action: 'create',
+    reviewStatus: ProposalReviewStatus.PENDING_REVIEW,
+    _sessionId: 'pbi-library-session-2',
+    targetTitle: 'Billing Dashboard FAQ',
+    targetLocale: 'en-us',
+    rationaleSummary: 'Create follow-up FAQ coverage for billing dashboard changes.',
+    proposedHtml: '<h1>Billing Dashboard FAQ</h1><p>New FAQ coverage.</p>',
+    relatedPbiIds: [middle!.id]
+  });
+
+  return {
+    batchAlpha,
+    batchBeta,
+    root: root!,
+    middle: middle!,
+    leaf: leaf!,
+    outOfScope: outOfScope!,
+    duplicate: duplicate!,
+    malformed: malformed!,
+    ignored: ignored!,
+  };
+}
 
 test.describe('workspace repository content model', () => {
   let workspaceRoot: string;
@@ -1474,6 +1698,117 @@ test.describe('workspace repository content model', () => {
     const visibleBatchList = await repository.listProposalReviewBatches(created.id);
     expect(visibleBatchList.batches).toHaveLength(1);
     expect(visibleBatchList.batches[0]?.pendingReviewCount).toBe(1);
+  });
+
+  test('lists PBI library rows across the full workspace', async () => {
+    const created = await repository.createWorkspace({
+      name: `PBILibraryWorkspace-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const fixture = await seedPBILibraryFixture(repository, created.id);
+
+    const library = await repository.listPBILibrary(created.id, {
+      workspaceId: created.id
+    });
+
+    expect(library.workspaceId).toBe(created.id);
+    expect(library.items).toHaveLength(9);
+    expect(new Set(library.items.map((item) => item.batchId))).toEqual(new Set([fixture.batchAlpha.id, fixture.batchBeta.id]));
+  });
+
+  test('filters PBI library search queries across row and batch metadata', async () => {
+    const created = await repository.createWorkspace({
+      name: `PBILibrarySearch-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    await seedPBILibraryFixture(repository, created.id);
+
+    const library = await repository.listPBILibrary(created.id, {
+      workspaceId: created.id,
+      query: 'roadmap'
+    });
+
+    expect(library.items).toHaveLength(2);
+    expect(new Set(library.items.map((item) => item.batchName))).toEqual(new Set(['Roadmap Batch']));
+    expect(new Set(library.items.map((item) => item.sourceFileName))).toEqual(new Set(['roadmap-library.csv']));
+  });
+
+  test('sorts PBI library rows using the requested field and direction', async () => {
+    const created = await repository.createWorkspace({
+      name: `PBILibrarySort-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    await seedPBILibraryFixture(repository, created.id);
+
+    const library = await repository.listPBILibrary(created.id, {
+      workspaceId: created.id,
+      sortBy: 'externalId',
+      sortDirection: 'desc'
+    });
+
+    expect(library.items.slice(0, 4).map((item) => item.externalId)).toEqual(['201', '200', '106', '105']);
+  });
+
+  test('derives PBI library scope states from validation status and scoped state', async () => {
+    const created = await repository.createWorkspace({
+      name: `PBILibraryScope-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const fixture = await seedPBILibraryFixture(repository, created.id);
+    const library = await repository.listPBILibrary(created.id, {
+      workspaceId: created.id
+    });
+    const byPbiId = new Map(library.items.map((item) => [item.pbiId, item.scopeState]));
+
+    expect(byPbiId.get(fixture.root.id)).toBe('in_scope');
+    expect(byPbiId.get(fixture.outOfScope.id)).toBe('out_of_scope');
+    expect(byPbiId.get(fixture.duplicate.id)).toBe('not_eligible');
+    expect(byPbiId.get(fixture.malformed.id)).toBe('not_eligible');
+    expect(byPbiId.get(fixture.ignored.id)).toBe('not_eligible');
+  });
+
+  test('counts linked proposals per PBI in the library list', async () => {
+    const created = await repository.createWorkspace({
+      name: `PBILibraryProposalCounts-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const fixture = await seedPBILibraryFixture(repository, created.id);
+    const library = await repository.listPBILibrary(created.id, {
+      workspaceId: created.id
+    });
+    const byPbiId = new Map(library.items.map((item) => [item.pbiId, item.proposalCount]));
+
+    expect(byPbiId.get(fixture.middle.id)).toBe(2);
+    expect(byPbiId.get(fixture.root.id)).toBe(0);
+  });
+
+  test('hydrates PBI library detail with batch metadata, lineage, and linked proposals', async () => {
+    const created = await repository.createWorkspace({
+      name: `PBILibraryDetail-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const fixture = await seedPBILibraryFixture(repository, created.id);
+    const detail = await repository.getPBILibraryDetail(created.id, fixture.middle.id);
+
+    expect(detail.workspaceId).toBe(created.id);
+    expect(detail.item.pbiId).toBe(fixture.middle.id);
+    expect(detail.batch.id).toBe(fixture.batchAlpha.id);
+    expect(detail.parent?.pbiId).toBe(fixture.root.id);
+    expect(detail.children.map((child) => child.pbiId)).toEqual([fixture.leaf.id]);
+    expect(detail.linkedProposals).toHaveLength(2);
+    expect(detail.titlePath).toEqual(['Billing', 'Dashboard']);
   });
 
   test('replays direct worker create_proposals mutations idempotently', async () => {

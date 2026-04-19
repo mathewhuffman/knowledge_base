@@ -4,7 +4,10 @@ import type {
   BatchAnalysisStageEventRecord,
   BatchAnalysisTimelineEntry,
 } from '@kb-vault/shared-types';
-import { buildTimelineEntriesWithSkippedStages } from '../src/renderer/src/components/batch-analysis/helpers';
+import {
+  buildTimelineEntriesWithSkippedStages,
+  deriveSkippedStages,
+} from '../src/renderer/src/components/batch-analysis/helpers';
 
 const EMPTY_COUNTS: BatchAnalysisExecutionCounts = {
   total: 0,
@@ -72,8 +75,16 @@ test.describe('batch analysis timeline skipped-stage synthesis', () => {
     const skippedStages = timeline
       .filter((entry) => 'syntheticKind' in entry && entry.syntheticKind === 'skipped_stage')
       .map((entry) => entry.stage);
+    const waitingForInputEntry = timeline.find(
+      (entry) => 'syntheticKind' in entry
+        && entry.syntheticKind === 'skipped_stage'
+        && entry.stage === 'awaiting_user_input',
+    );
 
     expect(skippedStages).toEqual(['awaiting_user_input', 'plan_revision']);
+    expect(waitingForInputEntry?.summary).toBe(
+      'Waiting for Input skipped when the run moved directly from Plan Review to Building.',
+    );
   });
 
   test('inserts skipped waiting and revision stages before building starts', () => {
@@ -289,5 +300,44 @@ test.describe('batch analysis timeline skipped-stage synthesis', () => {
       .map((entry) => entry.stage);
 
     expect(skippedStages).toEqual(['awaiting_user_input', 'plan_revision', 'reworking']);
+  });
+
+  test('does not keep a stage marked as skipped after it later runs in a new iteration', () => {
+    const entries: BatchAnalysisTimelineEntry[] = [
+      createTimelineEntry({
+        artifactType: 'iteration',
+        artifactId: 'iter-1',
+        stage: 'planning',
+        role: 'planner',
+        createdAtUtc: '2026-04-17T12:00:00.000Z',
+      }),
+      createTimelineEntry({
+        artifactType: 'review',
+        artifactId: 'review-1',
+        stage: 'plan_reviewing',
+        role: 'plan-reviewer',
+        createdAtUtc: '2026-04-17T12:01:00.000Z',
+      }),
+      createTimelineEntry({
+        artifactType: 'worker_report',
+        artifactId: 'worker-1',
+        stage: 'building',
+        role: 'worker',
+        createdAtUtc: '2026-04-17T12:02:00.000Z',
+      }),
+      createTimelineEntry({
+        artifactType: 'amendment',
+        artifactId: 'revision-2',
+        iterationId: 'iter-2',
+        iteration: 2,
+        stage: 'plan_revision',
+        role: 'planner',
+        createdAtUtc: '2026-04-17T12:03:00.000Z',
+      }),
+    ];
+
+    const skippedStages = Array.from(deriveSkippedStages(entries, []));
+
+    expect(skippedStages).toEqual(['awaiting_user_input']);
   });
 });

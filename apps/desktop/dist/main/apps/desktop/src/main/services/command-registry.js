@@ -1919,6 +1919,18 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
     const validPBIScopeModes = new Set([shared_types_1.PBIBatchScopeMode.ALL, shared_types_1.PBIBatchScopeMode.SELECTED_ONLY]);
     const validPBIBatchStatuses = new Set(Object.values(shared_types_1.PBIBatchStatus));
     const validPBIValidationStatuses = new Set(Object.values(shared_types_1.PBIValidationStatus));
+    const validPBILibraryScopeStates = new Set(['in_scope', 'out_of_scope', 'not_eligible']);
+    const validPBILibrarySortFields = new Set([
+        'importedAtUtc',
+        'externalId',
+        'title',
+        'workItemType',
+        'priority',
+        'validationStatus',
+        'scopeState',
+        'batchName',
+        'proposalCount'
+    ]);
     const validDraftBranchStatuses = new Set(Object.values(shared_types_1.DraftBranchStatus));
     const appWorkingStateService = new app_working_state_service_1.AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
     const buildZendeskClient = async (workspaceId) => {
@@ -3278,6 +3290,50 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         }
         catch (error) {
             if (error.message === 'Workspace not found' || error.message === 'PBI batch not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('pbiLibrary.list', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list requires workspaceId');
+            }
+            if (input.validationStatuses?.length && !input.validationStatuses.every((status) => validPBIValidationStatuses.has(status))) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list requires validationStatuses to be candidate|malformed|duplicate|ignored');
+            }
+            if (input.scopeStates?.length && !input.scopeStates.every((state) => validPBILibraryScopeStates.has(state))) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list requires scopeStates to be in_scope|out_of_scope|not_eligible');
+            }
+            if (input.sortBy && !validPBILibrarySortFields.has(input.sortBy)) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list sortBy must be importedAtUtc|externalId|title|workItemType|priority|validationStatus|scopeState|batchName|proposalCount');
+            }
+            if (input.sortDirection && input.sortDirection !== 'asc' && input.sortDirection !== 'desc') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'pbiLibrary.list sortDirection must be asc|desc');
+            }
+            const list = await workspaceRepository.listPBILibrary(input.workspaceId, input);
+            return { ok: true, data: list };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, 'Workspace not found');
+            }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('pbiLibrary.get', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.workspaceId || !input?.pbiId) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'pbiLibrary.get requires workspaceId and pbiId');
+            }
+            const detail = await workspaceRepository.getPBILibraryDetail(input.workspaceId, input.pbiId);
+            return { ok: true, data: detail };
+        }
+        catch (error) {
+            if (error.message === 'Workspace not found' || error.message === 'PBI library record not found') {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
             }
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));

@@ -76,6 +76,14 @@ import {
   type PersistedAgentAnalysisRun,
   type PBIRecord,
   type PBIBatchRecord,
+  type PBILibraryDetailResponse,
+  type PBILibraryLinkedProposalSummary,
+  type PBILibraryListItem,
+  type PBILibraryListRequest,
+  type PBILibraryListResponse,
+  type PBILibraryRecordSummary,
+  type PBILibraryScopeState,
+  type PBILibrarySortField,
   type TemplatePackRecord,
   type LineageRecord,
   type PlaceholderToken,
@@ -220,6 +228,16 @@ const OPEN_PROPOSAL_STATUSES = new Set<ProposalReviewStatus>([
   ProposalReviewStatus.DEFERRED
 ]);
 
+const PBI_LIBRARY_PRIORITY_ORDER_SQL = `
+  CASE COALESCE(p.priority, '')
+    WHEN 'low' THEN 1
+    WHEN 'medium' THEN 2
+    WHEN 'high' THEN 3
+    WHEN 'urgent' THEN 4
+    ELSE 5
+  END
+`;
+
 interface RevisionLatestRecord {
   revisionId: string;
   localeVariantId: string;
@@ -259,6 +277,21 @@ interface LegacyBatchAnalysisRunRow {
   toolCallsJson: string | null;
   rawOutputJson: string | null;
   message: string | null;
+}
+
+interface PBILibraryRecordRow {
+  pbiId: string;
+  batchId: string;
+  externalId: string;
+  title: string;
+  workItemType: string | null;
+  priority: PBILibraryListItem['priority'] | null;
+  validationStatus: PBIValidationStatus | null;
+  scopeState: PBILibraryScopeState;
+  batchName: string;
+  sourceFileName: string;
+  importedAtUtc: string;
+  proposalCount: number;
 }
 
 interface BatchAnalysisStageRunRow {
@@ -461,6 +494,24 @@ export interface WorkspaceMigrationHealthReport {
   catalogVersion: number;
   workspaceId: string | null;
   workspaces: WorkspaceMigrationHealth[];
+}
+
+function buildPBILibraryScopeStateSql(recordAlias: string): string {
+  return `
+    CASE
+      WHEN ${recordAlias}.validation_status = '${PBIValidationStatus.CANDIDATE}'
+        AND COALESCE(${recordAlias}.state, '${PBIValidationStatus.CANDIDATE}') = '${PBIValidationStatus.CANDIDATE}'
+        THEN 'in_scope'
+      WHEN ${recordAlias}.validation_status = '${PBIValidationStatus.CANDIDATE}'
+        AND ${recordAlias}.state = '${PBIValidationStatus.IGNORED}'
+        THEN 'out_of_scope'
+      ELSE 'not_eligible'
+    END
+  `;
+}
+
+function escapeSqlLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, '\\$&');
 }
 
 const ACP_ALLOWED_MODEL_IDS = new Set([
@@ -3635,6 +3686,374 @@ export class WorkspaceRepository {
       return row ?? null;
     } finally {
       workspaceDb.close();
+    }
+  }
+
+  async listPBILibrary(workspaceId: string, request: PBILibraryListRequest): Promise<PBILibraryListResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const scopeStateSql = buildPBILibraryScopeStateSql('p');
+      const conditions = ['b.workspace_id = @workspaceId'];
+      const params: Record<string, string | number> = { workspaceId };
+      const trimmedQuery = request.query?.trim();
+
+      if (trimmedQuery) {
+        params.query = `%${escapeSqlLikePattern(trimmedQuery.toLowerCase())}%`;
+        conditions.push(`(
+          LOWER(COALESCE(p.external_id, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(p.title, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(p.title1, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(p.title2, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(p.title3, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(p.description_text, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(p.acceptance_criteria_text, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(p.work_item_type, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(b.name, '')) LIKE @query ESCAPE '\\'
+          OR LOWER(COALESCE(b.source_file_name, '')) LIKE @query ESCAPE '\\'
+        )`);
+      }
+
+      if (request.validationStatuses?.length) {
+        const validationPlaceholders = request.validationStatuses.map((_, index) => `@validationStatus${index}`);
+        request.validationStatuses.forEach((status, index) => {
+          params[`validationStatus${index}`] = status;
+        });
+        conditions.push(`p.validation_status IN (${validationPlaceholders.join(', ')})`);
+      }
+
+      if (request.scopeStates?.length) {
+        const scopePlaceholders = request.scopeStates.map((_, index) => `@scopeState${index}`);
+        request.scopeStates.forEach((state, index) => {
+          params[`scopeState${index}`] = state;
+        });
+        conditions.push(`${scopeStateSql} IN (${scopePlaceholders.join(', ')})`);
+      }
+
+      if (request.batchId?.trim()) {
+        params.batchId = request.batchId.trim();
+        conditions.push('p.batch_id = @batchId');
+      }
+
+      const sortField = request.sortBy ?? 'importedAtUtc';
+      const sortDirection = request.sortDirection === 'asc' ? 'ASC' : 'DESC';
+      const sortExpression = this.resolvePBILibrarySortExpression(sortField, scopeStateSql);
+
+      const rows = workspaceDb.all<PBILibraryRecordRow>(`
+        WITH proposal_counts AS (
+          SELECT pbi_id as pbiId, COUNT(*) as proposalCount
+          FROM proposal_pbi_links
+          GROUP BY pbi_id
+        )
+        SELECT p.id as pbiId,
+               p.batch_id as batchId,
+               p.external_id as externalId,
+               p.title as title,
+               p.work_item_type as workItemType,
+               p.priority as priority,
+               COALESCE(p.validation_status, @candidateStatus) as validationStatus,
+               ${scopeStateSql} as scopeState,
+               b.name as batchName,
+               b.source_file_name as sourceFileName,
+               b.imported_at as importedAtUtc,
+               COALESCE(proposal_counts.proposalCount, 0) as proposalCount
+        FROM pbi_records p
+        JOIN pbi_batches b
+          ON b.id = p.batch_id
+        LEFT JOIN proposal_counts
+          ON proposal_counts.pbiId = p.id
+        WHERE ${conditions.join('\n          AND ')}
+        ORDER BY ${sortExpression} ${sortDirection},
+                 b.imported_at DESC,
+                 p.source_row_number ASC,
+                 p.id ASC
+      `, {
+        ...params,
+        candidateStatus: PBIValidationStatus.CANDIDATE
+      });
+
+      return {
+        workspaceId,
+        items: rows.map((row) => ({
+          pbiId: row.pbiId,
+          batchId: row.batchId,
+          externalId: row.externalId,
+          title: row.title,
+          workItemType: row.workItemType ?? undefined,
+          priority: row.priority ?? undefined,
+          validationStatus: row.validationStatus ?? PBIValidationStatus.CANDIDATE,
+          scopeState: row.scopeState,
+          batchName: row.batchName,
+          sourceFileName: row.sourceFileName,
+          importedAtUtc: row.importedAtUtc,
+          proposalCount: row.proposalCount
+        }))
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getPBILibraryDetail(workspaceId: string, pbiId: string): Promise<PBILibraryDetailResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const scopeStateSql = buildPBILibraryScopeStateSql('p');
+      const row = workspaceDb.get<{
+        pbiId: string;
+        batchId: string;
+        externalId: string;
+        title: string;
+        workItemType: string | null;
+        priority: PBILibraryListItem['priority'] | null;
+        validationStatus: PBIValidationStatus | null;
+        scopeState: PBILibraryScopeState;
+        batchName: string;
+        sourceFileName: string;
+        importedAtUtc: string;
+        proposalCount: number;
+        sourceRowNumber: number;
+        description: string | null;
+        state: PBIRecord['state'] | null;
+        title1: string | null;
+        title2: string | null;
+        title3: string | null;
+        rawDescription: string | null;
+        rawAcceptanceCriteria: string | null;
+        descriptionText: string | null;
+        acceptanceCriteriaText: string | null;
+        parentExternalId: string | null;
+        parentRecordId: string | null;
+        validationReason: string | null;
+        batchWorkspaceId: string;
+        batchSourceRowCount: number;
+        batchSourcePath: string;
+        batchSourceFormat: PBIImportFormat;
+        batchCandidateRowCount: number;
+        batchIgnoredRowCount: number;
+        batchMalformedRowCount: number;
+        batchDuplicateRowCount: number;
+        batchScopedRowCount: number;
+        batchScopeMode: PBIBatchScopeMode;
+        batchScopePayload: string | null;
+        batchWorkerStageBudgetMinutes: number | null;
+        batchStatus: PBIBatchStatus | 'proposed';
+      }>(`
+        WITH proposal_counts AS (
+          SELECT pbi_id as pbiId, COUNT(*) as proposalCount
+          FROM proposal_pbi_links
+          GROUP BY pbi_id
+        )
+        SELECT p.id as pbiId,
+               p.batch_id as batchId,
+               p.external_id as externalId,
+               p.title as title,
+               p.work_item_type as workItemType,
+               p.priority as priority,
+               COALESCE(p.validation_status, @candidateStatus) as validationStatus,
+               ${scopeStateSql} as scopeState,
+               b.name as batchName,
+               b.source_file_name as sourceFileName,
+               b.imported_at as importedAtUtc,
+               COALESCE(proposal_counts.proposalCount, 0) as proposalCount,
+               p.source_row_number as sourceRowNumber,
+               p.description as description,
+               p.state as state,
+               p.title1 as title1,
+               p.title2 as title2,
+               p.title3 as title3,
+               p.raw_description as rawDescription,
+               p.raw_acceptance_criteria as rawAcceptanceCriteria,
+               p.description_text as descriptionText,
+               p.acceptance_criteria_text as acceptanceCriteriaText,
+               p.parent_external_id as parentExternalId,
+               p.parent_record_id as parentRecordId,
+               p.validation_reason as validationReason,
+               b.workspace_id as batchWorkspaceId,
+               b.source_row_count as batchSourceRowCount,
+               b.source_path as batchSourcePath,
+               b.source_format as batchSourceFormat,
+               b.candidate_row_count as batchCandidateRowCount,
+               b.ignored_row_count as batchIgnoredRowCount,
+               b.malformed_row_count as batchMalformedRowCount,
+               b.duplicate_row_count as batchDuplicateRowCount,
+               b.scoped_row_count as batchScopedRowCount,
+               b.scope_mode as batchScopeMode,
+               b.scope_payload as batchScopePayload,
+               b.analysis_worker_budget_minutes as batchWorkerStageBudgetMinutes,
+               b.status as batchStatus
+        FROM pbi_records p
+        JOIN pbi_batches b
+          ON b.id = p.batch_id
+        LEFT JOIN proposal_counts
+          ON proposal_counts.pbiId = p.id
+        WHERE b.workspace_id = @workspaceId
+          AND p.id = @pbiId
+      `, {
+        workspaceId,
+        pbiId,
+        candidateStatus: PBIValidationStatus.CANDIDATE
+      });
+
+      if (!row) {
+        throw new Error('PBI library record not found');
+      }
+
+      const parent = row.parentRecordId
+        ? workspaceDb.get<PBILibraryRecordSummary>(`
+            SELECT id as pbiId,
+                   external_id as externalId,
+                   title
+            FROM pbi_records
+            WHERE batch_id = @batchId
+              AND id = @parentRecordId
+          `, {
+            batchId: row.batchId,
+            parentRecordId: row.parentRecordId
+          }) ?? undefined
+        : undefined;
+
+      const children = workspaceDb.all<PBILibraryRecordSummary>(`
+        SELECT id as pbiId,
+               external_id as externalId,
+               title
+        FROM pbi_records
+        WHERE batch_id = @batchId
+          AND parent_record_id = @pbiId
+        ORDER BY source_row_number ASC, id ASC
+      `, {
+        batchId: row.batchId,
+        pbiId: row.pbiId
+      });
+
+      const linkedProposals = workspaceDb.all<PBILibraryLinkedProposalSummary>(`
+        SELECT proposals.id as proposalId,
+               proposals.batch_id as batchId,
+               proposals.action as action,
+               COALESCE(proposals.review_status, @pendingReviewStatus) as reviewStatus,
+               proposals.generated_at as generatedAtUtc
+        FROM proposal_pbi_links links
+        JOIN proposals
+          ON proposals.id = links.proposal_id
+        WHERE proposals.workspace_id = @workspaceId
+          AND links.pbi_id = @pbiId
+        ORDER BY proposals.generated_at DESC, proposals.id ASC
+      `, {
+        workspaceId,
+        pbiId,
+        pendingReviewStatus: ProposalReviewStatus.PENDING_REVIEW
+      });
+
+      const item: PBILibraryListItem = {
+        pbiId: row.pbiId,
+        batchId: row.batchId,
+        externalId: row.externalId,
+        title: row.title,
+        workItemType: row.workItemType ?? undefined,
+        priority: row.priority ?? undefined,
+        validationStatus: row.validationStatus ?? PBIValidationStatus.CANDIDATE,
+        scopeState: row.scopeState,
+        batchName: row.batchName,
+        sourceFileName: row.sourceFileName,
+        importedAtUtc: row.importedAtUtc,
+        proposalCount: row.proposalCount
+      };
+
+      const record: PBIRecord = {
+        id: row.pbiId,
+        batchId: row.batchId,
+        sourceRowNumber: row.sourceRowNumber,
+        externalId: row.externalId,
+        title: row.title,
+        description: row.description ?? undefined,
+        state: row.state ?? undefined,
+        priority: row.priority ?? undefined,
+        workItemType: row.workItemType ?? undefined,
+        title1: row.title1 ?? undefined,
+        title2: row.title2 ?? undefined,
+        title3: row.title3 ?? undefined,
+        rawDescription: row.rawDescription ?? undefined,
+        rawAcceptanceCriteria: row.rawAcceptanceCriteria ?? undefined,
+        descriptionText: row.descriptionText ?? undefined,
+        acceptanceCriteriaText: row.acceptanceCriteriaText ?? undefined,
+        parentExternalId: row.parentExternalId ?? undefined,
+        parentRecordId: row.parentRecordId ?? undefined,
+        validationStatus: row.validationStatus ?? PBIValidationStatus.CANDIDATE,
+        validationReason: row.validationReason ?? undefined
+      };
+
+      const batch: PBIBatchRecord = {
+        id: row.batchId,
+        workspaceId: row.batchWorkspaceId,
+        name: row.batchName,
+        sourceFileName: row.sourceFileName,
+        sourceRowCount: row.batchSourceRowCount,
+        sourcePath: row.batchSourcePath,
+        sourceFormat: row.batchSourceFormat,
+        candidateRowCount: row.batchCandidateRowCount,
+        ignoredRowCount: row.batchIgnoredRowCount,
+        malformedRowCount: row.batchMalformedRowCount,
+        duplicateRowCount: row.batchDuplicateRowCount,
+        scopedRowCount: row.batchScopedRowCount,
+        scopeMode: row.batchScopeMode,
+        scopePayload: row.batchScopePayload ?? undefined,
+        workerStageBudgetMinutes: row.batchWorkerStageBudgetMinutes ?? undefined,
+        importedAtUtc: row.importedAtUtc,
+        status: row.batchStatus
+      };
+
+      const titlePath = [row.title1, row.title2, row.title3]
+        .map((value) => value?.trim() ?? '')
+        .filter((value): value is string => Boolean(value));
+
+      if (titlePath.length === 0 && row.title.trim()) {
+        titlePath.push(row.title.trim());
+      }
+
+      return {
+        workspaceId,
+        item,
+        record,
+        batch,
+        titlePath,
+        parent,
+        children,
+        linkedProposals
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  private resolvePBILibrarySortExpression(sortField: PBILibrarySortField, scopeStateSql: string): string {
+    switch (sortField) {
+      case 'externalId':
+        return `LOWER(COALESCE(p.external_id, ''))`;
+      case 'title':
+        return `LOWER(COALESCE(p.title, ''))`;
+      case 'workItemType':
+        return `LOWER(COALESCE(p.work_item_type, ''))`;
+      case 'priority':
+        return PBI_LIBRARY_PRIORITY_ORDER_SQL;
+      case 'validationStatus':
+        return `LOWER(COALESCE(p.validation_status, ''))`;
+      case 'scopeState':
+        return `
+          CASE ${scopeStateSql}
+            WHEN 'in_scope' THEN 1
+            WHEN 'out_of_scope' THEN 2
+            ELSE 3
+          END
+        `;
+      case 'batchName':
+        return `LOWER(COALESCE(b.name, ''))`;
+      case 'proposalCount':
+        return `COALESCE(proposal_counts.proposalCount, 0)`;
+      case 'importedAtUtc':
+      default:
+        return `b.imported_at`;
     }
   }
 

@@ -250,8 +250,12 @@ function isTimelineTransitionEvent(event: BatchAnalysisStageEventRecord): boolea
     || event.eventType === 'iteration_completed';
 }
 
-function summarizeSkippedStage(nextStage: BatchAnalysisStageStatus): string {
-  return `Skipped before execution advanced to ${STAGE_LABELS[nextStage]}.`;
+function summarizeSkippedStage(
+  skippedStage: BatchAnalysisStageStatus,
+  previousStage: BatchAnalysisStageStatus,
+  nextStage: BatchAnalysisStageStatus,
+): string {
+  return `${STAGE_LABELS[skippedStage]} skipped when the run moved directly from ${STAGE_LABELS[previousStage]} to ${STAGE_LABELS[nextStage]}.`;
 }
 
 function buildSkippedStageEntriesFromTransitions(
@@ -290,7 +294,7 @@ function buildSkippedStageEntriesFromTransitions(
             stage: skippedStage,
             role: STAGE_OWNER_ROLES[skippedStage],
             status: 'skipped',
-            summary: summarizeSkippedStage(nextStage),
+            summary: summarizeSkippedStage(skippedStage, previousStage, nextStage),
             createdAtUtc: transition.createdAtUtc,
             syntheticKind: 'skipped_stage',
             skippedFromStage: previousStage,
@@ -352,6 +356,50 @@ function collectTransitionPointsFromTimelineEntries(
   return transitions;
 }
 
+function collectSkippedStageEntries(
+  entries: BatchAnalysisTimelineEntry[],
+  stageEvents: BatchAnalysisStageEventRecord[] = [],
+): SkippedStageTimelineEntry[] {
+  const stageEventSkippedEntries = buildSkippedStageEntriesFromTransitions(
+    collectTransitionPointsFromStageEvents(stageEvents),
+  );
+  const timelineSkippedEntries = buildSkippedStageEntriesFromTransitions(
+    collectTransitionPointsFromTimelineEntries(entries),
+  );
+
+  return Array.from(
+    new Map(
+      [...stageEventSkippedEntries, ...timelineSkippedEntries].map((entry) => [
+        `${entry.iterationId ?? 'none'}:${entry.skippedFromStage}:${entry.stage}:${entry.skippedToStage}`,
+        entry,
+      ]),
+    ).values(),
+  );
+}
+
+export function deriveSkippedStages(
+  entries: BatchAnalysisTimelineEntry[],
+  stageEvents: BatchAnalysisStageEventRecord[] = [],
+): Set<BatchAnalysisStageStatus> {
+  const actualStagesSeen = new Set<BatchAnalysisStageStatus>();
+  for (const entry of entries) {
+    const visibleStage = getVisibleStage(entry.stage);
+    if (visibleStage) {
+      actualStagesSeen.add(visibleStage);
+    }
+  }
+
+  const skippedStages = new Set<BatchAnalysisStageStatus>();
+  for (const entry of collectSkippedStageEntries(entries, stageEvents)) {
+    const visibleStage = getVisibleStage(entry.stage) ?? entry.stage;
+    if (!actualStagesSeen.has(visibleStage)) {
+      skippedStages.add(visibleStage);
+    }
+  }
+
+  return skippedStages;
+}
+
 export function buildTimelineEntriesWithSkippedStages(
   entries: BatchAnalysisTimelineEntry[],
   stageEvents: BatchAnalysisStageEventRecord[] = [],
@@ -360,20 +408,7 @@ export function buildTimelineEntriesWithSkippedStages(
     return entries;
   }
 
-  const stageEventSkippedEntries = buildSkippedStageEntriesFromTransitions(
-    collectTransitionPointsFromStageEvents(stageEvents),
-  );
-  const timelineSkippedEntries = buildSkippedStageEntriesFromTransitions(
-    collectTransitionPointsFromTimelineEntries(entries),
-  );
-  const skippedEntries = Array.from(
-    new Map(
-      [...stageEventSkippedEntries, ...timelineSkippedEntries].map((entry) => [
-        `${entry.iterationId ?? 'none'}:${entry.skippedFromStage}:${entry.stage}:${entry.skippedToStage}`,
-        entry,
-      ]),
-    ).values(),
-  );
+  const skippedEntries = collectSkippedStageEntries(entries, stageEvents);
 
   if (skippedEntries.length === 0) {
     return entries;

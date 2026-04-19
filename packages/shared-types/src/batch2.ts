@@ -1,3 +1,5 @@
+import type { ProposalReviewStatus } from './batch7';
+
 export type EntityId = string;
 
 export enum WorkspaceState {
@@ -392,6 +394,79 @@ export interface PBIBatchRowsRequest {
 export interface PBIBatchDeleteRequest {
   workspaceId: EntityId;
   batchId: EntityId;
+}
+
+export type PBILibraryScopeState = 'in_scope' | 'out_of_scope' | 'not_eligible';
+
+export type PBILibrarySortField =
+  | 'importedAtUtc'
+  | 'externalId'
+  | 'title'
+  | 'workItemType'
+  | 'priority'
+  | 'validationStatus'
+  | 'scopeState'
+  | 'batchName'
+  | 'proposalCount';
+
+export interface PBILibraryListRequest {
+  workspaceId: string;
+  query?: string;
+  validationStatuses?: PBIValidationStatus[];
+  scopeStates?: PBILibraryScopeState[];
+  batchId?: string;
+  sortBy?: PBILibrarySortField;
+  sortDirection?: 'asc' | 'desc';
+}
+
+export interface PBILibraryListItem {
+  pbiId: string;
+  batchId: string;
+  externalId: string;
+  title: string;
+  workItemType?: string;
+  priority?: 'low' | 'medium' | 'high' | 'urgent';
+  validationStatus: PBIValidationStatus;
+  scopeState: PBILibraryScopeState;
+  batchName: string;
+  sourceFileName: string;
+  importedAtUtc: string;
+  proposalCount: number;
+}
+
+export interface PBILibraryListResponse {
+  workspaceId: string;
+  items: PBILibraryListItem[];
+}
+
+export interface PBILibraryGetRequest {
+  workspaceId: string;
+  pbiId: string;
+}
+
+export interface PBILibraryLinkedProposalSummary {
+  proposalId: string;
+  batchId: string;
+  action: ProposalAction;
+  reviewStatus: ProposalReviewStatus;
+  generatedAtUtc: string;
+}
+
+export interface PBILibraryRecordSummary {
+  pbiId: string;
+  externalId: string;
+  title: string;
+}
+
+export interface PBILibraryDetailResponse {
+  workspaceId: string;
+  item: PBILibraryListItem;
+  record: PBIRecord;
+  batch: PBIBatchRecord;
+  titlePath: string[];
+  parent?: PBILibraryRecordSummary;
+  children: PBILibraryRecordSummary[];
+  linkedProposals: PBILibraryLinkedProposalSummary[];
 }
 
 export interface PBIBatchStatusUpdateRequest {

@@ -13,6 +13,7 @@ interface StagePipelineProps {
   currentStage: BatchAnalysisStageStatus | undefined;
   iteration: number | undefined;
   completedStages: Set<BatchAnalysisStageStatus>;
+  skippedStages: Set<BatchAnalysisStageStatus>;
   failedStage?: BatchAnalysisStageStatus;
   isRunning: boolean;
 }
@@ -21,10 +22,12 @@ function resolveNodeState(
   stage: BatchAnalysisStageStatus,
   currentStage: BatchAnalysisStageStatus | undefined,
   completedStages: Set<BatchAnalysisStageStatus>,
+  skippedStages: Set<BatchAnalysisStageStatus>,
   failedStage: BatchAnalysisStageStatus | undefined,
 ): PipelineNodeState {
   if (failedStage === stage) return 'failed';
   if (stage === currentStage) return 'active';
+  if (skippedStages.has(stage)) return 'skipped';
   if (completedStages.has(stage)) return 'done';
   if (stage === 'queued' && currentStage && currentStage !== 'queued') return 'done';
   return 'pending';
@@ -34,6 +37,7 @@ export function StagePipeline({
   currentStage,
   iteration,
   completedStages,
+  skippedStages,
   failedStage,
   isRunning,
 }: StagePipelineProps) {
@@ -77,9 +81,10 @@ export function StagePipeline({
   return (
     <div ref={containerRef} className="ba-pipeline" role="group" aria-label="Batch analysis stage pipeline">
       {PIPELINE_STAGES.map((stage, idx) => {
-        const state = resolveNodeState(stage, visibleCurrentStage, completedStages, visibleFailedStage);
+        const state = resolveNodeState(stage, visibleCurrentStage, completedStages, skippedStages, visibleFailedStage);
         const isLast = idx === PIPELINE_STAGES.length - 1;
         const showIter = state === 'active' && iteration != null && iteration > 1;
+        const showSkipped = state === 'skipped';
         const queuedEmphasis = stage === 'queued' && state !== 'pending';
         const pulseClass = state === 'active' && isRunning
           ? queuedEmphasis
@@ -98,7 +103,12 @@ export function StagePipeline({
                 <span className="ba-pipeline-iter-badge">Iter {iteration}</span>
               )}
             </div>
-            <span className="ba-pipeline-label">{getVisibleStageLabel(stage)}</span>
+            <span className={`ba-pipeline-label${showSkipped ? ' ba-pipeline-label--skipped' : ''}`}>
+              {getVisibleStageLabel(stage)}
+            </span>
+            {showSkipped && (
+              <span className="ba-pipeline-status">Skipped</span>
+            )}
             {!isLast && (
               <div className={`ba-pipeline-connector ba-pipeline-connector--${state === 'done' ? 'done' : 'pending'}`} />
             )}

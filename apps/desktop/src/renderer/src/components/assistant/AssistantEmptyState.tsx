@@ -1,6 +1,6 @@
 import type { AiViewContext } from '@kb-vault/shared-types';
 import { AppRoute } from '@kb-vault/shared-types';
-import { IconMessageSquare, IconFileText, IconGitBranch, IconEye, IconTool, IconZap } from '../icons';
+import { IconMessageSquare, IconFileText, IconGitBranch, IconEye, IconTool, IconArchive, IconZap } from '../icons';
 
 interface RouteEmptyConfig {
   icon: React.ReactNode;
@@ -23,6 +23,11 @@ const ROUTE_EMPTY: Partial<Record<AppRoute, RouteEmptyConfig>> = {
     icon: <IconEye size={24} />,
     heading: 'Proposal assistant ready',
     description: 'Refine this proposal\'s content, rationale, or language. Changes update the review copy — accept or deny remains your decision.'
+  },
+  [AppRoute.PBI_LIBRARY]: {
+    icon: <IconArchive size={24} />,
+    heading: 'PBI assistant ready',
+    description: 'Ask about the selected PBI, its scope status, linked proposals, or what documentation impact it suggests.'
   },
   [AppRoute.TEMPLATES_AND_PROMPTS]: {
     icon: <IconTool size={24} />,

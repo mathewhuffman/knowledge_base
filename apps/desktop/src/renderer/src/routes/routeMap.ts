@@ -2,6 +2,7 @@ import { AppRoute } from '@kb-vault/shared-types';
 import { ArticleExplorer } from '../pages/ArticleExplorer';
 import { KBVaultHome } from '../pages/KBVaultHome';
 import { PBI } from '../pages/PBIBatches';
+import { PBILibrary } from '../pages/PBILibrary';
 import { ProposalReview } from '../pages/ProposalReview';
 import { Drafts } from '../pages/Drafts';
 import { PublishQueue } from '../pages/PublishQueue';
@@ -15,6 +16,7 @@ export const routeToComponent: Record<AppRoute, FunctionComponent> = {
   [AppRoute.KB_VAULT_HOME]: KBVaultHome,
   [AppRoute.ARTICLE_EXPLORER]: ArticleExplorer,
   [AppRoute.PBI_BATCHES]: PBI,
+  [AppRoute.PBI_LIBRARY]: PBILibrary,
   [AppRoute.PROPOSAL_REVIEW]: ProposalReview,
   [AppRoute.DRAFTS]: Drafts,
   [AppRoute.PUBLISH_QUEUE]: PublishQueue,
