@@ -15,7 +15,7 @@ const node_child_process_1 = require("node:child_process");
 const mcp_server_1 = require("@kb-vault/mcp-server");
 const shared_types_1 = require("@kb-vault/shared-types");
 const shared_types_2 = require("@kb-vault/shared-types");
-const DEFAULT_AGENT_ACCESS_MODE = 'mcp';
+const DEFAULT_AGENT_ACCESS_MODE = 'direct';
 const KB_CLI_BINARY_ENV = 'KBV_KB_CLI_BINARY';
 const KBV_CURSOR_BINARY_ENV = 'KBV_CURSOR_BINARY';
 const DEFAULT_AGENT_BINARY = 'agent';
@@ -28,6 +28,17 @@ const MCP_BRIDGE_HEALTH_TIMEOUT_MS = 2_000;
 const ACP_SESSION_READY_WAIT_MS = 1_200;
 const ACP_SESSION_NOT_FOUND_RETRY_LIMIT = 4;
 const ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT = 2;
+const DIRECT_ACTION_LOOP_MAX_TURNS = 8;
+const DIRECT_ACTION_REPEAT_LIMIT = 2;
+const DIRECT_PROTOCOL_RECOVERY_LIMIT = 2;
+const DIRECT_CONTINUATION_FULL_PROMPT_TURNS = 1;
+const DIRECT_ACTION_RESULT_MAX_PROMPT_CHARS = 24_000;
+const DIRECT_ACTION_RESULT_MAX_STRING_CHARS = 4_000;
+const DIRECT_ACTION_RESULT_MAX_ARRAY_ITEMS = 12;
+const DIRECT_ACTION_RESULT_MAX_OBJECT_KEYS = 24;
+const DIRECT_ACTION_RESULT_MAX_DEPTH = 5;
+const DIRECT_CONTINUATION_MARKER = 'Direct continuation instructions:';
+const DIRECT_RECOVERY_MARKER = 'Direct recovery instructions:';
 const KB_VAULT_MCP_SERVER_NAME = 'kb-vault';
 function resolveDefaultCursorBinary() {
     if (hasBinaryOnPath(DEFAULT_AGENT_BINARY)) {
@@ -311,6 +322,16 @@ const BATCH_PLANNER_JSON_STREAM_GRACE_MS = 1_500;
 const BATCH_PLANNER_MALFORMED_JSON_ABORT_MS = 6_000;
 const BATCH_ANALYSIS_AUTO_CONTINUE_LIMIT = 1;
 const BATCH_ANALYSIS_CONTINUATION_MARKER = 'Batch continuation instructions:';
+function stableStringify(value) {
+    if (value === null || typeof value !== 'object') {
+        return JSON.stringify(value) ?? 'null';
+    }
+    if (Array.isArray(value)) {
+        return `[${value.map((entry) => stableStringify(entry)).join(',')}]`;
+    }
+    const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`).join(',')}}`;
+}
 function isMissingAcpSessionError(error) {
     if (!error) {
         return false;
@@ -342,6 +363,9 @@ function detectAssistantToolPolicyViolationMode(error) {
         || normalized.includes('mcp mode forbids')
         || normalized.includes('mcp mode only allows')) {
         return 'mcp';
+    }
+    if (normalized.includes('direct mode blocked illegal tool call') || normalized.includes('direct mode forbids')) {
+        return 'direct';
     }
     return null;
 }
@@ -558,14 +582,225 @@ function buildBatchAnalysisPhaseGuidance(providerLabel) {
     ].join('\n');
 }
 function buildAssistantChatContinuePrompt(mode) {
+    const lookupInstruction = mode === 'mcp'
+        ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
+        : mode === 'cli'
+            ? 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
+            : 'If you still need KB access, return exactly one `needs_action` direct-action JSON envelope. Do not use MCP tools, CLI commands, shell commands, or filesystem exploration in this follow-up.';
     return [
         'Complete the same user request using the existing session context.',
         'Return the final user-facing answer now.',
         'Do not send a progress update.',
-        mode === 'mcp'
-            ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
-            : 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
+        lookupInstruction
     ].join(' ');
+}
+function getDirectBatchStageActionTypes(session) {
+    if (session.type !== 'batch_analysis') {
+        return null;
+    }
+    if (session.mode === 'plan' && (session.role === 'planner' || session.role === 'plan-reviewer' || session.role === 'final-reviewer')) {
+        return shared_types_2.DIRECT_BATCH_READ_ONLY_ACTION_TYPES;
+    }
+    if (session.mode === 'agent' && session.role === 'worker') {
+        return shared_types_2.DIRECT_BATCH_WORKER_ACTION_TYPES;
+    }
+    return null;
+}
+function getDirectActionTypesForSession(session) {
+    if (session.type === 'batch_analysis') {
+        return getDirectBatchStageActionTypes(session);
+    }
+    if (session.type === 'article_edit') {
+        return shared_types_2.DIRECT_ARTICLE_EDIT_ACTION_TYPES;
+    }
+    if (session.type === 'assistant_chat') {
+        return session.directContext?.allowPatchForm
+            ? shared_types_2.DIRECT_ASSISTANT_TEMPLATE_ACTION_TYPES
+            : shared_types_2.DIRECT_ASSISTANT_READ_ACTION_TYPES;
+    }
+    return null;
+}
+function buildDirectTaskPrompt(session, taskPayload, extras) {
+    const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
+    const locale = typeof taskPayload.locale === 'string' ? taskPayload.locale : session.locale ?? 'default';
+    const explicitPrompt = typeof taskPayload.prompt === 'string' ? taskPayload.prompt.trim() : '';
+    const extraSections = [
+        extras?.batchContext !== undefined ? `Preloaded batch context summary:\n${summarizeBatchContext(extras.batchContext)}` : '',
+        extras?.uploadedPbis !== undefined ? `Preloaded uploaded PBI JSON:\n${JSON.stringify(extras.uploadedPbis, null, 2)}` : '',
+        extras?.articleDirectory ? `KB article directory and file-style index:\n${extras.articleDirectory}` : ''
+    ]
+        .filter(Boolean)
+        .join('\n\n');
+    const allowedActionTypes = getDirectActionTypesForSession(session);
+    const allowedActions = allowedActionTypes?.join(', ') ?? 'none';
+    const supportsProposalMutation = Array.isArray(allowedActionTypes) && allowedActionTypes.includes('create_proposals');
+    const directProtocolBase = [
+        'KB Vault direct-mode protocol:',
+        '- The app is the sole authority for KB reads and writes. You do not execute tools or commands yourself.',
+        '- Never mention MCP, CLI, shell, terminal, filesystem exploration, or tool discovery in direct mode.',
+        '- If prompt context is insufficient, request exactly one direct action by returning a JSON object with `completionState="needs_action"` and `isFinal=false`.',
+        `- Allowed direct action types in this stage: ${allowedActions}.`,
+        '- Use direct actions only for concrete unresolved ambiguities. Reuse prior action results instead of repeating the same request.',
+        '- Each direct action turn may request only one action object.',
+        '- The app derives workspace ownership, route ownership, batch ownership, session ownership, and idempotency. Do not invent those fields yourself.',
+        'Needs-action example:',
+        JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+                id: 'action-1',
+                type: batchId ? 'get_batch_context' : 'get_article',
+                args: batchId
+                    ? { batchId: batchId || '<batch-id>' }
+                    : { localeVariantId: 'locale-variant-id' }
+            }
+        }, null, 2),
+        'Action-result continuation example:',
+        JSON.stringify({
+            type: 'action_result',
+            actionId: 'action-1',
+            ok: true,
+            data: batchId
+                ? { batch: { id: batchId || '<batch-id>' } }
+                : { article: { localeVariantId: 'locale-variant-id' } }
+        }, null, 2)
+    ];
+    if (taskPayload.task === 'analyze_batch' && Array.isArray(allowedActionTypes)) {
+        const directProtocol = [
+            ...directProtocolBase,
+            ...(supportsProposalMutation
+                ? [
+                    '- Mutation actions may include multiple proposal items when they are part of the same approved worker pass.',
+                    '- For batch-worker proposal persistence, use `create_proposals` with proposal items whose `action` is `create`, `edit`, or `retire`. Do not call `create_proposals` for no-impact decisions.',
+                    '- Approved plan target ids and titles already present in the prompt are authoritative execution inputs. Do not spend extra turns rediscovering them unless a read or write failure creates a concrete ambiguity.',
+                    '- For approved `edit` or `retire` items, `create_proposals` may use `localeVariantId`, `familyId`, or `targetTitle`. Use the most authoritative target already supplied in the prompt.',
+                    '- For approved `create` items, use `targetTitle` directly. Do not look up a localeVariantId for net-new work before creating the proposal.',
+                    '- Batch proposal writes as soon as the approved plan gives enough targeting and drafting context for one or more items.'
+                ]
+                : []),
+            '- When you have enough information, return only the final stage JSON object described in the task instructions below. Do not wrap that final stage JSON in another envelope.',
+            '- If the task truly cannot continue, return a terminal JSON envelope with `completionState="blocked"` or `completionState="needs_user_input"` and `isFinal=true`.',
+            ...(supportsProposalMutation
+                ? [
+                    'Mutation example:',
+                    JSON.stringify({
+                        completionState: 'needs_action',
+                        isFinal: false,
+                        action: {
+                            id: 'action-2',
+                            type: 'create_proposals',
+                            args: {
+                                proposals: [
+                                    {
+                                        itemId: 'plan-item-1',
+                                        action: 'edit',
+                                        familyId: 'family-1',
+                                        targetTitle: 'Example KB Article',
+                                        note: 'Update the article to reflect the approved workflow change.',
+                                        proposedHtml: '<h1>Example KB Article</h1><p>Updated content.</p>',
+                                        confidenceScore: 0.84,
+                                        relatedPbiIds: ['pbi-123']
+                                    }
+                                ]
+                            }
+                        }
+                    }, null, 2)
+                ]
+                : [])
+        ].join('\n');
+        return [
+            `You are running inside KB Vault as the ${session.role} in Direct mode.`,
+            `Workspace ID: ${session.workspaceId}`,
+            batchId ? `Batch ID: ${batchId}` : '',
+            `Locale: ${locale}`,
+            '',
+            directProtocol,
+            '',
+            explicitPrompt ? `Task instructions:\n${explicitPrompt}` : '',
+            '',
+            extraSections
+        ].filter(Boolean).join('\n');
+    }
+    if (taskPayload.task === 'edit_article' && Array.isArray(allowedActionTypes)) {
+        const directProtocol = [
+            ...directProtocolBase,
+            '- Return only the final article-edit JSON object with `updatedHtml` and `summary` when you have enough information.',
+            '- If you need more KB context, request it through a direct action instead of describing a tool plan.',
+            '- Do not wrap the final JSON in markdown fences.',
+            'Article-fetch example:',
+            JSON.stringify({
+                completionState: 'needs_action',
+                isFinal: false,
+                action: {
+                    id: 'action-article-1',
+                    type: 'get_article',
+                    args: { localeVariantId: typeof taskPayload.localeVariantId === 'string' ? taskPayload.localeVariantId : 'locale-variant-id' }
+                }
+            }, null, 2)
+        ].join('\n');
+        return [
+            'You are running inside KB Vault to edit one article revision in Direct mode.',
+            `Workspace ID: ${session.workspaceId}`,
+            `Locale: ${locale}`,
+            '',
+            directProtocol,
+            '',
+            explicitPrompt ? `Task instructions:\n${explicitPrompt}` : '',
+            '',
+            extraSections
+        ].filter(Boolean).join('\n');
+    }
+    if (taskPayload.task === 'assistant_chat' && Array.isArray(allowedActionTypes)) {
+        const directProtocol = [
+            ...directProtocolBase,
+            '- When you have enough information, return the normal final assistant JSON object requested in the task instructions below.',
+            '- If you need a read lookup, request it through one direct action instead of using tools.',
+            '- If the route allows confirmed live form edits, use `patch_form`, wait for the successful action result, then return an informational assistant response describing the confirmed change.',
+            '- Do not claim a working-state mutation succeeded unless the latest `action_result` reported `ok: true`.',
+            '- Do not wrap the final assistant JSON in markdown fences.',
+            session.directContext?.allowPatchForm
+                ? 'Patch-form example:\n'
+                    + JSON.stringify({
+                        completionState: 'needs_action',
+                        isFinal: false,
+                        action: {
+                            id: 'action-template-1',
+                            type: 'patch_form',
+                            args: {
+                                patch: {
+                                    toneRules: 'Lead with the direct answer, then add supporting detail.'
+                                }
+                            }
+                        }
+                    }, null, 2)
+                : ''
+        ].filter(Boolean).join('\n');
+        return [
+            'You are running inside KB Vault as a route-aware assistant in Direct mode.',
+            `Workspace ID: ${session.workspaceId}`,
+            `Locale: ${locale}`,
+            '',
+            directProtocol,
+            '',
+            explicitPrompt ? `Task instructions:\n${explicitPrompt}` : '',
+            '',
+            extraSections
+        ].filter(Boolean).join('\n');
+    }
+    return [
+        'You are running inside KB Vault in Direct mode.',
+        `Workspace ID: ${session.workspaceId}`,
+        batchId ? `Batch ID: ${batchId}` : '',
+        `Locale: ${locale}`,
+        '',
+        'Important constraints:',
+        '- Do not use MCP tools, kb CLI commands, shell commands, terminal commands, or filesystem exploration.',
+        '- Return a blocked JSON envelope explaining that this direct-mode route is not enabled for the current session.',
+        '',
+        explicitPrompt ? `Task instructions:\n${explicitPrompt}` : '',
+        '',
+        extraSections
+    ].filter(Boolean).join('\n');
 }
 function buildMcpTaskPrompt(session, taskPayload, extras) {
     const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
@@ -1909,6 +2144,7 @@ class CursorAcpRuntime {
             locale: input.locale,
             templatePackId: input.templatePackId,
             scope: input.scope,
+            directContext: input.directContext,
             createdAtUtc: now,
             updatedAtUtc: now
         };
@@ -1931,17 +2167,23 @@ class CursorAcpRuntime {
             selectedMode,
             workspaceKbAccessMode: workspaceKbAccessMode ?? selectedMode
         });
-        const [mcp, cli] = await Promise.all([
+        const [direct, mcp, cli] = await Promise.all([
+            this.getProviderHealth('direct', workspaceId),
             this.getProviderHealth('mcp'),
             this.getProviderHealth('cli', workspaceId)
         ]);
         const aggregatedIssues = Array.from(new Set([
+            ...(direct.issues ?? []),
             ...(mcp.issues ?? []),
             ...(cli.issues ?? []),
+            ...(!direct.ok && direct.message && !(direct.issues ?? []).includes(direct.message) ? [direct.message] : []),
             ...(!mcp.ok && mcp.message && !(mcp.issues ?? []).includes(mcp.message) ? [mcp.message] : []),
             ...(!cli.ok && cli.message && !(cli.issues ?? []).includes(cli.message) ? [cli.message] : [])
         ].filter(Boolean)));
-        const availableModes = [mcp, cli].filter((provider) => provider.ok).map((provider) => provider.mode);
+        const availableModes = shared_types_2.KB_ACCESS_MODES
+            .map((mode) => ({ mode, health: mode === 'direct' ? direct : mode === 'mcp' ? mcp : cli }))
+            .filter(({ health }) => health.ok)
+            .map(({ mode }) => mode);
         // If the selected mode is unavailable but the workspace preference is, flag an issue
         if (!availableModes.includes(selectedMode) && availableModes.length > 0) {
             aggregatedIssues.push(`Selected mode "${selectedMode}" is unavailable; available: ${availableModes.join(', ')}`);
@@ -1952,6 +2194,7 @@ class CursorAcpRuntime {
             workspaceKbAccessMode: workspaceKbAccessMode ?? selectedMode,
             selectedMode,
             providers: {
+                direct,
                 mcp,
                 cli
             },
@@ -1965,6 +2208,12 @@ class CursorAcpRuntime {
             availableModes,
             issues: aggregatedIssues,
             providers: {
+                direct: {
+                    ok: direct.ok,
+                    failureCode: direct.failureCode,
+                    message: direct.message,
+                    acpReachable: direct.acpReachable
+                },
                 mcp: {
                     ok: mcp.ok,
                     failureCode: mcp.failureCode,
@@ -2133,6 +2382,173 @@ class CursorAcpRuntime {
     async handleMcpJsonMessage(raw) {
         return this.mcpServer.handleJsonMessage(raw);
     }
+    shouldUseDirectBatchActionLoop(session) {
+        return (session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE) === 'direct'
+            && Boolean(getDirectBatchStageActionTypes(session));
+    }
+    shouldUseDirectActionLoop(session) {
+        return (session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE) === 'direct'
+            && Boolean(getDirectActionTypesForSession(session));
+    }
+    async runDirectActionLoop(session, taskPayload, emit, toolCalls, rawOutput, isCancelled, timeoutMs, startedAtMs) {
+        const executeDirectAction = this.runtimeOptions.executeDirectAction;
+        const originalPrompt = typeof taskPayload.prompt === 'string' ? taskPayload.prompt : '';
+        let nextPrompt = originalPrompt;
+        let turnCount = 0;
+        let recoveryCount = 0;
+        const repeatedActionDigests = new Map();
+        while (true) {
+            const initialResultPayload = await this.transit(session, {
+                ...taskPayload,
+                prompt: nextPrompt
+            }, emit, toolCalls, isCancelled, timeoutMs);
+            const settleWindow = session.type === 'batch_analysis'
+                ? getBatchAnalysisPromptSettleWindow(initialResultPayload, assemblePromptMessageText(this.promptMessageChunks.get(session.id)).trim())
+                : ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW;
+            const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
+            await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
+            const resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
+            const finalText = extractPromptResultText(resultPayload);
+            const actionEnvelope = parseDirectActionEnvelope(resultPayload);
+            if (!actionEnvelope) {
+                const terminalEnvelope = parseDirectTerminalEnvelope(resultPayload);
+                const canRecover = !terminalEnvelope
+                    && recoveryCount < DIRECT_PROTOCOL_RECOVERY_LIMIT
+                    && remainingWaitMs >= 5_000
+                    && looksLikeRecoverableDirectProtocolText(finalText);
+                if (canRecover) {
+                    recoveryCount += 1;
+                    rawOutput.push(`[direct protocol recovery ${recoveryCount}] ${String(finalText ?? '')}`);
+                    this.log('agent.runtime.direct_protocol_recovery', {
+                        workspaceId: session.workspaceId,
+                        sessionId: session.id,
+                        role: session.role,
+                        recoveryCount,
+                        finalText
+                    });
+                    nextPrompt = buildDirectRecoveryPrompt(session, nextPrompt, finalText, recoveryCount);
+                    continue;
+                }
+                return {
+                    resultPayload,
+                    finalText,
+                    terminalEnvelope: terminalEnvelope ?? undefined
+                };
+            }
+            recoveryCount = 0;
+            if (!executeDirectAction) {
+                const blocked = buildDirectBlockedResultEnvelope('Direct executor path is unavailable for this runtime session.');
+                return {
+                    resultPayload: buildSyntheticPromptResult(blocked),
+                    finalText: JSON.stringify(blocked),
+                    terminalEnvelope: blocked
+                };
+            }
+            turnCount += 1;
+            if (turnCount > DIRECT_ACTION_LOOP_MAX_TURNS) {
+                const blocked = buildDirectBlockedResultEnvelope(`Direct action loop exceeded ${DIRECT_ACTION_LOOP_MAX_TURNS} turns.`);
+                return {
+                    resultPayload: buildSyntheticPromptResult(blocked),
+                    finalText: JSON.stringify(blocked),
+                    terminalEnvelope: blocked
+                };
+            }
+            const actionDigest = `${actionEnvelope.action.type}:${stableStringify(actionEnvelope.action.args)}`;
+            const repeatCount = (repeatedActionDigests.get(actionDigest) ?? 0) + 1;
+            repeatedActionDigests.set(actionDigest, repeatCount);
+            if (repeatCount > DIRECT_ACTION_REPEAT_LIMIT) {
+                const blocked = buildDirectBlockedResultEnvelope(`Direct action loop repeated the same ${actionEnvelope.action.type} request too many times.`, {
+                    actionType: actionEnvelope.action.type,
+                    repeatCount
+                });
+                return {
+                    resultPayload: buildSyntheticPromptResult(blocked),
+                    finalText: JSON.stringify(blocked),
+                    terminalEnvelope: blocked
+                };
+            }
+            const requestedAtUtc = new Date().toISOString();
+            rawOutput.push(`[direct action request ${turnCount}] ${JSON.stringify(actionEnvelope.action)}`);
+            await this.appendTranscriptLine(session.id, 'system', 'direct_action_request', JSON.stringify(actionEnvelope.action));
+            await Promise.resolve(emit({
+                kind: 'tool_call',
+                data: {
+                    provider: 'direct',
+                    action: actionEnvelope.action
+                },
+                message: `direct_action:${actionEnvelope.action.type}`
+            }));
+            const execution = await executeDirectAction({
+                context: {
+                    workspaceId: session.workspaceId,
+                    batchId: session.batchId,
+                    sessionId: session.id,
+                    sessionType: session.type,
+                    sessionMode: session.mode,
+                    agentRole: session.role,
+                    locale: session.locale,
+                    scope: session.scope,
+                    directContext: session.directContext
+                },
+                action: actionEnvelope.action
+            });
+            const resultEnvelope = {
+                type: 'action_result',
+                actionId: execution.actionId,
+                ok: execution.ok,
+                ...(execution.ok ? { data: execution.data } : { error: execution.error ?? { message: 'Direct action failed' } })
+            };
+            const actionReason = execution.ok ? undefined : resultEnvelope.error?.message;
+            const auditEntry = {
+                workspaceId: session.workspaceId,
+                sessionId: session.id,
+                toolName: `direct.${actionEnvelope.action.type}`,
+                args: actionEnvelope.action.args,
+                calledAtUtc: requestedAtUtc,
+                allowed: execution.ok,
+                reason: actionReason
+            };
+            this.toolCallAudit.push(auditEntry);
+            toolCalls.push(auditEntry);
+            rawOutput.push(`[direct action result ${turnCount}] ${JSON.stringify(resultEnvelope)}`);
+            await this.appendTranscriptLine(session.id, 'system', 'direct_action_result', JSON.stringify(resultEnvelope));
+            await Promise.resolve(emit({
+                kind: 'tool_response',
+                data: {
+                    provider: 'direct',
+                    action: actionEnvelope.action,
+                    result: resultEnvelope
+                },
+                message: `direct_result:${actionEnvelope.action.type}`
+            }));
+            this.markSessionActivity(session.id);
+            if (execution.ok
+                && actionEnvelope.action.type === 'patch_form'
+                && session.directContext
+                && execution.data
+                && typeof execution.data === 'object'
+                && typeof execution.data.nextVersionToken === 'string') {
+                session.directContext = {
+                    ...session.directContext,
+                    workingStateVersionToken: String(execution.data.nextVersionToken)
+                };
+            }
+            if (isCancelled()) {
+                const canceledMessage = session.type === 'batch_analysis'
+                    ? 'Direct batch analysis was canceled.'
+                    : session.type === 'assistant_chat'
+                        ? 'Direct assistant turn was canceled.'
+                        : 'Direct article edit was canceled.';
+                const blocked = buildDirectBlockedResultEnvelope(canceledMessage);
+                return {
+                    resultPayload: buildSyntheticPromptResult(blocked),
+                    finalText: JSON.stringify(blocked),
+                    terminalEnvelope: blocked
+                };
+            }
+            nextPrompt = buildDirectContinuationPrompt(session, originalPrompt, resultEnvelope, turnCount);
+        }
+    }
     async runBatchAnalysis(request, emit, isCancelled) {
         const session = await this.resolveSession(request);
         const startedAtMs = Date.now();
@@ -2156,6 +2572,51 @@ class CursorAcpRuntime {
                 locale: request.locale,
                 templatePackId: request.templatePackId
             };
+            const streamEmit = (event) => {
+                rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+            };
+            if (this.shouldUseDirectBatchActionLoop(session)) {
+                const directLoopResult = await this.runDirectActionLoop(session, {
+                    ...baseTaskPayload,
+                    prompt: request.prompt
+                }, streamEmit, toolCalls, rawOutput, isCancelled, timeoutMs, startedAtMs);
+                const endedAt = new Date().toISOString();
+                const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
+                session.updatedAtUtc = endedAt;
+                session.status = 'idle';
+                if (directLoopResult.terminalEnvelope) {
+                    return {
+                        sessionId: session.id,
+                        acpSessionId,
+                        kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
+                        status: 'error',
+                        transcriptPath,
+                        rawOutput,
+                        resultPayload: directLoopResult.resultPayload,
+                        toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
+                        startedAtUtc: startedAt,
+                        endedAtUtc: endedAt,
+                        durationMs: Date.parse(endedAt) - startedAtMs,
+                        message: directLoopResult.terminalEnvelope.message
+                    };
+                }
+                return {
+                    sessionId: session.id,
+                    acpSessionId,
+                    kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
+                    status: isCancelled() ? 'canceled' : 'ok',
+                    transcriptPath,
+                    rawOutput,
+                    resultPayload: directLoopResult.resultPayload,
+                    finalText: directLoopResult.finalText,
+                    toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
+                    startedAtUtc: startedAt,
+                    endedAtUtc: endedAt,
+                    durationMs: Date.parse(endedAt) - startedAtMs,
+                    message: isCancelled() ? 'Run cancelled' : 'Completed'
+                };
+            }
             const structuredResultContract = this.getPromptStructuredResultContract(session, {
                 ...baseTaskPayload,
                 prompt: request.prompt
@@ -2169,10 +2630,7 @@ class CursorAcpRuntime {
                 const initialResultPayload = await this.transit(session, {
                     ...baseTaskPayload,
                     prompt: nextPrompt
-                }, (event) => {
-                    rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
-                    emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
-                }, toolCalls, isCancelled, timeoutMs);
+                }, streamEmit, toolCalls, isCancelled, timeoutMs);
                 const settleWindow = getBatchAnalysisPromptSettleWindow(initialResultPayload, assemblePromptMessageText(this.promptMessageChunks.get(session.id)).trim());
                 const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
                 await this.waitForSessionToSettle(session.id, settleWindow.idleMs, Math.min(settleWindow.maxWaitMs, remainingWaitMs), Math.min(settleWindow.minWaitMs, remainingWaitMs));
@@ -2261,7 +2719,8 @@ class CursorAcpRuntime {
     }
     async runArticleEdit(request, emit, isCancelled) {
         const session = await this.resolveSession(request);
-        const startedAt = new Date().toISOString();
+        const startedAtMs = Date.now();
+        const startedAt = new Date(startedAtMs).toISOString();
         const runId = (0, node_crypto_1.randomUUID)();
         const transcriptPath = await this.ensureTranscriptPath(session.id, runId);
         const toolCalls = [];
@@ -2272,17 +2731,40 @@ class CursorAcpRuntime {
             timeoutMs: request.timeoutMs ?? this.config.requestTimeoutMs
         });
         try {
-            const resultPayload = await this.transit(session, {
+            const streamEmit = (event) => {
+                rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+            };
+            const taskPayload = {
                 task: 'edit_article',
                 localeVariantId: request.localeVariantId,
                 prompt: request.prompt,
                 locale: request.locale
-            }, (event) => {
-                rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
-                emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
-            }, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs);
+            };
+            const directLoopResult = this.shouldUseDirectActionLoop(session)
+                ? await this.runDirectActionLoop(session, taskPayload, streamEmit, toolCalls, rawOutput, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs, startedAtMs)
+                : null;
+            const resultPayload = directLoopResult
+                ? directLoopResult.resultPayload
+                : await this.transit(session, taskPayload, streamEmit, toolCalls, isCancelled, request.timeoutMs ?? this.config.requestTimeoutMs);
             const endedAt = new Date().toISOString();
             const acpSessionId = this.cursorSessionIds.get(session.id)?.acpSessionId;
+            if (directLoopResult?.terminalEnvelope) {
+                return {
+                    sessionId: session.id,
+                    acpSessionId,
+                    kbAccessMode: session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
+                    status: 'error',
+                    transcriptPath,
+                    rawOutput,
+                    resultPayload,
+                    toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
+                    startedAtUtc: startedAt,
+                    endedAtUtc: endedAt,
+                    durationMs: Date.parse(endedAt) - startedAtMs,
+                    message: directLoopResult.terminalEnvelope.message
+                };
+            }
             return {
                 sessionId: session.id,
                 acpSessionId,
@@ -2294,7 +2776,7 @@ class CursorAcpRuntime {
                 toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
-                durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+                durationMs: Date.parse(endedAt) - startedAtMs,
                 message: isCancelled() ? 'Run cancelled' : 'Completed'
             };
         }
@@ -2317,11 +2799,12 @@ class CursorAcpRuntime {
                 toolCalls: this.populateRunToolCalls(toolCalls, session.id, request.workspaceId),
                 startedAtUtc: startedAt,
                 endedAtUtc: endedAt,
-                durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+                durationMs: Date.parse(endedAt) - startedAtMs,
                 message: error instanceof Error ? error.message : String(error)
             };
         }
         finally {
+            this.cleanupPromptState(session.id);
             session.status = 'idle';
             session.updatedAtUtc = new Date().toISOString();
             this.log('agent.runtime.article_edit_complete', {
@@ -2353,18 +2836,27 @@ class CursorAcpRuntime {
             let autoContinueCount = 0;
             let nextPrompt = request.prompt;
             const promptSeed = stripAssistantChatContinuation(request.prompt);
+            const useDirectActionLoop = this.shouldUseDirectActionLoop(session);
+            const streamEmit = (event) => {
+                rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
+                emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
+            };
             while (true) {
-                let initialResultPayload;
+                let directLoopResult = null;
+                let transitResultPayload = undefined;
                 try {
-                    initialResultPayload = await this.transit(session, {
+                    const taskPayload = {
                         task: 'assistant_chat',
                         localeVariantId: request.localeVariantId,
                         prompt: nextPrompt,
                         locale: request.locale
-                    }, (event) => {
-                        rawOutput.push(event.message ?? JSON.stringify(event.data ?? {}));
-                        emit({ sessionId: session.id, kind: event.kind, data: event.data, message: event.message, atUtc: new Date().toISOString() });
-                    }, toolCalls, isCancelled, timeoutMs);
+                    };
+                    if (useDirectActionLoop) {
+                        directLoopResult = await this.runDirectActionLoop(session, taskPayload, streamEmit, toolCalls, rawOutput, isCancelled, timeoutMs, startedAtMs);
+                    }
+                    else {
+                        transitResultPayload = await this.transit(session, taskPayload, streamEmit, toolCalls, isCancelled, timeoutMs);
+                    }
                 }
                 catch (error) {
                     const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
@@ -2389,13 +2881,21 @@ class CursorAcpRuntime {
                     });
                     continue;
                 }
-                const settleWindow = ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW;
-                await this.waitForSessionToSettle(session.id, settleWindow.idleMs, settleWindow.maxWaitMs, settleWindow.minWaitMs);
-                resultPayload = this.finalizePromptResult(session.id, initialResultPayload);
+                if (useDirectActionLoop && !directLoopResult) {
+                    throw new Error('Assistant chat direct loop did not produce a result');
+                }
+                if (!useDirectActionLoop) {
+                    const settleWindow = ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW;
+                    await this.waitForSessionToSettle(session.id, settleWindow.idleMs, settleWindow.maxWaitMs, settleWindow.minWaitMs);
+                    resultPayload = this.finalizePromptResult(session.id, transitResultPayload);
+                }
+                else {
+                    resultPayload = directLoopResult.resultPayload;
+                }
                 const completion = extractAssistantCompletionContract(resultPayload);
                 completionState = completion.completionState;
                 isFinal = completion.isFinal;
-                const resultText = extractPromptResultText(resultPayload);
+                const resultText = directLoopResult?.finalText ?? extractPromptResultText(resultPayload);
                 const remainingWaitMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
                 const canAutoContinue = !isCancelled()
                     && autoContinueCount < ASSISTANT_CHAT_AUTO_CONTINUE_LIMIT
@@ -2624,6 +3124,7 @@ class CursorAcpRuntime {
             if (!input.workspaceId) {
                 throw new Error('workspaceId is required');
             }
+            const directContext = 'directContext' in input ? input.directContext : undefined;
             const createRequest = {
                 workspaceId: input.workspaceId,
                 kbAccessMode: input.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE,
@@ -2633,7 +3134,15 @@ class CursorAcpRuntime {
                 batchId: 'batchId' in input ? input.batchId : undefined,
                 locale: input.locale,
                 templatePackId: 'templatePackId' in input ? input.templatePackId : undefined,
-                scope: 'localeVariantScope' in input && input.localeVariantScope ? { localeVariantIds: input.localeVariantScope } : undefined
+                scope: 'localeVariantScope' in input && input.localeVariantScope
+                    ? { localeVariantIds: input.localeVariantScope }
+                    : directContext?.localeVariantIds?.length || directContext?.familyIds?.length
+                        ? {
+                            ...(directContext.localeVariantIds?.length ? { localeVariantIds: directContext.localeVariantIds } : {}),
+                            ...(directContext.familyIds?.length ? { familyIds: directContext.familyIds } : {})
+                        }
+                        : undefined,
+                directContext
             };
             session = this.createSession(createRequest);
         }
@@ -2641,6 +3150,7 @@ class CursorAcpRuntime {
             let needsReset = sessionReusePolicy === 'reset_acp';
             const previousKbAccessMode = session.kbAccessMode ?? DEFAULT_AGENT_ACCESS_MODE;
             const previousSessionMode = session.mode;
+            const directContext = 'directContext' in input ? input.directContext : undefined;
             if (input.kbAccessMode && input.kbAccessMode !== session.kbAccessMode) {
                 session.kbAccessMode = input.kbAccessMode;
             }
@@ -2665,6 +3175,16 @@ class CursorAcpRuntime {
             }
             if ('localeVariantScope' in input && input.localeVariantScope?.length) {
                 session.scope = { ...(session.scope ?? {}), localeVariantIds: input.localeVariantScope };
+            }
+            if (directContext) {
+                session.directContext = directContext;
+                if (directContext.localeVariantIds?.length || directContext.familyIds?.length) {
+                    session.scope = {
+                        ...(session.scope ?? {}),
+                        ...(directContext.localeVariantIds?.length ? { localeVariantIds: directContext.localeVariantIds } : {}),
+                        ...(directContext.familyIds?.length ? { familyIds: directContext.familyIds } : {})
+                    };
+                }
             }
             if (needsReset) {
                 await this.resetCursorSession(session.id);
@@ -2939,7 +3459,9 @@ class CursorAcpRuntime {
                     this.auditedAssistantToolCallIds.set(localSessionId, recordedToolCallIds);
                     const policy = sessionInfo.mode === 'cli'
                         ? this.evaluateCliToolPolicy(assistantAuditLabel, params.update.kind, params.update.rawInput, params.update.rawOutput)
-                        : this.evaluateMcpToolPolicy(assistantAuditLabel, params.update.kind, params.update.rawInput, params.update.rawOutput);
+                        : sessionInfo.mode === 'direct'
+                            ? this.evaluateDirectToolPolicy(assistantAuditLabel, params.update.kind, params.update.rawInput, params.update.rawOutput)
+                            : this.evaluateMcpToolPolicy(assistantAuditLabel, params.update.kind, params.update.rawInput, params.update.rawOutput);
                     this.toolCallAudit.push({
                         workspaceId: session.workspaceId,
                         sessionId: localSessionId,
@@ -2950,7 +3472,11 @@ class CursorAcpRuntime {
                         reason: policy.reason
                     });
                     if (!policy.allowed && typeof params.sessionId === 'string') {
-                        const modeLabel = sessionInfo.mode === 'cli' ? 'CLI mode' : 'MCP mode';
+                        const modeLabel = sessionInfo.mode === 'cli'
+                            ? 'CLI mode'
+                            : sessionInfo.mode === 'direct'
+                                ? 'Direct mode'
+                                : 'MCP mode';
                         const violationReason = `${modeLabel} blocked illegal tool call "${policy.auditedToolName}": ${policy.reason}`;
                         this.log(`agent.runtime.${sessionInfo.mode}_tool_policy_violation`, {
                             sessionId: localSessionId,
@@ -3295,6 +3821,59 @@ class CursorAcpRuntime {
             reason: 'MCP mode only allows direct KB Vault MCP tools'
         };
     }
+    evaluateDirectToolPolicy(toolName, kind, rawInput, rawOutput) {
+        const normalizedToolName = normalizeAssistantToolPolicyName(toolName);
+        const normalizedKind = normalizeAssistantToolPolicyName(kind) ?? 'unknown';
+        const command = extractCliToolCommand(rawInput) ?? extractCliToolCommandFromRawOutput(rawOutput);
+        const kbCommandName = extractKbCliCommandName(toolName) ?? extractKbCliCommandName(command);
+        const allowedToolName = (normalizedToolName && ALLOWED_MCP_TOOL_NAMES.has(normalizedToolName) ? normalizedToolName : undefined)
+            ?? (ALLOWED_MCP_TOOL_NAMES.has(normalizedKind) ? normalizedKind : undefined);
+        const auditedToolName = allowedToolName ?? (kbCommandName ? `kb ${kbCommandName}` : toolName);
+        if (allowedToolName) {
+            return {
+                auditedToolName,
+                allowed: false,
+                reason: 'Direct mode forbids ACP tool usage; return a needs_action envelope instead of calling KB tools'
+            };
+        }
+        if (kbCommandName || looksLikeKbCliShellInvocation(toolName) || looksLikeKbCliShellInvocation(command)) {
+            return {
+                auditedToolName,
+                allowed: false,
+                reason: 'Direct mode forbids kb CLI commands; return a needs_action envelope instead'
+            };
+        }
+        if (isCliTerminalToolName(normalizedToolName)
+            || isCliTerminalToolName(normalizedKind)
+            || normalizedKind === 'execute') {
+            return {
+                auditedToolName,
+                allowed: false,
+                reason: 'Direct mode forbids terminal and shell tools'
+            };
+        }
+        if ((normalizedToolName && BLOCKED_MCP_RESOURCE_TOOL_NAMES.has(normalizedToolName))
+            || BLOCKED_MCP_RESOURCE_TOOL_NAMES.has(normalizedKind)) {
+            return {
+                auditedToolName,
+                allowed: false,
+                reason: 'Direct mode forbids MCP resource discovery'
+            };
+        }
+        if ((normalizedToolName && BLOCKED_GENERIC_TOOL_NAMES.has(normalizedToolName))
+            || BLOCKED_GENERIC_TOOL_NAMES.has(normalizedKind)) {
+            return {
+                auditedToolName,
+                allowed: false,
+                reason: 'Direct mode forbids generic ACP tools'
+            };
+        }
+        return {
+            auditedToolName,
+            allowed: false,
+            reason: 'Direct mode does not allow ACP tool calls; use needs_action envelopes only'
+        };
+    }
     parseCliLoopbackToolResult(updateRecord) {
         if (updateRecord.sessionUpdate !== 'tool_call_update' || updateRecord.status !== 'completed') {
             return null;
@@ -3421,6 +4000,20 @@ class CursorAcpRuntime {
         return buildBridgeMcpServerConfig();
     }
     getProvider(mode) {
+        if (mode === 'direct') {
+            return {
+                mode: 'direct',
+                provider: 'direct',
+                terminalEnabled: false,
+                buildSessionCreateParams: (sessionMode) => ({
+                    cwd: this.config.acpCwd,
+                    mcpServers: [],
+                    config: { mode: resolveProviderSessionMode('direct', sessionMode) }
+                }),
+                getPromptTaskBuilder: (session, taskPayload, extras) => buildDirectTaskPrompt(session, taskPayload, extras),
+                getHealth: (workspaceId) => this.getDirectHealth(workspaceId)
+            };
+        }
         if (mode === 'cli') {
             return {
                 mode: 'cli',
@@ -3458,6 +4051,53 @@ class CursorAcpRuntime {
     }
     async getProviderHealth(mode, workspaceId) {
         return this.getProvider(mode).getHealth(workspaceId);
+    }
+    async getDirectHealth(workspaceId) {
+        const executorHealth = await this.runtimeOptions.getDirectHealth?.(workspaceId).catch((error) => ({
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: error instanceof Error ? error.message : String(error),
+            issues: [error instanceof Error ? error.message : String(error)]
+        })) ?? {
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: 'Direct executor path is unavailable',
+            issues: ['Direct executor path is unavailable']
+        };
+        const issues = new Set(executorHealth.issues ?? []);
+        const cursorInstalled = this.isCursorAvailable('direct');
+        if (!cursorInstalled) {
+            issues.add('Cursor binary not found');
+        }
+        const acpReachable = cursorInstalled ? await this.canReachCursor('direct', workspaceId) : false;
+        if (cursorInstalled && !acpReachable) {
+            issues.add('Cursor ACP command did not initialize');
+        }
+        const ok = Boolean(executorHealth.ok) && cursorInstalled && acpReachable;
+        const result = {
+            mode: 'direct',
+            provider: 'direct',
+            ok,
+            acpReachable,
+            binaryPath: cursorInstalled ? this.resolveBinary('direct') : undefined,
+            message: ok
+                ? executorHealth.message ?? 'Direct access ready'
+                : executorHealth.message && !(executorHealth.issues ?? []).includes(executorHealth.message)
+                    ? executorHealth.message
+                    : Array.from(issues)[0] ?? 'Direct access unavailable',
+            issues: Array.from(issues)
+        };
+        this.log('agent.runtime.direct_health_result', {
+            workspaceId,
+            ok: result.ok,
+            acpReachable: result.acpReachable,
+            binaryPath: result.binaryPath,
+            message: result.message,
+            issues: result.issues
+        });
+        return result;
     }
     async getMcpHealth(workspaceId) {
         const issues = new Set();
@@ -4176,7 +4816,7 @@ function looksLikePromptStructuredResultContractText(value, contract) {
     }
     switch (contract) {
         case 'batch_planner':
-            return trimmed.includes('"coverage"') || trimmed.includes('"items"') || trimmed.includes('"openQuestions"');
+            return trimmed.includes('"coverage"') || trimmed.includes('"items"') || trimmed.includes('"questions"') || trimmed.includes('"openQuestions"');
         case 'batch_plan_review':
             return trimmed.includes('"verdict"') || trimmed.includes('"delta"') || trimmed.includes('"requestedChanges"');
         case 'batch_worker':
@@ -4245,6 +4885,250 @@ function shouldAutoContinueBatchAnalysisTurn(params) {
     }
     return false;
 }
+function extractDirectProtocolObject(result) {
+    const streamedText = result && typeof result === 'object' && typeof result.streamedText === 'string'
+        ? String(result.streamedText)
+        : '';
+    const explicitText = extractPromptResultText(result) ?? '';
+    const candidates = [explicitText, streamedText].map((value) => value.trim()).filter(Boolean);
+    for (const candidate of candidates) {
+        const parsed = extractLargestBalancedJsonObject(candidate);
+        if (parsed) {
+            return parsed;
+        }
+    }
+    return null;
+}
+function parseDirectActionEnvelope(result) {
+    const parsed = extractDirectProtocolObject(result);
+    if (!parsed || parsed.completionState !== 'needs_action' || parsed.isFinal !== false) {
+        return null;
+    }
+    const action = parsed.action;
+    if (!action || typeof action !== 'object' || Array.isArray(action)) {
+        return null;
+    }
+    const request = action;
+    if (typeof request.id !== 'string'
+        || typeof request.type !== 'string'
+        || !shared_types_2.DIRECT_ACTION_TYPES.includes(request.type)
+        || !request.args
+        || typeof request.args !== 'object'
+        || Array.isArray(request.args)) {
+        return null;
+    }
+    return {
+        completionState: 'needs_action',
+        isFinal: false,
+        action: {
+            id: request.id,
+            type: request.type,
+            args: request.args
+        }
+    };
+}
+function parseDirectTerminalEnvelope(result) {
+    const parsed = extractDirectProtocolObject(result);
+    if (!parsed || parsed.isFinal !== true) {
+        return null;
+    }
+    if (parsed.completionState !== 'blocked'
+        && parsed.completionState !== 'needs_user_input'
+        && parsed.completionState !== 'errored') {
+        return null;
+    }
+    if (typeof parsed.message !== 'string' || !parsed.message.trim()) {
+        return null;
+    }
+    return {
+        completionState: parsed.completionState,
+        isFinal: true,
+        message: parsed.message.trim(),
+        details: parsed.details
+    };
+}
+function compactDirectActionPromptValue(value, depth = 0) {
+    if (value == null || typeof value === 'number' || typeof value === 'boolean') {
+        return value;
+    }
+    if (typeof value === 'string') {
+        if (value.length <= DIRECT_ACTION_RESULT_MAX_STRING_CHARS) {
+            return value;
+        }
+        return `${value.slice(0, DIRECT_ACTION_RESULT_MAX_STRING_CHARS)}… [truncated ${value.length - DIRECT_ACTION_RESULT_MAX_STRING_CHARS} chars]`;
+    }
+    if (depth >= DIRECT_ACTION_RESULT_MAX_DEPTH) {
+        if (Array.isArray(value)) {
+            return `[array truncated at depth ${DIRECT_ACTION_RESULT_MAX_DEPTH}; ${value.length} items]`;
+        }
+        return '[object truncated for prompt budget]';
+    }
+    if (Array.isArray(value)) {
+        const limited = value
+            .slice(0, DIRECT_ACTION_RESULT_MAX_ARRAY_ITEMS)
+            .map((entry) => compactDirectActionPromptValue(entry, depth + 1));
+        if (value.length > DIRECT_ACTION_RESULT_MAX_ARRAY_ITEMS) {
+            limited.push({
+                _truncatedItems: value.length - DIRECT_ACTION_RESULT_MAX_ARRAY_ITEMS
+            });
+        }
+        return limited;
+    }
+    if (typeof value === 'object') {
+        const entries = Object.entries(value);
+        const limitedEntries = entries.slice(0, DIRECT_ACTION_RESULT_MAX_OBJECT_KEYS);
+        const compacted = Object.fromEntries(limitedEntries.map(([key, entry]) => [key, compactDirectActionPromptValue(entry, depth + 1)]));
+        if (entries.length > DIRECT_ACTION_RESULT_MAX_OBJECT_KEYS) {
+            compacted._truncatedKeys = entries.length - DIRECT_ACTION_RESULT_MAX_OBJECT_KEYS;
+        }
+        return compacted;
+    }
+    return String(value);
+}
+function serializeDirectActionResultForPrompt(actionResult) {
+    const serialized = JSON.stringify(actionResult);
+    if (serialized.length <= DIRECT_ACTION_RESULT_MAX_PROMPT_CHARS) {
+        return serialized;
+    }
+    const compacted = compactDirectActionPromptValue(actionResult);
+    if (compacted && typeof compacted === 'object') {
+        compacted._promptCompacted = true;
+        compacted._promptCompactionReason = `Action result exceeded ${DIRECT_ACTION_RESULT_MAX_PROMPT_CHARS} characters`;
+    }
+    return JSON.stringify(compacted);
+}
+function stripDirectContinuation(prompt) {
+    const normalized = prompt?.trim() ?? '';
+    if (!normalized) {
+        return '';
+    }
+    const markerIndex = normalized.indexOf(DIRECT_CONTINUATION_MARKER);
+    return markerIndex >= 0 ? normalized.slice(0, markerIndex).trim() : normalized;
+}
+function buildDirectContinuationPrompt(session, prompt, actionResult, turnCount) {
+    const includeBasePrompt = turnCount <= DIRECT_CONTINUATION_FULL_PROMPT_TURNS;
+    const basePrompt = includeBasePrompt
+        ? session.type === 'batch_analysis'
+            ? stripBatchAnalysisContinuation(prompt)
+            : stripDirectContinuation(prompt)
+        : '';
+    const sessionLabel = session.type === 'batch_analysis'
+        ? `the same ${(session.role?.trim() ? session.role.trim() : 'current')} batch-analysis stage`
+        : session.type === 'assistant_chat'
+            ? 'the same KB Vault assistant turn'
+            : 'the same article-edit turn';
+    const finalContractLine = session.type === 'assistant_chat'
+        ? 'Return either one new `needs_action` JSON envelope or the complete final assistant JSON object now.'
+        : session.type === 'article_edit'
+            ? 'Return either one new `needs_action` JSON envelope or the complete final article-edit JSON object with `updatedHtml` and `summary` now.'
+            : 'Return either one new `needs_action` JSON envelope or the complete final stage JSON object now.';
+    const workerExecutionReminder = session.type === 'batch_analysis' && session.role === 'worker'
+        ? [
+            'Approved plan targets already present in the prompt remain authoritative unless a read or write failure proves otherwise.',
+            'For approved edit/retire items, `create_proposals` may use `localeVariantId`, `familyId`, or `targetTitle`; for creates, use `targetTitle` directly.',
+            'If you already have a usable target, stop researching and issue `create_proposals` now. Batch multiple approved items together when possible.'
+        ]
+        : [];
+    return [
+        basePrompt,
+        [
+            DIRECT_CONTINUATION_MARKER,
+            `You are still in ${sessionLabel} in Direct mode.`,
+            `The app executed direct action turn ${turnCount}.`,
+            'Continue in the same ACP session.',
+            includeBasePrompt
+                ? 'Reuse all prior context and action results already gathered.'
+                : 'Reuse the original task instructions and prior action results already present earlier in this ACP session.',
+            'Do not repeat an identical direct action unless the earlier result was an explicit transient failure and retrying is necessary.',
+            ...workerExecutionReminder,
+            finalContractLine,
+            'Do not add narration, markdown fences, or progress prose.',
+            'Latest action result JSON:',
+            serializeDirectActionResultForPrompt(actionResult)
+        ].join('\n')
+    ].filter(Boolean).join('\n\n');
+}
+function buildDirectRecoveryPrompt(session, prompt, partialText, recoveryAttempt) {
+    const includeBasePrompt = recoveryAttempt <= 1;
+    const basePrompt = includeBasePrompt
+        ? session.type === 'batch_analysis'
+            ? stripBatchAnalysisContinuation(prompt)
+            : stripDirectContinuation(prompt)
+        : '';
+    const sessionLabel = session.type === 'batch_analysis'
+        ? `the same ${(session.role?.trim() ? session.role.trim() : 'current')} batch-analysis stage`
+        : session.type === 'assistant_chat'
+            ? 'the same KB Vault assistant turn'
+            : 'the same article-edit turn';
+    const finalContractLine = session.type === 'assistant_chat'
+        ? 'Return either one complete `needs_action` JSON envelope or the complete final assistant JSON object now.'
+        : session.type === 'article_edit'
+            ? 'Return either one complete `needs_action` JSON envelope or the complete final article-edit JSON object with `updatedHtml` and `summary` now.'
+            : 'Return either one complete `needs_action` JSON envelope or the complete final stage JSON object now.';
+    const partialSnippet = (partialText?.trim() ?? '').slice(0, 6_000);
+    const workerExecutionReminder = session.type === 'batch_analysis' && session.role === 'worker'
+        ? [
+            'Approved plan targets already present in the prompt remain authoritative unless a read or write failure proves otherwise.',
+            'For approved edit/retire items, `create_proposals` may use `localeVariantId`, `familyId`, or `targetTitle`; for creates, use `targetTitle` directly.',
+            'If you already have a usable target, resend or issue `create_proposals` now instead of spending more turns on lookup.'
+        ]
+        : [];
+    return [
+        basePrompt,
+        [
+            DIRECT_RECOVERY_MARKER,
+            `You are still in ${sessionLabel} in Direct mode.`,
+            'Your previous reply was incomplete or malformed JSON, so the app could not parse or execute it.',
+            'Continue in the same ACP session.',
+            includeBasePrompt
+                ? 'Reuse the task instructions and any prior session context already gathered.'
+                : 'Reuse the earlier task instructions and prior session context already present earlier in this ACP session.',
+            ...workerExecutionReminder,
+            finalContractLine,
+            'Return exactly one complete JSON object.',
+            'Do not add narration, markdown fences, or progress prose.',
+            session.type === 'batch_analysis'
+                ? 'If you were issuing `create_proposals`, resend the full complete `needs_action` envelope with the complete proposal payload.'
+                : '',
+            partialSnippet ? `Previous partial output:\n${partialSnippet}` : 'Previous partial output was empty.'
+        ].filter(Boolean).join('\n')
+    ].filter(Boolean).join('\n\n');
+}
+function looksLikeRecoverableDirectProtocolText(value) {
+    const trimmed = value?.trim() ?? '';
+    if (!trimmed) {
+        return false;
+    }
+    if (extractLargestBalancedJsonObject(trimmed)) {
+        return false;
+    }
+    if (trimmed.startsWith('{') || trimmed.startsWith('```json')) {
+        return true;
+    }
+    const normalized = trimmed.toLowerCase();
+    return (normalized.includes('"completionstate"')
+        || normalized.includes('"isfinal"')
+        || normalized.includes('"action"')
+        || normalized.includes('"summary"')
+        || normalized.includes('"updatedhtml"')
+        || normalized.includes('"response"'));
+}
+function buildDirectBlockedResultEnvelope(message, details) {
+    return {
+        completionState: 'blocked',
+        isFinal: true,
+        message,
+        ...(details !== undefined ? { details } : {})
+    };
+}
+function buildSyntheticPromptResult(payload) {
+    const text = JSON.stringify(payload);
+    return {
+        finalText: text,
+        text,
+        content: [{ type: 'text', text }]
+    };
+}
 function scorePromptFinalTextCandidate(value) {
     const trimmed = value.trim();
     if (!trimmed) {
@@ -4296,7 +5180,7 @@ const ASSISTANT_CHAT_PROMPT_SETTLE_WINDOW = {
 const ASSISTANT_CHAT_RECOVERY_RETRY_LIMIT = 2;
 const ASSISTANT_CHAT_CONTINUATION_MARKER = 'Continuation instructions:';
 function buildAssistantChatToolRecoveryPrompt(mode, policyError) {
-    const providerLabel = mode === 'mcp' ? 'MCP mode' : 'CLI mode';
+    const providerLabel = mode === 'mcp' ? 'MCP mode' : mode === 'cli' ? 'CLI mode' : 'Direct mode';
     const violationText = policyError?.trim()
         ? `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}: ${policyError.trim()}.`
         : `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}.`;
@@ -4313,6 +5197,17 @@ function buildAssistantChatToolRecoveryPrompt(mode, policyError) {
             'Do not claim that KB Vault MCP tools are unavailable just because they were not shown in a generic tool list.',
             'Your job is to finish answering the user\'s question, not to explore the environment.',
             'Do the research now and return the final user-facing answer in this same turn.',
+            'Do not send a progress update.'
+        ].join(' ');
+    }
+    if (mode === 'direct') {
+        return [
+            'Continue the same user request using the existing session context.',
+            violationText,
+            'Do not try that illegal operation again.',
+            'Direct mode does not allow ACP tool calls, MCP tools, kb CLI commands, Shell, Terminal, list_mcp_resources, fetch_mcp_resource, Read File, grep, codebase search, or filesystem exploration.',
+            'If you already gathered enough context in this session, answer now.',
+            'If you still need KB or app context, return exactly one `needs_action` direct-action JSON envelope instead of calling a tool.',
             'Do not send a progress update.'
         ].join(' ');
     }

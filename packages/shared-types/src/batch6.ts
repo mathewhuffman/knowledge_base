@@ -11,6 +11,7 @@ export type BatchAnalysisStageStatus =
   | 'planning'
   | 'plan_reviewing'
   | 'plan_revision'
+  | 'awaiting_user_input'
   | 'building'
   | 'worker_discovery_review'
   | 'final_reviewing'
@@ -22,6 +23,7 @@ export type BatchAnalysisStageStatus =
 export type BatchAnalysisArtifactVerdict =
   | 'approved'
   | 'needs_revision'
+  | 'needs_user_input'
   | 'needs_rework'
   | 'rejected'
   | 'blocked'
@@ -29,9 +31,33 @@ export type BatchAnalysisArtifactVerdict =
 export type BatchPlanItemAction = 'create' | 'edit' | 'retire' | 'no_impact';
 export type BatchPlanTargetType = 'article' | 'article_family' | 'article_set' | 'new_article' | 'unknown';
 export type BatchPlanExecutionStatus = 'pending' | 'approved' | 'executed' | 'blocked' | 'rejected';
-export type BatchAnalysisIterationStatus = 'running' | 'completed' | 'failed' | 'needs_human_review' | 'canceled';
+export type BatchAnalysisIterationStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'needs_user_input'
+  | 'needs_human_review'
+  | 'canceled';
 
 export type AgentSessionStatus = 'starting' | 'running' | 'idle' | 'closed' | 'error';
+
+export const MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 5;
+export const MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 180;
+export const DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 10;
+
+export function normalizeBatchAnalysisWorkerStageBudgetMinutes(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') {
+    return undefined;
+  }
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return undefined;
+  }
+  return Math.min(
+    MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
+    Math.max(MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, Math.round(parsed))
+  );
+}
 
 export enum AgentCommand {
   ANALYSIS_RUN = 'agent.analysis.run',
@@ -53,8 +79,19 @@ export interface AgentSessionRecord {
     localeVariantIds?: string[];
     familyIds?: string[];
   };
+  directContext?: AgentDirectSessionContext;
   createdAtUtc: string;
   updatedAtUtc: string;
+}
+
+export interface AgentDirectSessionContext {
+  route?: AppRoute;
+  entityType?: AppWorkingStateEntityType;
+  entityId?: string;
+  workingStateVersionToken?: string;
+  allowPatchForm?: boolean;
+  localeVariantIds?: string[];
+  familyIds?: string[];
 }
 
 export interface AgentSessionCreateRequest {
@@ -70,6 +107,7 @@ export interface AgentSessionCreateRequest {
     localeVariantIds?: string[];
     familyIds?: string[];
   };
+  directContext?: AgentDirectSessionContext;
 }
 
 export interface AgentSessionCloseRequest {
@@ -132,6 +170,7 @@ export interface AgentAnalysisRunRequest {
   templatePackId?: string;
   localeVariantScope?: string[];
   timeoutMs?: number;
+  workerStageBudgetMinutes?: number;
 }
 
 export interface AgentArticleEditRunRequest {
@@ -146,6 +185,7 @@ export interface AgentArticleEditRunRequest {
   agentRole?: BatchAnalysisAgentRole;
   prompt?: string;
   timeoutMs?: number;
+  directContext?: AgentDirectSessionContext;
 }
 
 export interface AgentAssistantChatRunRequest {
@@ -160,6 +200,7 @@ export interface AgentAssistantChatRunRequest {
   agentRole?: BatchAnalysisAgentRole;
   prompt?: string;
   timeoutMs?: number;
+  directContext?: AgentDirectSessionContext;
 }
 
 export enum CliHealthFailure {
@@ -206,10 +247,7 @@ export interface AgentHealthCheckResponse {
   workspaceId?: string;
   workspaceKbAccessMode?: KbAccessMode;
   selectedMode: KbAccessMode;
-  providers: {
-    mcp: KbAccessHealth;
-    cli: KbAccessHealth;
-  };
+  providers: Record<KbAccessMode, KbAccessHealth>;
   issues: string[];
   availableModes: KbAccessMode[];
 }
@@ -337,6 +375,48 @@ export interface BatchPlanCoverage {
   notes?: string;
 }
 
+export type BatchAnalysisQuestionStatus = 'pending' | 'answered' | 'resolved' | 'dismissed';
+export type BatchAnalysisQuestionSetStatus = 'waiting' | 'ready_to_resume' | 'resuming' | 'resolved' | 'canceled';
+
+export interface BatchAnalysisQuestion {
+  id: string;
+  questionSetId?: string;
+  prompt: string;
+  reason: string;
+  requiresUserInput: boolean;
+  linkedPbiIds: string[];
+  linkedPlanItemIds: string[];
+  linkedDiscoveryIds: string[];
+  answer?: string;
+  status: BatchAnalysisQuestionStatus;
+  createdAtUtc: string;
+  answeredAtUtc?: string;
+}
+
+export interface BatchAnalysisQuestionAnswer {
+  questionId: string;
+  prompt: string;
+  answer: string;
+  answeredAtUtc?: string;
+}
+
+export interface BatchAnalysisQuestionSet {
+  id: string;
+  workspaceId: string;
+  batchId: string;
+  iterationId: string;
+  sourceStage: BatchAnalysisStageStatus;
+  sourceRole: BatchAnalysisAgentRole;
+  resumeStage: Extract<BatchAnalysisStageStatus, 'planning' | 'plan_revision' | 'worker_discovery_review'>;
+  resumeRole: Extract<BatchAnalysisAgentRole, 'planner' | 'plan-reviewer'>;
+  status: BatchAnalysisQuestionSetStatus;
+  summary: string;
+  planId?: string;
+  reviewId?: string;
+  createdAtUtc: string;
+  updatedAtUtc: string;
+}
+
 export interface BatchPlanItem {
   planItemId: string;
   pbiIds: string[];
@@ -365,6 +445,7 @@ export interface BatchAnalysisPlan {
   summary: string;
   coverage: BatchPlanCoverage[];
   items: BatchPlanItem[];
+  questions?: BatchAnalysisQuestion[];
   openQuestions: string[];
   createdAtUtc: string;
   supersedesPlanId?: string;
@@ -402,6 +483,7 @@ export interface BatchPlanReview {
   foundAdditionalArticleWork: boolean;
   underScopedKbImpact: boolean;
   delta?: BatchPlanReviewDelta;
+  questions?: BatchAnalysisQuestion[];
   createdAtUtc: string;
   planId?: string;
   agentModelId?: string;
@@ -460,7 +542,7 @@ export interface BatchPlanAmendment {
   sourceDiscoveryIds: string[];
   proposedPlanId?: string;
   reviewId?: string;
-  status: 'pending' | 'approved' | 'rejected' | 'needs_human_review';
+  status: 'pending' | 'approved' | 'rejected' | 'needs_user_input' | 'needs_human_review';
   summary: string;
   createdAtUtc: string;
   updatedAtUtc: string;
@@ -585,6 +667,10 @@ export interface BatchAnalysisSnapshotResponse {
   latestWorkerReport: BatchWorkerExecutionReport | null;
   latestFinalReview: BatchFinalReview | null;
   discoveredWork: BatchDiscoveredWorkItem[];
+  activeQuestionSet: BatchAnalysisQuestionSet | null;
+  questions: BatchAnalysisQuestion[];
+  pausedForUserInput: boolean;
+  unansweredRequiredQuestionCount: number;
 }
 
 export interface BatchAnalysisReviewDeltaRecord {
@@ -654,6 +740,8 @@ export interface BatchAnalysisInspectionResponse {
   reviewDeltas: BatchAnalysisReviewDeltaRecord[];
   workerReports: BatchWorkerExecutionReport[];
   discoveredWork: BatchDiscoveredWorkItem[];
+  questionSets: BatchAnalysisQuestionSet[];
+  questions: BatchAnalysisQuestion[];
   amendments: BatchPlanAmendment[];
   finalReviews: BatchFinalReview[];
   finalReviewReworkPlans: BatchAnalysisFinalReviewDeltaRecord[];
@@ -674,6 +762,10 @@ export interface BatchAnalysisRuntimeStatus {
   approvedPlanId?: string;
   lastReviewVerdict?: BatchAnalysisArtifactVerdict;
   outstandingDiscoveredWorkCount: number;
+  activeQuestionSetId?: string;
+  activeQuestionSetStatus?: BatchAnalysisQuestionSetStatus;
+  pausedForUserInput: boolean;
+  unansweredRequiredQuestionCount: number;
   executionCounts: BatchAnalysisExecutionCounts;
   stageStartedAtUtc?: string;
   stageEndedAtUtc?: string;
@@ -687,7 +779,7 @@ export interface BatchAnalysisStageEventDetails {
   previousRole?: BatchAnalysisAgentRole;
   transitionReason?: string;
   triggerBranch?: string;
-  triggerArtifactType?: 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'stage_run' | 'session' | 'system';
+  triggerArtifactType?: 'plan' | 'review' | 'worker_report' | 'amendment' | 'final_review' | 'stage_run' | 'question_set' | 'session' | 'system';
   triggerArtifactId?: string;
   triggerSessionId?: string;
   triggerVerdict?: BatchAnalysisArtifactVerdict | 'draft';
@@ -724,6 +816,24 @@ export interface BatchAnalysisEventStreamResponse {
   workspaceId: string;
   batchId: string;
   events: BatchAnalysisStageEventRecord[];
+}
+
+export interface BatchAnalysisQuestionAnswerRequest {
+  workspaceId: string;
+  batchId: string;
+  questionId: string;
+  answer: string;
+}
+
+export interface BatchAnalysisQuestionAnswerResponse {
+  workspaceId: string;
+  batchId: string;
+  questionId: string;
+  questionSetId: string;
+  unansweredRequiredQuestionCount: number;
+  resumeTriggered: boolean;
+  questionSetStatus: BatchAnalysisQuestionSetStatus;
+  question: BatchAnalysisQuestion;
 }
 
 export interface AgentStreamingPayload {

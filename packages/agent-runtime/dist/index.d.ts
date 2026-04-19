@@ -1,4 +1,4 @@
-import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentAssistantChatRunRequest, AgentHealthCheckResponse, AgentRuntimeOptionsResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRunResult, KbAccessMode, MCPSearchKbInput, MCPAppGetFormSchemaInput, MCPAppPatchFormInput, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPGetTemplateInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode, KbAccessHealth } from '@kb-vault/shared-types';
+import type { AgentArticleEditRunRequest, AgentAnalysisRunRequest, AgentAssistantChatRunRequest, DirectActionExecutionRequest, DirectActionExecutionResult, AgentHealthCheckResponse, AgentRuntimeOptionsResponse, AgentSessionCreateRequest, AgentSessionCloseRequest, AgentSessionRecord, AgentStreamingPayload, AgentTranscriptRequest, AgentTranscriptResponse, AgentRunResult, KbAccessMode, MCPSearchKbInput, MCPAppGetFormSchemaInput, MCPAppPatchFormInput, MCPGetArticleFamilyInput, MCPGetArticleInput, MCPGetArticleHistoryInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBISubsetInput, MCPGetPBIInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPGetTemplateInput, MCPRecordAgentNotesInput, MCPFindRelatedArticlesInput, ExplorerNode, KbAccessHealth } from '@kb-vault/shared-types';
 interface ScopedToolContext {
     workspaceId: string;
     allowedLocaleVariantIds?: string[];
@@ -8,6 +8,8 @@ interface ScopedToolContext {
 }
 type RuntimeDebugLogger = (message: string, details?: unknown) => void;
 interface KbRuntimeOptions {
+    getDirectHealth?: (workspaceId?: string) => Promise<KbAccessHealth>;
+    executeDirectAction?: (request: DirectActionExecutionRequest) => Promise<DirectActionExecutionResult>;
     getCliHealth?: (workspaceId?: string) => Promise<KbAccessHealth>;
     buildCliPromptSuffix?: () => string;
     getWorkspaceAgentModel?: (workspaceId: string) => Promise<string | undefined>;
@@ -93,6 +95,9 @@ export declare class CursorAcpRuntime {
     private clearAcpSessionState;
     private waitForAcpSessionReady;
     handleMcpJsonMessage(raw: string | Record<string, unknown>): Promise<string | null>;
+    private shouldUseDirectBatchActionLoop;
+    private shouldUseDirectActionLoop;
+    private runDirectActionLoop;
     runBatchAnalysis(request: AgentAnalysisRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean): Promise<AgentRunResult>;
     runArticleEdit(request: AgentArticleEditRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean): Promise<AgentRunResult>;
     runAssistantChat(request: AgentAssistantChatRunRequest, emit: (payload: AgentStreamingPayload) => Promise<void> | void, isCancelled: () => boolean): Promise<AgentRunResult>;
@@ -128,11 +133,13 @@ export declare class CursorAcpRuntime {
     private getTransport;
     private evaluateCliToolPolicy;
     private evaluateMcpToolPolicy;
+    private evaluateDirectToolPolicy;
     private parseCliLoopbackToolResult;
     private maybeAbortCliPlannerLoop;
     private resolveMcpServerConfigs;
     private getProvider;
     private getProviderHealth;
+    private getDirectHealth;
     private getMcpHealth;
     private getCliHealth;
     private resetCursorSession;

@@ -4,6 +4,7 @@ export const STAGE_LABELS = {
     planning: 'Planning',
     plan_reviewing: 'Plan Review',
     plan_revision: 'Revision',
+    awaiting_user_input: 'Waiting for Input',
     building: 'Building',
     worker_discovery_review: 'Discovery Review',
     final_reviewing: 'Final Review',
@@ -21,6 +22,7 @@ export const PIPELINE_STAGES = [
     'queued',
     'planning',
     'plan_reviewing',
+    'awaiting_user_input',
     'plan_revision',
     'building',
     'final_reviewing',
@@ -32,6 +34,34 @@ export const TERMINAL_STAGES = new Set([
     'failed',
     'canceled',
 ]);
+const ORCHESTRATION_TIMELINE_STAGES = [
+    'planning',
+    'plan_reviewing',
+    'awaiting_user_input',
+    'plan_revision',
+    'building',
+    'final_reviewing',
+    'reworking',
+    'approved',
+    'needs_human_review',
+    'failed',
+    'canceled',
+];
+const STAGE_OWNER_ROLES = {
+    queued: 'planner',
+    planning: 'planner',
+    plan_reviewing: 'plan-reviewer',
+    plan_revision: 'planner',
+    awaiting_user_input: 'plan-reviewer',
+    building: 'worker',
+    worker_discovery_review: 'planner',
+    final_reviewing: 'final-reviewer',
+    reworking: 'worker',
+    approved: 'final-reviewer',
+    needs_human_review: 'final-reviewer',
+    failed: 'worker',
+    canceled: 'worker',
+};
 /* ---------- Role labels ---------- */
 export const ROLE_LABELS = {
     planner: 'Planner',
@@ -44,6 +74,7 @@ export function verdictBadgeVariant(verdict) {
         case 'approved':
             return 'success';
         case 'needs_revision':
+        case 'needs_user_input':
         case 'needs_rework':
             return 'warning';
         case 'rejected':
@@ -151,6 +182,127 @@ export function deriveCompletedStages(timeline) {
         }
     }
     return completed;
+}
+function isTimelineTransitionEvent(event) {
+    return event.eventType === 'iteration_started'
+        || event.eventType === 'stage_transition'
+        || event.eventType === 'iteration_completed';
+}
+function summarizeSkippedStage(nextStage) {
+    return `Skipped before execution advanced to ${STAGE_LABELS[nextStage]}.`;
+}
+function buildSkippedStageEntriesFromTransitions(transitions) {
+    if (transitions.length < 2) {
+        return [];
+    }
+    const skippedEntries = [];
+    let previousStage;
+    let previousIterationId;
+    for (const transition of transitions) {
+        const nextStage = getVisibleStage(transition.stage);
+        if (!nextStage || nextStage === 'queued') {
+            continue;
+        }
+        if (previousStage
+            && previousStage !== nextStage
+            && previousIterationId === transition.iterationId) {
+            const previousIndex = ORCHESTRATION_TIMELINE_STAGES.indexOf(previousStage);
+            const nextIndex = ORCHESTRATION_TIMELINE_STAGES.indexOf(nextStage);
+            if (previousIndex >= 0 && nextIndex > previousIndex + 1) {
+                for (let index = previousIndex + 1; index < nextIndex; index += 1) {
+                    const skippedStage = ORCHESTRATION_TIMELINE_STAGES[index];
+                    skippedEntries.push({
+                        artifactType: 'skipped_stage',
+                        artifactId: `skipped:${transition.iterationId}:${previousStage}:${skippedStage}:${nextStage}:${transition.createdAtUtc}`,
+                        iterationId: transition.iterationId,
+                        iteration: transition.iteration,
+                        stage: skippedStage,
+                        role: STAGE_OWNER_ROLES[skippedStage],
+                        status: 'skipped',
+                        summary: summarizeSkippedStage(nextStage),
+                        createdAtUtc: transition.createdAtUtc,
+                        syntheticKind: 'skipped_stage',
+                        skippedFromStage: previousStage,
+                        skippedToStage: nextStage,
+                    });
+                }
+            }
+        }
+        previousStage = nextStage;
+        previousIterationId = transition.iterationId;
+    }
+    return skippedEntries;
+}
+function collectTransitionPointsFromStageEvents(stageEvents) {
+    return [...stageEvents]
+        .filter(isTimelineTransitionEvent)
+        .sort((left, right) => left.createdAtUtc.localeCompare(right.createdAtUtc))
+        .map((event) => ({
+        iterationId: event.iterationId,
+        iteration: event.iteration,
+        stage: event.stage,
+        createdAtUtc: event.createdAtUtc,
+    }));
+}
+function collectTransitionPointsFromTimelineEntries(entries) {
+    const orderedEntries = [...entries].sort((left, right) => left.createdAtUtc.localeCompare(right.createdAtUtc));
+    const transitions = [];
+    let previousVisibleStage;
+    let previousIterationId;
+    for (const entry of orderedEntries) {
+        const visibleStage = getVisibleStage(entry.stage);
+        if (!visibleStage || visibleStage === 'queued') {
+            continue;
+        }
+        if (previousIterationId === entry.iterationId && previousVisibleStage === visibleStage) {
+            continue;
+        }
+        transitions.push({
+            iterationId: entry.iterationId,
+            iteration: entry.iteration,
+            stage: entry.stage,
+            createdAtUtc: entry.createdAtUtc,
+        });
+        previousVisibleStage = visibleStage;
+        previousIterationId = entry.iterationId;
+    }
+    return transitions;
+}
+export function buildTimelineEntriesWithSkippedStages(entries, stageEvents = []) {
+    if (entries.length === 0) {
+        return entries;
+    }
+    const stageEventSkippedEntries = buildSkippedStageEntriesFromTransitions(collectTransitionPointsFromStageEvents(stageEvents));
+    const timelineSkippedEntries = buildSkippedStageEntriesFromTransitions(collectTransitionPointsFromTimelineEntries(entries));
+    const skippedEntries = Array.from(new Map([...stageEventSkippedEntries, ...timelineSkippedEntries].map((entry) => [
+        `${entry.iterationId ?? 'none'}:${entry.skippedFromStage}:${entry.stage}:${entry.skippedToStage}`,
+        entry,
+    ])).values());
+    if (skippedEntries.length === 0) {
+        return entries;
+    }
+    return [
+        ...entries.map((entry, index) => ({
+            entry,
+            sortBucket: 1,
+            index,
+        })),
+        ...skippedEntries.map((entry, index) => ({
+            entry,
+            sortBucket: 0,
+            index,
+        })),
+    ]
+        .sort((left, right) => {
+        const byTime = left.entry.createdAtUtc.localeCompare(right.entry.createdAtUtc);
+        if (byTime !== 0)
+            return byTime;
+        if (left.sortBucket !== right.sortBucket) {
+            return left.sortBucket - right.sortBucket;
+        }
+        return left.index - right.index;
+    })
+        .map(({ entry }) => entry);
 }
 /* ---------- Timestamp formatting ---------- */
 export function formatTimestamp(utc) {

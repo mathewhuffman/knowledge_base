@@ -6,6 +6,7 @@ import {
   PBIImportFormat,
   PBIBatchScopeMode,
   ProposalAction,
+  isKbAccessMode,
   type AiArtifactRecord,
   type AiArtifactStatus,
   type AiArtifactType,
@@ -37,6 +38,7 @@ import {
   type AiViewContext,
   type AgentStreamingPayload,
   type DraftPatchPayload,
+  type AgentDirectSessionContext,
   type KbAccessMode,
   type ProposalCandidatePayload,
   type ProposalHtmlMutationOperation,
@@ -62,13 +64,17 @@ const ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_MAX_WAIT_MS = 60_000;
 const ASSISTANT_CHAT_TRANSCRIPT_POLL_MS = 250;
 
 function buildAssistantChatCompletionFollowupPrompt(kbAccessMode: KbAccessMode): string {
+  const lookupInstruction = kbAccessMode === 'mcp'
+    ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
+    : kbAccessMode === 'cli'
+      ? 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
+      : 'If you still need KB access or a confirmed app mutation, return exactly one `needs_action` direct-action JSON envelope instead of using MCP tools, CLI commands, terminal commands, or filesystem exploration in this follow-up.';
+
   return [
     'Complete the same user request using the research already gathered in this session.',
     'Return the final user-facing answer now.',
     'Do not send a progress update.',
-    kbAccessMode === 'mcp'
-      ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
-      : 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
+    lookupInstruction
   ].join(' ');
 }
 
@@ -150,7 +156,7 @@ export class AiAssistantService {
   constructor(
     private readonly workspaceRepository: WorkspaceRepository,
     private readonly agentRuntime: CursorAcpRuntime,
-    private readonly resolveWorkspaceKbAccessMode: (workspaceId: string) => Promise<'mcp' | 'cli'>,
+    private readonly resolveWorkspaceKbAccessMode: (workspaceId: string) => Promise<KbAccessMode>,
     private readonly appWorkingStateService: AppWorkingStateService,
     private readonly emitAssistantEvent?: (event: AiAssistantStreamEvent) => void
   ) {}
@@ -376,7 +382,10 @@ export class AiAssistantService {
             sessionMode: 'agent',
             locale: context.subject?.locale,
             prompt: runtimePrompt,
-            sessionType: 'assistant_chat'
+            sessionType: 'assistant_chat',
+            directContext: kbAccessMode === 'direct'
+              ? this.buildDirectSessionContext(context)
+              : undefined
           },
           (stream) => {
             this.publishAssistantStreamEvent(input.workspaceId, session.id, turnId, stream, turnAudit);
@@ -868,20 +877,33 @@ export class AiAssistantService {
           '- Use `get_batch_context`, `find_related_articles`, proposal tools, and app mutation tools only when the route or user request clearly requires them.',
           '- Do not use tools just to decide what to do next.'
         ]
-      : [
-          '- If the answer is already clear from the provided context, answer immediately without using tools.',
-          '- If workspace knowledge is needed, use the minimum KB lookup path required to answer accurately.',
-          '- For app-feature, workflow, or terminology questions, default to this sequence: `kb search-kb --workspace-id <workspace-id> --query "<topic>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json` for the best 1-3 matches, then answer the user clearly.',
-          '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
-          '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply. If the runtime supports separate thought updates, use those instead of status messages.',
-          '- When research or data lookup is needed, use only exact kb CLI commands needed for the answer. Never use direct MCP tool names, terminal commands like grep, Read File, codebase search, filesystem exploration, list_mcp_resources, or fetch_mcp_resource.',
-          '- If the runtime exposes Shell or Terminal, it may be used only for exact `kb` CLI commands.',
-          '- Prefer `search-kb` first and `get-article` second for ordinary user questions about the app.',
-          '- Use `kb get-article-family` only when one clearly relevant article needs family or locale context.',
-          '- Use `kb batch-context`, `kb find-related-articles`, proposal commands, and form-editing commands only when the route or user request clearly requires them.',
-          '- Use `kb help --json` only if a needed KB command is genuinely unclear. Do not spend the turn exploring command syntax when the answer can be produced from `search-kb` plus `get-article`.',
-          '- Do not use tools just to decide what to do next.'
-        ];
+      : kbAccessMode === 'direct'
+        ? [
+            '- If the answer is already clear from the provided context, answer immediately without requesting a direct action.',
+            '- If workspace knowledge is needed, request the minimum direct KB action needed to answer accurately.',
+            '- For app-feature, workflow, or terminology questions, default to this sequence: request `search_kb`, then request `get_article` for the best 1-3 matches, then answer the user clearly.',
+            '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and return the final findings in the same turn. Do not stop on a progress update.',
+            '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply.',
+            '- When research or data lookup is needed, return a `needs_action` envelope instead of using MCP tools, kb CLI commands, terminal commands, list_mcp_resources, fetch_mcp_resource, Read File, grep, codebase search, or filesystem exploration.',
+            '- Prefer `search_kb` first and `get_article` second for ordinary user questions about the app.',
+            '- Use `get_article_family` only when one clearly relevant article needs family or locale context.',
+            '- Use `get_batch_context`, `find_related_articles`, and `patch_form` only when the route or user request clearly requires them.',
+            '- Do not request actions just to decide what to do next.'
+          ]
+        : [
+            '- If the answer is already clear from the provided context, answer immediately without using tools.',
+            '- If workspace knowledge is needed, use the minimum KB lookup path required to answer accurately.',
+            '- For app-feature, workflow, or terminology questions, default to this sequence: `kb search-kb --workspace-id <workspace-id> --query "<topic>" --json`, `kb get-article --workspace-id <workspace-id> --locale-variant-id <locale-variant-id> --json` for the best 1-3 matches, then answer the user clearly.',
+            '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
+            '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply. If the runtime supports separate thought updates, use those instead of status messages.',
+            '- When research or data lookup is needed, use only exact kb CLI commands needed for the answer. Never use direct MCP tool names, terminal commands like grep, Read File, codebase search, filesystem exploration, list_mcp_resources, or fetch_mcp_resource.',
+            '- If the runtime exposes Shell or Terminal, it may be used only for exact `kb` CLI commands.',
+            '- Prefer `search-kb` first and `get-article` second for ordinary user questions about the app.',
+            '- Use `kb get-article-family` only when one clearly relevant article needs family or locale context.',
+            '- Use `kb batch-context`, `kb find-related-articles`, proposal commands, and form-editing commands only when the route or user request clearly requires them.',
+            '- Use `kb help --json` only if a needed KB command is genuinely unclear. Do not spend the turn exploring command syntax when the answer can be produced from `search-kb` plus `get-article`.',
+            '- Do not use tools just to decide what to do next.'
+          ];
     const proposalReviewRules = [
       '- In Proposal Review, prefer returning `command="patch_proposal"` with `artifactType="proposal_patch"` so the current proposal can be updated directly.',
       '- In Proposal Review, do not create or edit a separate proposal record. Patch the currently open proposal instead.',
@@ -900,26 +922,42 @@ export class AiAssistantService {
           '- Do not use `payload.lineEdits` for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
           '- Do not claim KB Vault MCP tools are unavailable because they are not shown in a generic tool list. In MCP mode, call the KB Vault MCP tools named in this prompt directly when needed.'
         ]
-      : [
-          '- On article view, when the user asks to change the article or draft a proposal outside Proposal Review, create a `proposal_candidate` rather than a chat-only answer.',
-          '- For an article `proposal_candidate`, fetch the current article with `kb get-article` if the full HTML is not already present in the prompt context.',
-          '- For an article `proposal_candidate`, prefer targeted `payload.htmlMutations` when the requested change is narrow and you can anchor it to exact existing HTML fragments.',
-          '- If you use `payload.htmlMutations`, the app will materialize the final HTML locally from the current article HTML.',
-          '- For broad rewrites, return the full final article HTML in `html` or `payload.proposedHtml`.',
-          '- Do not use `payload.lineEdits` for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
-          '- Do not claim direct KB access is unavailable because it is not shown in a generic tool list. In CLI mode, use only the exact `kb` commands named in this prompt when needed.'
-        ];
+      : kbAccessMode === 'direct'
+        ? [
+            '- On article view, when the user asks to change the article or draft a proposal outside Proposal Review, create a `proposal_candidate` rather than a chat-only answer.',
+            '- For an article `proposal_candidate`, request `get_article` if the full HTML is not already present in the prompt context.',
+            '- For an article `proposal_candidate`, prefer targeted `payload.htmlMutations` when the requested change is narrow and you can anchor it to exact existing HTML fragments.',
+            '- If you use `payload.htmlMutations`, the app will materialize the final HTML locally from the current article HTML.',
+            '- For broad rewrites, return the full final article HTML in `html` or `payload.proposedHtml`.',
+            '- Do not use `payload.lineEdits` for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
+            '- Do not claim direct KB actions are unavailable because they are not shown in a generic tool list. In Direct mode, request the named direct actions instead.'
+          ]
+        : [
+            '- On article view, when the user asks to change the article or draft a proposal outside Proposal Review, create a `proposal_candidate` rather than a chat-only answer.',
+            '- For an article `proposal_candidate`, fetch the current article with `kb get-article` if the full HTML is not already present in the prompt context.',
+            '- For an article `proposal_candidate`, prefer targeted `payload.htmlMutations` when the requested change is narrow and you can anchor it to exact existing HTML fragments.',
+            '- If you use `payload.htmlMutations`, the app will materialize the final HTML locally from the current article HTML.',
+            '- For broad rewrites, return the full final article HTML in `html` or `payload.proposedHtml`.',
+            '- Do not use `payload.lineEdits` for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
+            '- Do not claim direct KB access is unavailable because it is not shown in a generic tool list. In CLI mode, use only the exact `kb` commands named in this prompt when needed.'
+          ];
     const templateRules = kbAccessMode === 'mcp'
       ? [
           '- For live form edits such as Templates & Prompts, use `app_get_form_schema` first when needed, then use `app_patch_form`.',
           '- After a successful `app_patch_form`, respond with informational_response that accurately summarizes the applied change.',
           '- If the app mutation tool call does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.'
         ]
-      : [
-          '- For live form edits such as Templates & Prompts, use the kb CLI app commands as the source of truth: call `kb app get-form-schema` first when needed, then call `kb app patch-form`.',
-          '- After a successful `kb app patch-form`, respond with informational_response that accurately summarizes the applied change.',
-          '- If the kb command does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.'
-        ];
+      : kbAccessMode === 'direct'
+        ? [
+            '- For live form edits such as Templates & Prompts, request `patch_form` as the source of truth when a confirmed change is needed.',
+            '- After a successful `patch_form` action result, respond with informational_response that accurately summarizes the applied change.',
+            '- If the direct action does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.'
+          ]
+        : [
+            '- For live form edits such as Templates & Prompts, use the kb CLI app commands as the source of truth: call `kb app get-form-schema` first when needed, then call `kb app patch-form`.',
+            '- After a successful `kb app patch-form`, respond with informational_response that accurately summarizes the applied change.',
+            '- If the kb command does not succeed, do not claim the field changed. Describe the failure or offer a suggestion instead.'
+          ];
 
     return [
       'You are the KB Vault global AI assistant.',
@@ -962,6 +1000,12 @@ export class AiAssistantService {
       '- If you need a user answer before continuing, set `completionState="needs_user_input"` and `isFinal=true`.',
       '- If you are blocked or hit a hard failure, set `completionState="blocked"` or `completionState="errored"` and `isFinal=true`.',
       '- Do not send a progress update with `isFinal=true`.',
+      ...(kbAccessMode === 'direct'
+        ? [
+            '- In Direct mode, if you need KB access or a confirmed app mutation, return a separate JSON object with `completionState="needs_action"`, `isFinal=false`, and one `action` object instead of calling tools.',
+            '- After the app returns an `action_result`, continue and return either another `needs_action` envelope or the final assistant JSON object.'
+          ]
+        : []),
       '- Any mutating result must include an explicit command and valid JSON. Without a valid command, the result will be treated as informational_response.',
       ...providerRules,
       '- For informational_response, put only the user-facing reply in `response`. Do not include chain-of-thought, policy commentary, analysis, or extra JSON-shaped explanation outside the response field.',
@@ -1009,6 +1053,7 @@ export class AiAssistantService {
       : 'informational_response';
     const primaryResponse =
       extractString(parsed?.response)
+      ?? extractString(parsed?.message)
       ?? extractString(parsed?.summary)
       ?? selectPreferredAssistantReply(resultPayload, transcriptFallbackText);
     const rawResponse = primaryResponse ?? runtimeFailureMessage;
@@ -1052,6 +1097,13 @@ export class AiAssistantService {
       && (context.capabilities.canPatchProposal || context.capabilities.canPatchDraft)
       && !directWorkingStateMutationApplied
       && looksLikeSuccessfulMutationClaim(response)
+    ) {
+      artifactType = 'clarification_request';
+    }
+
+    if (
+      artifactType === 'informational_response'
+      && completionState === 'needs_user_input'
     ) {
       artifactType = 'clarification_request';
     }
@@ -1184,6 +1236,33 @@ export class AiAssistantService {
     if (context.capabilities.canPatchDraft) allowed.push('draft_patch');
     if (context.capabilities.canPatchTemplate) allowed.push('template_patch');
     return allowed;
+  }
+
+  private buildDirectSessionContext(context: AiViewContext): AgentDirectSessionContext {
+    const backing = context.backingData && typeof context.backingData === 'object'
+      ? context.backingData as Record<string, unknown>
+      : {};
+    const localeVariantId = extractString(backing.localeVariantId)
+      ?? (context.subject?.type === 'article' ? context.subject.id : undefined);
+    const familyId = extractString(backing.familyId);
+    const canPatchTemplate =
+      context.route === AppRoute.TEMPLATES_AND_PROMPTS
+      && context.subject?.type === 'template_pack'
+      && context.capabilities.canPatchTemplate;
+
+    return {
+      route: context.route,
+      ...(canPatchTemplate
+        ? {
+            entityType: 'template_pack' as const,
+            entityId: context.subject?.id,
+            workingStateVersionToken: context.workingState?.versionToken,
+            allowPatchForm: true
+          }
+        : {}),
+      ...(localeVariantId ? { localeVariantIds: [localeVariantId] } : {}),
+      ...(familyId ? { familyIds: [familyId] } : {})
+    };
   }
 
   private resolveRuntimeLocaleVariantId(context: AiViewContext): string {
@@ -2199,9 +2278,7 @@ function safeParseJson<T = unknown>(value: string | null | undefined): T | null 
 }
 
 function extractKbAccessMode(value: unknown): KbAccessMode | undefined {
-  return value === 'mcp' || value === 'cli'
-    ? value
-    : undefined;
+  return isKbAccessMode(value) ? value : undefined;
 }
 
 function extractString(value: unknown): string | undefined {
@@ -2675,6 +2752,36 @@ function normalizeAssistantStreamPayload(
   atUtc: string,
   stream: AgentStreamingPayload
 ): AiAssistantStreamEvent[] {
+  if ((stream.kind === 'tool_call' || stream.kind === 'tool_response') && stream.data && typeof stream.data === 'object') {
+    const payload = stream.data as {
+      action?: { type?: unknown; id?: unknown };
+      result?: { ok?: unknown; error?: { message?: unknown } };
+    };
+    const actionType = extractString(payload.action?.type);
+    if (!actionType) {
+      return [];
+    }
+    return [{
+      workspaceId,
+      sessionId,
+      turnId,
+      kind: stream.kind === 'tool_call' ? 'tool_call' : 'tool_update',
+      atUtc,
+      toolCallId: extractString(payload.action?.id),
+      toolName: `direct.${actionType}`,
+      toolStatus: stream.kind === 'tool_call'
+        ? 'pending'
+        : payload.result?.ok === true
+          ? 'completed'
+          : payload.result?.ok === false
+            ? 'blocked'
+            : undefined,
+      resourceLabel: stream.kind === 'tool_response'
+        ? extractString(payload.result?.error?.message)
+        : undefined
+    }];
+  }
+
   if (stream.kind !== 'progress' || !stream.data || typeof stream.data !== 'object') {
     return [];
   }

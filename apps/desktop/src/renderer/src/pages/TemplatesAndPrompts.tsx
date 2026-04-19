@@ -158,7 +158,7 @@ export const TemplatesAndPrompts = () => {
         canCreateProposal: false,
         canPatchProposal: false,
         canPatchDraft: false,
-        canPatchTemplate: false,
+        canPatchTemplate: true,
         canUseUnsavedWorkingState: true
       },
       backingData: {
@@ -166,6 +166,17 @@ export const TemplatesAndPrompts = () => {
         templatePackId: selectedId,
         persistedTemplate: selected
       }
+    },
+    applyUiActions: (actions) => {
+      actions.forEach((action) => {
+        if (action.type === 'replace_template_form') {
+          setDraft((prev) => ({
+            ...prev,
+            ...action.payload,
+            templateType: (action.payload.templateType as TemplatePackType | undefined) ?? prev.templateType
+          }));
+        }
+      });
     },
     applyWorkingStatePatch: (patch) => {
       setDraft((prev) => ({

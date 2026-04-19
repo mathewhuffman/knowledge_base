@@ -978,6 +978,60 @@ export const migrations: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_agent_notes_batch_created
         ON agent_notes(batch_id, created_at DESC);
     `
+  },
+  {
+    version: 22,
+    name: '0022_batch_analysis_questions',
+    description: 'Persist batch-analysis user-input question sets and inline answers.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS batch_analysis_question_sets (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        source_stage TEXT NOT NULL,
+        source_role TEXT NOT NULL,
+        resume_stage TEXT NOT NULL,
+        resume_role TEXT NOT NULL,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        plan_id TEXT,
+        review_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_question_sets_batch
+        ON batch_analysis_question_sets(workspace_id, batch_id, updated_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_question_sets_iteration
+        ON batch_analysis_question_sets(iteration_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS batch_analysis_questions (
+        id TEXT PRIMARY KEY,
+        question_set_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        iteration_id TEXT NOT NULL,
+        question_order INTEGER NOT NULL DEFAULT 0,
+        prompt TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        requires_user_input INTEGER NOT NULL DEFAULT 1,
+        linked_pbi_ids_json TEXT NOT NULL DEFAULT '[]',
+        linked_plan_item_ids_json TEXT NOT NULL DEFAULT '[]',
+        linked_discovery_ids_json TEXT NOT NULL DEFAULT '[]',
+        answer TEXT,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        answered_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_questions_set
+        ON batch_analysis_questions(question_set_id, question_order ASC, created_at ASC);
+
+      CREATE INDEX IF NOT EXISTS idx_batch_analysis_questions_batch
+        ON batch_analysis_questions(workspace_id, batch_id, created_at DESC);
+    `
   }
 ];
 

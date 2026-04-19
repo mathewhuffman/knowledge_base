@@ -4,6 +4,8 @@ import type {
   BatchAnalysisExecutionCounts,
   BatchAnalysisIterationRecord,
   BatchAnalysisPlan,
+  BatchAnalysisQuestion,
+  BatchAnalysisQuestionAnswer,
   BatchPlannerArticleMatch,
   BatchPlannerPrefetch,
   BatchPlannerPrefetchCluster,
@@ -44,6 +46,18 @@ export interface BatchFinalReviewerProposalContext {
   proposedContentPreview?: string;
 }
 
+interface BatchPlanExecutionValidation {
+  ok: boolean;
+  needsUserInput: boolean;
+  blockingUserInputQuestions: BatchAnalysisQuestion[];
+  invalidCoverageReasons: string[];
+  conflictingTargets: string[];
+  unresolvedTargetIssues: string[];
+  unresolvedReferenceIssues: string[];
+  advisoryMissingEditTargets: string[];
+  advisoryMissingCreateTargets: string[];
+}
+
 export class BatchAnalysisOrchestrator {
   constructor(private readonly workspaceRepository: WorkspaceRepository) {}
 
@@ -61,7 +75,81 @@ export class BatchAnalysisOrchestrator {
 
     const normalizedItems = await Promise.all(
       params.plan.items.map(async (item) => {
-        if (item.action === 'create' || item.targetType !== 'article') {
+        if (
+          item.action === 'create'
+          || (item.targetType !== 'article' && item.targetType !== 'article_family')
+        ) {
+          return item;
+        }
+
+        const trimmedTargetArticleId = item.targetArticleId?.trim();
+        const trimmedTargetFamilyId = item.targetFamilyId?.trim();
+        const resolvedVariant = await this.tryGetLocaleVariant(params.workspaceId, trimmedTargetArticleId);
+
+        if (item.targetType === 'article_family') {
+          if (!trimmedTargetFamilyId) {
+            if (!resolvedVariant) {
+              unresolvedTargetIssues.push(
+                trimmedTargetArticleId
+                  ? `Plan item ${item.planItemId} (${item.targetTitle}) references missing locale variant ${trimmedTargetArticleId} and has no targetFamilyId for deterministic repair.`
+                  : `Plan item ${item.planItemId} (${item.targetTitle}) is missing targetFamilyId, so the KB target cannot be validated deterministically.`
+              );
+              return item;
+            }
+
+            if (resolvedVariant.status !== 'live') {
+              unresolvedTargetIssues.push(
+                `Plan item ${item.planItemId} (${item.targetTitle}) points at locale variant ${resolvedVariant.id}, but that variant is ${resolvedVariant.status} instead of live.`
+              );
+              return item;
+            }
+
+            const resolvedFamilyExternalKey = await this.getFamilyExternalKey(params.workspaceId, resolvedVariant.familyId);
+            if (resolvedFamilyExternalKey?.startsWith('proposal-')) {
+              unresolvedTargetIssues.push(
+                `Plan item ${item.planItemId} (${item.targetTitle}) points at proposal-scoped draft family ${resolvedFamilyExternalKey}, which is generated draft output rather than live KB coverage.`
+              );
+              return item;
+            }
+
+            repairs.push(
+              `Filled missing target family ID for ${item.targetTitle} with ${resolvedVariant.familyId} from locale variant ${resolvedVariant.id}.`
+            );
+            return {
+              ...item,
+              targetFamilyId: resolvedVariant.familyId
+            };
+          }
+
+          const resolvedFamilyExternalKey = await this.getFamilyExternalKey(params.workspaceId, trimmedTargetFamilyId);
+          if (resolvedFamilyExternalKey?.startsWith('proposal-')) {
+            unresolvedTargetIssues.push(
+              `Plan item ${item.planItemId} (${item.targetTitle}) points at proposal-scoped draft family ${resolvedFamilyExternalKey}, which is generated draft output rather than live KB coverage.`
+            );
+            return item;
+          }
+
+          const liveFamilyVariants = await this.getLiveFamilyVariants(params.workspaceId, trimmedTargetFamilyId);
+          if (liveFamilyVariants.length === 0) {
+            unresolvedTargetIssues.push(
+              `Plan item ${item.planItemId} (${item.targetTitle}) points at family ${trimmedTargetFamilyId}, but that family does not resolve to any live locale variants.`
+            );
+            return item;
+          }
+
+          if (resolvedVariant && resolvedVariant.familyId !== trimmedTargetFamilyId) {
+            unresolvedTargetIssues.push(
+              `Plan item ${item.planItemId} (${item.targetTitle}) points at locale variant ${resolvedVariant.id}, but that article belongs to family ${resolvedVariant.familyId} instead of ${trimmedTargetFamilyId}.`
+            );
+            return item;
+          }
+
+          if (resolvedVariant && resolvedVariant.status !== 'live') {
+            unresolvedTargetIssues.push(
+              `Plan item ${item.planItemId} (${item.targetTitle}) points at locale variant ${resolvedVariant.id}, but that variant is ${resolvedVariant.status} instead of live.`
+            );
+          }
+
           return item;
         }
 
@@ -93,13 +181,6 @@ export class BatchAnalysisOrchestrator {
             );
           }
           return item;
-        }
-
-        let resolvedVariant: LocaleVariantRecord | null = null;
-        try {
-          resolvedVariant = await this.workspaceRepository.getLocaleVariant(params.workspaceId, item.targetArticleId);
-        } catch {
-          resolvedVariant = null;
         }
 
         if (resolvedVariant) {
@@ -666,11 +747,14 @@ export class BatchAnalysisOrchestrator {
     priorPlan?: BatchAnalysisPlan;
     reviewDelta?: BatchPlanReviewDelta;
     plannerPrefetch?: BatchPlannerPrefetch;
+    resolvedUserAnswers?: BatchAnalysisQuestionAnswer[];
   }): string {
     return [
       'Return only valid JSON.',
       'Create a complete structured batch analysis plan.',
       'Each candidate PBI must be accounted for in coverage.',
+      'Mark a PBI as `covered` whenever the plan fully accounts for it, including when the work is a net-new article create.',
+      'Use `gap` only when required KB work is still unresolved after planning and the plan does not yet fully cover that PBI.',
       'Use plan items to represent create, edit, retire, or no_impact outcomes.',
       'Prefer edit work over create work when the deterministic prefetch shows strong existing article matches unless the evidence clearly supports net-new KB coverage.',
       'Prefer create work when a topic cluster has deterministic search coverage but no meaningful existing article match; do not force unrelated edits just to avoid net-new articles.',
@@ -679,15 +763,23 @@ export class BatchAnalysisOrchestrator {
       'Only issue new KB lookups when you still have a concrete unresolved ambiguity after reviewing the prefetch, or when a cluster is genuinely missing the evidence required to choose create versus edit versus no-impact.',
       'If the prefetch already gives you enough evidence for a cluster, reuse it directly instead of re-proving the same point with more searches.',
       'If a deterministic prefetch query already returned zero meaningful matches, treat that zero-result evidence as final unless you have a materially different query.',
+      'If a question can be resolved by revising the plan with the existing evidence, revise the plan and do not emit a user-input question.',
+      'Emit `requiresUserInput: true` only when the user must decide scope, intent, sequencing, or another product decision the planner cannot infer safely.',
+      params.resolvedUserAnswers && params.resolvedUserAnswers.length > 0
+        ? 'Incorporate every resolved user answer below into the revised plan. Close, remove, or resolve those questions instead of carrying them forward unchanged.'
+        : '',
       'JSON shape:',
-      '{"summary":string,"coverage":[{"pbiId":string,"outcome":"covered"|"gap"|"no_impact"|"blocked","planItemIds":string[],"notes"?:string}],"items":[{"planItemId":string,"pbiIds":string[],"action":"create"|"edit"|"retire"|"no_impact","targetType":"article"|"article_family"|"article_set"|"new_article"|"unknown","targetArticleId"?:string,"targetFamilyId"?:string,"targetTitle":string,"reason":string,"evidence":[{"kind":"pbi"|"article"|"search"|"review"|"transcript"|"other","ref":string,"summary":string}],"confidence":number,"dependsOn"?:string[],"executionStatus":"pending"}],"openQuestions":string[]}',
+      '{"summary":string,"coverage":[{"pbiId":string,"outcome":"covered"|"gap"|"no_impact"|"blocked","planItemIds":string[],"notes"?:string}],"items":[{"planItemId":string,"pbiIds":string[],"action":"create"|"edit"|"retire"|"no_impact","targetType":"article"|"article_family"|"article_set"|"new_article"|"unknown","targetArticleId"?:string,"targetFamilyId"?:string,"targetTitle":string,"reason":string,"evidence":[{"kind":"pbi"|"article"|"search"|"review"|"transcript"|"other","ref":string,"summary":string}],"confidence":number,"dependsOn"?:string[],"executionStatus":"pending"}],"questions":[{"id"?:string,"prompt":string,"reason":string,"requiresUserInput":boolean,"linkedPbiIds":string[],"linkedPlanItemIds":string[],"linkedDiscoveryIds":string[]}],"openQuestions"?:string[]}',
       'Batch context summary:',
       JSON.stringify(compactBatchContextForPrompt(params.batchContext), null, 2),
       'Uploaded PBI summary:',
       JSON.stringify(compactUploadedPbisForPrompt(params.uploadedPbis), null, 2),
       params.plannerPrefetch ? `Deterministic planner prefetch:\n${JSON.stringify(compactPlannerPrefetchForPrompt(params.plannerPrefetch), null, 2)}` : '',
       params.priorPlan ? `Prior plan summary:\n${JSON.stringify(compactPlanForPrompt(params.priorPlan), null, 2)}` : '',
-      params.reviewDelta ? `Reviewer delta summary:\n${JSON.stringify(compactReviewDeltaForPrompt(params.reviewDelta), null, 2)}` : ''
+      params.reviewDelta ? `Reviewer delta summary:\n${JSON.stringify(compactReviewDeltaForPrompt(params.reviewDelta), null, 2)}` : '',
+      params.resolvedUserAnswers && params.resolvedUserAnswers.length > 0
+        ? `Resolved user answers:\n${JSON.stringify({ resolvedUserAnswers: params.resolvedUserAnswers }, null, 2)}`
+        : ''
     ].filter(Boolean).join('\n\n');
   }
 
@@ -741,9 +833,13 @@ export class BatchAnalysisOrchestrator {
       'Use the deterministic planner prefetch to challenge the submitted plan, especially when existing article matches suggest edits instead of net-new article creates.',
       'Do not approve a create-only or create-heavy plan when strong existing article matches are present unless the plan explicitly accounts for why those existing articles are not edit targets.',
       'Also do not approve an edit-only or edit-heavy plan when deterministic search coverage shows a topic cluster with no meaningful existing article match and the plan never explains why net-new documentation is unnecessary.',
+      'Treat `gap` or `blocked` coverage as unresolved scope. Do not approve a plan while any PBI still has unresolved coverage.',
+      'A PBI satisfied by a net-new article create should still be marked `covered`, not `gap`.',
+      'If the plan contains unresolved questions that require a user scope or product decision, set verdict to `needs_user_input` and emit structured questions.',
+      'Use `needs_revision` instead when the reviewer can name concrete plan corrections the planner should make without user help.',
       'Do not execute proposals or mutate KB content in this stage.',
       'JSON shape:',
-      '{"summary":string,"verdict":"approved"|"needs_revision"|"needs_human_review","didAccountForEveryPbi":boolean,"hasMissingCreates":boolean,"hasMissingEdits":boolean,"hasTargetIssues":boolean,"hasOverlapOrConflict":boolean,"foundAdditionalArticleWork":boolean,"underScopedKbImpact":boolean,"delta":{"summary":string,"requestedChanges":string[],"missingPbiIds":string[],"missingCreates":string[],"missingEdits":string[],"additionalArticleWork":string[],"targetCorrections":string[],"overlapConflicts":string[]}}',
+      '{"summary":string,"verdict":"approved"|"needs_revision"|"needs_user_input"|"needs_human_review","didAccountForEveryPbi":boolean,"hasMissingCreates":boolean,"hasMissingEdits":boolean,"hasTargetIssues":boolean,"hasOverlapOrConflict":boolean,"foundAdditionalArticleWork":boolean,"underScopedKbImpact":boolean,"delta":{"summary":string,"requestedChanges":string[],"missingPbiIds":string[],"missingCreates":string[],"missingEdits":string[],"additionalArticleWork":string[],"targetCorrections":string[],"overlapConflicts":string[]},"questions":[{"id"?:string,"prompt":string,"reason":string,"requiresUserInput":boolean,"linkedPbiIds":string[],"linkedPlanItemIds":string[],"linkedDiscoveryIds":string[]}]}',
       'Batch context summary:',
       JSON.stringify(compactBatchContextForPrompt(params.batchContext), null, 2),
       'Uploaded PBI summary:',
@@ -752,6 +848,78 @@ export class BatchAnalysisOrchestrator {
       'Submitted plan summary:',
       JSON.stringify(compactPlanForPrompt(params.plan), null, 2)
     ].join('\n\n');
+  }
+
+  private normalizeStructuredQuestions(params: {
+    rawQuestions: unknown;
+    legacyOpenQuestions?: unknown;
+    sourceRole: 'planner' | 'plan-reviewer';
+  }): BatchAnalysisQuestion[] {
+    const createdAtUtc = new Date().toISOString();
+    const structuredQuestions = Array.isArray(params.rawQuestions)
+      ? params.rawQuestions.flatMap((question): BatchAnalysisQuestion[] => {
+          if (!question || typeof question !== 'object') {
+            return [];
+          }
+          const candidate = question as Record<string, unknown>;
+          const prompt = typeof candidate.prompt === 'string' ? humanizeReadableText(candidate.prompt) : '';
+          if (!prompt) {
+            return [];
+          }
+          const reason = typeof candidate.reason === 'string'
+            ? humanizeReadableText(candidate.reason)
+            : (params.sourceRole === 'planner'
+              ? 'Planner needs a user decision before the plan can be completed.'
+              : 'Reviewer needs a user decision before the plan can be approved.');
+          const answer = typeof candidate.answer === 'string' && candidate.answer.trim()
+            ? humanizeReadableText(candidate.answer)
+            : undefined;
+          const status = normalizeQuestionStatus(candidate.status, answer);
+          return [{
+            id: typeof candidate.id === 'string' && candidate.id.trim() ? candidate.id.trim() : randomUUID(),
+            questionSetId: typeof candidate.questionSetId === 'string' && candidate.questionSetId.trim()
+              ? candidate.questionSetId.trim()
+              : undefined,
+            prompt,
+            reason,
+            requiresUserInput: candidate.requiresUserInput !== false,
+            linkedPbiIds: Array.isArray(candidate.linkedPbiIds)
+              ? candidate.linkedPbiIds.filter((entry): entry is string => typeof entry === 'string')
+              : [],
+            linkedPlanItemIds: Array.isArray(candidate.linkedPlanItemIds)
+              ? candidate.linkedPlanItemIds.filter((entry): entry is string => typeof entry === 'string')
+              : [],
+            linkedDiscoveryIds: Array.isArray(candidate.linkedDiscoveryIds)
+              ? candidate.linkedDiscoveryIds.filter((entry): entry is string => typeof entry === 'string')
+              : [],
+            answer,
+            status,
+            createdAtUtc: typeof candidate.createdAtUtc === 'string' ? candidate.createdAtUtc : createdAtUtc,
+            answeredAtUtc: typeof candidate.answeredAtUtc === 'string' ? candidate.answeredAtUtc : undefined
+          }];
+        })
+      : [];
+    if (structuredQuestions.length > 0) {
+      return mergeStructuredQuestions(structuredQuestions);
+    }
+    const legacyQuestions = Array.isArray(params.legacyOpenQuestions)
+      ? params.legacyOpenQuestions
+          .filter((entry): entry is string => typeof entry === 'string')
+          .map((prompt) => ({
+            id: randomUUID(),
+            prompt: humanizeReadableText(prompt),
+            reason: params.sourceRole === 'planner'
+              ? 'Planner flagged this open question before plan approval.'
+              : 'Reviewer flagged this open question before plan approval.',
+            requiresUserInput: true,
+            linkedPbiIds: [],
+            linkedPlanItemIds: [],
+            linkedDiscoveryIds: [],
+            status: 'pending' as const,
+            createdAtUtc
+          }))
+      : [];
+    return mergeStructuredQuestions(legacyQuestions);
   }
 
   parsePlannerResult(params: {
@@ -773,6 +941,11 @@ export class BatchAnalysisOrchestrator {
     if (coverage.length === 0) {
       throw new Error('Planner returned no coverage records');
     }
+    const questions = this.normalizeStructuredQuestions({
+      rawQuestions: parsed.questions,
+      legacyOpenQuestions: parsed.openQuestions,
+      sourceRole: 'planner'
+    });
     return {
       id: randomUUID(),
       workspaceId: params.workspaceId,
@@ -784,10 +957,7 @@ export class BatchAnalysisOrchestrator {
       verdict: 'draft',
       planVersion: params.planVersion,
       summary: typeof parsed.summary === 'string' ? humanizeReadableText(parsed.summary) : `Plan version ${params.planVersion}`,
-      coverage: coverage.map((item) => ({
-        ...item,
-        notes: typeof item.notes === 'string' ? humanizeReadableText(item.notes) : item.notes
-      })),
+      coverage: coverage.map((item) => normalizePlanCoverage(item)),
       items: items.map((item) => ({
         ...item,
         targetTitle: humanizeReadableText(item.targetTitle),
@@ -799,11 +969,8 @@ export class BatchAnalysisOrchestrator {
             }))
           : []
       })),
-      openQuestions: Array.isArray(parsed.openQuestions)
-        ? parsed.openQuestions
-            .filter((x): x is string => typeof x === 'string')
-            .map((question) => humanizeReadableText(question))
-        : [],
+      questions,
+      openQuestions: serializeOpenQuestionPrompts(questions, parsed.openQuestions),
       createdAtUtc: new Date().toISOString(),
       supersedesPlanId: params.supersedesPlanId,
       agentModelId: params.agentModelId,
@@ -817,18 +984,28 @@ export class BatchAnalysisOrchestrator {
     iteration: BatchAnalysisIterationRecord;
     plan: BatchAnalysisPlan;
     resultText: string;
+    stage?: BatchPlanReview['stage'];
     agentModelId?: string;
     sessionId?: string;
   }): BatchPlanReview {
     const parsed = this.parseJsonObject(params.resultText);
-    const verdict = parsed.verdict === 'approved' || parsed.verdict === 'needs_human_review' ? parsed.verdict : 'needs_revision';
+    const verdict =
+      parsed.verdict === 'approved'
+      || parsed.verdict === 'needs_human_review'
+      || parsed.verdict === 'needs_user_input'
+        ? parsed.verdict
+        : 'needs_revision';
+    const questions = this.normalizeStructuredQuestions({
+      rawQuestions: parsed.questions,
+      sourceRole: 'plan-reviewer'
+    });
     return {
       id: randomUUID(),
       workspaceId: params.workspaceId,
       batchId: params.batchId,
       iterationId: params.iteration.id,
       iteration: params.iteration.iteration,
-      stage: 'plan_reviewing',
+      stage: params.stage ?? 'plan_reviewing',
       role: 'plan-reviewer',
       verdict,
       summary: typeof parsed.summary === 'string' ? humanizeReadableText(parsed.summary) : 'Plan review completed.',
@@ -842,10 +1019,44 @@ export class BatchAnalysisOrchestrator {
       delta: parsed.delta && typeof parsed.delta === 'object'
         ? humanizePlanReviewDelta(parsed.delta as BatchPlanReviewDelta)
         : undefined,
+      questions,
       createdAtUtc: new Date().toISOString(),
       planId: params.plan.id,
       agentModelId: params.agentModelId,
       sessionId: params.sessionId
+    };
+  }
+
+  validatePlanForExecution(params: {
+    plan: BatchAnalysisPlan;
+    review: BatchPlanReview;
+    plannerPrefetch?: BatchPlannerPrefetch;
+    unresolvedTargetIssues?: string[];
+    unresolvedReferenceIssues?: string[];
+  }): BatchPlanExecutionValidation {
+    const blockingUserInputQuestions = collectBlockingUserInputQuestions(params.plan, params.review);
+    const invalidCoverageReasons = this.validateApprovedPlan(params.plan).reasons;
+    const conflictingTargets = this.findDeterministicTargetConflicts(params.plan);
+    const unresolvedTargetIssues = dedupePlanReviewStrings(params.unresolvedTargetIssues ?? []).slice(0, 20);
+    const unresolvedReferenceIssues = dedupePlanReviewStrings(params.unresolvedReferenceIssues ?? []).slice(0, 20);
+    const advisoryMissingEditTargets = this.findLikelyMissingEditTargets(params.plan, params.plannerPrefetch);
+    const advisoryMissingCreateTargets = this.findLikelyMissingCreateTargets(params.plan, params.plannerPrefetch);
+    const hasObjectiveBlockingIssues =
+      invalidCoverageReasons.length > 0
+      || conflictingTargets.length > 0
+      || unresolvedTargetIssues.length > 0
+      || unresolvedReferenceIssues.length > 0;
+
+    return {
+      ok: blockingUserInputQuestions.length === 0 && !hasObjectiveBlockingIssues,
+      needsUserInput: blockingUserInputQuestions.length > 0,
+      blockingUserInputQuestions,
+      invalidCoverageReasons,
+      conflictingTargets,
+      unresolvedTargetIssues,
+      unresolvedReferenceIssues,
+      advisoryMissingEditTargets,
+      advisoryMissingCreateTargets
     };
   }
 
@@ -858,35 +1069,29 @@ export class BatchAnalysisOrchestrator {
   }): {
     review: BatchPlanReview;
     forcedRevision: boolean;
+    blockingUserInputQuestions: BatchAnalysisQuestion[];
+    invalidCoverageReasons: string[];
     missingEditTargets: string[];
     missingCreateTargets: string[];
     conflictingTargets: string[];
     unresolvedTargetIssues: string[];
     unresolvedReferenceIssues: string[];
   } {
-    const missingEditTargets = this.findLikelyMissingEditTargets(params.plan, params.plannerPrefetch);
-    const missingCreateTargets = this.findLikelyMissingCreateTargets(params.plan, params.plannerPrefetch);
-    const conflictingTargets = this.findDeterministicTargetConflicts(params.plan);
-    const unresolvedTargetIssues = dedupePlanReviewStrings(params.unresolvedTargetIssues ?? []).slice(0, 20);
-    const unresolvedReferenceIssues = dedupePlanReviewStrings(params.unresolvedReferenceIssues ?? []).slice(0, 20);
-    if (
-      (
-        missingEditTargets.length === 0
-        && missingCreateTargets.length === 0
-        && conflictingTargets.length === 0
-        && unresolvedTargetIssues.length === 0
-        && unresolvedReferenceIssues.length === 0
-      )
-      || params.review.verdict === 'needs_human_review'
-    ) {
+    const validation = this.validatePlanForExecution(params);
+    const missingEditTargets = validation.advisoryMissingEditTargets;
+    const missingCreateTargets = validation.advisoryMissingCreateTargets;
+
+    if (validation.ok || params.review.verdict === 'needs_human_review') {
       return {
         review: params.review,
         forcedRevision: false,
+        blockingUserInputQuestions: validation.blockingUserInputQuestions,
+        invalidCoverageReasons: validation.invalidCoverageReasons,
         missingEditTargets,
         missingCreateTargets,
-        conflictingTargets,
-        unresolvedTargetIssues,
-        unresolvedReferenceIssues
+        conflictingTargets: validation.conflictingTargets,
+        unresolvedTargetIssues: validation.unresolvedTargetIssues,
+        unresolvedReferenceIssues: validation.unresolvedReferenceIssues
       };
     }
 
@@ -906,87 +1111,96 @@ export class BatchAnalysisOrchestrator {
     const overlapConflicts = [...existingDelta.overlapConflicts];
     const issueSummaries: string[] = [];
 
-    if (missingEditTargets.length > 0) {
-      const titlesSummary = missingEditTargets.join(', ');
-      issueSummaries.push(`likely missing edit coverage for ${titlesSummary}`);
-      requestedChanges.push(`Account for likely existing-article edits surfaced by deterministic prefetch: ${titlesSummary}`);
-      additionalArticleWork.push(...missingEditTargets);
+    if (validation.blockingUserInputQuestions.length > 0) {
+      const promptsSummary = validation.blockingUserInputQuestions.map((question) => question.prompt).join('; ');
+      issueSummaries.push(`waiting on ${validation.blockingUserInputQuestions.length} required user answer(s)`);
+      requestedChanges.push(`Pause for user input and re-plan after answers are provided: ${promptsSummary}`);
     }
 
-    if (missingCreateTargets.length > 0) {
-      const titlesSummary = missingCreateTargets.join(', ');
-      issueSummaries.push(`likely missing net-new article coverage for ${titlesSummary}`);
-      requestedChanges.push(`Account for likely net-new documentation work surfaced by deterministic prefetch: ${titlesSummary}`);
-      additionalArticleWork.push(...missingCreateTargets);
+    if (validation.invalidCoverageReasons.length > 0) {
+      issueSummaries.push(`unresolved PBI coverage remains in ${validation.invalidCoverageReasons.length} place(s)`);
+      requestedChanges.push(...validation.invalidCoverageReasons);
+      additionalArticleWork.push(...validation.invalidCoverageReasons);
     }
 
-    if (conflictingTargets.length > 0) {
-      const titlesSummary = conflictingTargets.join(', ');
+    if (validation.conflictingTargets.length > 0) {
+      const titlesSummary = validation.conflictingTargets.join(', ');
       issueSummaries.push(`overlapping target coverage for ${titlesSummary}`);
       requestedChanges.push(`Resolve duplicate or conflicting plan items targeting the same article: ${titlesSummary}`);
-      targetCorrections.push(...conflictingTargets);
-      overlapConflicts.push(...conflictingTargets.map((title) => `Multiple plan items target ${title}`));
+      targetCorrections.push(...validation.conflictingTargets);
+      overlapConflicts.push(...validation.conflictingTargets.map((title) => `Multiple plan items target ${title}`));
     }
 
-    if (unresolvedTargetIssues.length > 0) {
-      issueSummaries.push(`invalid or unresolved KB targets in ${unresolvedTargetIssues.length} plan item(s)`);
-      requestedChanges.push(...unresolvedTargetIssues);
-      targetCorrections.push(...unresolvedTargetIssues);
+    if (validation.unresolvedTargetIssues.length > 0) {
+      issueSummaries.push(`invalid or unresolved KB targets in ${validation.unresolvedTargetIssues.length} plan item(s)`);
+      requestedChanges.push(...validation.unresolvedTargetIssues);
+      targetCorrections.push(...validation.unresolvedTargetIssues);
     }
 
-    if (unresolvedReferenceIssues.length > 0) {
-      issueSummaries.push(`invalid or unresolved batch references in ${unresolvedReferenceIssues.length} plan item(s)`);
-      requestedChanges.push(...unresolvedReferenceIssues);
+    if (validation.unresolvedReferenceIssues.length > 0) {
+      issueSummaries.push(`invalid or unresolved batch references in ${validation.unresolvedReferenceIssues.length} plan item(s)`);
+      requestedChanges.push(...validation.unresolvedReferenceIssues);
     }
 
     const summaryText = issueSummaries.join('; ');
-    const forcedRevision = params.review.verdict === 'approved';
+    const forcedRevision = !validation.needsUserInput && params.review.verdict === 'approved';
+    const forcedNeedsUserInput = validation.needsUserInput;
 
     return {
       review: {
         ...params.review,
-        verdict: 'needs_revision',
-        summary: forcedRevision
+        verdict: forcedNeedsUserInput ? 'needs_user_input' : 'needs_revision',
+        summary: (forcedRevision || forcedNeedsUserInput)
           ? `Deterministic review found ${summaryText}.`
           : params.review.summary,
-        hasMissingCreates: params.review.hasMissingCreates || missingCreateTargets.length > 0,
-        hasMissingEdits: params.review.hasMissingEdits || missingEditTargets.length > 0,
-        hasTargetIssues: params.review.hasTargetIssues || conflictingTargets.length > 0 || unresolvedTargetIssues.length > 0,
-        hasOverlapOrConflict: params.review.hasOverlapOrConflict || conflictingTargets.length > 0,
-        foundAdditionalArticleWork: params.review.foundAdditionalArticleWork || missingEditTargets.length > 0 || missingCreateTargets.length > 0,
-        underScopedKbImpact: params.review.underScopedKbImpact || missingEditTargets.length > 0 || missingCreateTargets.length > 0,
+        hasMissingCreates: params.review.hasMissingCreates,
+        hasMissingEdits: params.review.hasMissingEdits,
+        hasTargetIssues: params.review.hasTargetIssues || validation.invalidCoverageReasons.length > 0 || validation.conflictingTargets.length > 0 || validation.unresolvedTargetIssues.length > 0,
+        hasOverlapOrConflict: params.review.hasOverlapOrConflict || validation.conflictingTargets.length > 0,
+        foundAdditionalArticleWork: params.review.foundAdditionalArticleWork || validation.invalidCoverageReasons.length > 0,
+        underScopedKbImpact: params.review.underScopedKbImpact || validation.invalidCoverageReasons.length > 0,
+        questions: mergeStructuredQuestions(params.plan.questions ?? [], params.review.questions ?? []),
         delta: {
           summary: existingDelta.summary?.trim()
             ? existingDelta.summary
             : `Deterministic review found ${summaryText}.`,
           requestedChanges: dedupePlanReviewStrings(requestedChanges).slice(0, 20),
-          missingPbiIds: dedupePlanReviewStrings([...existingDelta.missingPbiIds, ...unresolvedReferenceIssues]).slice(0, 20),
-          missingCreates: dedupePlanReviewStrings([...existingDelta.missingCreates, ...missingCreateTargets]).slice(0, 20),
-          missingEdits: dedupePlanReviewStrings([...existingDelta.missingEdits, ...missingEditTargets]).slice(0, 20),
+          missingPbiIds: dedupePlanReviewStrings([...existingDelta.missingPbiIds, ...validation.invalidCoverageReasons, ...validation.unresolvedReferenceIssues]).slice(0, 20),
+          missingCreates: dedupePlanReviewStrings(existingDelta.missingCreates).slice(0, 20),
+          missingEdits: dedupePlanReviewStrings(existingDelta.missingEdits).slice(0, 20),
           additionalArticleWork: dedupePlanReviewStrings(additionalArticleWork).slice(0, 20),
           targetCorrections: dedupePlanReviewStrings(targetCorrections).slice(0, 20),
           overlapConflicts: dedupePlanReviewStrings(overlapConflicts).slice(0, 20)
         }
       },
       forcedRevision,
+      blockingUserInputQuestions: validation.blockingUserInputQuestions,
+      invalidCoverageReasons: validation.invalidCoverageReasons,
       missingEditTargets,
       missingCreateTargets,
-      conflictingTargets,
-      unresolvedTargetIssues,
-      unresolvedReferenceIssues
+      conflictingTargets: validation.conflictingTargets,
+      unresolvedTargetIssues: validation.unresolvedTargetIssues,
+      unresolvedReferenceIssues: validation.unresolvedReferenceIssues
     };
   }
 
-  buildWorkerPrompt(plan: BatchAnalysisPlan, extraInstructions?: string): string {
+  async buildWorkerPrompt(plan: BatchAnalysisPlan, extraInstructions?: string): Promise<string> {
+    const workerPlan = await this.buildWorkerPlanPromptPayload(plan);
     return [
       extraInstructions?.trim() ?? '',
       'Execute only the approved plan items below.',
+      'Approved plan targets and execution hints below are authoritative. Do not re-verify them unless a read or write fails or the approved plan still leaves a concrete ambiguity.',
       'Persist proposal records for create/edit/retire work where warranted.',
+      'Use `create_proposals` as soon as you have enough content for one or more approved items, and batch proposal writes whenever practical.',
+      'For approved edit/retire items, `create_proposals` may persist with `localeVariantId`, `familyId`, or `targetTitle` using the authoritative target already supplied in the plan.',
+      'For approved create items, persist with `targetTitle` directly. Do not spend lookup turns trying to discover a localeVariantId for net-new work first.',
+      'Use direct read actions only when they unblock missing article content, explain a failed write, or resolve a concrete ambiguity not already answered by the approved plan.',
       'Do not silently expand scope.',
       'If you discover new missing work, return it in the final JSON under `discoveredWork` and do not execute that new work yet.',
+      'Every `discoveredWork` item must use a unique `discoveryId` within this response.',
       'Return only JSON with this shape:',
       '{"summary":string,"discoveredWork":[{"discoveryId":string,"discoveredAction":"create"|"edit"|"retire","suspectedTarget":string,"reason":string,"evidence":[{"kind":"pbi"|"article"|"search"|"review"|"transcript"|"other","ref":string,"summary":string}],"linkedPbiIds":string[],"confidence":number,"requiresPlanAmendment":boolean}]}',
-      JSON.stringify(compactPlanForPrompt(plan), null, 2)
+      JSON.stringify(workerPlan, null, 2)
     ].filter(Boolean).join('\n\n');
   }
 
@@ -999,6 +1213,7 @@ export class BatchAnalysisOrchestrator {
       return { summary: fallbackSummary, discoveredWork: [] };
     }
     const parsed = this.parseJsonObject(resultText);
+    const issuedDiscoveryIds = new Set<string>();
     const discoveredWork = Array.isArray(parsed.discoveredWork)
       ? (parsed.discoveredWork as Array<Record<string, unknown>>).map((item, index): BatchDiscoveredWorkItem => {
           const discoveredAction: BatchDiscoveredWorkItem['discoveredAction'] =
@@ -1006,7 +1221,7 @@ export class BatchAnalysisOrchestrator {
               ? item.discoveredAction
               : 'edit';
           return {
-            discoveryId: typeof item.discoveryId === 'string' ? item.discoveryId : `discovery-${index + 1}`,
+            discoveryId: nextUniqueDiscoveryId(item.discoveryId, index, issuedDiscoveryIds),
             sourceWorkerRunId: sessionId,
             discoveredAction,
             suspectedTarget: typeof item.suspectedTarget === 'string' ? humanizeReadableText(item.suspectedTarget) : 'Unknown target',
@@ -1036,12 +1251,14 @@ export class BatchAnalysisOrchestrator {
     approvedPlan: BatchAnalysisPlan;
     discoveredWork: BatchDiscoveredWorkItem[];
     plannerPrefetch?: BatchPlannerPrefetch;
+    resolvedUserAnswers?: BatchAnalysisQuestionAnswer[];
   }): string {
     return this.buildPlannerPrompt({
       batchContext: params.batchContext,
       uploadedPbis: params.uploadedPbis,
       plannerPrefetch: params.plannerPrefetch,
       priorPlan: params.approvedPlan,
+      resolvedUserAnswers: params.resolvedUserAnswers,
       reviewDelta: {
         summary: 'Worker discovered additional scope requiring amendment review.',
         requestedChanges: params.discoveredWork.map((item) => item.reason),
@@ -1137,6 +1354,12 @@ export class BatchAnalysisOrchestrator {
       }
       if (coverage.outcome === 'gap') {
         reasons.push(`PBI ${coverage.pbiId} is still marked as a gap.`);
+      }
+      if (coverage.outcome === 'blocked') {
+        reasons.push(`PBI ${coverage.pbiId} is still marked as blocked.`);
+      }
+      if (coverage.outcome === 'covered' && coverage.planItemIds.length === 0) {
+        reasons.push(`PBI ${coverage.pbiId} is marked as covered without any plan items.`);
       }
       for (const planItemId of coverage.planItemIds) {
         if (!planItemIds.has(planItemId)) {
@@ -1266,26 +1489,36 @@ export class BatchAnalysisOrchestrator {
     const representedKeys = new Set(
       plan.items
         .filter((item) => item.action !== 'create')
-        .flatMap((item) => [
-          item.targetFamilyId ? `family:${item.targetFamilyId}` : null,
-          item.targetTitle ? `title:${this.normalizeTitle(item.targetTitle)}` : null
-        ])
-        .filter((value): value is string => Boolean(value))
+        .flatMap((item) => Array.from(collectPlanItemTargetSignalKeys(item, (value) => this.normalizeTitle(value))))
     );
-
-    const candidates = collectDeterministicExistingArticleSignals(plannerPrefetch)
-      .filter((candidate) => !representedKeys.has(candidate.key));
+    const candidates = dedupePlanReviewStrings(
+      [
+        ...collectDeterministicClusterCoverageAssessments({
+          plan,
+          plannerPrefetch,
+          normalizeTitle: (value) => this.normalizeTitle(value)
+        })
+          .filter((assessment) => assessment.hasStrongArticleSignal && !assessment.hasStrongArticleCoverage)
+          .flatMap((assessment) => assessment.strongArticleTitles),
+        ...collectStrongArticleTargetSignals(
+          plannerPrefetch?.articleMatches ?? [],
+          (value) => this.normalizeTitle(value)
+        )
+          .filter((signal) => !representedKeys.has(signal.key))
+          .map((signal) => signal.title)
+      ]
+    ).slice(0, 8);
 
     if (candidates.length === 0) {
       return [];
     }
 
     if (decisiveItemCount === 0 || editItemCount === 0) {
-      return candidates.map((candidate) => candidate.title).slice(0, 8);
+      return candidates;
     }
 
     return candidates.length >= 2 && editItemCount < candidates.length
-      ? candidates.map((candidate) => candidate.title).slice(0, 8)
+      ? candidates
       : [];
   }
 
@@ -1294,47 +1527,20 @@ export class BatchAnalysisOrchestrator {
       return [];
     }
 
-    const representedCreatePbiIds = new Set(
-      plan.items
-        .filter((item) => item.action === 'create')
-        .flatMap((item) => item.pbiIds.map((pbiId) => pbiId.trim()))
-        .filter(Boolean)
-    );
-    const clusterMatchesById = new Map<string, BatchPlannerArticleMatch[]>();
-    for (const match of plannerPrefetch.articleMatches ?? []) {
-      const existing = clusterMatchesById.get(match.clusterId) ?? [];
-      existing.push(match);
-      clusterMatchesById.set(match.clusterId, existing);
-    }
-
-    const likelyMissingCreates = (plannerPrefetch.topicClusters ?? [])
-      .filter((cluster) => Array.isArray(cluster.pbiIds) && cluster.pbiIds.length > 0)
-      .filter((cluster) => cluster.pbiIds.every((pbiId) => !representedCreatePbiIds.has(pbiId.trim())))
-      .filter((cluster) => {
-        const relatedPlanItems = plan.items.filter((item) => item.pbiIds.some((pbiId) => cluster.pbiIds.includes(pbiId)));
-        if (relatedPlanItems.length === 0 || relatedPlanItems.every((item) => item.action === 'create')) {
-          return false;
-        }
-
-        const clusterMatches = clusterMatchesById.get(cluster.clusterId) ?? [];
-        if (clusterMatches.length === 0) {
-          return false;
-        }
-
-        const hasSearchCoverage = clusterMatches.length >= Math.min(cluster.queries.length, 2);
-        const hasStrongExistingSignal = clusterMatches.some((match) =>
-          (match.topResults ?? []).some((candidate) => {
-            const score = typeof candidate.score === 'number' ? candidate.score : 0;
-            const matchContext = typeof candidate.matchContext === 'string' ? candidate.matchContext : '';
-            return matchContext === 'title' || matchContext === 'metadata' || score >= 0.18;
-          })
-        );
-        const hasWeakNonZeroSearchHit = clusterMatches.some((match) => (match.total ?? 0) > 0 || (match.topResults?.length ?? 0) > 0);
-        return hasSearchCoverage && !hasStrongExistingSignal && !hasWeakNonZeroSearchHit;
+    return dedupePlanReviewStrings(
+      collectDeterministicClusterCoverageAssessments({
+        plan,
+        plannerPrefetch,
+        normalizeTitle: (value) => this.normalizeTitle(value)
       })
-      .map((cluster) => humanizeReadableText(cluster.label || cluster.sampleTitles[0] || cluster.queries[0] || `Cluster ${cluster.clusterId}`));
-
-    return dedupePlanReviewStrings(likelyMissingCreates).slice(0, 8);
+        .filter((assessment) => !assessment.hasCreateCoverage)
+        .filter((assessment) => assessment.relatedPlanItems.length > 0)
+        .filter((assessment) => assessment.relatedPlanItems.some((item) => item.action !== 'create'))
+        .filter((assessment) => assessment.hasSearchCoverage)
+        .filter((assessment) => !assessment.hasNonZeroSearchHit)
+        .filter((assessment) => !assessment.hasSupportedExistingCoverage)
+        .map((assessment) => assessment.displayTitle)
+    ).slice(0, 8);
   }
 
   private findDeterministicTargetConflicts(plan: BatchAnalysisPlan): string[] {
@@ -1363,6 +1569,17 @@ export class BatchAnalysisOrchestrator {
       .slice(0, 8);
   }
 
+  private async tryGetLocaleVariant(workspaceId: string, variantId?: string): Promise<LocaleVariantRecord | null> {
+    if (!variantId?.trim()) {
+      return null;
+    }
+    try {
+      return await this.workspaceRepository.getLocaleVariant(workspaceId, variantId.trim());
+    } catch {
+      return null;
+    }
+  }
+
   private async getLiveFamilyVariants(workspaceId: string, familyId?: string): Promise<LocaleVariantRecord[]> {
     if (!familyId?.trim()) {
       return [];
@@ -1389,6 +1606,126 @@ export class BatchAnalysisOrchestrator {
     } catch {
       return null;
     }
+  }
+
+  private async buildWorkerPlanPromptPayload(plan: BatchAnalysisPlan): Promise<Record<string, unknown>> {
+    return {
+      planId: plan.id,
+      verdict: plan.verdict,
+      planVersion: plan.planVersion,
+      summary: plan.summary,
+      coverage: plan.coverage.map((item) => compactPlanCoverageForPrompt(item)),
+      items: await Promise.all(plan.items.map(async (item) => ({
+        ...compactPlanItemForPrompt(item),
+        executionTarget: await this.buildWorkerExecutionTargetHint(plan.workspaceId, item)
+      }))),
+      questions: (plan.questions ?? []).map((question) => compactPlanQuestionForPrompt(question)),
+      openQuestions: serializeOpenQuestionPrompts(plan.questions ?? [], plan.openQuestions)
+    };
+  }
+
+  private async buildWorkerExecutionTargetHint(
+    workspaceId: string,
+    item: BatchPlanItem
+  ): Promise<Record<string, unknown>> {
+    const targetTitle = item.targetTitle.trim();
+    const trimmedTargetArticleId = item.targetArticleId?.trim();
+    const trimmedTargetFamilyId = item.targetFamilyId?.trim();
+
+    if (item.action === 'no_impact') {
+      return {
+        strategy: 'no_proposal',
+        authoritative: true,
+        canPersistImmediately: false,
+        note: 'No proposal should be created for approved no-impact items.',
+        recommendedProposalArgs: null
+      };
+    }
+
+    if (item.action === 'create') {
+      return {
+        strategy: 'target_title',
+        authoritative: true,
+        canPersistImmediately: Boolean(targetTitle),
+        targetTitle: targetTitle || null,
+        note: 'Persist this net-new proposal with `targetTitle` directly. Locale variant lookup is unnecessary before `create_proposals`.',
+        recommendedProposalArgs: {
+          itemId: item.planItemId,
+          action: item.action,
+          ...(targetTitle ? { targetTitle } : {}),
+          relatedPbiIds: item.pbiIds
+        }
+      };
+    }
+
+    if (trimmedTargetArticleId) {
+      return {
+        strategy: 'locale_variant_id',
+        authoritative: true,
+        canPersistImmediately: true,
+        localeVariantId: trimmedTargetArticleId,
+        familyId: trimmedTargetFamilyId || null,
+        targetTitle: targetTitle || null,
+        note: 'Approved plan already names the live locale variant target. Use it directly in `create_proposals`.',
+        recommendedProposalArgs: {
+          itemId: item.planItemId,
+          action: item.action,
+          localeVariantId: trimmedTargetArticleId,
+          ...(targetTitle ? { targetTitle } : {}),
+          relatedPbiIds: item.pbiIds
+        }
+      };
+    }
+
+    if (trimmedTargetFamilyId) {
+      const preferredLocaleVariant = await this.getUniqueLiveFamilyVariant(workspaceId, trimmedTargetFamilyId);
+      return {
+        strategy: 'family_id',
+        authoritative: true,
+        canPersistImmediately: true,
+        familyId: trimmedTargetFamilyId,
+        preferredLocaleVariantId: preferredLocaleVariant?.id ?? null,
+        targetTitle: targetTitle || null,
+        note: preferredLocaleVariant
+          ? `Persist with \`familyId\` directly. Locale variant ${preferredLocaleVariant.id} is the unique live variant if you need article content before writing.`
+          : 'Persist with `familyId` directly. Locale variant lookup is optional and only needed if you need existing article content before writing.',
+        recommendedProposalArgs: {
+          itemId: item.planItemId,
+          action: item.action,
+          familyId: trimmedTargetFamilyId,
+          ...(targetTitle ? { targetTitle } : {}),
+          relatedPbiIds: item.pbiIds
+        }
+      };
+    }
+
+    if (targetTitle) {
+      return {
+        strategy: 'target_title',
+        authoritative: true,
+        canPersistImmediately: true,
+        targetTitle,
+        note: 'The approved plan preserved only the authoritative title. Use `targetTitle` directly unless a write fails or content drafting truly needs a lookup.',
+        recommendedProposalArgs: {
+          itemId: item.planItemId,
+          action: item.action,
+          targetTitle,
+          relatedPbiIds: item.pbiIds
+        }
+      };
+    }
+
+    return {
+      strategy: 'lookup_required',
+      authoritative: false,
+      canPersistImmediately: false,
+      note: 'No usable target id or title was preserved in the approved plan. Only now should you spend a direct read action resolving the target before `create_proposals`.',
+      recommendedProposalArgs: {
+        itemId: item.planItemId,
+        action: item.action,
+        relatedPbiIds: item.pbiIds
+      }
+    };
   }
 
   private parseJsonObject(value: string): Record<string, unknown> {
@@ -1689,31 +2026,54 @@ function compactPlanForPrompt(plan: BatchAnalysisPlan): Record<string, unknown> 
     verdict: plan.verdict,
     planVersion: plan.planVersion,
     summary: plan.summary,
-    coverage: plan.coverage.map((item) => ({
-      pbiId: item.pbiId,
-      outcome: item.outcome,
-      planItemIds: item.planItemIds,
-      notes: truncatePromptText(item.notes, 160)
+    coverage: plan.coverage.map((item) => compactPlanCoverageForPrompt(item)),
+    items: plan.items.map((item) => compactPlanItemForPrompt(item)),
+    questions: (plan.questions ?? []).map((question) => compactPlanQuestionForPrompt(question)),
+    openQuestions: serializeOpenQuestionPrompts(plan.questions ?? [], plan.openQuestions)
+  };
+}
+
+function compactPlanCoverageForPrompt(item: BatchPlanCoverage): Record<string, unknown> {
+  return {
+    pbiId: item.pbiId,
+    outcome: item.outcome,
+    planItemIds: item.planItemIds,
+    notes: truncatePromptText(item.notes, 160)
+  };
+}
+
+function compactPlanItemForPrompt(item: BatchPlanItem): Record<string, unknown> {
+  return {
+    planItemId: item.planItemId,
+    pbiIds: item.pbiIds,
+    action: item.action,
+    targetType: item.targetType,
+    targetArticleId: item.targetArticleId ?? null,
+    targetFamilyId: item.targetFamilyId ?? null,
+    targetTitle: item.targetTitle,
+    reason: truncatePromptText(item.reason, 220),
+    evidence: item.evidence.map((evidence) => ({
+      kind: evidence.kind,
+      ref: evidence.ref,
+      summary: truncatePromptText(evidence.summary, 120)
     })),
-    items: plan.items.map((item) => ({
-      planItemId: item.planItemId,
-      pbiIds: item.pbiIds,
-      action: item.action,
-      targetType: item.targetType,
-      targetArticleId: item.targetArticleId ?? null,
-      targetFamilyId: item.targetFamilyId ?? null,
-      targetTitle: item.targetTitle,
-      reason: truncatePromptText(item.reason, 220),
-      evidence: item.evidence.map((evidence) => ({
-        kind: evidence.kind,
-        ref: evidence.ref,
-        summary: truncatePromptText(evidence.summary, 120)
-      })),
-      confidence: item.confidence,
-      dependsOn: item.dependsOn ?? [],
-      executionStatus: item.executionStatus
-    })),
-    openQuestions: plan.openQuestions
+    confidence: item.confidence,
+    dependsOn: item.dependsOn ?? [],
+    executionStatus: item.executionStatus
+  };
+}
+
+function compactPlanQuestionForPrompt(question: BatchAnalysisQuestion): Record<string, unknown> {
+  return {
+    id: question.id,
+    prompt: truncatePromptText(question.prompt, 180),
+    reason: truncatePromptText(question.reason, 180),
+    requiresUserInput: question.requiresUserInput,
+    linkedPbiIds: question.linkedPbiIds,
+    linkedPlanItemIds: question.linkedPlanItemIds,
+    linkedDiscoveryIds: question.linkedDiscoveryIds,
+    status: question.status,
+    answer: truncatePromptText(question.answer, 220)
   };
 }
 
@@ -1922,6 +2282,21 @@ function shouldAggressivelyHumanize(value: string): boolean {
     || collapsedTokens.some((token) => token.length >= 16);
 }
 
+function nextUniqueDiscoveryId(value: unknown, index: number, issuedIds: Set<string>): string {
+  const normalizedBaseId =
+    typeof value === 'string' && value.trim().length > 0
+      ? value.trim()
+      : `discovery-${index + 1}`;
+  let candidate = normalizedBaseId;
+  let suffix = 2;
+  while (issuedIds.has(candidate)) {
+    candidate = `${normalizedBaseId}-${suffix}`;
+    suffix += 1;
+  }
+  issuedIds.add(candidate);
+  return candidate;
+}
+
 function humanizeReadableToken(token: string, aggressive: boolean): string {
   if (!token || !/[A-Za-z]/.test(token) || /\s+/.test(token) || /[-/()"':;,.!?]+/.test(token)) {
     return token;
@@ -2030,43 +2405,173 @@ function dedupePlanReviewStrings(values: string[]): string[] {
   );
 }
 
-function collectDeterministicExistingArticleSignals(
-  plannerPrefetch: BatchPlannerPrefetch | undefined
-): Array<{ key: string; title: string }> {
-  if (!plannerPrefetch) {
+interface DeterministicTargetSignal {
+  key: string;
+  title: string;
+}
+
+interface DeterministicClusterCoverageAssessment {
+  displayTitle: string;
+  relatedPlanItems: BatchPlanItem[];
+  hasCreateCoverage: boolean;
+  hasStrongArticleSignal: boolean;
+  hasStrongArticleCoverage: boolean;
+  hasSupportedExistingCoverage: boolean;
+  hasSearchCoverage: boolean;
+  hasNonZeroSearchHit: boolean;
+  strongArticleTitles: string[];
+}
+
+function collectDeterministicClusterCoverageAssessments(params: {
+  plan: BatchAnalysisPlan;
+  plannerPrefetch?: BatchPlannerPrefetch;
+  normalizeTitle: (value: string) => string;
+}): DeterministicClusterCoverageAssessment[] {
+  if (!params.plannerPrefetch) {
     return [];
   }
 
-  const articleMatches = Array.isArray(plannerPrefetch.articleMatches) ? plannerPrefetch.articleMatches : [];
-  const signals: Array<{ key: string; title: string }> = [];
+  const articleMatchesByCluster = new Map<string, BatchPlannerArticleMatch[]>();
+  for (const match of params.plannerPrefetch.articleMatches ?? []) {
+    const existing = articleMatchesByCluster.get(match.clusterId) ?? [];
+    existing.push(match);
+    articleMatchesByCluster.set(match.clusterId, existing);
+  }
+
+  const relationSignalKeys = new Set(
+    collectRelationTargetSignals(params.plannerPrefetch.relationMatches ?? [], params.normalizeTitle)
+      .map((signal) => signal.key)
+  );
+
+  return (params.plannerPrefetch.topicClusters ?? [])
+    .filter((cluster) => Array.isArray(cluster.pbiIds) && cluster.pbiIds.length > 0)
+    .map((cluster) => {
+      const clusterPbiIds = new Set(cluster.pbiIds.map((pbiId) => pbiId.trim()).filter(Boolean));
+      const relatedPlanItems = params.plan.items.filter((item) =>
+        item.pbiIds.some((pbiId) => clusterPbiIds.has(pbiId.trim()))
+      );
+      const strongArticleSignals = collectStrongArticleTargetSignals(
+        articleMatchesByCluster.get(cluster.clusterId) ?? [],
+        params.normalizeTitle
+      );
+      const strongArticleSignalKeys = new Set(strongArticleSignals.map((signal) => signal.key));
+      const supportedExistingSignalKeys = new Set([
+        ...strongArticleSignalKeys,
+        ...relationSignalKeys
+      ]);
+      const clusterMatches = articleMatchesByCluster.get(cluster.clusterId) ?? [];
+      const hasSearchCoverage = clusterMatches.length >= Math.min(cluster.queries.length, 2);
+      const hasNonZeroSearchHit = clusterMatches.some((match) => (match.total ?? 0) > 0 || (match.topResults?.length ?? 0) > 0);
+
+      return {
+        displayTitle: humanizeReadableText(cluster.label || cluster.sampleTitles[0] || cluster.queries[0] || `Cluster ${cluster.clusterId}`),
+        relatedPlanItems,
+        hasCreateCoverage: relatedPlanItems.some((item) => item.action === 'create'),
+        hasStrongArticleSignal: strongArticleSignals.length > 0,
+        hasStrongArticleCoverage: relatedPlanItems
+          .filter((item) => item.action !== 'create')
+          .some((item) => planItemMatchesTargetSignals(item, strongArticleSignalKeys, params.normalizeTitle)),
+        hasSupportedExistingCoverage: relatedPlanItems
+          .filter((item) => item.action !== 'create')
+          .some((item) => planItemMatchesTargetSignals(item, supportedExistingSignalKeys, params.normalizeTitle)),
+        hasSearchCoverage,
+        hasNonZeroSearchHit,
+        strongArticleTitles: strongArticleSignals.map((signal) => signal.title)
+      };
+    });
+}
+
+function collectStrongArticleTargetSignals(
+  articleMatches: BatchPlannerArticleMatch[],
+  normalizeTitle: (value: string) => string
+): DeterministicTargetSignal[] {
+  const signals: DeterministicTargetSignal[] = [];
   const seen = new Set<string>();
-  const pushSignal = (title: string | undefined, familyId?: string) => {
-    const normalizedTitle = typeof title === 'string' ? humanizeReadableText(title).trim() : '';
-    if (!normalizedTitle) {
-      return;
-    }
-    const key = familyId?.trim()
-      ? `family:${familyId.trim()}`
-      : `title:${normalizedTitle.toLowerCase().replace(/[^a-z0-9]+/g, '')}`;
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    signals.push({ key, title: normalizedTitle });
-  };
 
   articleMatches.forEach((match) => {
     const candidates = Array.isArray(match.topResults) ? match.topResults.slice(0, 2) : [];
     candidates.forEach((candidate) => {
-      const score = typeof candidate.score === 'number' ? candidate.score : 0;
-      const matchContext = typeof candidate.matchContext === 'string' ? candidate.matchContext : '';
-      if (matchContext === 'title' || matchContext === 'metadata' || score >= 0.18) {
-        pushSignal(candidate.title, candidate.familyId);
+      if (!isStrongExistingArticleMatch(candidate)) {
+        return;
       }
+      const signal = createDeterministicTargetSignal(candidate.title, candidate.familyId, normalizeTitle);
+      if (!signal || seen.has(signal.key)) {
+        return;
+      }
+      seen.add(signal.key);
+      signals.push(signal);
     });
   });
 
   return signals;
+}
+
+function collectRelationTargetSignals(
+  relationMatches: BatchPlannerRelationMatch[],
+  normalizeTitle: (value: string) => string
+): DeterministicTargetSignal[] {
+  const signals: DeterministicTargetSignal[] = [];
+  const seen = new Set<string>();
+
+  relationMatches.forEach((match) => {
+    const signal = createDeterministicTargetSignal(match.title, match.familyId, normalizeTitle);
+    if (!signal || seen.has(signal.key)) {
+      return;
+    }
+    seen.add(signal.key);
+    signals.push(signal);
+  });
+
+  return signals;
+}
+
+function createDeterministicTargetSignal(
+  title: string | undefined,
+  familyId: string | undefined,
+  normalizeTitle: (value: string) => string
+): DeterministicTargetSignal | null {
+  const normalizedTitle = typeof title === 'string' ? humanizeReadableText(title).trim() : '';
+  if (!normalizedTitle) {
+    return null;
+  }
+  return {
+    key: familyId?.trim()
+      ? `family:${familyId.trim()}`
+      : `title:${normalizeTitle(normalizedTitle)}`,
+    title: normalizedTitle
+  };
+}
+
+function collectPlanItemTargetSignalKeys(
+  item: BatchPlanItem,
+  normalizeTitle: (value: string) => string
+): Set<string> {
+  const keys = new Set<string>();
+  if (item.targetFamilyId?.trim()) {
+    keys.add(`family:${item.targetFamilyId.trim()}`);
+  }
+  if (item.targetTitle?.trim()) {
+    keys.add(`title:${normalizeTitle(item.targetTitle)}`);
+  }
+  return keys;
+}
+
+function planItemMatchesTargetSignals(
+  item: BatchPlanItem,
+  signalKeys: Set<string>,
+  normalizeTitle: (value: string) => string
+): boolean {
+  if (signalKeys.size === 0) {
+    return false;
+  }
+  const planItemSignalKeys = collectPlanItemTargetSignalKeys(item, normalizeTitle);
+  return Array.from(planItemSignalKeys).some((key) => signalKeys.has(key));
+}
+
+function isStrongExistingArticleMatch(candidate: BatchPlannerArticleMatch['topResults'][number]): boolean {
+  const score = typeof candidate.score === 'number' ? candidate.score : 0;
+  const matchContext = typeof candidate.matchContext === 'string' ? candidate.matchContext : '';
+  return matchContext === 'title' || matchContext === 'metadata' || score >= 0.18;
 }
 
 function applyTextualTargetReplacementsToPlan(params: {
@@ -2107,7 +2612,95 @@ function applyTextualTargetReplacementsToPlan(params: {
         summary: replaceText(evidence.summary) ?? evidence.summary
       }))
     })),
+    questions: (params.plan.questions ?? []).map((question) => ({
+      ...question,
+      prompt: replaceText(question.prompt) ?? question.prompt,
+      reason: replaceText(question.reason) ?? question.reason,
+      answer: replaceText(question.answer)
+    })),
     openQuestions: params.plan.openQuestions.map((question) => replaceText(question) ?? question)
+  };
+}
+
+function normalizeQuestionStatus(rawStatus: unknown, answer?: string): BatchAnalysisQuestion['status'] {
+  if (rawStatus === 'answered' || rawStatus === 'resolved' || rawStatus === 'dismissed' || rawStatus === 'pending') {
+    return rawStatus;
+  }
+  return answer ? 'answered' : 'pending';
+}
+
+function serializeOpenQuestionPrompts(questions: BatchAnalysisQuestion[], legacyOpenQuestions?: unknown): string[] {
+  const prompts = questions
+    .map((question) => question.prompt?.trim())
+    .filter((prompt): prompt is string => Boolean(prompt));
+  const legacy = Array.isArray(legacyOpenQuestions)
+    ? legacyOpenQuestions.filter((entry): entry is string => typeof entry === 'string').map((entry) => humanizeReadableText(entry))
+    : [];
+  return Array.from(new Set([...prompts, ...legacy]));
+}
+
+function mergeStructuredQuestions(...questionGroups: BatchAnalysisQuestion[][]): BatchAnalysisQuestion[] {
+  const merged = new Map<string, BatchAnalysisQuestion>();
+  for (const question of questionGroups.flat()) {
+    const key = `${question.prompt.trim().toLowerCase()}|${question.reason.trim().toLowerCase()}|${question.requiresUserInput ? 'required' : 'optional'}`;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, {
+        ...question,
+        linkedPbiIds: Array.from(new Set(question.linkedPbiIds ?? [])),
+        linkedPlanItemIds: Array.from(new Set(question.linkedPlanItemIds ?? [])),
+        linkedDiscoveryIds: Array.from(new Set(question.linkedDiscoveryIds ?? []))
+      });
+      continue;
+    }
+    merged.set(key, {
+      ...existing,
+      answer: existing.answer ?? question.answer,
+      answeredAtUtc: existing.answeredAtUtc ?? question.answeredAtUtc,
+      status: existing.status === 'resolved' ? existing.status : question.status,
+      linkedPbiIds: Array.from(new Set([...(existing.linkedPbiIds ?? []), ...(question.linkedPbiIds ?? [])])),
+      linkedPlanItemIds: Array.from(new Set([...(existing.linkedPlanItemIds ?? []), ...(question.linkedPlanItemIds ?? [])])),
+      linkedDiscoveryIds: Array.from(new Set([...(existing.linkedDiscoveryIds ?? []), ...(question.linkedDiscoveryIds ?? [])]))
+    });
+  }
+  return Array.from(merged.values());
+}
+
+function collectBlockingUserInputQuestions(plan: BatchAnalysisPlan, review: BatchPlanReview): BatchAnalysisQuestion[] {
+  return mergeStructuredQuestions(plan.questions ?? [], review.questions ?? [])
+    .filter((question) =>
+      question.requiresUserInput
+      && question.status !== 'answered'
+      && question.status !== 'resolved'
+      && !question.answer?.trim()
+    );
+}
+
+function normalizePlanCoverage(item: BatchPlanCoverage): BatchPlanCoverage {
+  const planItemIds = Array.isArray(item.planItemIds)
+    ? item.planItemIds.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : [];
+  const rawOutcome = item.outcome;
+  let outcome: BatchPlanCoverage['outcome'];
+  switch (rawOutcome) {
+    case 'covered':
+    case 'gap':
+    case 'no_impact':
+    case 'blocked':
+      outcome = rawOutcome;
+      break;
+    default:
+      outcome = planItemIds.length > 0 ? 'covered' : 'gap';
+      break;
+  }
+  if (outcome === 'gap' && planItemIds.length > 0) {
+    outcome = 'covered';
+  }
+  return {
+    ...item,
+    outcome,
+    planItemIds,
+    notes: typeof item.notes === 'string' ? humanizeReadableText(item.notes) : item.notes
   };
 }
 

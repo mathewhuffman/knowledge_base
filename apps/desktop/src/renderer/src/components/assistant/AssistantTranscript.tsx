@@ -112,7 +112,8 @@ function ThoughtsBlock({
   thoughtText,
   toolEvents,
   completionState,
-  isFinal
+  isFinal,
+  open = false
 }: {
   thoughtText?: string;
   toolEvents?: Array<{
@@ -123,6 +124,7 @@ function ThoughtsBlock({
   }>;
   completionState?: AiAssistantTurnCompletionState;
   isFinal?: boolean;
+  open?: boolean;
 }) {
   const hasThoughts =
     Boolean(thoughtText?.trim())
@@ -136,7 +138,7 @@ function ThoughtsBlock({
   const completionLine = formatCompletionLine(completionState, isFinal);
 
   return (
-    <details className="ai-msg__thoughts">
+    <details className="ai-msg__thoughts" open={open}>
       <summary>Thoughts</summary>
       {completionLine ? (
         <div className="ai-msg__thoughts-text">{completionLine}</div>
@@ -145,13 +147,16 @@ function ThoughtsBlock({
         <div className="ai-msg__thoughts-text">{thoughtText}</div>
       ) : null}
       {toolEvents && toolEvents.length > 0 ? (
-        <div className="ai-msg__thoughts-tools">
-          {toolEvents.map((tool, index) => (
-            <div key={`${tool.toolCallId ?? 'tool'}:${index}`} className="ai-msg__thoughts-tool">
-              {formatThoughtToolLine(tool)}
-            </div>
-          ))}
-        </div>
+        <>
+          <div className="ai-msg__thoughts-section-title">Tools</div>
+          <div className="ai-msg__thoughts-tools">
+            {toolEvents.map((tool, index) => (
+              <div key={`${tool.toolCallId ?? 'tool'}:${index}`} className="ai-msg__thoughts-tool">
+                {formatThoughtToolLine(tool)}
+              </div>
+            ))}
+          </div>
+        </>
       ) : null}
     </details>
   );
@@ -210,7 +215,8 @@ function PendingAssistantBubble({
   processingCommand: boolean;
 }) {
   const hasThoughts = pendingTurn.thoughtText.trim().length > 0 || pendingTurn.toolEvents.length > 0;
-  const displayResponse = extractStreamedAssistantEnvelope(pendingTurn.rawResponseText).responseText || pendingTurn.responseText;
+  const streamedEnvelope = extractStreamedAssistantEnvelope(pendingTurn.rawResponseText);
+  const displayResponse = streamedEnvelope.responseText || pendingTurn.responseText;
   const showProcessingIndicator = processingCommand && pendingTurn.hasRenderableFinalResponse && displayResponse.trim().length > 0;
 
   return (
@@ -236,7 +242,13 @@ function PendingAssistantBubble({
           </div>
         )}
         {hasThoughts ? (
-          <ThoughtsBlock thoughtText={pendingTurn.thoughtText} toolEvents={pendingTurn.toolEvents} />
+          <ThoughtsBlock
+            thoughtText={pendingTurn.thoughtText}
+            toolEvents={pendingTurn.toolEvents}
+            completionState={streamedEnvelope.completionState}
+            isFinal={streamedEnvelope.isFinal}
+            open={pendingTurn.toolEvents.length > 0}
+          />
         ) : null}
         {pendingTurn.error && (
           <div className="ai-msg__stream-error">{pendingTurn.error}</div>

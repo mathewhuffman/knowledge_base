@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ArticleRelationEvidenceType = exports.ArticleRelationStatus = exports.ArticleRelationOrigin = exports.ArticleRelationDirection = exports.ArticleRelationType = exports.PublishStatus = exports.PBIValidationStatus = exports.PBIImportFormat = exports.PBIBatchScopeMode = exports.PBIBatchStatus = exports.ProposalDecision = exports.ProposalAction = exports.RevisionStatus = exports.RevisionState = exports.WorkspaceState = void 0;
+exports.KB_ACCESS_MODES = exports.ArticleRelationEvidenceType = exports.ArticleRelationStatus = exports.ArticleRelationOrigin = exports.ArticleRelationDirection = exports.ArticleRelationType = exports.PublishStatus = exports.PBIValidationStatus = exports.PBIImportFormat = exports.PBIBatchScopeMode = exports.PBIBatchStatus = exports.ProposalDecision = exports.ProposalAction = exports.RevisionStatus = exports.RevisionState = exports.WorkspaceState = void 0;
+exports.isKbAccessMode = isKbAccessMode;
 var WorkspaceState;
 (function (WorkspaceState) {
     WorkspaceState["ACTIVE"] = "active";
@@ -110,3 +111,7 @@ var ArticleRelationEvidenceType;
     ArticleRelationEvidenceType["MANUAL_NOTE"] = "manual_note";
     ArticleRelationEvidenceType["HEURISTIC"] = "heuristic";
 })(ArticleRelationEvidenceType || (exports.ArticleRelationEvidenceType = ArticleRelationEvidenceType = {}));
+exports.KB_ACCESS_MODES = ['direct', 'mcp', 'cli'];
+function isKbAccessMode(value) {
+    return typeof value === 'string' && exports.KB_ACCESS_MODES.includes(value);
+}

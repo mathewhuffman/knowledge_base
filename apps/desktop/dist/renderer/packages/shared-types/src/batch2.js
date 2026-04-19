@@ -107,3 +107,7 @@ export var ArticleRelationEvidenceType;
     ArticleRelationEvidenceType["MANUAL_NOTE"] = "manual_note";
     ArticleRelationEvidenceType["HEURISTIC"] = "heuristic";
 })(ArticleRelationEvidenceType || (ArticleRelationEvidenceType = {}));
+export const KB_ACCESS_MODES = ['direct', 'mcp', 'cli'];
+export function isKbAccessMode(value) {
+    return typeof value === 'string' && KB_ACCESS_MODES.includes(value);
+}

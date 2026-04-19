@@ -173,11 +173,11 @@ async function createFakeBatchAnalysisAcpBinary(root: string): Promise<string> {
   const source = `#!/usr/bin/env node
 const fs = require('node:fs');
 const readline = require('node:readline');
-const sessionId = 'fake-batch-analysis-session';
 const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
 let reviewCount = 0;
 let workerCount = 0;
 let finalReviewCount = 0;
+let sessionCount = 0;
 
 function append(entry) {
   if (!logPath) {
@@ -197,7 +197,8 @@ rl.on('line', (line) => {
     return;
   }
   if (message.method === 'session/new') {
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    sessionCount += 1;
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'fake-batch-analysis-session-' + sessionCount } }) + '\\n');
     return;
   }
   if (message.method === 'session/prompt') {
@@ -361,6 +362,282 @@ rl.on('line', (line) => {
           }
         };
       }
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createUserInputBatchAnalysisAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-user-input-agent');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+let sessionCount = 0;
+
+function append(entry) {
+  if (!logPath) {
+    return;
+  }
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    sessionCount += 1;
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'fake-batch-analysis-user-input-session-' + sessionCount } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      const resumedWithAnswer = promptText.includes('resolvedUserAnswers') && promptText.includes('Include Delete a Food List');
+      payload = resumedWithAnswer
+        ? {
+            summary: 'Revised plan now includes Delete a Food List before worker execution.',
+            coverage: [
+              { pbiId: '1', outcome: 'covered', planItemIds: ['item-1', 'item-2'] }
+            ],
+            items: [
+              {
+                planItemId: 'item-1',
+                pbiIds: ['1'],
+                action: 'create',
+                targetType: 'new_article',
+                targetTitle: 'Create a Food List',
+                reason: 'The batch still needs the create flow article.',
+                evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+                confidence: 0.9,
+                executionStatus: 'pending'
+              },
+              {
+                planItemId: 'item-2',
+                pbiIds: ['1'],
+                action: 'create',
+                targetType: 'new_article',
+                targetTitle: 'Delete a Food List',
+                reason: 'User confirmed Delete a Food List belongs in scope and should be covered before worker execution.',
+                evidence: [{ kind: 'review', ref: 'question-delete-food-list', summary: 'User answered the scope question during batch analysis.' }],
+                confidence: 0.84,
+                executionStatus: 'pending'
+              }
+            ],
+            questions: [],
+            openQuestions: []
+          }
+        : {
+            summary: 'Initial draft plan leaves Delete a Food List unresolved.',
+            coverage: [
+              { pbiId: '1', outcome: 'covered', planItemIds: ['item-1'] }
+            ],
+            items: [
+              {
+                planItemId: 'item-1',
+                pbiIds: ['1'],
+                action: 'create',
+                targetType: 'new_article',
+                targetTitle: 'Create a Food List',
+                reason: 'Initial draft only covers create flow.',
+                evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+                confidence: 0.9,
+                executionStatus: 'pending'
+              }
+            ],
+            questions: [
+              {
+                id: 'question-delete-food-list',
+                prompt: 'Should Delete a Food List be included in this batch or explicitly deferred?',
+                reason: 'Planner found the Delete a Food List scope gap, and that product intent must be confirmed before approval.',
+                requiresUserInput: true,
+                linkedPbiIds: ['1'],
+                linkedPlanItemIds: ['item-1'],
+                linkedDiscoveryIds: []
+              }
+            ],
+            openQuestions: ['Should Delete a Food List be included in this batch or explicitly deferred?']
+          };
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      payload = {
+        summary: 'Plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      payload = {
+        summary: 'Worker executed the approved user-resolved plan.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review approved after the user-resolved plan ran.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
+    } else {
+      payload = { text: 'noop' };
+    }
+
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { text: JSON.stringify(payload) } }) + '\\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createUnresolvedGapBatchAnalysisAcpBinary(root: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-batch-analysis-unresolved-gap-agent');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+let sessionCount = 0;
+
+function append(entry) {
+  if (!logPath) {
+    return;
+  }
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/new') {
+    sessionCount += 1;
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'fake-batch-analysis-unresolved-gap-session-' + sessionCount } }) + '\\n');
+    return;
+  }
+  if (message.method === 'session/prompt') {
+    const promptText = (((message.params || {}).prompt || [])[0] || {}).text || '';
+    let payload;
+
+    if (promptText.includes('Create a complete structured batch analysis plan.')) {
+      payload = {
+        summary: 'Draft plan still leaves one required PBI unresolved.',
+        coverage: [
+          { pbiId: '1', outcome: 'covered', planItemIds: ['item-1'] },
+          { pbiId: '2', outcome: 'gap', planItemIds: [] }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['1'],
+            action: 'create',
+            targetType: 'new_article',
+            targetTitle: 'Covered article',
+            reason: 'Only the first PBI is covered in this intentionally incomplete plan.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported test PBI.' }],
+            confidence: 0.83,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      };
+    } else if (promptText.includes('Review the submitted batch plan for completeness and correctness.')) {
+      payload = {
+        summary: 'Reviewer incorrectly claims the plan is approved.',
+        verdict: 'approved',
+        didAccountForEveryPbi: true,
+        hasMissingCreates: false,
+        hasMissingEdits: false,
+        hasTargetIssues: false,
+        hasOverlapOrConflict: false,
+        foundAdditionalArticleWork: false,
+        underScopedKbImpact: false,
+        delta: {
+          summary: 'No changes requested.',
+          requestedChanges: [],
+          missingPbiIds: [],
+          missingCreates: [],
+          missingEdits: [],
+          additionalArticleWork: [],
+          targetCorrections: [],
+          overlapConflicts: []
+        }
+      };
+    } else if (promptText.includes('Execute only the approved plan items below.')) {
+      payload = {
+        summary: 'Worker should never run for unresolved gap coverage.',
+        discoveredWork: []
+      };
+    } else if (promptText.includes('You are the final reviewer for the batch.')) {
+      payload = {
+        summary: 'Final review should never run for unresolved gap coverage.',
+        verdict: 'approved',
+        allPbisMapped: true,
+        planExecutionComplete: true,
+        hasMissingArticleChanges: false,
+        hasUnresolvedDiscoveredWork: false,
+        delta: {
+          summary: 'No further work required.',
+          requestedRework: [],
+          uncoveredPbiIds: [],
+          missingArticleChanges: [],
+          duplicateRiskTitles: [],
+          unnecessaryChanges: [],
+          unresolvedAmbiguities: []
+        }
+      };
     } else {
       payload = { text: 'noop' };
     }
@@ -1478,6 +1755,22 @@ async function waitForLoggedMethod(logPath: string, method: string, timeoutMs = 
   throw new Error(`Timed out waiting for ${method}`);
 }
 
+async function waitForCondition<T>(
+  load: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  timeoutMs = 8_000
+): Promise<T> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const value = await load();
+    if (predicate(value)) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error('Timed out waiting for condition');
+}
+
 function extractPromptText(entry: { params?: Record<string, unknown> } | undefined): string {
   const prompt = entry?.params?.prompt;
   if (!Array.isArray(prompt)) {
@@ -1597,6 +1890,12 @@ async function runGlobalAssistantFlowForMode(kbAccessMode: 'cli' | 'mcp') {
       workspaceKbAccessMode: workspaceMode ?? 'cli',
       selectedMode: selectedMode ?? workspaceMode ?? 'cli',
       providers: {
+        direct: {
+          mode: 'direct',
+          provider: 'direct',
+          ok: false,
+          message: 'Direct access shell registered, but the executor path is not enabled yet'
+        },
         mcp: {
           mode: 'mcp',
           provider: 'mcp',
@@ -1980,6 +2279,12 @@ async function runBatchAnalysisForMode(kbAccessMode: 'cli' | 'mcp') {
       workspaceKbAccessMode: workspaceMode ?? 'cli',
       selectedMode: selectedMode ?? workspaceMode ?? 'cli',
       providers: {
+        direct: {
+          mode: 'direct',
+          provider: 'direct',
+          ok: false,
+          message: 'Direct access shell registered, but the executor path is not enabled yet'
+        },
         mcp: {
           mode: 'mcp',
           provider: 'mcp',
@@ -2111,7 +2416,7 @@ test.describe('command registry content model transitions', () => {
     });
     expect(getResp.ok).toBe(true);
     expect((getResp.data as { zendeskSubdomain: string; kbAccessMode: string }).zendeskSubdomain).toBe('support');
-    expect((getResp.data as { kbAccessMode: string }).kbAccessMode).toBe('mcp');
+    expect((getResp.data as { kbAccessMode: string }).kbAccessMode).toBe('direct');
 
     const updateResp = await bus.execute({
       method: 'workspace.settings.update',
@@ -2142,7 +2447,7 @@ test.describe('command registry content model transitions', () => {
       payload: { workspaceId: workspace.id }
     });
     expect(firstHealthResp.ok).toBe(true);
-    expect((firstHealthResp.data as { selectedMode: string }).selectedMode).toBe('mcp');
+    expect((firstHealthResp.data as { selectedMode: string }).selectedMode).toBe('direct');
 
     const cliSettingsResp = await bus.execute({
       method: 'workspace.settings.update',
@@ -2686,6 +2991,12 @@ test.describe('command registry content model transitions', () => {
         workspaceKbAccessMode: workspaceMode ?? 'cli',
         selectedMode: selectedMode ?? workspaceMode ?? 'cli',
         providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: 'Direct access shell registered, but the executor path is not enabled yet'
+          },
           mcp: {
             mode: 'mcp',
             provider: 'mcp',
@@ -2750,11 +3061,886 @@ test.describe('command registry content model transitions', () => {
     }
   });
 
+  test('direct batch analysis keeps planner, worker, and review stages on direct', async () => {
+    const workspace = await createWorkspace();
+    const settingsResp = await bus.execute({
+      method: 'workspace.settings.update',
+      payload: {
+        workspaceId: workspace.id,
+        kbAccessMode: 'direct'
+      }
+    });
+    expect(settingsResp.ok).toBe(true);
+
+    const importResp = await bus.execute({
+      method: 'pbiBatch.import',
+      payload: {
+        workspaceId: workspace.id,
+        sourceFileName: 'direct-phase-2.csv',
+        sourceContent: 'Id,Title,Description\n1,Direct Phase 3,Verify direct planner, worker, and review stages stay on direct'
+      }
+    });
+    expect(importResp.ok).toBe(true);
+    const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+    const rowsResp = await bus.execute({
+      method: 'pbiBatch.rows.list',
+      payload: {
+        workspaceId: workspace.id,
+        batchId
+      }
+    });
+    expect(rowsResp.ok).toBe(true);
+    const uploadedPbis = (rowsResp.data as { rows: Array<{ id: string }> }).rows;
+    const firstPbiId = uploadedPbis[0]?.id;
+    expect(firstPbiId).toBeTruthy();
+
+    const agentRuntime = services.agentRuntime as any;
+    const batchAnalysisOrchestrator = services.batchAnalysisOrchestrator as {
+      applyDeterministicPlanReviewGuard: (params: {
+        review: unknown;
+      }) => {
+        review: unknown;
+        forcedRevision: boolean;
+        missingEditTargets: string[];
+        missingCreateTargets: string[];
+        conflictingTargets: string[];
+        unresolvedTargetIssues: string[];
+        unresolvedReferenceIssues: string[];
+      };
+    };
+    batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard = ({ review }) => ({
+      review,
+      forcedRevision: false,
+      missingEditTargets: [],
+      missingCreateTargets: [],
+      conflictingTargets: [],
+      unresolvedTargetIssues: [],
+      unresolvedReferenceIssues: []
+    });
+    agentRuntime.checkHealth = async (workspaceId, selectedMode, workspaceMode) => ({
+      checkedAtUtc: new Date().toISOString(),
+      workspaceId,
+      workspaceKbAccessMode: workspaceMode ?? 'direct',
+      selectedMode: selectedMode ?? workspaceMode ?? 'direct',
+      providers: {
+        direct: {
+          mode: 'direct',
+          provider: 'direct',
+          ok: true,
+          message: 'Direct executor ready for direct batch analysis stages'
+        },
+        mcp: {
+          mode: 'mcp',
+          provider: 'mcp',
+          ok: true,
+          message: 'MCP access available as a compatibility provider'
+        },
+        cli: {
+          mode: 'cli',
+          provider: 'cli',
+          ok: false,
+          message: 'CLI access disabled for this test'
+        }
+      },
+      issues: [],
+      availableModes: ['direct', 'mcp']
+    });
+
+    const runRequests: Array<{ role?: string; kbAccessMode?: string }> = [];
+    agentRuntime.getTranscripts = async ({ workspaceId, sessionId }) => ({
+      workspaceId,
+      sessionId,
+      lines: []
+    });
+    agentRuntime.runBatchAnalysis = async (request: {
+      agentRole?: string;
+      kbAccessMode?: string;
+      workspaceId: string;
+      batchId: string;
+    }) => {
+      runRequests.push({ role: request.agentRole, kbAccessMode: request.kbAccessMode });
+      const startedAtUtc = new Date().toISOString();
+      const payloadByRole: Record<string, unknown> = request.agentRole === 'planner'
+        ? {
+            text: JSON.stringify({
+              summary: 'Direct planner completed.',
+              coverage: [
+                {
+                  pbiId: firstPbiId,
+                  outcome: 'no_impact',
+                  planItemIds: ['plan-1']
+                }
+              ],
+              items: [
+                {
+                  planItemId: 'plan-1',
+                  pbiIds: [firstPbiId],
+                  action: 'no_impact',
+                  targetType: 'unknown',
+                  targetTitle: 'Direct Phase 2',
+                  reason: 'No KB change is required for this compatibility-path test.',
+                  evidence: [
+                    {
+                      kind: 'pbi',
+                      ref: `pbi:${firstPbiId}`,
+                      summary: 'Imported PBI is covered without KB changes.'
+                    }
+                  ],
+                  confidence: 0.88,
+                  executionStatus: 'pending'
+                }
+              ],
+              openQuestions: []
+            })
+          }
+        : request.agentRole === 'plan-reviewer'
+          ? {
+              text: JSON.stringify({
+                summary: 'Direct review approved the no-impact plan.',
+                verdict: 'approved',
+                didAccountForEveryPbi: true,
+                hasMissingCreates: false,
+                hasMissingEdits: false,
+                hasTargetIssues: false,
+                hasOverlapOrConflict: false,
+                foundAdditionalArticleWork: false,
+                underScopedKbImpact: false,
+                delta: {
+                  summary: 'No changes requested.',
+                  requestedChanges: [],
+                  missingPbiIds: [],
+                  missingCreates: [],
+                  missingEdits: [],
+                  additionalArticleWork: [],
+                  targetCorrections: [],
+                  overlapConflicts: []
+                }
+              })
+            }
+          : request.agentRole === 'worker'
+            ? {
+                text: JSON.stringify({
+                  summary: 'Compatibility worker completed.',
+                  discoveredWork: []
+                })
+              }
+            : {
+                text: JSON.stringify({
+                  summary: 'Direct final review approved the batch.',
+                  verdict: 'approved',
+                  allPbisMapped: true,
+                  planExecutionComplete: true,
+                  hasMissingArticleChanges: false,
+                  hasUnresolvedDiscoveredWork: false,
+                  delta: {
+                    summary: 'No rework required.',
+                    requestedRework: [],
+                    uncoveredPbiIds: [],
+                    missingArticleChanges: [],
+                    duplicateRiskTitles: [],
+                    unnecessaryChanges: [],
+                    unresolvedAmbiguities: []
+                  }
+                })
+              };
+
+      return {
+        sessionId: `${request.agentRole}-session`,
+        kbAccessMode: request.kbAccessMode ?? 'unknown',
+        status: 'ok',
+        transcriptPath: '',
+        rawOutput: [],
+        resultPayload: payloadByRole,
+        finalText: typeof (payloadByRole as { text?: string }).text === 'string' ? (payloadByRole as { text: string }).text : undefined,
+        toolCalls: [],
+        startedAtUtc,
+        endedAtUtc: startedAtUtc,
+        durationMs: 1,
+        message: 'Completed'
+      };
+    };
+
+    const job = await jobs.start('agent.analysis.run', {
+      workspaceId: workspace.id,
+      batchId
+    });
+    expect(job.state).toBe('SUCCEEDED');
+    expect(runRequests).toEqual([
+      { role: 'planner', kbAccessMode: 'direct' },
+      { role: 'plan-reviewer', kbAccessMode: 'direct' },
+      { role: 'worker', kbAccessMode: 'direct' },
+      { role: 'final-reviewer', kbAccessMode: 'direct' }
+    ]);
+
+    const inspectionResp = await bus.execute({
+      method: 'batch.analysis.inspection.get',
+      payload: { workspaceId: workspace.id, batchId }
+    });
+    expect(inspectionResp.ok).toBe(true);
+    const inspection = inspectionResp.data as {
+      stageRuns: Array<{ role: string; kbAccessMode?: string }>;
+    };
+    expect(
+      inspection.stageRuns.some((run) => run.role === 'worker' && run.kbAccessMode === 'direct')
+    ).toBe(true);
+    expect(
+      inspection.stageRuns.some((run) => run.role === 'planner' && run.kbAccessMode === 'direct')
+    ).toBe(true);
+    expect(
+      inspection.stageRuns.some((run) => run.role === 'final-reviewer' && run.kbAccessMode === 'direct')
+    ).toBe(true);
+  });
+
+  test('worker watchdog fails a stuck building stage and preserves the in-flight stage run', async () => {
+    const harness = await createTestHarness();
+    const previousWorkerTimeout = process.env.KBV_WORKER_STAGE_TIMEOUT_MS;
+    const previousWorkerWatchdog = process.env.KBV_WORKER_STAGE_WATCHDOG_MS;
+    process.env.KBV_WORKER_STAGE_TIMEOUT_MS = '25';
+    process.env.KBV_WORKER_STAGE_WATCHDOG_MS = '50';
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'direct'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await harness.bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'worker-watchdog.csv',
+          sourceContent: 'Id,Title,Description\n1,Worker Watchdog,Ensure the worker stage fails fast when ACP stalls'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const rowsResp = await harness.bus.execute({
+        method: 'pbiBatch.rows.list',
+        payload: {
+          workspaceId: workspace.id,
+          batchId
+        }
+      });
+      expect(rowsResp.ok).toBe(true);
+      const uploadedPbis = (rowsResp.data as { rows: Array<{ id: string }> }).rows;
+      const firstPbiId = uploadedPbis[0]?.id;
+      expect(firstPbiId).toBeTruthy();
+
+      const agentRuntime = harness.services.agentRuntime as any;
+      const batchAnalysisOrchestrator = harness.services.batchAnalysisOrchestrator as {
+        applyDeterministicPlanReviewGuard: (params: { review: unknown }) => {
+          review: unknown;
+          forcedRevision: boolean;
+          missingEditTargets: string[];
+          missingCreateTargets: string[];
+          conflictingTargets: string[];
+          unresolvedTargetIssues: string[];
+          unresolvedReferenceIssues: string[];
+        };
+      };
+      batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard = ({ review }) => ({
+        review,
+        forcedRevision: false,
+        missingEditTargets: [],
+        missingCreateTargets: [],
+        conflictingTargets: [],
+        unresolvedTargetIssues: [],
+        unresolvedReferenceIssues: []
+      });
+      agentRuntime.checkHealth = async (workspaceId: string, selectedMode?: string, workspaceMode?: string) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: (workspaceMode ?? 'direct') as 'direct',
+        selectedMode: (selectedMode ?? workspaceMode ?? 'direct') as 'direct',
+        providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: true,
+            message: 'Direct executor ready for worker watchdog coverage'
+          },
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: true,
+            message: 'Compatibility MCP provider available'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: false,
+            message: 'CLI disabled for worker watchdog coverage'
+          }
+        },
+        issues: [],
+        availableModes: ['direct', 'mcp']
+      });
+      agentRuntime.getTranscripts = async ({ workspaceId, sessionId }: { workspaceId: string; sessionId: string }) => ({
+        workspaceId,
+        sessionId,
+        lines: []
+      });
+      agentRuntime.runBatchAnalysis = async (request: {
+        sessionId?: string;
+        agentRole?: string;
+        kbAccessMode?: string;
+      }) => {
+        const startedAtUtc = new Date().toISOString();
+        if (request.agentRole === 'worker') {
+          return await new Promise<never>(() => undefined);
+        }
+
+        const payloadByRole: Record<string, unknown> = request.agentRole === 'planner'
+          ? {
+              text: JSON.stringify({
+                summary: 'Watchdog planner completed.',
+                coverage: [
+                  {
+                    pbiId: firstPbiId,
+                    outcome: 'edit_required',
+                    planItemIds: ['plan-watchdog-1']
+                  }
+                ],
+                items: [
+                  {
+                    planItemId: 'plan-watchdog-1',
+                    pbiIds: [firstPbiId],
+                    action: 'edit',
+                    targetType: 'article',
+                    targetTitle: 'Worker Watchdog Article',
+                    reason: 'The worker watchdog test needs one worker item.',
+                    evidence: [
+                      {
+                        kind: 'pbi',
+                        ref: `pbi:${firstPbiId}`,
+                        summary: 'Imported watchdog PBI requires article work.'
+                      }
+                    ],
+                    confidence: 0.9,
+                    executionStatus: 'pending'
+                  }
+                ],
+                openQuestions: []
+              })
+            }
+          : {
+              text: JSON.stringify({
+                summary: 'Watchdog reviewer approved the worker plan.',
+                verdict: 'approved',
+                didAccountForEveryPbi: true,
+                hasMissingCreates: false,
+                hasMissingEdits: false,
+                hasTargetIssues: false,
+                hasOverlapOrConflict: false,
+                foundAdditionalArticleWork: false,
+                underScopedKbImpact: false,
+                delta: {
+                  summary: 'No changes requested.',
+                  requestedChanges: [],
+                  missingPbiIds: [],
+                  missingCreates: [],
+                  missingEdits: [],
+                  additionalArticleWork: [],
+                  targetCorrections: [],
+                  overlapConflicts: []
+                }
+              })
+            };
+
+        return {
+          sessionId: request.sessionId ?? `${request.agentRole}-watchdog-session`,
+          kbAccessMode: request.kbAccessMode ?? 'direct',
+          status: 'ok',
+          transcriptPath: '',
+          rawOutput: [],
+          resultPayload: payloadByRole,
+          finalText: (payloadByRole as { text: string }).text,
+          toolCalls: [],
+          startedAtUtc,
+          endedAtUtc: startedAtUtc,
+          durationMs: 1,
+          message: 'Completed'
+        };
+      };
+
+      const job = await harness.jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('FAILED');
+
+      const inspectionResp = await harness.bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        latestIteration?: { stage: string; role: string; status: string; summary?: string } | null;
+        stageRuns: Array<{ stage: string; role: string; status: string; promptTemplate?: string; endedAtUtc?: string }>;
+      };
+      expect(inspection.latestIteration?.stage).toBe('building');
+      expect(inspection.latestIteration?.role).toBe('worker');
+      expect(inspection.latestIteration?.status).toBe('failed');
+      expect(inspection.latestIteration?.summary).toContain('watchdog');
+
+      const workerStageRun = inspection.stageRuns.find((run) => run.stage === 'building' && run.role === 'worker');
+      expect(workerStageRun).toBeTruthy();
+      expect(workerStageRun?.status).toBe('failed');
+      expect(workerStageRun?.promptTemplate).toContain('Execute only the approved plan items below.');
+      expect(workerStageRun?.endedAtUtc).toBeTruthy();
+    } finally {
+      if (previousWorkerTimeout === undefined) {
+        delete process.env.KBV_WORKER_STAGE_TIMEOUT_MS;
+      } else {
+        process.env.KBV_WORKER_STAGE_TIMEOUT_MS = previousWorkerTimeout;
+      }
+      if (previousWorkerWatchdog === undefined) {
+        delete process.env.KBV_WORKER_STAGE_WATCHDOG_MS;
+      } else {
+        process.env.KBV_WORKER_STAGE_WATCHDOG_MS = previousWorkerWatchdog;
+      }
+      await harness.cleanup();
+    }
+  });
+
+  test('uses the batch worker budget minutes to size the worker timeout', async () => {
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'direct'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await harness.bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'worker-budget.csv',
+          sourceContent: 'Id,Title,Description\n1,Worker Budget,Verify custom worker stage budgeting reaches the runtime'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const submitResp = await harness.bus.execute({
+        method: 'pbiBatch.setStatus',
+        payload: {
+          workspaceId: workspace.id,
+          batchId,
+          status: PBIBatchStatus.SUBMITTED,
+          workerStageBudgetMinutes: 45
+        }
+      });
+      expect(submitResp.ok).toBe(true);
+
+      const rowsResp = await harness.bus.execute({
+        method: 'pbiBatch.rows.list',
+        payload: {
+          workspaceId: workspace.id,
+          batchId
+        }
+      });
+      expect(rowsResp.ok).toBe(true);
+      const uploadedPbis = (rowsResp.data as { rows: Array<{ id: string }> }).rows;
+      const firstPbiId = uploadedPbis[0]?.id;
+      expect(firstPbiId).toBeTruthy();
+
+      const agentRuntime = harness.services.agentRuntime as any;
+      let observedWorkerTimeoutMs: number | undefined;
+      agentRuntime.checkHealth = async (workspaceId: string, selectedMode?: string, workspaceMode?: string) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: (workspaceMode ?? 'direct') as 'direct',
+        selectedMode: (selectedMode ?? workspaceMode ?? 'direct') as 'direct',
+        providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: true,
+            message: 'Direct executor ready for worker budget coverage'
+          },
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: true,
+            message: 'Compatibility MCP provider available'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: false,
+            message: 'CLI disabled for worker budget coverage'
+          }
+        },
+        issues: [],
+        availableModes: ['direct', 'mcp']
+      });
+      agentRuntime.getTranscripts = async ({ workspaceId, sessionId }: { workspaceId: string; sessionId: string }) => ({
+        workspaceId,
+        sessionId,
+        lines: []
+      });
+      agentRuntime.runBatchAnalysis = async (request: {
+        sessionId?: string;
+        agentRole?: string;
+        kbAccessMode?: string;
+        timeoutMs?: number;
+      }) => {
+        const startedAtUtc = new Date().toISOString();
+        let text = JSON.stringify({
+          summary: 'Budget test reviewer approved the no-impact plan.',
+          verdict: 'approved',
+          didAccountForEveryPbi: true,
+          hasMissingCreates: false,
+          hasMissingEdits: false,
+          hasTargetIssues: false,
+          hasOverlapOrConflict: false,
+          foundAdditionalArticleWork: false,
+          underScopedKbImpact: false,
+          delta: {
+            summary: 'No changes requested.',
+            requestedChanges: [],
+            missingPbiIds: [],
+            missingCreates: [],
+            missingEdits: [],
+            additionalArticleWork: [],
+            targetCorrections: [],
+            overlapConflicts: []
+          }
+        });
+
+        if (request.agentRole === 'planner') {
+          text = JSON.stringify({
+            summary: 'Budget test planner completed.',
+            coverage: [
+              {
+                pbiId: firstPbiId,
+                outcome: 'no_impact',
+                planItemIds: ['plan-budget-1']
+              }
+            ],
+            items: [
+              {
+                planItemId: 'plan-budget-1',
+                pbiIds: [firstPbiId],
+                action: 'no_impact',
+                targetType: 'unknown',
+                targetTitle: 'No KB Changes Needed',
+                reason: 'This item is only here to verify the worker timeout budget.',
+                evidence: [
+                  {
+                    kind: 'pbi',
+                    ref: `pbi:${firstPbiId}`,
+                    summary: 'Imported PBI does not require KB updates.'
+                  }
+                ],
+                confidence: 0.9,
+                executionStatus: 'pending'
+              }
+            ],
+            openQuestions: []
+          });
+        } else if (request.agentRole === 'worker') {
+          observedWorkerTimeoutMs = request.timeoutMs;
+          text = JSON.stringify({
+            summary: 'Worker confirmed that no KB changes are required.',
+            discoveredWork: []
+          });
+        } else if (request.agentRole === 'final-reviewer') {
+          text = JSON.stringify({
+            summary: 'Final review confirms there is nothing to propose for this no-impact batch.',
+            verdict: 'approved',
+            appliedAmendment: false,
+            requiresRework: false,
+            delta: {
+              summary: 'No changes requested.',
+              requestedChanges: [],
+              missingPbiIds: [],
+              additionalArticleWork: [],
+              targetCorrections: [],
+              overlapConflicts: []
+            }
+          });
+        }
+
+        return {
+          sessionId: request.sessionId ?? `${request.agentRole}-budget-session`,
+          kbAccessMode: request.kbAccessMode ?? 'direct',
+          status: 'ok',
+          transcriptPath: '',
+          rawOutput: [],
+          resultPayload: { text },
+          finalText: text,
+          toolCalls: [],
+          startedAtUtc,
+          endedAtUtc: startedAtUtc,
+          durationMs: 1,
+          message: 'Completed'
+        };
+      };
+
+      const job = await harness.jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+
+      expect(job.state).toBe('SUCCEEDED');
+      expect(observedWorkerTimeoutMs).toBe(45 * 60_000);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   for (const kbAccessMode of ['mcp', 'cli'] as const) {
     test(`keeps batch analysis history and prompts pinned to ${kbAccessMode.toUpperCase()} mode`, async () => {
       await runBatchAnalysisForMode(kbAccessMode);
     });
   }
+
+  test('pauses for required Delete a Food List user input and auto-resumes before worker execution', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-user-input-'));
+    const logPath = path.join(isolatedRoot, 'batch-analysis-user-input.jsonl');
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_CURSOR_BINARY = await createUserInputBatchAnalysisAcpBinary(isolatedRoot);
+
+    try {
+      const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const agentRuntime = services.agentRuntime as any;
+      agentRuntime.checkHealth = async (workspaceId: string, selectedMode?: string, workspaceMode?: string) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: workspaceMode ?? 'cli',
+        selectedMode: selectedMode ?? workspaceMode ?? 'cli',
+        providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: 'Direct access shell registered, but the executor path is not enabled yet'
+          },
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: true,
+            message: 'MCP access ready'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: true,
+            message: 'CLI access ready'
+          }
+        },
+        issues: [],
+        availableModes: ['mcp', 'cli']
+      });
+
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'delete-food-list.csv',
+          sourceContent: 'Id,Title,Description\n1,Delete a Food List,Fix the batch-analysis scope gap for Delete a Food List before worker execution'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const initialJob = await jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(initialJob.state).toBe('FAILED');
+
+      const pausedInspectionResp = await bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(pausedInspectionResp.ok).toBe(true);
+      const pausedInspection = pausedInspectionResp.data as {
+        snapshot: {
+          pausedForUserInput: boolean;
+          unansweredRequiredQuestionCount: number;
+          latestIteration?: { stage: string; status: string } | null;
+        };
+        reviews: Array<{ verdict: string }>;
+        questionSets: Array<{ id: string; resumeStage: string; status: string }>;
+        questions: Array<{ id: string; prompt: string; answer?: string }>;
+        workerReports: Array<unknown>;
+        stageRuns: Array<{ role: string }>;
+      };
+      expect(pausedInspection.snapshot.pausedForUserInput).toBe(true);
+      expect(pausedInspection.snapshot.unansweredRequiredQuestionCount).toBe(1);
+      expect(pausedInspection.snapshot.latestIteration?.stage).toBe('awaiting_user_input');
+      expect(pausedInspection.snapshot.latestIteration?.status).toBe('needs_user_input');
+      expect(pausedInspection.reviews.some((review) => review.verdict === 'needs_user_input')).toBe(true);
+      expect(pausedInspection.questionSets[0]?.resumeStage).toBe('plan_revision');
+      expect(pausedInspection.questionSets[0]?.status).toBe('waiting');
+      expect(pausedInspection.workerReports).toHaveLength(0);
+      expect(pausedInspection.stageRuns.some((run) => run.role === 'worker')).toBe(false);
+
+      const question = pausedInspection.questions.find((entry) => entry.prompt.includes('Delete a Food List'));
+      expect(question?.id).toBeTruthy();
+
+      const answerResp = await bus.execute({
+        method: 'batch.analysis.questions.answer',
+        payload: {
+          workspaceId: workspace.id,
+          batchId,
+          questionId: question?.id,
+          answer: 'Include Delete a Food List in this batch as an edit to the existing article.'
+        }
+      });
+      expect(answerResp.ok).toBe(true);
+      const answerData = answerResp.data as {
+        resumeTriggered: boolean;
+        unansweredRequiredQuestionCount: number;
+        questionSetStatus: string;
+      };
+      expect(answerData.resumeTriggered).toBe(true);
+      expect(answerData.unansweredRequiredQuestionCount).toBe(0);
+      expect(answerData.questionSetStatus).toBe('ready_to_resume');
+
+      const resumedInspection = await waitForCondition(async () => {
+        const inspectionResp = await bus.execute({
+          method: 'batch.analysis.inspection.get',
+          payload: { workspaceId: workspace.id, batchId }
+        });
+        expect(inspectionResp.ok).toBe(true);
+        return inspectionResp.data as {
+          snapshot: {
+            pausedForUserInput: boolean;
+            latestIteration?: { stage: string } | null;
+            latestApprovedPlan?: { items: Array<{ targetTitle?: string }> } | null;
+          };
+          questions: Array<{ prompt: string; answer?: string }>;
+          workerReports: Array<unknown>;
+          stageRuns: Array<{ role: string }>;
+          finalReviews: Array<{ verdict: string }>;
+        };
+      }, (inspection) =>
+        inspection.snapshot.latestIteration?.stage === 'approved'
+        && inspection.workerReports.length > 0
+        && inspection.finalReviews.some((review) => review.verdict === 'approved')
+      );
+
+      expect(resumedInspection.snapshot.pausedForUserInput).toBe(false);
+      expect(
+        resumedInspection.snapshot.latestApprovedPlan?.items.some((item) => item.targetTitle === 'Delete a Food List')
+      ).toBe(true);
+      expect(
+        resumedInspection.questions.some((entry) =>
+          entry.prompt.includes('Delete a Food List')
+          && entry.answer?.includes('Include Delete a Food List')
+        )
+      ).toBe(true);
+      expect(resumedInspection.stageRuns.some((run) => run.role === 'worker')).toBe(true);
+
+      const promptRequests = await readLoggedRequests(logPath);
+      const plannerPrompts = promptRequests
+        .filter((entry) => entry.method === 'session/prompt')
+        .map((entry) => extractPromptText(entry))
+        .filter((text) => text.includes('Create a complete structured batch analysis plan.'));
+      expect(plannerPrompts.length).toBeGreaterThanOrEqual(2);
+      expect(plannerPrompts.some((text) =>
+        text.includes('resolvedUserAnswers')
+        && text.includes('Include Delete a Food List in this batch as an edit to the existing article.')
+      )).toBe(true);
+    } finally {
+      delete process.env.KBV_TEST_ACP_LOG_PATH;
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('does not start worker when approved review still leaves unresolved PBI gap coverage', async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-unresolved-gap-'));
+    const logPath = path.join(isolatedRoot, 'batch-analysis-unresolved-gap.jsonl');
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    process.env.KBV_CURSOR_BINARY = await createUnresolvedGapBatchAnalysisAcpBinary(isolatedRoot);
+
+    try {
+      const workspace = await createWorkspace();
+      const settingsResp = await bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'unresolved-gap.csv',
+          sourceContent: 'Id,Title,Description\n1,Covered article,Cover the first article\n2,Missing article,Leave this unresolved to exercise the approval guard'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const job = await jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('FAILED');
+
+      const inspectionResp = await bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        snapshot: {
+          latestIteration?: { stage: string; status: string } | null;
+        };
+        reviews: Array<{ verdict: string; delta?: { requestedChanges?: string[] } }>;
+        workerReports: Array<unknown>;
+        stageRuns: Array<{ role: string }>;
+      };
+      expect(inspection.snapshot.latestIteration?.stage).toBe('needs_human_review');
+      expect(inspection.snapshot.latestIteration?.status).toBe('needs_human_review');
+      expect(inspection.workerReports).toHaveLength(0);
+      expect(inspection.stageRuns.some((run) => run.role === 'worker')).toBe(false);
+      expect(
+        inspection.reviews.some((review) =>
+          review.verdict === 'needs_revision'
+          && review.delta?.requestedChanges?.includes('PBI 2 is still marked as a gap.')
+        )
+      ).toBe(true);
+
+      const promptRequests = await readLoggedRequests(logPath);
+      expect(promptRequests.some((entry) => {
+        const text = extractPromptText(entry);
+        return text.includes('Execute only the approved plan items below.');
+      })).toBe(false);
+    } finally {
+      delete process.env.KBV_TEST_ACP_LOG_PATH;
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
 
   test('runs batch analysis through revision, amendment, and final rework loops', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-commands-'));
@@ -2849,6 +4035,13 @@ test.describe('command registry content model transitions', () => {
       });
       expect(inspectionResp.ok).toBe(true);
       const inspection = inspectionResp.data as {
+        stageRuns: Array<{
+          stage: string;
+          role: string;
+          localSessionId?: string;
+          acpSessionId?: string;
+          status: string;
+        }>;
         plans: Array<{ verdict: string }>;
         reviews: Array<{ verdict: string }>;
         amendments: Array<{ status: string }>;
@@ -2858,6 +4051,17 @@ test.describe('command registry content model transitions', () => {
       expect(inspection.reviews.some((review) => review.verdict === 'needs_revision')).toBeTruthy();
       expect(inspection.amendments.some((amendment) => amendment.status === 'approved')).toBeTruthy();
       expect(inspection.finalReviewReworkPlans).toHaveLength(1);
+      const buildingWorkerRuns = inspection.stageRuns.filter((run) => run.stage === 'building' && run.role === 'worker');
+      expect(buildingWorkerRuns).toHaveLength(2);
+      expect(new Set(buildingWorkerRuns.map((run) => run.localSessionId))).toEqual(new Set([buildingWorkerRuns[0]?.localSessionId]));
+      expect(new Set(buildingWorkerRuns.map((run) => run.acpSessionId))).toEqual(new Set([buildingWorkerRuns[0]?.acpSessionId]));
+      const planningStageRuns = inspection.stageRuns.filter((run) => run.role === 'planner' || run.role === 'plan-reviewer');
+      expect(planningStageRuns.length).toBeGreaterThanOrEqual(4);
+      expect(new Set(planningStageRuns.map((run) => run.localSessionId)).size).toBe(1);
+      expect(planningStageRuns[0]?.localSessionId).not.toBe(buildingWorkerRuns[0]?.localSessionId);
+      const reworkRuns = inspection.stageRuns.filter((run) => run.stage === 'reworking' && run.role === 'worker');
+      expect(reworkRuns).toHaveLength(1);
+      expect(reworkRuns[0]?.localSessionId).toBe(buildingWorkerRuns[0]?.localSessionId);
 
       const runtimeResp = await bus.execute({
         method: 'batch.analysis.runtime.get',
@@ -3069,6 +4273,12 @@ test.describe('command registry content model transitions', () => {
         workspaceKbAccessMode: workspaceMode ?? 'cli',
         selectedMode: selectedMode ?? 'cli',
         providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: 'Direct access shell registered, but the executor path is not enabled yet'
+          },
           mcp: {
             mode: 'mcp',
             provider: 'mcp',
@@ -3148,6 +4358,12 @@ test.describe('command registry content model transitions', () => {
         workspaceKbAccessMode: workspaceMode ?? 'mcp',
         selectedMode: selectedMode ?? 'mcp',
         providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: 'Direct access shell registered, but the executor path is not enabled yet'
+          },
           mcp: {
             mode: 'mcp',
             provider: 'mcp',
@@ -3236,6 +4452,12 @@ test.describe('command registry content model transitions', () => {
         workspaceKbAccessMode: workspaceMode ?? 'cli',
         selectedMode: selectedMode ?? workspaceMode ?? 'cli',
         providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: 'Direct access shell registered, but the executor path is not enabled yet'
+          },
           mcp: {
             mode: 'mcp',
             provider: 'mcp',

@@ -1,5 +1,5 @@
 /**
- * ProviderBadge — visual indicator for MCP vs CLI runtime provider.
+ * ProviderBadge — visual indicator for direct, MCP, or CLI runtime providers.
  *
  * Designed for use in session lists, session details, run history, and
  * batch analysis views. Each provider gets a distinct icon, color, and
@@ -13,7 +13,7 @@
  */
 
 import type { KbAccessMode } from '@kb-vault/shared-types';
-import { IconServer, IconTerminal } from './icons';
+import { IconServer, IconTerminal, IconZap } from './icons';
 
 /* ---------- Types ---------- */
 
@@ -40,14 +40,20 @@ const providerConfig: Record<KbAccessMode, {
   mcp: {
     label: 'MCP',
     expandedLabel: 'MCP Runtime',
-    description: 'Model Context Protocol — structured KB tool access via MCP server',
+    description: 'Model Context Protocol — optional advanced mode for structured KB tool access via MCP server',
     cssModifier: 'mcp',
   },
   cli: {
     label: 'CLI',
     expandedLabel: 'CLI Runtime',
-    description: 'Command Line — KB access via CLI loopback with terminal capability',
+    description: 'Command Line — optional advanced mode for KB access via CLI loopback with terminal capability',
     cssModifier: 'cli',
+  },
+  direct: {
+    label: 'Direct',
+    expandedLabel: 'Direct Runtime',
+    description: 'App-owned direct execution contract. Recommended default for assistant chat, article edit, and batch analysis.',
+    cssModifier: 'direct',
   },
 };
 
@@ -76,7 +82,11 @@ export function ProviderBadge({ mode, size = 'inline', expanded = false, live = 
       title={config.description}
     >
       <span className="provider-badge-icon">
-        {mode === 'mcp' ? <IconServer size={iconSize} /> : <IconTerminal size={iconSize} />}
+        {mode === 'mcp'
+          ? <IconServer size={iconSize} />
+          : mode === 'cli'
+            ? <IconTerminal size={iconSize} />
+            : <IconZap size={iconSize} />}
       </span>
       <span className="provider-badge-label">{label}</span>
       {live && <span className="provider-badge-pulse" />}

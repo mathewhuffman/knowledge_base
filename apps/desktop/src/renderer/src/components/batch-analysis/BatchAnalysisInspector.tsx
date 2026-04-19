@@ -12,11 +12,12 @@ import { PlanReviewView } from './PlanReviewView';
 import { FinalReviewView } from './FinalReviewView';
 import { WorkerReportView } from './WorkerReportView';
 import { DiscoveredWorkList } from './DiscoveredWorkList';
+import { OpenQuestionsList } from './OpenQuestionsList';
 import { TimelineView } from './TimelineView';
 import { ArtifactTranscriptLink } from './ArtifactTranscriptLink';
 import { deriveCompletedStages, getVisibleStage, getVisibleStageLabel, STAGE_LABELS, ROLE_LABELS } from './helpers';
 
-type InspectorTab = 'overview' | 'plan' | 'reviews' | 'execution' | 'timeline' | 'transcripts';
+type InspectorTab = 'overview' | 'questions' | 'plan' | 'reviews' | 'execution' | 'timeline' | 'transcripts';
 
 interface BatchAnalysisInspectorProps {
   inspection: BatchAnalysisInspectionResponse;
@@ -24,6 +25,7 @@ interface BatchAnalysisInspectorProps {
   eventStream: BatchAnalysisEventStreamResponse | null;
   isRunning: boolean;
   onOpenSession?: (sessionId: string) => void;
+  onRefresh?: () => void | Promise<void>;
 }
 
 function ExecCountsSummary({ counts }: { counts: BatchAnalysisExecutionCounts }) {
@@ -63,6 +65,7 @@ export function BatchAnalysisInspector({
   eventStream,
   isRunning,
   onOpenSession,
+  onRefresh,
 }: BatchAnalysisInspectorProps) {
   const [activeTab, setActiveTab] = useState<InspectorTab>('overview');
 
@@ -73,6 +76,9 @@ export function BatchAnalysisInspector({
   const currentRole = runtimeStatus?.role ?? snapshot.latestIteration?.role;
   const executionCounts = runtimeStatus?.executionCounts ?? snapshot.latestIteration?.executionCounts;
   const outstandingDiscoveries = runtimeStatus?.outstandingDiscoveredWorkCount ?? snapshot.latestIteration?.outstandingDiscoveredWorkCount ?? 0;
+  const pausedForUserInput = runtimeStatus?.pausedForUserInput ?? snapshot.pausedForUserInput;
+  const unansweredRequiredQuestions = runtimeStatus?.unansweredRequiredQuestionCount ?? snapshot.unansweredRequiredQuestionCount ?? 0;
+  const questionCount = inspection.questions.length;
 
   const completedStages = useMemo(
     () => deriveCompletedStages(inspection.timeline),
@@ -143,6 +149,7 @@ export function BatchAnalysisInspector({
 
   const tabs: { key: InspectorTab; label: string; count?: number }[] = [
     { key: 'overview', label: 'Overview' },
+    { key: 'questions', label: 'Questions', count: unansweredRequiredQuestions || questionCount },
     { key: 'plan', label: 'Plan', count: inspection.plans.length },
     { key: 'reviews', label: 'Reviews', count: inspection.reviews.length + inspection.finalReviews.length },
     { key: 'execution', label: 'Execution', count: inspection.workerReports.length },
@@ -211,6 +218,14 @@ export function BatchAnalysisInspector({
                   <Badge variant="warning">{outstandingDiscoveries}</Badge>
                 </div>
               )}
+              {(pausedForUserInput || questionCount > 0) && (
+                <div className="ba-overview-meta-item">
+                  <span className="ba-detail-label">Questions</span>
+                  <Badge variant={pausedForUserInput || unansweredRequiredQuestions > 0 ? 'warning' : 'neutral'}>
+                    {unansweredRequiredQuestions > 0 ? `${unansweredRequiredQuestions} pending` : `${questionCount} tracked`}
+                  </Badge>
+                </div>
+              )}
               {runtimeStatus?.agentModelId && (
                 <div className="ba-overview-meta-item">
                   <span className="ba-detail-label">Model</span>
@@ -256,6 +271,27 @@ export function BatchAnalysisInspector({
               </div>
             )}
 
+            {inspection.questionSets.length > 0 && (
+              <div className="ba-overview-section">
+                <h4 className="ba-section-heading">
+                  Questions
+                  <Badge variant={pausedForUserInput || unansweredRequiredQuestions > 0 ? 'warning' : 'neutral'}>
+                    {unansweredRequiredQuestions || questionCount}
+                  </Badge>
+                </h4>
+                <OpenQuestionsList
+                  workspaceId={inspection.workspaceId}
+                  batchId={inspection.batchId}
+                  questionSets={inspection.questionSets}
+                  questions={inspection.questions}
+                  pausedForUserInput={pausedForUserInput}
+                  unansweredRequiredQuestionCount={unansweredRequiredQuestions}
+                  compact
+                  onRefresh={onRefresh}
+                />
+              </div>
+            )}
+
             {latestPlanReview && (
               <div className="ba-overview-section">
                 <h4 className="ba-section-heading">Latest Plan Review</h4>
@@ -293,6 +329,18 @@ export function BatchAnalysisInspector({
           <PlanView
             plans={inspection.plans}
             supersededPlans={inspection.supersededPlans}
+          />
+        )}
+
+        {activeTab === 'questions' && (
+          <OpenQuestionsList
+            workspaceId={inspection.workspaceId}
+            batchId={inspection.batchId}
+            questionSets={inspection.questionSets}
+            questions={inspection.questions}
+            pausedForUserInput={pausedForUserInput}
+            unansweredRequiredQuestionCount={unansweredRequiredQuestions}
+            onRefresh={onRefresh}
           />
         )}
 

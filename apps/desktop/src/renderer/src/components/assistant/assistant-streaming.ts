@@ -87,8 +87,12 @@ function decodeJsonStringEscape(value: string): string {
   }
 }
 
+function buildPartialJsonFieldPattern(fieldName: string, suffix: string): RegExp {
+  return new RegExp(`(?:^|[\\s,{])"?${fieldName}"?\\s*:${suffix}`);
+}
+
 function extractPartialJsonStringField(source: string, fieldName: string): string | undefined {
-  const fieldPattern = new RegExp(`"${fieldName}"\\s*:\\s*"`);
+  const fieldPattern = buildPartialJsonFieldPattern(fieldName, '\\s*"');
   const match = fieldPattern.exec(source);
   if (!match) {
     return undefined;
@@ -128,7 +132,7 @@ function extractPartialJsonStringField(source: string, fieldName: string): strin
 }
 
 function extractPartialJsonBooleanField(source: string, fieldName: string): boolean | undefined {
-  const fieldPattern = new RegExp(`"${fieldName}"\\s*:\\s*(true|false)`);
+  const fieldPattern = buildPartialJsonFieldPattern(fieldName, '\\s*(true|false)');
   const match = fieldPattern.exec(source);
   if (!match) {
     return undefined;
@@ -142,7 +146,14 @@ function extractPartialJsonCompletionState(source: string): AiAssistantTurnCompl
 }
 
 function looksLikePartialAssistantEnvelope(value: string): boolean {
-  return /"(command|artifactType|completionState|response|summary|isFinal)"\s*:/.test(value);
+  const normalized = value.trimStart();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.startsWith('{') || normalized.startsWith('```')) {
+    return true;
+  }
+  return /(?:^|[\s,{])"?(command|artifactType|completionState|response|summary|isFinal)"?\s*:/.test(normalized);
 }
 
 export function normalizeAssistantCompletionState(value: unknown): AiAssistantTurnCompletionState | undefined {
@@ -193,7 +204,7 @@ export function extractStreamedAssistantEnvelope(value: string | undefined): {
   const source = normalizeStructuredStreamSource(value);
   const parsed = extractLastJsonObjectFromText(source);
   if (!parsed || !looksLikeAssistantEnvelope(parsed)) {
-    const looksStructured = looksLikePartialAssistantEnvelope(source) || source.trimStart().startsWith('{');
+    const looksStructured = looksLikePartialAssistantEnvelope(source);
     if (looksStructured) {
       const responseText = extractPartialJsonStringField(source, 'response')
         ?? extractPartialJsonStringField(source, 'summary')
@@ -218,7 +229,7 @@ export function extractStreamedAssistantEnvelope(value: string | undefined): {
 
   const completionState = normalizeAssistantCompletionState(parsed.completionState);
   const isFinal = typeof parsed.isFinal === 'boolean' ? parsed.isFinal : undefined;
-  const responseText = extractString(parsed.response) ?? extractString(parsed.summary) ?? source;
+  const responseText = extractString(parsed.response) ?? extractString(parsed.summary) ?? '';
 
   return {
     responseText,

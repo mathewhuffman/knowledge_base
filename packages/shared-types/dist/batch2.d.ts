@@ -106,7 +106,9 @@ export interface WorkspaceRecord {
     state: WorkspaceState;
     path: string;
 }
-export type KbAccessMode = 'mcp' | 'cli';
+export declare const KB_ACCESS_MODES: readonly ["direct", "mcp", "cli"];
+export type KbAccessMode = (typeof KB_ACCESS_MODES)[number];
+export declare function isKbAccessMode(value: unknown): value is KbAccessMode;
 export interface WorkspaceDefaultRequest {
     workspaceId: EntityId;
 }
@@ -275,6 +277,7 @@ export interface PBIBatchRecord {
     scopedRowCount: number;
     scopeMode: PBIBatchScopeMode;
     scopePayload?: string;
+    workerStageBudgetMinutes?: number;
     importedAtUtc: string;
     status: PBIBatchStatus | 'proposed';
 }
@@ -348,6 +351,7 @@ export interface PBIBatchStatusUpdateRequest {
     batchId: EntityId;
     status: PBIBatchStatus | 'proposed';
     force?: boolean;
+    workerStageBudgetMinutes?: number | null;
 }
 export interface PBIBatchImportSummary {
     batch: PBIBatchRecord;

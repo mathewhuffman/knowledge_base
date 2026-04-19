@@ -21,6 +21,8 @@ const kb_cli_runtime_service_1 = require("./kb-cli-runtime-service");
 const ai_assistant_service_1 = require("./ai-assistant-service");
 const app_working_state_service_1 = require("./app-working-state-service");
 const batch_analysis_orchestrator_1 = require("./batch-analysis-orchestrator");
+const kb_action_service_1 = require("./kb-action-service");
+const direct_kb_executor_1 = require("./direct-kb-executor");
 const kb_access_mode_resolver_1 = require("./kb-access-mode-resolver");
 const proposal_working_state_1 = require("./proposal-working-state");
 const RUNTIME_MODEL_CATALOG = [
@@ -101,7 +103,7 @@ const buildRuntimeModelCatalog = (availableModels, currentModelId) => {
 const extractOptionalString = (value) => typeof value === 'string' && value.trim()
     ? value.trim()
     : undefined;
-const extractOptionalKbAccessMode = (value) => value === 'mcp' || value === 'cli'
+const extractOptionalKbAccessMode = (value) => (0, shared_types_1.isKbAccessMode)(value)
     ? value
     : undefined;
 const asRecord = (value) => value && typeof value === 'object' && !Array.isArray(value)
@@ -233,6 +235,35 @@ const dedupeStrings = (values) => Array.from(new Set(values.map((value) => value
 const PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX = 'proposal-';
 const FINAL_REVIEW_STAGE_TIMEOUT_MS = 180_000;
 const FINAL_REVIEW_STAGE_WATCHDOG_MS = 210_000;
+const DEFAULT_WORKER_STAGE_TIMEOUT_MS = 300_000;
+const DEFAULT_WORKER_STAGE_WATCHDOG_MS = 330_000;
+const CONFIGURED_WORKER_STAGE_WATCHDOG_BUFFER_MS = 30_000;
+const parseStageTimeoutOverride = (envName, fallbackMs) => {
+    const raw = process.env[envName]?.trim();
+    if (!raw) {
+        return fallbackMs;
+    }
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs;
+};
+const getWorkerStageTimeoutMs = () => parseStageTimeoutOverride('KBV_WORKER_STAGE_TIMEOUT_MS', DEFAULT_WORKER_STAGE_TIMEOUT_MS);
+const getWorkerStageWatchdogMs = () => Math.max(parseStageTimeoutOverride('KBV_WORKER_STAGE_WATCHDOG_MS', DEFAULT_WORKER_STAGE_WATCHDOG_MS), getWorkerStageTimeoutMs() + 5_000);
+const resolveWorkerStageRunBudget = (configuredBudgetMinutes) => {
+    const normalizedBudgetMinutes = (0, shared_types_1.normalizeBatchAnalysisWorkerStageBudgetMinutes)(configuredBudgetMinutes);
+    if (normalizedBudgetMinutes !== undefined) {
+        const timeoutMs = normalizedBudgetMinutes * 60_000;
+        return {
+            timeoutMs,
+            watchdogMs: timeoutMs + CONFIGURED_WORKER_STAGE_WATCHDOG_BUFFER_MS,
+            budgetMinutes: normalizedBudgetMinutes
+        };
+    }
+    const timeoutMs = getWorkerStageTimeoutMs();
+    return {
+        timeoutMs,
+        watchdogMs: Math.max(getWorkerStageWatchdogMs(), timeoutMs + 5_000)
+    };
+};
 class BatchStageWatchdogError extends Error {
     stage;
     sessionId;
@@ -774,6 +805,29 @@ const matchesExpectedBatchResultShape = (parsed, expectedShape) => {
             return true;
     }
 };
+const inspectDirectBatchEnvelope = (candidate) => {
+    const extracted = extractJsonObject(candidate);
+    if (!extracted) {
+        return null;
+    }
+    const completionState = typeof extracted.completionState === 'string'
+        ? extracted.completionState.trim().toLowerCase()
+        : '';
+    if (completionState === 'needs_action'
+        && extracted.isFinal === false
+        && extracted.action
+        && typeof extracted.action === 'object') {
+        return { kind: 'needs_action' };
+    }
+    if (extracted.isFinal === true
+        && (completionState === 'blocked' || completionState === 'needs_user_input' || completionState === 'errored')) {
+        return {
+            kind: 'terminal',
+            completionState
+        };
+    }
+    return null;
+};
 const scoreResultTextCandidate = (candidate, expectedShape) => {
     const trimmed = candidate.trim();
     if (!trimmed) {
@@ -784,8 +838,15 @@ const scoreResultTextCandidate = (candidate, expectedShape) => {
         return 10_000 + trimmed.length;
     }
     let score = trimmed.length;
+    const directEnvelope = inspectDirectBatchEnvelope(trimmed);
+    if (expectedShape === 'worker' && directEnvelope?.kind === 'terminal') {
+        return 9_500 + trimmed.length;
+    }
     if (expectedShape && !trimmed.includes('{')) {
         score -= 1_500;
+    }
+    if (expectedShape === 'worker' && directEnvelope?.kind === 'needs_action') {
+        score -= 6_000;
     }
     if (expectedShape
         && !trimmed.includes('{')
@@ -898,6 +959,9 @@ const shouldAwaitMoreStructuredBatchResult = (params) => {
         return params.initialCandidateCount === 0 || params.transcriptCandidateCount === 0;
     }
     if (detectBatchInfrastructureFailureText(trimmed)) {
+        return false;
+    }
+    if (params.expectedShape === 'worker' && inspectDirectBatchEnvelope(trimmed)?.kind === 'terminal') {
         return false;
     }
     return (looksLikeStructuredBatchResultText(trimmed, params.expectedShape)
@@ -1216,6 +1280,22 @@ const extractCompleteJsonStringsFromArray = (text, fieldName) => {
     }
     return results;
 };
+const extractRecoveredQuestionsFromText = (text) => {
+    const structured = extractCompleteJsonObjectsFromArray(text, 'questions')
+        .filter((question) => typeof question.prompt === 'string');
+    if (structured.length > 0) {
+        return structured;
+    }
+    return extractCompleteJsonStringsFromArray(text, 'openQuestions')
+        .map((prompt) => ({
+        prompt,
+        reason: 'Recovered legacy open question.',
+        requiresUserInput: true,
+        linkedPbiIds: [],
+        linkedPlanItemIds: [],
+        linkedDiscoveryIds: []
+    }));
+};
 const UUID_LIKE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const normalizeRecoveredPlannerTargetId = (value) => {
     if (typeof value !== 'string') {
@@ -1240,7 +1320,7 @@ const salvagePlannerJsonText = (text) => {
     const summary = extractJsonStringField(text, 'summary');
     const rawCoverage = extractCompleteJsonObjectsFromArray(text, 'coverage');
     const rawItems = extractCompleteJsonObjectsFromArray(text, 'items');
-    const openQuestions = extractCompleteJsonStringsFromArray(text, 'openQuestions');
+    const questions = extractRecoveredQuestionsFromText(text);
     const items = rawItems
         .filter((item) => typeof item.planItemId === 'string'
         && Array.isArray(item.pbiIds)
@@ -1319,7 +1399,8 @@ const salvagePlannerJsonText = (text) => {
         summary: summary ?? 'Recovered planner draft from truncated output.',
         coverage,
         items: normalizedItems,
-        openQuestions
+        questions,
+        openQuestions: questions.map((question) => question.prompt).filter((prompt) => typeof prompt === 'string')
     });
 };
 const summarizePlannerRecoveryContext = (text) => {
@@ -1349,13 +1430,14 @@ const summarizePlannerRecoveryContext = (text) => {
         targetFamilyId: entry.targetFamilyId,
         confidence: entry.confidence
     }));
-    const openQuestions = extractCompleteJsonStringsFromArray(normalized, 'openQuestions').slice(0, 12);
-    if (summary || coverage.length > 0 || items.length > 0 || openQuestions.length > 0) {
+    const questions = extractRecoveredQuestionsFromText(normalized).slice(0, 12);
+    if (summary || coverage.length > 0 || items.length > 0 || questions.length > 0) {
         return JSON.stringify({
             summary: summary ?? 'Recovered partial planner draft context.',
             coverage,
             items,
-            openQuestions
+            questions,
+            openQuestions: questions.map((question) => question.prompt).filter((prompt) => typeof prompt === 'string')
         }, null, 2);
     }
     return normalized.slice(0, 6_000);
@@ -1370,6 +1452,7 @@ const salvagePlanReviewJsonText = (text) => {
     }
     const summary = extractJsonStringField(text, 'summary');
     const verdict = extractJsonStringField(text, 'verdict');
+    const questions = extractRecoveredQuestionsFromText(text);
     const requestedChanges = extractCompleteJsonStringsFromArray(text, 'requestedChanges');
     const missingPbiIds = extractCompleteJsonStringsFromArray(text, 'missingPbiIds');
     const missingCreates = extractCompleteJsonStringsFromArray(text, 'missingCreates');
@@ -1385,13 +1468,14 @@ const salvagePlanReviewJsonText = (text) => {
         || missingEdits.length > 0
         || additionalArticleWork.length > 0
         || targetCorrections.length > 0
-        || overlapConflicts.length > 0;
+        || overlapConflicts.length > 0
+        || questions.length > 0;
     if (!hasAnyStructuredSignal) {
         return null;
     }
     return JSON.stringify({
         summary: summary ?? 'Recovered plan review output from truncated response.',
-        verdict: verdict === 'approved' || verdict === 'needs_human_review' ? verdict : 'needs_revision',
+        verdict: verdict === 'approved' || verdict === 'needs_human_review' || verdict === 'needs_user_input' ? verdict : 'needs_revision',
         didAccountForEveryPbi: extractJsonBooleanField(text, 'didAccountForEveryPbi') ?? false,
         hasMissingCreates: extractJsonBooleanField(text, 'hasMissingCreates') ?? (missingCreates.length > 0),
         hasMissingEdits: extractJsonBooleanField(text, 'hasMissingEdits') ?? (missingEdits.length > 0),
@@ -1401,6 +1485,7 @@ const salvagePlanReviewJsonText = (text) => {
         underScopedKbImpact: extractJsonBooleanField(text, 'underScopedKbImpact') ?? (missingCreates.length > 0
             || missingEdits.length > 0
             || additionalArticleWork.length > 0),
+        questions,
         delta: {
             summary: summary ?? 'Recovered plan review output from truncated response.',
             requestedChanges,
@@ -1423,6 +1508,7 @@ const buildMalformedPlanReviewFallback = (summary, verdict = 'needs_human_review
     hasOverlapOrConflict: false,
     foundAdditionalArticleWork: false,
     underScopedKbImpact: false,
+    questions: [],
     delta: {
         summary,
         requestedChanges: [],
@@ -1537,7 +1623,9 @@ exports.__commandRegistryTestables = {
     selectBestResultText,
     selectBestParseableResultText,
     matchesExpectedBatchResultShape,
-    shouldRetryReviewWithFreshSession
+    shouldRetryReviewWithFreshSession,
+    shouldAwaitMoreStructuredBatchResult,
+    inspectDirectBatchEnvelope
 };
 const ARTICLE_AI_PRESET_PROMPTS = {
     [shared_types_1.ArticleAiPresetAction.REWRITE_TONE]: 'Rewrite the article for clearer tone and readability while preserving factual meaning.',
@@ -1825,145 +1913,72 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
     const batchAnalysisOrchestrator = new batch_analysis_orchestrator_1.BatchAnalysisOrchestrator(workspaceRepository);
     const zendeskSyncService = new zendesk_sync_service_1.ZendeskSyncService(workspaceRepository);
     const pbiBatchImportService = new pbi_batch_import_service_1.PBIBatchImportService(workspaceRepository);
-    const defaultKbAccessMode = 'mcp';
+    const defaultKbAccessMode = 'direct';
     const validRevisionStates = new Set(Object.values(shared_types_1.RevisionState));
     const validRevisionStatuses = new Set(Object.values(shared_types_1.RevisionStatus));
     const validPBIScopeModes = new Set([shared_types_1.PBIBatchScopeMode.ALL, shared_types_1.PBIBatchScopeMode.SELECTED_ONLY]);
     const validPBIBatchStatuses = new Set(Object.values(shared_types_1.PBIBatchStatus));
     const validPBIValidationStatuses = new Set(Object.values(shared_types_1.PBIValidationStatus));
     const validDraftBranchStatuses = new Set(Object.values(shared_types_1.DraftBranchStatus));
+    const appWorkingStateService = new app_working_state_service_1.AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
+    const buildZendeskClient = async (workspaceId) => {
+        const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
+        const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
+        if (!credentials) {
+            throw new Error('Zendesk credentials are not configured for this workspace');
+        }
+        return zendesk_client_1.ZendeskClient.fromConfig({ timeoutMs: 30_000 }, {
+            subdomain: settings.zendeskSubdomain,
+            email: credentials.email,
+            apiToken: credentials.apiToken
+        });
+    };
+    const kbActionService = new kb_action_service_1.KbActionService({
+        workspaceRepository,
+        appWorkingStateService,
+        buildZendeskClient
+    });
+    const directKbExecutor = new direct_kb_executor_1.DirectKbExecutor({ kbActionService });
+    const batchAnalysisAutoResumeLocks = new Set();
+    const scheduleBatchAnalysisAutoResume = (workspaceId, batchId, questionSetId) => {
+        const lockKey = `${workspaceId}:${batchId}:${questionSetId}`;
+        if (batchAnalysisAutoResumeLocks.has(lockKey)) {
+            return false;
+        }
+        batchAnalysisAutoResumeLocks.add(lockKey);
+        void jobs.start('agent.analysis.run', {
+            workspaceId,
+            batchId
+        }).catch((error) => {
+            logger_1.logger.error('[batch.analysis.questions.answer] automatic resume failed', {
+                workspaceId,
+                batchId,
+                questionSetId,
+                error: error instanceof Error ? error.message : String(error)
+            });
+        }).finally(() => {
+            batchAnalysisAutoResumeLocks.delete(lockKey);
+        });
+        return true;
+    };
     const runtimeToolContext = {
-        searchKb: async (input) => {
-            return workspaceRepository.searchArticles(input.workspaceId, {
-                workspaceId: input.workspaceId,
-                query: input.query,
-                localeVariantIds: input.localeVariantIds,
-                familyIds: input.familyIds,
-                revisionIds: input.revisionIds,
-                scope: 'all',
-                includeArchived: input.includeArchived ?? true
-            });
-        },
-        getExplorerTree: async (workspaceId) => {
-            return workspaceRepository.getExplorerTree(workspaceId);
-        },
-        getArticle: async (input) => {
-            return workspaceRepository.getArticleDetail(input.workspaceId, {
-                workspaceId: input.workspaceId,
-                revisionId: input.revisionId,
-                localeVariantId: input.localeVariantId,
-                includePublishLog: true,
-                includeLineage: true
-            });
-        },
-        getArticleFamily: async (input) => {
-            return workspaceRepository.getArticleFamily(input.workspaceId, input.familyId);
-        },
-        getLocaleVariant: async (input) => {
-            return workspaceRepository.getLocaleVariant(input.workspaceId, input.localeVariantId);
-        },
-        getAppFormSchema: async (input) => {
-            return appWorkingStateService.getFormSchema(input);
-        },
-        patchAppForm: async (input) => {
-            return (0, proposal_working_state_1.applyAppWorkingStatePatch)({
-                workspaceRepository,
-                appWorkingStateService,
-                request: input
-            });
-        },
-        findRelatedArticles: async (input) => {
-            if (input.articleId || input.familyId || input.batchId) {
-                return workspaceRepository.listArticleRelations(input.workspaceId, {
-                    workspaceId: input.workspaceId,
-                    localeVariantId: input.articleId,
-                    familyId: input.familyId,
-                    batchId: input.batchId,
-                    limit: input.max,
-                    minScore: input.minScore,
-                    includeEvidence: input.includeEvidence
-                });
-            }
-            if (input.query?.trim()) {
-                const search = await workspaceRepository.searchArticles(input.workspaceId, {
-                    workspaceId: input.workspaceId,
-                    query: input.query,
-                    scope: 'all',
-                    includeArchived: true
-                });
-                const top = search.results[0];
-                if (!top) {
-                    return {
-                        workspaceId: input.workspaceId,
-                        seedFamilyIds: [],
-                        total: 0,
-                        relations: []
-                    };
-                }
-                return workspaceRepository.listArticleRelations(input.workspaceId, {
-                    workspaceId: input.workspaceId,
-                    familyId: top.familyId,
-                    limit: input.max,
-                    minScore: input.minScore,
-                    includeEvidence: input.includeEvidence
-                });
-            }
-            return {
-                workspaceId: input.workspaceId,
-                seedFamilyIds: [],
-                total: 0,
-                relations: []
-            };
-        },
-        listCategories: async (input) => {
-            const client = await buildZendeskClient(input.workspaceId);
-            const categories = await client.listCategories(input.locale.trim());
-            return {
-                ok: true,
-                workspaceId: input.workspaceId,
-                locale: input.locale,
-                categories
-            };
-        },
-        listSections: async (input) => {
-            const client = await buildZendeskClient(input.workspaceId);
-            const sections = await client.listSections(input.categoryId, input.locale.trim());
-            return {
-                ok: true,
-                workspaceId: input.workspaceId,
-                locale: input.locale,
-                categoryId: input.categoryId,
-                sections
-            };
-        },
-        listArticleTemplates: async (input) => {
-            const templates = await workspaceRepository.listTemplatePacks(input.workspaceId);
-            return { workspaceId: input.workspaceId, templates };
-        },
-        getTemplate: async (input) => {
-            return workspaceRepository.getTemplatePack(input.workspaceId, input.templatePackId);
-        },
-        getBatchContext: async (input) => {
-            const context = await workspaceRepository.getBatchContext(input.workspaceId, input.batchId);
-            if (!context) {
-                throw new Error('batch not found');
-            }
-            return context;
-        },
-        getPBI: async (input) => {
-            const pbi = await workspaceRepository.getPBIRecord(input.workspaceId, input.pbiId);
-            if (!pbi) {
-                throw new Error('pbi not found');
-            }
-            return pbi;
-        },
-        getPBISubset: async (input) => {
-            return workspaceRepository.getPBISubset(input.workspaceId, input.batchId, input.rowNumbers);
-        },
-        getArticleHistory: async (input) => {
-            return workspaceRepository.getHistory(input.workspaceId, input.localeVariantId);
-        },
-        recordAgentNotes: async (input) => workspaceRepository.recordAgentNotes(input),
+        searchKb: async (input) => kbActionService.searchKb(input),
+        getExplorerTree: async (workspaceId) => kbActionService.getExplorerTree(workspaceId),
+        getArticle: async (input) => kbActionService.getArticle(input),
+        getArticleFamily: async (input) => kbActionService.getArticleFamily(input),
+        getLocaleVariant: async (input) => kbActionService.getLocaleVariant(input),
+        getAppFormSchema: async (input) => kbActionService.getAppFormSchema(input),
+        patchAppForm: async (input) => kbActionService.patchAppForm(input),
+        findRelatedArticles: async (input) => kbActionService.findRelatedArticles(input),
+        listCategories: async (input) => kbActionService.listCategories(input),
+        listSections: async (input) => kbActionService.listSections(input),
+        listArticleTemplates: async (input) => kbActionService.listArticleTemplates(input),
+        getTemplate: async (input) => kbActionService.getTemplate(input),
+        getBatchContext: async (input) => kbActionService.getBatchContext(input),
+        getPBI: async (input) => kbActionService.getPBI(input),
+        getPBISubset: async (input) => kbActionService.getPBISubset(input),
+        getArticleHistory: async (input) => kbActionService.getArticleHistory(input),
+        recordAgentNotes: async (input) => kbActionService.recordAgentNotes(input),
         proposeCreateKb: async (input, context) => {
             if (!context.workspaceId) {
                 throw new Error('workspaceId is required');
@@ -1974,13 +1989,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 throw new Error('batchId is required for create proposal');
             }
             const reviewStatus = context.batchId ? shared_types_1.ProposalReviewStatus.STAGED_ANALYSIS : shared_types_1.ProposalReviewStatus.PENDING_REVIEW;
-            const created = await workspaceRepository.createAgentProposal({
+            const created = await kbActionService.createProposal({
                 workspaceId: context.workspaceId,
                 batchId,
                 action: shared_types_1.ProposalAction.CREATE,
                 reviewStatus,
-                _sessionId: sessionId,
-                originPath: 'batch_analysis',
+                sessionId,
                 localeVariantId: input.localeVariantId,
                 note: input.note,
                 rationale: input.rationale,
@@ -1999,13 +2013,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 throw new Error('batchId is required for edit proposal');
             }
             const reviewStatus = context.batchId ? shared_types_1.ProposalReviewStatus.STAGED_ANALYSIS : shared_types_1.ProposalReviewStatus.PENDING_REVIEW;
-            const created = await workspaceRepository.createAgentProposal({
+            const created = await kbActionService.createProposal({
                 workspaceId: context.workspaceId,
                 batchId,
                 action: shared_types_1.ProposalAction.EDIT,
                 reviewStatus,
-                _sessionId: sessionId,
-                originPath: 'batch_analysis',
+                sessionId,
                 localeVariantId: input.localeVariantId,
                 note: input.note,
                 rationale: input.rationale,
@@ -2024,13 +2037,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 throw new Error('batchId is required for retire proposal');
             }
             const reviewStatus = context.batchId ? shared_types_1.ProposalReviewStatus.STAGED_ANALYSIS : shared_types_1.ProposalReviewStatus.PENDING_REVIEW;
-            const created = await workspaceRepository.createAgentProposal({
+            const created = await kbActionService.createProposal({
                 workspaceId: context.workspaceId,
                 batchId,
                 action: shared_types_1.ProposalAction.RETIRE,
                 reviewStatus,
-                _sessionId: sessionId,
-                originPath: 'batch_analysis',
+                sessionId,
                 localeVariantId: input.localeVariantId,
                 note: input.note,
                 rationale: input.rationale,
@@ -2040,7 +2052,6 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             return { ok: true, ...created };
         }
     };
-    const appWorkingStateService = new app_working_state_service_1.AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
     const kbCliLoopback = new kb_cli_loopback_service_1.KbCliLoopbackService(workspaceRepository, appWorkingStateService);
     const kbCliRuntime = new kb_cli_runtime_service_1.KbCliRuntimeService(kbCliLoopback, workspaceRepository);
     const noisyAgentRuntimeLogs = new Set([
@@ -2060,6 +2071,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
     const agentRuntime = new agent_runtime_1.CursorAcpRuntime(workspaceRoot, runtimeToolContext, {
         prepareCliEnvironment: async (workspaceId) => kbCliRuntime.ensureReady(),
         getCliHealth: (workspaceId) => kbCliRuntime.checkHealth(workspaceId),
+        getDirectHealth: (workspaceId) => directKbExecutor.checkHealth(workspaceId),
+        executeDirectAction: async (request) => directKbExecutor.execute(request),
         buildCliPromptSuffix: () => kbCliRuntime.buildPromptSuffix(),
         getWorkspaceAgentModel: async (workspaceId) => {
             const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
@@ -2096,18 +2109,6 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
         agentRuntime
     });
     const aiAssistantService = new ai_assistant_service_1.AiAssistantService(workspaceRepository, agentRuntime, resolveWorkspaceKbAccessMode, appWorkingStateService, emitAiAssistantEvent);
-    const buildZendeskClient = async (workspaceId) => {
-        const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
-        const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
-        if (!credentials) {
-            throw new Error('Zendesk credentials are not configured for this workspace');
-        }
-        return zendesk_client_1.ZendeskClient.fromConfig({ timeoutMs: 30_000 }, {
-            subdomain: settings.zendeskSubdomain,
-            email: credentials.email,
-            apiToken: credentials.apiToken
-        });
-    };
     bus.register('workspace.getRouteConfig', async () => ({
         ok: true,
         data: {
@@ -2148,6 +2149,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             availableModes: health.availableModes,
             issues: health.issues,
             providers: {
+                direct: {
+                    ok: health.providers.direct.ok,
+                    failureCode: health.providers.direct.failureCode,
+                    message: health.providers.direct.message,
+                    acpReachable: health.providers.direct.acpReachable
+                },
                 mcp: {
                     ok: health.providers.mcp.ok,
                     failureCode: health.providers.mcp.failureCode,
@@ -2367,6 +2374,44 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
         }
     });
+    bus.register('batch.analysis.questions.answer', async (payload) => {
+        const input = payload;
+        try {
+            if (!input?.workspaceId || !input.batchId || !input.questionId || !input.answer?.trim()) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'batch.analysis.questions.answer requires workspaceId, batchId, questionId, and a non-empty answer');
+            }
+            const answered = await workspaceRepository.answerBatchAnalysisQuestion(input);
+            let questionSetStatus = answered.questionSet.status;
+            let resumeTriggered = false;
+            if (answered.unansweredRequiredQuestionCount === 0 && answered.questionSet.status === 'waiting') {
+                const markedReady = await workspaceRepository.markBatchAnalysisQuestionSetReadyToResume({
+                    workspaceId: input.workspaceId,
+                    questionSetId: answered.questionSet.id
+                });
+                questionSetStatus = markedReady.questionSet?.status ?? 'ready_to_resume';
+                resumeTriggered = markedReady.transitioned
+                    ? scheduleBatchAnalysisAutoResume(input.workspaceId, input.batchId, answered.questionSet.id)
+                    : false;
+            }
+            const response = {
+                workspaceId: input.workspaceId,
+                batchId: input.batchId,
+                questionId: answered.question.id,
+                questionSetId: answered.questionSet.id,
+                unansweredRequiredQuestionCount: answered.unansweredRequiredQuestionCount,
+                resumeTriggered,
+                questionSetStatus,
+                question: answered.question
+            };
+            return {
+                ok: true,
+                data: response
+            };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+        }
+    });
     bus.register('workspace.create', async (payload, requestId) => {
         logger_1.logger.info('command workspace.create begin', { requestId });
         try {
@@ -2495,8 +2540,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (Array.isArray(input.enabledLocales) && input.enabledLocales.length && input.enabledLocales.some((locale) => !locale || !String(locale).trim())) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'enabledLocales must only contain non-empty values');
             }
-            if (input.kbAccessMode !== undefined && input.kbAccessMode !== 'mcp' && input.kbAccessMode !== 'cli') {
-                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'kbAccessMode must be mcp or cli');
+            if (input.kbAccessMode !== undefined && !(0, shared_types_1.isKbAccessMode)(input.kbAccessMode)) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'kbAccessMode must be direct, mcp, or cli');
             }
             if (typeof input.agentModelId === 'string' && !input.agentModelId.trim()) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'agentModelId cannot be empty');
@@ -3296,7 +3341,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (!validPBIBatchStatuses.has(batchStatus)) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'pbiBatch.setStatus status must be imported|scoped|submitted|analyzed|review_in_progress|review_complete|archived');
             }
-            const batch = await workspaceRepository.setPBIBatchStatus(workspaceId, batchId, batchStatus, Boolean(input?.force));
+            const batch = await workspaceRepository.setPBIBatchStatus(workspaceId, batchId, batchStatus, Boolean(input?.force), input && Object.prototype.hasOwnProperty.call(input, 'workerStageBudgetMinutes')
+                ? { workerStageBudgetMinutes: input.workerStageBudgetMinutes }
+                : undefined);
             return { ok: true, data: { batch } };
         }
         catch (error) {
@@ -3305,6 +3352,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             }
             if (error.message?.startsWith('Cannot transition batch status')) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, error.message);
+            }
+            if (error.message?.startsWith('workerStageBudgetMinutes')) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, `${error.message} Allowed range: ${shared_types_1.MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES}-${shared_types_1.MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES} minutes.`);
             }
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
         }
@@ -3730,6 +3780,13 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 sessionId: session.session.runtimeSessionId,
                 kbAccessMode,
                 locale: input.targetLocale ?? session.session.locale,
+                directContext: kbAccessMode === 'direct'
+                    ? {
+                        route: input.branchId ? shared_types_1.AppRoute.DRAFTS : shared_types_1.AppRoute.ARTICLE_EXPLORER,
+                        localeVariantIds: [session.session.localeVariantId],
+                        familyIds: [session.session.familyId]
+                    }
+                    : undefined,
                 prompt: buildArticleAiPrompt({
                     session,
                     request: input,
@@ -3739,6 +3796,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         : undefined
                 })
             }, () => undefined, () => false);
+            if (run.status === 'error') {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, run.message ?? 'Article AI runtime failed');
+            }
             const parsed = parseArticleAiResult(run.resultPayload);
             if (!parsed) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, 'Unable to parse AI article edit result');
@@ -4125,6 +4185,27 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             });
             return;
         }
+        const requestedWorkerStageBudgetMinutes = input.workerStageBudgetMinutes;
+        const normalizedRequestedWorkerStageBudgetMinutes = requestedWorkerStageBudgetMinutes == null
+            ? undefined
+            : (0, shared_types_1.normalizeBatchAnalysisWorkerStageBudgetMinutes)(requestedWorkerStageBudgetMinutes);
+        if (requestedWorkerStageBudgetMinutes != null && normalizedRequestedWorkerStageBudgetMinutes === undefined) {
+            emit({
+                id: payload.jobId,
+                command: payload.command,
+                state: shared_types_2.JobState.FAILED,
+                progress: 100,
+                message: `workerStageBudgetMinutes must be between ${shared_types_1.MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES} and ${shared_types_1.MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES} minutes.`,
+                metadata: {
+                    batchId: input.batchId,
+                    requestedKbAccessMode: kbAccessMode,
+                    kbAccessMode,
+                    agentModelId
+                }
+            });
+            return;
+        }
+        const workerStageRunBudget = resolveWorkerStageRunBudget(normalizedRequestedWorkerStageBudgetMinutes ?? batchContext.batch.workerStageBudgetMinutes);
         const uploadedPbis = await workspaceRepository.getPBISubset(input.workspaceId, input.batchId).catch(() => ({ rows: [] }));
         const plannerPrefetch = await buildPlannerPrefetch(workspaceRepository, input.workspaceId, input.batchId, uploadedPbis).catch(() => ({
             priorAnalysis: null,
@@ -4132,25 +4213,131 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             articleMatches: [],
             relationMatches: []
         }));
+        const existingSnapshot = await workspaceRepository.getBatchAnalysisSnapshot(input.workspaceId, input.batchId);
+        let latestPendingQuestionSet = existingSnapshot.activeQuestionSet;
+        const latestPendingQuestions = existingSnapshot.questions;
+        const latestPendingQuestionCount = existingSnapshot.unansweredRequiredQuestionCount;
+        const buildResolvedUserAnswers = (questions) => questions
+            .filter((question) => Boolean(question.answer?.trim()))
+            .map((question) => ({
+            questionId: question.id,
+            prompt: question.prompt,
+            answer: question.answer.trim(),
+            answeredAtUtc: question.answeredAtUtc
+        }));
+        let resumeState = null;
+        if (existingSnapshot.latestIteration?.status === 'needs_user_input' && latestPendingQuestionSet) {
+            if (latestPendingQuestionCount > 0) {
+                emit({
+                    id: payload.jobId,
+                    command: payload.command,
+                    state: shared_types_2.JobState.FAILED,
+                    progress: 100,
+                    message: `Batch analysis is waiting for ${latestPendingQuestionCount} required answer(s) before it can resume.`,
+                    metadata: {
+                        batchId: input.batchId,
+                        requestedKbAccessMode: kbAccessMode,
+                        kbAccessMode,
+                        agentModelId
+                    }
+                });
+                return;
+            }
+            if (latestPendingQuestionSet.status === 'waiting') {
+                const markedReady = await workspaceRepository.markBatchAnalysisQuestionSetReadyToResume({
+                    workspaceId: input.workspaceId,
+                    questionSetId: latestPendingQuestionSet.id
+                });
+                latestPendingQuestionSet = markedReady.questionSet ?? latestPendingQuestionSet;
+            }
+            if (latestPendingQuestionSet.status === 'ready_to_resume') {
+                const markedResuming = await workspaceRepository.markBatchAnalysisQuestionSetResuming({
+                    workspaceId: input.workspaceId,
+                    questionSetId: latestPendingQuestionSet.id
+                });
+                if (!markedResuming.questionSet) {
+                    emit({
+                        id: payload.jobId,
+                        command: payload.command,
+                        state: shared_types_2.JobState.CANCELED,
+                        progress: 100,
+                        message: 'Resume already claimed by another batch-analysis run.'
+                    });
+                    return;
+                }
+                latestPendingQuestionSet = markedResuming.questionSet;
+            }
+            const inspection = await workspaceRepository.getBatchAnalysisInspection(input.workspaceId, input.batchId);
+            const resolvedUserAnswers = buildResolvedUserAnswers(latestPendingQuestions);
+            const pendingQuestionSet = latestPendingQuestionSet;
+            if (!pendingQuestionSet) {
+                throw new Error('Cannot resume batch analysis without a pending question set.');
+            }
+            if (pendingQuestionSet.resumeStage === 'worker_discovery_review') {
+                const activeApprovedPlan = existingSnapshot.latestApprovedPlan;
+                if (!activeApprovedPlan) {
+                    throw new Error('Cannot resume amendment review without an approved plan.');
+                }
+                const discoveryIds = new Set(latestPendingQuestions.flatMap((question) => question.linkedDiscoveryIds));
+                const discoveredForAmendment = inspection.discoveredWork.filter((item) => discoveryIds.has(item.discoveryId));
+                if (discoveredForAmendment.length === 0) {
+                    throw new Error('Cannot resume amendment review without linked discovered work.');
+                }
+                resumeState = {
+                    kind: 'amendment',
+                    questionSet: pendingQuestionSet,
+                    questions: latestPendingQuestions,
+                    resolvedUserAnswers,
+                    activeApprovedPlan,
+                    discoveredForAmendment,
+                    amendmentLoops: Math.max(1, inspection.amendments.filter((amendment) => amendment.iterationId === existingSnapshot.latestIteration?.id).length)
+                };
+            }
+            else {
+                const priorPlan = inspection.plans.find((plan) => plan.id === pendingQuestionSet.planId)
+                    ?? inspection.plans[0]
+                    ?? null;
+                const priorReview = inspection.reviews.find((review) => review.id === pendingQuestionSet.reviewId)
+                    ?? inspection.reviews[0]
+                    ?? null;
+                resumeState = {
+                    kind: 'planning',
+                    questionSet: pendingQuestionSet,
+                    questions: latestPendingQuestions,
+                    resolvedUserAnswers,
+                    priorPlanJson: priorPlan ? JSON.stringify(priorPlan) : undefined,
+                    reviewDeltaJson: priorReview?.delta ? JSON.stringify(priorReview.delta) : undefined,
+                    nextAttempt: (priorPlan?.planVersion ?? 1) + 1
+                };
+            }
+        }
         const streamMetadata = {
             batchId: input.batchId,
             kbAccessMode,
             workspaceId: input.workspaceId,
             agentModelId
         };
-        const orchestrationIteration = await batchAnalysisOrchestrator.startIteration({
-            workspaceId: input.workspaceId,
-            batchId: input.batchId,
-            agentModelId,
-            startedAtUtc: new Date().toISOString()
-        });
+        const orchestrationIteration = resumeState && existingSnapshot.latestIteration
+            ? existingSnapshot.latestIteration
+            : await batchAnalysisOrchestrator.startIteration({
+                workspaceId: input.workspaceId,
+                batchId: input.batchId,
+                agentModelId,
+                startedAtUtc: new Date().toISOString()
+            });
         let liveIteration = orchestrationIteration;
         let liveExecutionCounts = orchestrationIteration.executionCounts;
         let liveOutstandingDiscoveredWorkCount = orchestrationIteration.outstandingDiscoveredWorkCount;
         let liveApprovedPlanId = orchestrationIteration.approvedPlanId;
         let liveLastReviewVerdict = orchestrationIteration.lastReviewVerdict;
         let liveSessionId = orchestrationIteration.sessionId;
+        let planningSessionId = orchestrationIteration.sessionId;
+        let workerSessionId;
         let liveStageStartedAtUtc = orchestrationIteration.startedAtUtc;
+        let liveActiveQuestionSetId = existingSnapshot.activeQuestionSet?.id;
+        let liveActiveQuestionSetStatus = existingSnapshot.activeQuestionSet?.status;
+        let livePausedForUserInput = existingSnapshot.pausedForUserInput;
+        let liveUnansweredRequiredQuestionCount = existingSnapshot.unansweredRequiredQuestionCount;
         const buildStreamMetadata = (overrides) => ({
             ...streamMetadata,
             ...overrides,
@@ -4168,6 +4355,10 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 approvedPlanId: liveApprovedPlanId,
                 lastReviewVerdict: liveLastReviewVerdict,
                 outstandingDiscoveredWorkCount: liveOutstandingDiscoveredWorkCount,
+                activeQuestionSetId: liveActiveQuestionSetId,
+                activeQuestionSetStatus: liveActiveQuestionSetStatus,
+                pausedForUserInput: livePausedForUserInput,
+                unansweredRequiredQuestionCount: liveUnansweredRequiredQuestionCount,
                 executionCounts: liveExecutionCounts,
                 stageStartedAtUtc: liveStageStartedAtUtc,
                 stageEndedAtUtc: overrides?.stageEndedAtUtc,
@@ -4215,8 +4406,92 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 createdAtUtc: new Date().toISOString()
             });
         };
+        const resolveStageKbAccessMode = (_role) => kbAccessMode;
+        const ensurePlanningSession = (role) => {
+            if (planningSessionId?.trim()) {
+                return {
+                    sessionId: planningSessionId,
+                    reusePolicy: 'reuse'
+                };
+            }
+            const session = agentRuntime.createSession({
+                workspaceId: input.workspaceId,
+                kbAccessMode,
+                type: 'batch_analysis',
+                mode: 'plan',
+                role,
+                batchId: input.batchId,
+                locale: input.locale,
+                templatePackId: input.templatePackId
+            });
+            planningSessionId = session.id;
+            return {
+                sessionId: session.id,
+                reusePolicy: 'new_local_session'
+            };
+        };
+        const ensureWorkerSession = (stage) => {
+            if (workerSessionId?.trim()) {
+                return {
+                    sessionId: workerSessionId,
+                    reusePolicy: 'reuse'
+                };
+            }
+            const session = agentRuntime.createSession({
+                workspaceId: input.workspaceId,
+                kbAccessMode: resolveStageKbAccessMode('worker'),
+                type: 'batch_analysis',
+                mode: 'agent',
+                role: 'worker',
+                batchId: input.batchId,
+                locale: input.locale,
+                templatePackId: input.templatePackId
+            });
+            workerSessionId = session.id;
+            logger_1.logger.info('[agent.analysis.run] created dedicated worker session', {
+                jobId: payload.jobId,
+                workspaceId: input.workspaceId,
+                batchId: input.batchId,
+                iterationId: orchestrationIteration.id,
+                stage,
+                sessionId: session.id
+            });
+            return {
+                sessionId: session.id,
+                reusePolicy: 'new_local_session'
+            };
+        };
+        const beginWorkerStage = async (params) => {
+            const workerSession = ensureWorkerSession(params.stage);
+            liveSessionId = workerSession.sessionId;
+            liveIteration = await batchAnalysisOrchestrator.transitionIteration({
+                workspaceId: input.workspaceId,
+                iterationId: orchestrationIteration.id,
+                stage: params.stage,
+                role: 'worker',
+                summary: params.summary,
+                agentModelId,
+                sessionId: workerSession.sessionId,
+                approvedPlanId: params.approvedPlanId,
+                lastReviewVerdict: params.lastReviewVerdict
+            });
+            streamMetadata.stage = params.stage;
+            streamMetadata.role = 'worker';
+            liveApprovedPlanId = params.approvedPlanId;
+            if (params.lastReviewVerdict) {
+                liveLastReviewVerdict = params.lastReviewVerdict;
+            }
+            liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+            return workerSession;
+        };
         const persistBatchStageRun = async (params) => {
-            await workspaceRepository.recordBatchAnalysisStageRun({
+            const stageKbAccessMode = params.stageKbAccessMode ?? kbAccessMode;
+            const stageRunStatus = params.result.status === 'ok' || params.resolution?.parseable
+                ? 'complete'
+                : params.result.status === 'canceled'
+                    ? 'canceled'
+                    : 'failed';
+            const stageRunPayload = {
                 workspaceId: input.workspaceId,
                 batchId: input.batchId,
                 iterationId: liveIteration.id,
@@ -4227,13 +4502,9 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 sessionReusePolicy: params.sessionReusePolicy,
                 localSessionId: params.result.sessionId,
                 acpSessionId: params.result.acpSessionId,
-                kbAccessMode,
+                kbAccessMode: stageKbAccessMode,
                 agentModelId,
-                status: params.result.status === 'ok' || params.resolution?.parseable
-                    ? 'complete'
-                    : params.result.status === 'canceled'
-                        ? 'canceled'
-                        : 'failed',
+                status: stageRunStatus,
                 startedAtUtc: params.result.startedAtUtc,
                 endedAtUtc: params.result.endedAtUtc,
                 promptTemplate: params.promptTemplate,
@@ -4247,33 +4518,125 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 transcriptCandidateCount: params.resolution?.transcriptCandidateCount,
                 textLength: params.resolution?.text.length,
                 resultTextPreview: params.resolution ? buildStageEventTextPreview(params.resolution.text) : undefined
-            });
+            };
+            if (params.stageRunId) {
+                await workspaceRepository.updateBatchAnalysisStageRun({
+                    workspaceId: input.workspaceId,
+                    stageRunId: params.stageRunId,
+                    localSessionId: stageRunPayload.localSessionId,
+                    acpSessionId: stageRunPayload.acpSessionId,
+                    kbAccessMode: stageRunPayload.kbAccessMode,
+                    agentModelId: stageRunPayload.agentModelId,
+                    status: stageRunPayload.status,
+                    startedAtUtc: stageRunPayload.startedAtUtc,
+                    endedAtUtc: stageRunPayload.endedAtUtc,
+                    promptTemplate: stageRunPayload.promptTemplate,
+                    transcriptPath: stageRunPayload.transcriptPath,
+                    toolCalls: stageRunPayload.toolCalls,
+                    rawOutput: stageRunPayload.rawOutput,
+                    message: stageRunPayload.message,
+                    parseable: stageRunPayload.parseable,
+                    usedTranscriptRecovery: stageRunPayload.usedTranscriptRecovery,
+                    initialCandidateCount: stageRunPayload.initialCandidateCount,
+                    transcriptCandidateCount: stageRunPayload.transcriptCandidateCount,
+                    textLength: stageRunPayload.textLength,
+                    resultTextPreview: stageRunPayload.resultTextPreview
+                });
+            }
+            else {
+                await workspaceRepository.recordBatchAnalysisStageRun(stageRunPayload);
+            }
             if (params.result.sessionId) {
                 await workspaceRepository.annotateProposalProvenanceForSession({
                     workspaceId: input.workspaceId,
                     batchId: input.batchId,
                     sessionId: params.result.sessionId,
-                    kbAccessMode,
+                    kbAccessMode: stageKbAccessMode,
                     acpSessionId: params.result.acpSessionId,
                     originPath: 'batch_analysis'
                 });
             }
         };
+        const pauseForUserInput = async (params) => {
+            await workspaceRepository.recordBatchAnalysisQuestionSet(params.questionSet);
+            await workspaceRepository.recordBatchAnalysisQuestions({
+                workspaceId: params.questionSet.workspaceId,
+                batchId: params.questionSet.batchId,
+                iterationId: params.questionSet.iterationId,
+                questionSetId: params.questionSet.id,
+                questions: params.questions
+            });
+            liveActiveQuestionSetId = params.questionSet.id;
+            liveActiveQuestionSetStatus = params.questionSet.status;
+            livePausedForUserInput = true;
+            liveUnansweredRequiredQuestionCount = params.questions.filter((question) => question.requiresUserInput
+                && question.status !== 'answered'
+                && question.status !== 'resolved').length;
+            await logAnalysisProgress(params.logMessage, {
+                stage: 'awaiting_user_input',
+                role: params.role
+            }, {
+                questionSetId: params.questionSet.id,
+                questionCount: params.questions.length,
+                unansweredRequiredQuestionCount: liveUnansweredRequiredQuestionCount,
+                ...(params.details ?? {})
+            });
+            liveIteration = await workspaceRepository.updateBatchAnalysisIteration({
+                workspaceId: input.workspaceId,
+                iterationId: orchestrationIteration.id,
+                stage: 'awaiting_user_input',
+                role: params.role,
+                status: 'needs_user_input',
+                summary: params.summary,
+                agentModelId,
+                lastReviewVerdict: params.lastReviewVerdict
+            });
+            streamMetadata.stage = 'awaiting_user_input';
+            streamMetadata.role = params.role;
+            liveStageStartedAtUtc = liveIteration.updatedAtUtc;
+            emit({
+                id: payload.jobId,
+                command: payload.command,
+                state: shared_types_2.JobState.FAILED,
+                progress: 100,
+                message: params.progressMessage,
+                metadata: buildStreamMetadata()
+            });
+        };
         try {
             streamMetadata.iterationId = orchestrationIteration.id;
             streamMetadata.stage = orchestrationIteration.stage;
             streamMetadata.role = orchestrationIteration.role;
-            await logAnalysisProgress('Batch analysis iteration started.', { eventType: 'stage_progress' }, {
-                kbAccessMode,
-                agentModelId,
-                uploadedPbiCount: Array.isArray(uploadedPbis?.rows) ? (uploadedPbis.rows?.length ?? 0) : 0,
-                prefetchedClusterCount: plannerPrefetch.topicClusters.length,
-                prefetchedArticleMatchCount: plannerPrefetch.articleMatches.length,
-                prefetchedRelationCount: plannerPrefetch.relationMatches.length
-            });
+            if (resumeState) {
+                liveActiveQuestionSetId = resumeState.questionSet.id;
+                liveActiveQuestionSetStatus = 'resuming';
+                livePausedForUserInput = false;
+                liveUnansweredRequiredQuestionCount = 0;
+                await logAnalysisProgress('Resuming batch analysis after required user answers were submitted.', { eventType: 'stage_progress' }, {
+                    kbAccessMode,
+                    agentModelId,
+                    resumedQuestionSetId: resumeState.questionSet.id,
+                    resumedQuestionCount: resumeState.questions.length,
+                    resumeStage: resumeState.questionSet.resumeStage,
+                    resumeRole: resumeState.questionSet.resumeRole
+                });
+            }
+            else {
+                await logAnalysisProgress('Batch analysis iteration started.', { eventType: 'stage_progress' }, {
+                    kbAccessMode,
+                    agentModelId,
+                    uploadedPbiCount: Array.isArray(uploadedPbis?.rows) ? (uploadedPbis.rows?.length ?? 0) : 0,
+                    prefetchedClusterCount: plannerPrefetch.topicClusters.length,
+                    prefetchedArticleMatchCount: plannerPrefetch.articleMatches.length,
+                    prefetchedRelationCount: plannerPrefetch.relationMatches.length
+                });
+            }
             let approvedPlanId;
-            const runPlanningPass = async (attempt, priorPlanJson, reviewDeltaJson) => {
+            let resumeQuestionSetToResolve = resumeState?.questionSet.id;
+            const runPlanningPass = async (attempt, priorPlanJson, reviewDeltaJson, resolvedUserAnswers) => {
                 const planningStage = attempt === 1 ? 'planning' : 'plan_revision';
+                const planningSession = ensurePlanningSession('planner');
+                liveSessionId = planningSession.sessionId;
                 await logAnalysisProgress(attempt === 1 ? 'Planner attempt 1 started.' : `Planner revision attempt ${attempt} started.`, { stage: planningStage, role: 'planner' }, {
                     attempt,
                     hasPriorPlan: Boolean(priorPlanJson),
@@ -4285,7 +4648,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     stage: planningStage,
                     role: 'planner',
                     summary: attempt === 1 ? 'Generating initial batch plan.' : `Revising plan after review feedback (attempt ${attempt}).`,
-                    agentModelId
+                    agentModelId,
+                    sessionId: planningSession.sessionId
                 });
                 streamMetadata.stage = planningStage;
                 streamMetadata.role = 'planner';
@@ -4303,13 +4667,14 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     uploadedPbis,
                     plannerPrefetch,
                     priorPlan: priorPlanJson ? JSON.parse(priorPlanJson) : undefined,
-                    reviewDelta: reviewDeltaJson ? JSON.parse(reviewDeltaJson) : undefined
+                    reviewDelta: reviewDeltaJson ? JSON.parse(reviewDeltaJson) : undefined,
+                    resolvedUserAnswers
                 });
                 let plannerResult;
                 try {
                     plannerResult = await agentRuntime.runBatchAnalysis({
                         ...input,
-                        sessionId: liveSessionId,
+                        sessionId: planningSession.sessionId,
                         kbAccessMode,
                         agentRole: 'planner',
                         sessionMode: 'plan',
@@ -4338,6 +4703,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     throw error;
                 }
                 liveSessionId = plannerResult.sessionId;
+                planningSessionId = plannerResult.sessionId;
                 const parseDraftPlan = (resultText, sessionId) => batchAnalysisOrchestrator.parsePlannerResult({
                     workspaceId: input.workspaceId,
                     batchId: input.batchId,
@@ -4385,6 +4751,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         });
                         plannerResult = await agentRuntime.runBatchAnalysis({
                             ...input,
+                            sessionId: planningSessionId,
                             sessionReusePolicy: 'new_local_session',
                             kbAccessMode,
                             agentRole: 'planner',
@@ -4401,6 +4768,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                             });
                         }, isCancelled);
                         liveSessionId = plannerResult.sessionId;
+                        planningSessionId = plannerResult.sessionId;
                         plannerResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, plannerResult.sessionId, plannerResult.resultPayload, 'planner');
                         await persistBatchStageRun({
                             stage: planningStage,
@@ -4447,6 +4815,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                             });
                         plannerResult = await agentRuntime.runBatchAnalysis({
                             ...input,
+                            sessionId: planningSessionId,
                             sessionReusePolicy: 'reset_acp',
                             kbAccessMode,
                             agentRole: 'planner',
@@ -4463,6 +4832,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                             });
                         }, isCancelled);
                         liveSessionId = plannerResult.sessionId;
+                        planningSessionId = plannerResult.sessionId;
                         plannerResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, plannerResult.sessionId, plannerResult.resultPayload, 'planner');
                         await persistBatchStageRun({
                             stage: planningStage,
@@ -4627,21 +4997,37 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                 }
                 await batchAnalysisOrchestrator.recordPlan(draftPlan);
+                if (resumeState?.kind === 'planning' && resumeQuestionSetToResolve) {
+                    await workspaceRepository.resolveBatchAnalysisQuestionSet({
+                        workspaceId: input.workspaceId,
+                        questionSetId: resumeQuestionSetToResolve
+                    });
+                    liveActiveQuestionSetId = undefined;
+                    liveActiveQuestionSetStatus = 'resolved';
+                    livePausedForUserInput = false;
+                    liveUnansweredRequiredQuestionCount = 0;
+                    resumeQuestionSetToResolve = undefined;
+                    resumeState = null;
+                }
                 await logAnalysisProgress('Planner draft plan recorded.', { stage: planningStage, role: 'planner', sessionId: draftPlan.sessionId }, {
                     attempt,
                     planId: draftPlan.id,
                     planVersion: draftPlan.planVersion,
                     coverageCount: draftPlan.coverage.length,
                     itemCount: draftPlan.items.length,
-                    openQuestionCount: draftPlan.openQuestions.length
+                    openQuestionCount: draftPlan.openQuestions.length,
+                    structuredQuestionCount: draftPlan.questions?.length ?? 0
                 });
+                const planningReviewSession = ensurePlanningSession('plan-reviewer');
+                liveSessionId = planningReviewSession.sessionId;
                 liveIteration = await batchAnalysisOrchestrator.transitionIteration({
                     workspaceId: input.workspaceId,
                     iterationId: orchestrationIteration.id,
                     stage: 'plan_reviewing',
                     role: 'plan-reviewer',
                     summary: 'Reviewing planner output for completeness and missed KB impact.',
-                    agentModelId
+                    agentModelId,
+                    sessionId: planningReviewSession.sessionId
                 });
                 streamMetadata.stage = 'plan_reviewing';
                 streamMetadata.role = 'plan-reviewer';
@@ -4662,7 +5048,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 });
                 let reviewResult = await agentRuntime.runBatchAnalysis({
                     ...input,
-                    sessionId: liveSessionId,
+                    sessionId: planningReviewSession.sessionId,
                     kbAccessMode,
                     agentRole: 'plan-reviewer',
                     sessionMode: 'plan',
@@ -4678,6 +5064,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                 }, isCancelled);
                 liveSessionId = reviewResult.sessionId;
+                planningSessionId = reviewResult.sessionId;
                 let reviewResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, reviewResult.sessionId, reviewResult.resultPayload, 'plan_review');
                 await persistBatchStageRun({
                     stage: 'plan_reviewing',
@@ -4699,6 +5086,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                     reviewResult = await agentRuntime.runBatchAnalysis({
                         ...input,
+                        sessionId: planningSessionId,
                         sessionReusePolicy: 'reset_acp',
                         kbAccessMode,
                         agentRole: 'plan-reviewer',
@@ -4715,6 +5103,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         });
                     }, isCancelled);
                     liveSessionId = reviewResult.sessionId;
+                    planningSessionId = reviewResult.sessionId;
                     reviewResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, reviewResult.sessionId, reviewResult.resultPayload, 'plan_review');
                     await persistBatchStageRun({
                         stage: 'plan_reviewing',
@@ -4801,35 +5190,43 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 });
                 review = deterministicReviewGuard.review;
                 if (deterministicReviewGuard.missingEditTargets.length > 0) {
-                    await logAnalysisProgress(deterministicReviewGuard.forcedRevision
-                        ? 'Deterministic review guard blocked approval because likely edit targets were missing from the plan.'
-                        : 'Deterministic review guard added likely missing edit targets to the review delta.', {
+                    await logAnalysisProgress('Deterministic prefetch surfaced advisory likely edit targets for reviewer visibility.', {
                         stage: 'plan_reviewing',
                         role: 'plan-reviewer',
                         sessionId: review.sessionId
                     }, {
                         attempt,
-                        forcedRevision: deterministicReviewGuard.forcedRevision,
+                        advisoryOnly: true,
                         missingEditTargets: deterministicReviewGuard.missingEditTargets,
-                        transitionReason: deterministicReviewGuard.forcedRevision
-                            ? 'deterministic_prefetch_missing_edits'
-                            : 'deterministic_prefetch_review_delta_augmented'
+                        transitionReason: 'deterministic_prefetch_missing_edits_advisory'
                     });
                 }
                 if (deterministicReviewGuard.missingCreateTargets.length > 0) {
+                    await logAnalysisProgress('Deterministic prefetch surfaced advisory likely net-new article work for reviewer visibility.', {
+                        stage: 'plan_reviewing',
+                        role: 'plan-reviewer',
+                        sessionId: review.sessionId
+                    }, {
+                        attempt,
+                        advisoryOnly: true,
+                        missingCreateTargets: deterministicReviewGuard.missingCreateTargets,
+                        transitionReason: 'deterministic_prefetch_missing_creates_advisory'
+                    });
+                }
+                if (deterministicReviewGuard.invalidCoverageReasons.length > 0) {
                     await logAnalysisProgress(deterministicReviewGuard.forcedRevision
-                        ? 'Deterministic review guard blocked approval because likely net-new article work was missing from the plan.'
-                        : 'Deterministic review guard added likely net-new article work to the review delta.', {
+                        ? 'Deterministic approval validation blocked approval because the plan still contained unresolved PBI coverage.'
+                        : 'Deterministic approval validation added unresolved PBI coverage issues to the review delta.', {
                         stage: 'plan_reviewing',
                         role: 'plan-reviewer',
                         sessionId: review.sessionId
                     }, {
                         attempt,
                         forcedRevision: deterministicReviewGuard.forcedRevision,
-                        missingCreateTargets: deterministicReviewGuard.missingCreateTargets,
+                        invalidCoverageReasons: deterministicReviewGuard.invalidCoverageReasons,
                         transitionReason: deterministicReviewGuard.forcedRevision
-                            ? 'deterministic_prefetch_missing_creates'
-                            : 'deterministic_prefetch_review_delta_augmented'
+                            ? 'deterministic_unresolved_coverage_blocked_approval'
+                            : 'deterministic_unresolved_coverage_review_delta_augmented'
                     });
                 }
                 if (deterministicReviewGuard.unresolvedTargetIssues.length > 0) {
@@ -4882,6 +5279,51 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     underScopedKbImpact: review.underScopedKbImpact,
                     triggerSummary: review.summary
                 });
+                if (review.verdict === 'needs_user_input') {
+                    const questionSetCreatedAtUtc = new Date().toISOString();
+                    const blockingQuestions = deterministicReviewGuard.blockingUserInputQuestions.map((question) => ({
+                        ...question,
+                        id: question.id?.trim() ? question.id : (0, node_crypto_1.randomUUID)(),
+                        createdAtUtc: question.createdAtUtc ?? questionSetCreatedAtUtc
+                    }));
+                    const questionSet = {
+                        id: (0, node_crypto_1.randomUUID)(),
+                        workspaceId: input.workspaceId,
+                        batchId: input.batchId,
+                        iterationId: orchestrationIteration.id,
+                        sourceStage: 'plan_reviewing',
+                        sourceRole: 'plan-reviewer',
+                        resumeStage: 'plan_revision',
+                        resumeRole: 'planner',
+                        status: 'waiting',
+                        summary: review.summary,
+                        planId: draftPlan.id,
+                        reviewId: review.id,
+                        createdAtUtc: questionSetCreatedAtUtc,
+                        updatedAtUtc: questionSetCreatedAtUtc
+                    };
+                    await pauseForUserInput({
+                        questionSet,
+                        questions: blockingQuestions,
+                        summary: review.summary,
+                        role: 'plan-reviewer',
+                        lastReviewVerdict: review.verdict,
+                        progressMessage: 'Batch analysis paused until required user questions are answered.',
+                        logMessage: 'Plan review paused execution pending required user input.',
+                        details: {
+                            attempt,
+                            reviewId: review.id,
+                            transitionReason: 'plan_review_needs_user_input',
+                            triggerBranch: 'review.verdict === needs_user_input',
+                            triggerArtifactType: 'question_set',
+                            triggerArtifactId: questionSet.id,
+                            triggerSessionId: review.sessionId,
+                            triggerVerdict: review.verdict,
+                            triggerSummary: review.summary
+                        }
+                    });
+                    return { needsUserInput: true, review, questionSet };
+                }
                 if (review.verdict === 'approved') {
                     const approvedPlan = {
                         ...draftPlan,
@@ -4892,21 +5334,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     };
                     await batchAnalysisOrchestrator.recordPlan(approvedPlan);
                     approvedPlanId = approvedPlan.id;
-                    liveIteration = await batchAnalysisOrchestrator.transitionIteration({
-                        workspaceId: input.workspaceId,
-                        iterationId: orchestrationIteration.id,
+                    await beginWorkerStage({
                         stage: 'building',
-                        role: 'worker',
                         summary: 'Plan approved. Executing worker stage.',
-                        agentModelId,
                         approvedPlanId: approvedPlan.id,
                         lastReviewVerdict: review.verdict
                     });
-                    liveApprovedPlanId = approvedPlan.id;
-                    liveLastReviewVerdict = review.verdict;
-                    liveStageStartedAtUtc = liveIteration.updatedAtUtc;
-                    streamMetadata.stage = 'building';
-                    streamMetadata.role = 'worker';
                     await logAnalysisProgress('Plan approved; advancing to worker stage.', {
                         stage: 'building',
                         role: 'worker'
@@ -4976,9 +5409,21 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             let planningOutcome = null;
             let priorPlanJson;
             let reviewDeltaJson;
+            const planningResolvedUserAnswers = resumeState?.kind === 'planning'
+                ? resumeState.resolvedUserAnswers
+                : undefined;
             const maxPlannerAttempts = 3;
-            for (let attempt = 1; attempt <= maxPlannerAttempts; attempt += 1) {
-                const outcome = await runPlanningPass(attempt, priorPlanJson, reviewDeltaJson);
+            const planningStartAttempt = resumeState?.kind === 'planning' ? resumeState.nextAttempt : 1;
+            const planningAttemptLimit = resumeState?.kind === 'planning'
+                ? Math.max(maxPlannerAttempts, resumeState.nextAttempt + 1)
+                : maxPlannerAttempts;
+            priorPlanJson = resumeState?.kind === 'planning' ? resumeState.priorPlanJson : undefined;
+            reviewDeltaJson = resumeState?.kind === 'planning' ? resumeState.reviewDeltaJson : undefined;
+            for (let attempt = planningStartAttempt; attempt <= planningAttemptLimit; attempt += 1) {
+                const outcome = await runPlanningPass(attempt, priorPlanJson, reviewDeltaJson, planningResolvedUserAnswers);
+                if ('needsUserInput' in outcome) {
+                    return;
+                }
                 if ('approvedPlan' in outcome) {
                     planningOutcome = outcome;
                     break;
@@ -5018,35 +5463,87 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 return;
             }
             const runAnalysis = async (plan, extraInstructions) => {
-                const promptTemplate = batchAnalysisOrchestrator.buildWorkerPrompt(plan, extraInstructions ?? input.prompt);
-                const result = await agentRuntime.runBatchAnalysis({
-                    ...input,
-                    sessionId: liveSessionId,
-                    kbAccessMode,
-                    agentRole: 'worker',
-                    sessionMode: 'agent',
-                    prompt: promptTemplate
-                }, (stream) => {
-                    emit({
-                        id: payload.jobId,
-                        command: payload.command,
-                        state: shared_types_2.JobState.RUNNING,
-                        progress: stream.kind === 'result' ? 100 : 35,
-                        message: JSON.stringify(stream),
-                        metadata: buildStreamMetadata({ sessionId: stream.sessionId })
+                const workerStageKbAccessMode = resolveStageKbAccessMode('worker');
+                const workerStage = (streamMetadata.stage ?? liveIteration.stage);
+                const workerSession = ensureWorkerSession(workerStage);
+                liveSessionId = workerSession.sessionId;
+                const promptTemplate = await batchAnalysisOrchestrator.buildWorkerPrompt(plan, extraInstructions ?? input.prompt);
+                const startedAtUtc = new Date().toISOString();
+                const stageRun = await workspaceRepository.recordBatchAnalysisStageRun({
+                    workspaceId: input.workspaceId,
+                    batchId: input.batchId,
+                    iterationId: liveIteration.id,
+                    iteration: liveIteration.iteration,
+                    stage: workerStage,
+                    role: 'worker',
+                    sessionReusePolicy: workerSession.reusePolicy,
+                    localSessionId: workerSession.sessionId,
+                    kbAccessMode: workerStageKbAccessMode,
+                    agentModelId,
+                    status: 'running',
+                    promptTemplate,
+                    message: `[${workerStage}/worker] running`,
+                    startedAtUtc
+                });
+                try {
+                    const result = await runBatchAnalysisWithStageWatchdog(agentRuntime, {
+                        ...input,
+                        sessionId: workerSession.sessionId,
+                        kbAccessMode: workerStageKbAccessMode,
+                        agentRole: 'worker',
+                        sessionMode: 'agent',
+                        timeoutMs: workerStageRunBudget.timeoutMs,
+                        prompt: promptTemplate
+                    }, (stream) => {
+                        emit({
+                            id: payload.jobId,
+                            command: payload.command,
+                            state: shared_types_2.JobState.RUNNING,
+                            progress: stream.kind === 'result' ? 100 : 35,
+                            message: JSON.stringify(stream),
+                            metadata: buildStreamMetadata({ sessionId: stream.sessionId, kbAccessMode: workerStageKbAccessMode })
+                        });
+                    }, isCancelled, {
+                        stage: workerStage,
+                        sessionId: workerSession.sessionId,
+                        watchdogMs: workerStageRunBudget.watchdogMs
                     });
-                }, isCancelled);
-                return { result, promptTemplate };
+                    return {
+                        result,
+                        promptTemplate,
+                        workerStageKbAccessMode,
+                        workerStage,
+                        stageRunId: stageRun.id
+                    };
+                }
+                catch (error) {
+                    const inferredStatus = inferBatchStageFailureStatus(error);
+                    await workspaceRepository.updateBatchAnalysisStageRun({
+                        workspaceId: input.workspaceId,
+                        stageRunId: stageRun.id,
+                        localSessionId: workerSession.sessionId,
+                        kbAccessMode: workerStageKbAccessMode,
+                        agentModelId,
+                        status: inferredStatus === 'timeout' ? 'failed' : 'failed',
+                        promptTemplate,
+                        message: `[${workerStage}/worker] ${error instanceof Error ? error.message : String(error)}`,
+                        endedAtUtc: new Date().toISOString()
+                    });
+                    throw error;
+                }
             };
             const executeWorkerPass = async (approvedPlan, extraInstructions) => {
-                const workerStage = (streamMetadata.stage ?? liveIteration.stage);
                 const workerAttempt = await runAnalysis(approvedPlan, extraInstructions);
                 let workerResult = workerAttempt.result;
                 let workerPromptTemplate = workerAttempt.promptTemplate;
+                const workerStageKbAccessMode = workerAttempt.workerStageKbAccessMode;
+                const workerStage = workerAttempt.workerStage;
                 const workerResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, workerResult.sessionId, workerResult.resultPayload, 'worker');
                 await persistBatchStageRun({
+                    stageRunId: workerAttempt.stageRunId,
                     stage: workerStage,
                     role: 'worker',
+                    stageKbAccessMode: workerStageKbAccessMode,
                     result: workerResult,
                     promptTemplate: workerPromptTemplate,
                     resolution: workerResolution
@@ -5063,7 +5560,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     usedTranscriptRecovery: workerResolution.usedTranscript,
                     payloadCandidateCount: workerResolution.initialCandidateCount,
                     transcriptCandidateCount: workerResolution.transcriptCandidateCount,
-                    kbAccessMode,
+                    kbAccessMode: workerStageKbAccessMode,
                     status: workerResult.status
                 });
                 const workerFallbackSummary = workerResult.message ?? 'Worker pass completed.';
@@ -5119,19 +5616,49 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                 }
                 liveSessionId = workerResult.sessionId;
+                workerSessionId = workerResult.sessionId;
                 return {
                     result: workerResult,
                     workerSummary: workerParsed.summary,
                     discoveredWork: workerParsed.discoveredWork
                 };
             };
-            let workerPass = await executeWorkerPass(planningOutcome.approvedPlan);
+            let workerPass = resumeState?.kind === 'amendment'
+                ? {
+                    result: {
+                        sessionId: liveSessionId ?? planningSessionId ?? 'resume-amendment',
+                        kbAccessMode,
+                        status: 'ok',
+                        startedAtUtc: new Date().toISOString(),
+                        endedAtUtc: new Date().toISOString(),
+                        transcriptPath: '',
+                        rawOutput: [],
+                        toolCalls: [],
+                        durationMs: 0,
+                        message: 'Resuming amendment review after required user answers.'
+                    },
+                    workerSummary: existingSnapshot.latestWorkerReport?.summary ?? 'Resuming amendment review after user answers.',
+                    discoveredWork: existingSnapshot.latestWorkerReport?.discoveredWork ?? resumeState.discoveredForAmendment
+                }
+                : await executeWorkerPass(planningOutcome.approvedPlan);
             const maxAmendmentLoops = 2;
-            let amendmentLoops = 0;
-            let activeApprovedPlan = planningOutcome.approvedPlan;
+            let amendmentLoops = resumeState?.kind === 'amendment'
+                ? Math.max(0, resumeState.amendmentLoops - 1)
+                : 0;
+            const amendmentResolvedUserAnswers = resumeState?.kind === 'amendment'
+                ? resumeState.resolvedUserAnswers
+                : undefined;
+            let activeApprovedPlan = resumeState?.kind === 'amendment'
+                ? resumeState.activeApprovedPlan
+                : planningOutcome.approvedPlan;
+            let reusedWorkerReportForResume = resumeState?.kind === 'amendment' ? existingSnapshot.latestWorkerReport : null;
             while (workerPass.result.status === 'ok' && workerPass.discoveredWork.some((item) => item.requiresPlanAmendment)) {
                 amendmentLoops += 1;
-                const discoveredForAmendment = workerPass.discoveredWork.filter((item) => item.requiresPlanAmendment);
+                const discoveredForAmendment = reusedWorkerReportForResume
+                    ? resumeState?.kind === 'amendment'
+                        ? resumeState.discoveredForAmendment
+                        : workerPass.discoveredWork.filter((item) => item.requiresPlanAmendment)
+                    : workerPass.discoveredWork.filter((item) => item.requiresPlanAmendment);
                 await logAnalysisProgress('Worker discovered additional scope requiring plan amendment.', {
                     stage: 'worker_discovery_review',
                     role: 'planner',
@@ -5141,25 +5668,34 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     totalDiscoveredCount: workerPass.discoveredWork.length,
                     amendmentLoop: amendmentLoops
                 });
-                const workerPassRecord = await batchAnalysisOrchestrator.recordWorkerPass({
-                    iteration: orchestrationIteration,
-                    workspaceId: input.workspaceId,
-                    batchId: input.batchId,
-                    agentModelId,
-                    approvedPlan: activeApprovedPlan,
-                    result: workerPass.result,
-                    summary: workerPass.workerSummary,
-                    discoveredWork: workerPass.discoveredWork
-                });
+                const workerPassRecord = reusedWorkerReportForResume
+                    ? {
+                        workerReport: reusedWorkerReportForResume,
+                        executionCounts: liveExecutionCounts
+                    }
+                    : await batchAnalysisOrchestrator.recordWorkerPass({
+                        iteration: orchestrationIteration,
+                        workspaceId: input.workspaceId,
+                        batchId: input.batchId,
+                        agentModelId,
+                        approvedPlan: activeApprovedPlan,
+                        result: workerPass.result,
+                        summary: workerPass.workerSummary,
+                        discoveredWork: workerPass.discoveredWork
+                    });
                 liveExecutionCounts = workerPassRecord.executionCounts;
                 liveOutstandingDiscoveredWorkCount = workerPassRecord.workerReport.discoveredWork.length;
+                reusedWorkerReportForResume = null;
+                const amendmentPlanningSession = ensurePlanningSession('planner');
+                liveSessionId = amendmentPlanningSession.sessionId;
                 liveIteration = await batchAnalysisOrchestrator.transitionIteration({
                     workspaceId: input.workspaceId,
                     iterationId: orchestrationIteration.id,
                     stage: 'worker_discovery_review',
                     role: 'planner',
                     summary: 'Worker discovered additional scope. Reviewing amendment.',
-                    agentModelId
+                    agentModelId,
+                    sessionId: amendmentPlanningSession.sessionId
                 });
                 streamMetadata.stage = 'worker_discovery_review';
                 streamMetadata.role = 'planner';
@@ -5188,7 +5724,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 });
                 const amendmentPlannerResult = await agentRuntime.runBatchAnalysis({
                     ...input,
-                    sessionId: liveSessionId,
+                    sessionId: amendmentPlanningSession.sessionId,
                     kbAccessMode,
                     agentRole: 'planner',
                     sessionMode: 'plan',
@@ -5197,7 +5733,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         uploadedPbis,
                         approvedPlan: activeApprovedPlan,
                         discoveredWork: discoveredForAmendment,
-                        plannerPrefetch
+                        plannerPrefetch,
+                        resolvedUserAnswers: amendmentResolvedUserAnswers
                     })
                 }, (stream) => {
                     emit({
@@ -5210,6 +5747,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                 }, isCancelled);
                 liveSessionId = amendmentPlannerResult.sessionId;
+                planningSessionId = amendmentPlannerResult.sessionId;
                 const amendmentPlannerResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, amendmentPlannerResult.sessionId, amendmentPlannerResult.resultPayload, 'planner');
                 await persistBatchStageRun({
                     stage: 'worker_discovery_review',
@@ -5296,11 +5834,24 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                 }
                 await batchAnalysisOrchestrator.recordPlan(amendmentDraftPlan);
+                if (resumeState?.kind === 'amendment' && resumeQuestionSetToResolve) {
+                    await workspaceRepository.resolveBatchAnalysisQuestionSet({
+                        workspaceId: input.workspaceId,
+                        questionSetId: resumeQuestionSetToResolve
+                    });
+                    liveActiveQuestionSetId = undefined;
+                    liveActiveQuestionSetStatus = 'resolved';
+                    livePausedForUserInput = false;
+                    liveUnansweredRequiredQuestionCount = 0;
+                    resumeQuestionSetToResolve = undefined;
+                    resumeState = null;
+                }
+                const amendmentReviewSession = ensurePlanningSession('plan-reviewer');
                 streamMetadata.role = 'plan-reviewer';
-                liveSessionId = amendmentPlannerResult.sessionId;
+                liveSessionId = amendmentReviewSession.sessionId;
                 const amendmentReviewResult = await agentRuntime.runBatchAnalysis({
                     ...input,
-                    sessionId: liveSessionId,
+                    sessionId: amendmentReviewSession.sessionId,
                     kbAccessMode,
                     agentRole: 'plan-reviewer',
                     sessionMode: 'plan',
@@ -5321,6 +5872,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                 }, isCancelled);
                 liveSessionId = amendmentReviewResult.sessionId;
+                planningSessionId = amendmentReviewResult.sessionId;
                 const amendmentReviewResolution = await resolveBatchAnalysisResultText(agentRuntime, input.workspaceId, amendmentReviewResult.sessionId, amendmentReviewResult.resultPayload, 'plan_review');
                 await persistBatchStageRun({
                     stage: 'worker_discovery_review',
@@ -5354,6 +5906,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         iteration: orchestrationIteration,
                         plan: amendmentDraftPlan,
                         resultText: salvagedAmendmentReviewText ?? amendmentReviewResolution.text,
+                        stage: 'worker_discovery_review',
                         agentModelId,
                         sessionId: amendmentReviewResult.sessionId
                     });
@@ -5376,6 +5929,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         iteration: orchestrationIteration,
                         plan: amendmentDraftPlan,
                         resultText: buildMalformedPlanReviewFallback(fallbackSummary),
+                        stage: 'worker_discovery_review',
                         agentModelId,
                         sessionId: amendmentReviewResult.sessionId
                     });
@@ -5401,35 +5955,27 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 });
                 amendmentReview = deterministicAmendmentReviewGuard.review;
                 if (deterministicAmendmentReviewGuard.missingEditTargets.length > 0) {
-                    await logAnalysisProgress(deterministicAmendmentReviewGuard.forcedRevision
-                        ? 'Deterministic review guard blocked amendment approval because likely edit targets were still missing.'
-                        : 'Deterministic review guard added likely missing edit targets to the amendment review delta.', {
+                    await logAnalysisProgress('Deterministic prefetch surfaced advisory likely edit targets during amendment review.', {
                         stage: 'worker_discovery_review',
                         role: 'plan-reviewer',
                         sessionId: amendmentReview.sessionId
                     }, {
                         amendmentLoop: amendmentLoops,
-                        forcedRevision: deterministicAmendmentReviewGuard.forcedRevision,
+                        advisoryOnly: true,
                         missingEditTargets: deterministicAmendmentReviewGuard.missingEditTargets,
-                        transitionReason: deterministicAmendmentReviewGuard.forcedRevision
-                            ? 'deterministic_prefetch_missing_edits'
-                            : 'deterministic_prefetch_review_delta_augmented'
+                        transitionReason: 'deterministic_prefetch_missing_edits_advisory'
                     });
                 }
                 if (deterministicAmendmentReviewGuard.missingCreateTargets.length > 0) {
-                    await logAnalysisProgress(deterministicAmendmentReviewGuard.forcedRevision
-                        ? 'Deterministic review guard blocked amendment approval because likely net-new article work was still missing.'
-                        : 'Deterministic review guard added likely net-new article work to the amendment review delta.', {
+                    await logAnalysisProgress('Deterministic prefetch surfaced advisory likely net-new article work during amendment review.', {
                         stage: 'worker_discovery_review',
                         role: 'plan-reviewer',
                         sessionId: amendmentReview.sessionId
                     }, {
                         amendmentLoop: amendmentLoops,
-                        forcedRevision: deterministicAmendmentReviewGuard.forcedRevision,
+                        advisoryOnly: true,
                         missingCreateTargets: deterministicAmendmentReviewGuard.missingCreateTargets,
-                        transitionReason: deterministicAmendmentReviewGuard.forcedRevision
-                            ? 'deterministic_prefetch_missing_creates'
-                            : 'deterministic_prefetch_review_delta_augmented'
+                        transitionReason: 'deterministic_prefetch_missing_creates_advisory'
                     });
                 }
                 if (deterministicAmendmentReviewGuard.unresolvedTargetIssues.length > 0) {
@@ -5465,6 +6011,66 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     });
                 }
                 await batchAnalysisOrchestrator.recordReview(amendmentReview);
+                if (amendmentReview.verdict === 'needs_user_input') {
+                    const questionSetCreatedAtUtc = new Date().toISOString();
+                    const blockingQuestions = deterministicAmendmentReviewGuard.blockingUserInputQuestions.map((question) => ({
+                        ...question,
+                        id: question.id?.trim() ? question.id : (0, node_crypto_1.randomUUID)(),
+                        createdAtUtc: question.createdAtUtc ?? questionSetCreatedAtUtc
+                    }));
+                    const questionSet = {
+                        id: (0, node_crypto_1.randomUUID)(),
+                        workspaceId: input.workspaceId,
+                        batchId: input.batchId,
+                        iterationId: orchestrationIteration.id,
+                        sourceStage: 'worker_discovery_review',
+                        sourceRole: 'plan-reviewer',
+                        resumeStage: 'worker_discovery_review',
+                        resumeRole: 'planner',
+                        status: 'waiting',
+                        summary: amendmentReview.summary,
+                        planId: amendmentDraftPlan.id,
+                        reviewId: amendmentReview.id,
+                        createdAtUtc: questionSetCreatedAtUtc,
+                        updatedAtUtc: questionSetCreatedAtUtc
+                    };
+                    await batchAnalysisOrchestrator.recordAmendment({
+                        id: (0, node_crypto_1.randomUUID)(),
+                        workspaceId: input.workspaceId,
+                        batchId: input.batchId,
+                        iterationId: orchestrationIteration.id,
+                        approvedPlanId: activeApprovedPlan.id,
+                        sourceWorkerReportId: workerPassRecord.workerReport.id,
+                        sourceDiscoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
+                        proposedPlanId: amendmentDraftPlan.id,
+                        reviewId: amendmentReview.id,
+                        status: 'needs_user_input',
+                        summary: amendmentReview.summary,
+                        createdAtUtc: questionSetCreatedAtUtc,
+                        updatedAtUtc: questionSetCreatedAtUtc
+                    });
+                    await pauseForUserInput({
+                        questionSet,
+                        questions: blockingQuestions,
+                        summary: amendmentReview.summary,
+                        role: 'plan-reviewer',
+                        lastReviewVerdict: amendmentReview.verdict,
+                        progressMessage: 'Batch analysis paused until amendment questions are answered.',
+                        logMessage: 'Amendment review paused execution pending required user input.',
+                        details: {
+                            amendmentLoop: amendmentLoops,
+                            reviewId: amendmentReview.id,
+                            transitionReason: 'amendment_review_needs_user_input',
+                            triggerBranch: 'amendmentReview.verdict === needs_user_input',
+                            triggerArtifactType: 'question_set',
+                            triggerArtifactId: questionSet.id,
+                            triggerSessionId: amendmentReview.sessionId,
+                            triggerVerdict: amendmentReview.verdict,
+                            triggerSummary: amendmentReview.summary
+                        }
+                    });
+                    return;
+                }
                 if (amendmentReview.verdict !== 'approved') {
                     const amendmentStatus = amendmentReview.verdict === 'needs_human_review' ? 'needs_human_review' : 'rejected';
                     await batchAnalysisOrchestrator.recordAmendment({
@@ -5485,6 +6091,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     if (amendmentStatus === 'rejected') {
                         await workspaceRepository.updateBatchAnalysisDiscoveredWorkStatuses({
                             workspaceId: input.workspaceId,
+                            batchId: input.batchId,
                             discoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
                             status: 'rejected'
                         });
@@ -5555,30 +6162,23 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 });
                 await workspaceRepository.updateBatchAnalysisDiscoveredWorkStatuses({
                     workspaceId: input.workspaceId,
+                    batchId: input.batchId,
                     discoveryIds: discoveredForAmendment.map((item) => item.discoveryId),
                     status: 'approved'
                 });
                 liveOutstandingDiscoveredWorkCount = Math.max(0, liveOutstandingDiscoveredWorkCount - discoveredForAmendment.length);
                 activeApprovedPlan = approvedAmendmentPlan;
                 approvedPlanId = approvedAmendmentPlan.id;
-                liveIteration = await batchAnalysisOrchestrator.transitionIteration({
-                    workspaceId: input.workspaceId,
-                    iterationId: orchestrationIteration.id,
+                const resumedWorkerSession = await beginWorkerStage({
                     stage: 'building',
-                    role: 'worker',
                     summary: 'Plan amendment approved. Resuming worker execution.',
-                    agentModelId,
-                    approvedPlanId
+                    approvedPlanId,
+                    lastReviewVerdict: amendmentReview.verdict
                 });
-                streamMetadata.stage = 'building';
-                streamMetadata.role = 'worker';
-                liveApprovedPlanId = approvedPlanId;
-                liveLastReviewVerdict = amendmentReview.verdict;
-                liveStageStartedAtUtc = liveIteration.updatedAtUtc;
                 await logAnalysisProgress('Amendment approved; resuming worker execution.', {
                     stage: 'building',
                     role: 'worker',
-                    sessionId: amendmentReview.sessionId
+                    sessionId: resumedWorkerSession.sessionId
                 }, {
                     amendmentLoop: amendmentLoops,
                     approvedPlanId,
@@ -5605,11 +6205,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     sessionId: workerPass.result.sessionId
                 })
             });
+            const primaryWorkerKbAccessMode = resolveStageKbAccessMode('worker');
             logger_1.logger.info('[agent.analysis.run] runtime finished', {
                 jobId: payload.jobId,
                 batchId: input.batchId,
                 status: workerPass.result.status,
-                kbAccessMode,
+                kbAccessMode: primaryWorkerKbAccessMode,
                 toolCalls: workerPass.result.toolCalls.length,
                 transcriptPath: workerPass.result.transcriptPath
             });
@@ -5619,7 +6220,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 sessionId: workerPass.result.sessionId
             }, {
                 status: workerPass.result.status,
-                kbAccessMode,
+                kbAccessMode: primaryWorkerKbAccessMode,
                 durationMs: workerPass.result.durationMs,
                 toolCallCount: workerPass.result.toolCalls.length,
                 transcriptPath: workerPass.result.transcriptPath
@@ -5633,7 +6234,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 workspaceId: input.workspaceId,
                 batchId: input.batchId,
                 sessionId: workerPass.result.sessionId,
-                kbAccessMode,
+                kbAccessMode: primaryWorkerKbAccessMode,
                 agentModelId,
                 status: persistedStatus,
                 startedAtUtc: workerPass.result.startedAtUtc,
@@ -5659,6 +6260,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             liveExecutionCounts = latestExecutionCounts;
             liveOutstandingDiscoveredWorkCount = latestWorkerReport.discoveredWork.length;
             liveSessionId = workerPass.result.sessionId;
+            workerSessionId = workerPass.result.sessionId;
             const runFinalReview = async () => {
                 liveIteration = await batchAnalysisOrchestrator.transitionIteration({
                     workspaceId: input.workspaceId,
@@ -5860,18 +6462,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             let reworkLoops = 0;
             while (finalReviewOutcome.finalReview.verdict === 'needs_rework' && reworkLoops < maxFinalReworkLoops) {
                 reworkLoops += 1;
-                liveIteration = await batchAnalysisOrchestrator.transitionIteration({
-                    workspaceId: input.workspaceId,
-                    iterationId: orchestrationIteration.id,
+                await beginWorkerStage({
                     stage: 'reworking',
-                    role: 'worker',
                     summary: 'Final review requested rework. Executing rework pass.',
-                    agentModelId,
-                    approvedPlanId: activeApprovedPlan.id
+                    approvedPlanId: activeApprovedPlan.id,
+                    lastReviewVerdict: finalReviewOutcome.finalReview.verdict
                 });
-                streamMetadata.stage = 'reworking';
-                streamMetadata.role = 'worker';
-                liveStageStartedAtUtc = liveIteration.updatedAtUtc;
                 const reworkInstructions = [
                     'Apply the final-review rework requests below.',
                     JSON.stringify(finalReviewOutcome.finalReview.delta ?? {}, null, 2)
@@ -5892,6 +6488,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 liveExecutionCounts = latestExecutionCounts;
                 liveOutstandingDiscoveredWorkCount = latestWorkerReport.discoveredWork.length;
                 liveSessionId = workerPass.result.sessionId;
+                workerSessionId = workerPass.result.sessionId;
                 finalReviewOutcome = await runFinalReview();
             }
             let completedIteration;

@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import type { BatchAnalysisPlan, BatchPlanItem } from '@kb-vault/shared-types';
+import type { BatchAnalysisPlan, BatchAnalysisQuestion, BatchPlanItem } from '@kb-vault/shared-types';
 import { Badge } from '../Badge';
 import { EmptyState } from '../EmptyState';
 import { IconChevronRight } from '../icons';
@@ -18,6 +18,26 @@ interface PlanViewProps {
   plans: BatchAnalysisPlan[];
   supersededPlans?: BatchAnalysisPlan[];
   compact?: boolean;
+}
+
+function questionStatusBadgeVariant(question: BatchAnalysisQuestion) {
+  if (question.status === 'resolved') {
+    return 'success' as const;
+  }
+  if (question.status === 'answered') {
+    return 'success' as const;
+  }
+  if (question.status === 'dismissed') {
+    return 'neutral' as const;
+  }
+  return question.requiresUserInput ? 'warning' as const : 'neutral' as const;
+}
+
+function questionStatusLabel(question: BatchAnalysisQuestion): string {
+  if (question.status === 'pending' && question.requiresUserInput) {
+    return 'Needs input';
+  }
+  return question.status.replace(/_/g, ' ');
 }
 
 function PlanItemRow({
@@ -135,6 +155,14 @@ export function PlanView({ plans, supersededPlans, compact }: PlanViewProps) {
 
   const totalItems = latestPlan.items.length;
   const supersededCount = supersededPlans?.length ?? 0;
+  const structuredQuestions = latestPlan.questions ?? [];
+  const requiredQuestionCount = structuredQuestions.filter((question) => question.requiresUserInput).length;
+  const unansweredRequiredQuestionCount = structuredQuestions.filter((question) =>
+    question.requiresUserInput
+    && question.status !== 'answered'
+    && question.status !== 'resolved'
+  ).length;
+  const displayedQuestions = compact ? structuredQuestions.slice(0, 3) : structuredQuestions;
 
   return (
     <div className="ba-plan-view">
@@ -159,10 +187,62 @@ export function PlanView({ plans, supersededPlans, compact }: PlanViewProps) {
         <div className="ba-plan-summary">{humanizeAnalysisText(latestPlan.summary)}</div>
       )}
 
-      {/* Open questions */}
-      {latestPlan.openQuestions.length > 0 && (
+      {/* Structured questions */}
+      {structuredQuestions.length > 0 && (
         <div className="ba-plan-questions">
-          <span className="ba-detail-label">Open questions:</span>
+          <div className="ba-plan-questions-header">
+            <span className="ba-detail-label">Questions</span>
+            <div className="ba-plan-question-badges">
+              <Badge variant={unansweredRequiredQuestionCount > 0 ? 'warning' : 'neutral'}>
+                {structuredQuestions.length} total
+              </Badge>
+              {requiredQuestionCount > 0 && (
+                <Badge variant={unansweredRequiredQuestionCount > 0 ? 'warning' : 'success'}>
+                  {unansweredRequiredQuestionCount > 0 ? `${unansweredRequiredQuestionCount} required pending` : 'Required answered'}
+                </Badge>
+              )}
+            </div>
+          </div>
+          <div className="ba-plan-question-list">
+            {displayedQuestions.map((question) => (
+              <div key={question.id} className="ba-plan-question-row">
+                <div className="ba-plan-question-row-top">
+                  <span className="ba-plan-question-prompt">{humanizeAnalysisText(question.prompt)}</span>
+                  <div className="ba-plan-question-row-badges">
+                    {question.requiresUserInput && (
+                      <Badge variant="warning">Required</Badge>
+                    )}
+                    <Badge variant={questionStatusBadgeVariant(question)}>
+                      {questionStatusLabel(question)}
+                    </Badge>
+                  </div>
+                </div>
+                {!compact && question.reason && (
+                  <div className="ba-plan-question-detail">
+                    {humanizeAnalysisText(question.reason)}
+                  </div>
+                )}
+                {!compact && question.answer && (
+                  <div className="ba-plan-question-answer">
+                    <span className="ba-detail-label">Answer</span>
+                    <span>{question.answer}</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          {compact && structuredQuestions.length > displayedQuestions.length && (
+            <div className="ba-plan-question-more">
+              +{structuredQuestions.length - displayedQuestions.length} more question{structuredQuestions.length - displayedQuestions.length !== 1 ? 's' : ''}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Legacy string questions */}
+      {structuredQuestions.length === 0 && latestPlan.openQuestions.length > 0 && (
+        <div className="ba-plan-questions">
+          <span className="ba-detail-label">Legacy open questions</span>
           <ul>
             {latestPlan.openQuestions.map((q, i) => (
               <li key={i}>{humanizeAnalysisText(q)}</li>

@@ -1,7 +1,11 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
+  DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
+  MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
+  MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
   PBIBatchStatus,
   PBIBatchScopeMode,
+  normalizeBatchAnalysisWorkerStageBudgetMinutes,
   type PBIBatchRecord,
   type PBIRecord,
   type PBIBatchImportSummary,
@@ -48,11 +52,46 @@ const STATUS_LABEL: Record<string, string> = {
   submitted: 'Submitted',
   analyzing: 'Analyzing',
   analyzed: 'Analyzed',
+  waiting_for_input: 'Waiting for Input',
+  needs_human_review: 'Needs Review',
+  analysis_failed: 'Analysis Failed',
+  analysis_canceled: 'Analysis Canceled',
   review_in_progress: 'In Review',
   review_complete: 'Complete',
   archived: 'Archived',
   proposed: 'Proposed',
 };
+
+type PersistedAnalysisState = {
+  hasHistory: boolean;
+  displayStatus: string | null;
+};
+
+function derivePersistedDisplayStatus(stage: string | null | undefined): string | null {
+  switch (stage) {
+    case 'queued':
+    case 'planning':
+    case 'plan_reviewing':
+    case 'plan_revision':
+    case 'building':
+    case 'worker_discovery_review':
+    case 'final_reviewing':
+    case 'reworking':
+      return 'analyzing';
+    case 'awaiting_user_input':
+      return 'waiting_for_input';
+    case 'approved':
+      return PBIBatchStatus.ANALYZED;
+    case 'needs_human_review':
+      return 'needs_human_review';
+    case 'failed':
+      return 'analysis_failed';
+    case 'canceled':
+      return 'analysis_canceled';
+    default:
+      return null;
+  }
+}
 
 /* ---------- Helpers ---------- */
 
@@ -63,6 +102,10 @@ function batchStatusVariant(status: string): 'neutral' | 'primary' | 'success' |
     case 'submitted': return 'primary';
     case 'analyzing': return 'warning';
     case 'analyzed': return 'primary';
+    case 'waiting_for_input': return 'warning';
+    case 'needs_human_review': return 'danger';
+    case 'analysis_failed': return 'danger';
+    case 'analysis_canceled': return 'warning';
     case 'review_in_progress': return 'warning';
     case 'review_complete': return 'success';
     case 'archived': return 'neutral';
@@ -76,6 +119,19 @@ function formatDate(utc: string): string {
   } catch {
     return utc;
   }
+}
+
+function recommendWorkerStageBudgetMinutes(scopedCount: number): number {
+  if (scopedCount >= 100) {
+    return 60;
+  }
+  if (scopedCount >= 50) {
+    return 30;
+  }
+  if (scopedCount >= 20) {
+    return 15;
+  }
+  return DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES;
 }
 
 /* ---------- Sub-components ---------- */
@@ -214,6 +270,9 @@ function PreflightPanel({
   ignoredCount,
   scopedCount,
   candidateTitles,
+  workerStageBudgetMinutes,
+  recommendedWorkerStageBudgetMinutes,
+  onWorkerStageBudgetMinutesChange,
 }: {
   batch: PBIBatchRecord;
   candidateCount: number;
@@ -222,6 +281,9 @@ function PreflightPanel({
   ignoredCount: number;
   scopedCount: number;
   candidateTitles: string[];
+  workerStageBudgetMinutes: number;
+  recommendedWorkerStageBudgetMinutes: number;
+  onWorkerStageBudgetMinutesChange: (minutes: number) => void;
 }) {
   return (
     <>
@@ -255,6 +317,36 @@ function PreflightPanel({
             )}
             <span>{scopedCount} row{scopedCount !== 1 ? 's' : ''} in scope for AI analysis</span>
           </div>
+        </div>
+      </div>
+
+      <div className="preflight-section">
+        <div className="preflight-heading">Worker Time Budget</div>
+        <label className="preflight-budget-field">
+          <span className="preflight-budget-label">
+            Let the build stage run this long before the watchdog cancels it.
+          </span>
+          <div className="preflight-budget-input-row">
+            <input
+              className="preflight-budget-input"
+              type="number"
+              min={MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES}
+              max={MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES}
+              step={5}
+              value={workerStageBudgetMinutes}
+              onChange={(event) => {
+                const nextValue = normalizeBatchAnalysisWorkerStageBudgetMinutes(event.target.value);
+                onWorkerStageBudgetMinutesChange(
+                  nextValue ?? MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES
+                );
+              }}
+            />
+            <span className="preflight-budget-suffix">minutes</span>
+          </div>
+        </label>
+        <div className="preflight-budget-note">
+          Recommended: {recommendedWorkerStageBudgetMinutes} minutes for {scopedCount} scoped item{scopedCount === 1 ? '' : 's'}.
+          This drives the worker timeout and gives the watchdog a small safety buffer on top.
         </div>
       </div>
 
@@ -294,6 +386,8 @@ interface WizardState {
   scopeResult: PBIBatchScopePayload | null;
   preflightLoading: boolean;
   preflightError: string | null;
+  workerStageBudgetMinutes: number;
+  workerStageBudgetDirty: boolean;
   preflightData: {
     batch: PBIBatchRecord;
     candidateRows: PBIRecord[];
@@ -319,6 +413,8 @@ const WIZARD_INITIAL: WizardState = {
   scopeResult: null,
   preflightLoading: false,
   preflightError: null,
+  workerStageBudgetMinutes: DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
+  workerStageBudgetDirty: false,
   preflightData: null,
   submitting: false,
   submitError: null,
@@ -342,7 +438,7 @@ export const PBI = () => {
   const [activeAnalysisBatchIds, setActiveAnalysisBatchIds] = useState<string[]>([]);
   const [cachedBatches, setCachedBatches] = useState<PBIBatchRecord[]>([]);
   const [cachedSessions, setCachedSessions] = useState<AgentSessionRecord[]>([]);
-  const [persistedAnalysisBatchIds, setPersistedAnalysisBatchIds] = useState<string[]>([]);
+  const [persistedAnalysisStateByBatchId, setPersistedAnalysisStateByBatchId] = useState<Record<string, PersistedAnalysisState>>({});
   const batches = useMemo(() => {
     const data = batchListQuery.data;
     if (data && Array.isArray(data.batches)) {
@@ -373,13 +469,13 @@ export const PBI = () => {
       setCachedBatches([]);
       setCachedSessions([]);
       setActiveAnalysisBatchIds([]);
-      setPersistedAnalysisBatchIds([]);
+      setPersistedAnalysisStateByBatchId({});
     }
   }, [activeWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!activeWorkspace) {
-      setPersistedAnalysisBatchIds([]);
+      setPersistedAnalysisStateByBatchId({});
       return;
     }
 
@@ -392,7 +488,7 @@ export const PBI = () => {
       .map((batch) => batch.id);
 
     if (candidateBatchIds.length === 0) {
-      setPersistedAnalysisBatchIds([]);
+      setPersistedAnalysisStateByBatchId({});
       return;
     }
 
@@ -408,11 +504,18 @@ export const PBI = () => {
               limit: 0,
             });
             if (!response.ok || !response.data) {
-              return null;
+              return [batchId, { hasHistory: false, displayStatus: null }] as const;
             }
-            return response.data.run || response.data.orchestration?.latestIteration ? batchId : null;
+            const latestIteration = response.data.orchestration?.latestIteration ?? null;
+            return [
+              batchId,
+              {
+                hasHistory: Boolean(response.data.run || latestIteration),
+                displayStatus: derivePersistedDisplayStatus(latestIteration?.stage),
+              },
+            ] as const;
           } catch {
-            return null;
+            return [batchId, { hasHistory: false, displayStatus: null }] as const;
           }
         })
       );
@@ -421,7 +524,7 @@ export const PBI = () => {
         return;
       }
 
-      setPersistedAnalysisBatchIds(results.filter((batchId): batchId is string => Boolean(batchId)));
+      setPersistedAnalysisStateByBatchId(Object.fromEntries(results));
     })();
 
     return () => {
@@ -442,22 +545,25 @@ export const PBI = () => {
       const metadata = (event as { metadata?: { batchId?: unknown } }).metadata;
       const batchId = typeof metadata?.batchId === 'string' ? metadata.batchId : null;
 
-      if (batchId) {
+      const stateChanged = previousState !== event.state;
+      const isActiveState = event.state === 'RUNNING' || event.state === 'QUEUED';
+      const isTerminalState = event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED';
+
+      if (batchId && stateChanged && (isActiveState || isTerminalState)) {
         setActiveAnalysisBatchIds((current) => {
-          const next = new Set(current);
-          if (event.state === 'RUNNING' || event.state === 'QUEUED') {
-            next.add(batchId);
+          const alreadyTracked = current.includes(batchId);
+          if (isActiveState) {
+            return alreadyTracked ? current : [...current, batchId];
           }
-          if (event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED') {
-            next.delete(batchId);
+          if (isTerminalState) {
+            return alreadyTracked ? current.filter((id) => id !== batchId) : current;
           }
-          return Array.from(next);
+          return current;
         });
       }
 
-      const stateChanged = previousState !== event.state;
       const shouldRefresh =
-        (event.state === 'QUEUED' || event.state === 'RUNNING' || event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED')
+        (isActiveState || isTerminalState)
         && stateChanged;
 
       if (shouldRefresh) {
@@ -495,11 +601,13 @@ export const PBI = () => {
         analyzedBatchIds.add(session.batchId);
       }
     }
-    for (const batchId of persistedAnalysisBatchIds) {
-      analyzedBatchIds.add(batchId);
+    for (const [batchId, state] of Object.entries(persistedAnalysisStateByBatchId)) {
+      if (state.hasHistory) {
+        analyzedBatchIds.add(batchId);
+      }
     }
     return analyzedBatchIds;
-  }, [sessionListQuery.data?.sessions, cachedSessions, persistedAnalysisBatchIds]);
+  }, [sessionListQuery.data?.sessions, cachedSessions, persistedAnalysisStateByBatchId]);
 
   const runningAnalysisBatchIds = useMemo(() => {
     const sessions = sessionListQuery.data?.sessions ?? cachedSessions;
@@ -520,16 +628,17 @@ export const PBI = () => {
     if (runningAnalysisBatchIds.has(batch.id)) {
       return 'analyzing';
     }
+    const persistedState = persistedAnalysisStateByBatchId[batch.id];
     if (
-      persistedAnalysisBatchIds.includes(batch.id)
+      persistedState?.displayStatus
       && batch.status !== PBIBatchStatus.ANALYZED
       && batch.status !== PBIBatchStatus.REVIEW_IN_PROGRESS
       && batch.status !== PBIBatchStatus.REVIEW_COMPLETE
     ) {
-      return PBIBatchStatus.ANALYZED;
+      return persistedState.displayStatus;
     }
     return batch.status;
-  }, [persistedAnalysisBatchIds, runningAnalysisBatchIds]);
+  }, [persistedAnalysisStateByBatchId, runningAnalysisBatchIds]);
 
   const openAnalysis = useCallback((batch: PBIBatchRecord, shouldAutoRun = false) => {
     setAnalysisBatch(batch);
@@ -551,11 +660,14 @@ export const PBI = () => {
         && response.data
         && (response.data.run || response.data.orchestration?.latestIteration)
       );
-      if (hasPersistedOutcome) {
-        setPersistedAnalysisBatchIds((current) => (
-          current.includes(batchId) ? current : [...current, batchId]
-        ));
-      }
+      const latestIteration = response.data?.orchestration?.latestIteration ?? null;
+      setPersistedAnalysisStateByBatchId((current) => ({
+        ...current,
+        [batchId]: {
+          hasHistory: hasPersistedOutcome,
+          displayStatus: derivePersistedDisplayStatus(latestIteration?.stage),
+        },
+      }));
       return hasPersistedOutcome;
     } catch {
       return false;
@@ -744,11 +856,16 @@ export const PBI = () => {
       });
 
       if (res.ok && res.data) {
+        const scopedCount = res.data.scopePayload.scopedCount ?? res.data.candidateRows.length;
+        const recommendedBudgetMinutes = recommendWorkerStageBudgetMinutes(scopedCount);
+        const storedBudgetMinutes = normalizeBatchAnalysisWorkerStageBudgetMinutes(res.data.batch.workerStageBudgetMinutes);
         setWizard((s) => ({
           ...s,
           preflightLoading: false,
           preflightData: res.data!,
           step: 'preflight',
+          workerStageBudgetMinutes: storedBudgetMinutes
+            ?? (s.workerStageBudgetDirty ? s.workerStageBudgetMinutes : recommendedBudgetMinutes),
         }));
       } else {
         setWizard((s) => ({
@@ -773,10 +890,13 @@ export const PBI = () => {
     setWizard((s) => ({ ...s, submitting: true, submitError: null }));
 
     try {
+      const workerStageBudgetMinutes = normalizeBatchAnalysisWorkerStageBudgetMinutes(wizard.workerStageBudgetMinutes)
+        ?? recommendWorkerStageBudgetMinutes(wizard.preflightData?.scopePayload.scopedCount ?? 0);
       const res = await window.kbv.invoke<{ batch: PBIBatchRecord }>('pbiBatch.setStatus', {
         workspaceId: activeWorkspace.id,
         batchId: wizard.importResult.batch.id,
         status: PBIBatchStatus.SUBMITTED,
+        workerStageBudgetMinutes,
       });
 
       if (res.ok && res.data?.batch) {
@@ -799,7 +919,15 @@ export const PBI = () => {
         submitError: err instanceof Error ? err.message : 'Failed to submit batch for analysis',
       }));
     }
-  }, [activeWorkspace, batchListQuery, openAnalysis, sessionListQuery, wizard.importResult]);
+  }, [
+    activeWorkspace,
+    batchListQuery,
+    openAnalysis,
+    sessionListQuery,
+    wizard.importResult,
+    wizard.preflightData,
+    wizard.workerStageBudgetMinutes,
+  ]);
 
   // ---- Wizard step navigation ----
   const goToStep = useCallback((step: WizardStep) => {
@@ -908,10 +1036,13 @@ export const PBI = () => {
           </>
         );
 
-      case 'preflight':
+      case 'preflight': {
         if (wizard.preflightLoading) return <LoadingState message="Running preflight checks..." />;
         if (wizard.preflightError) return <ErrorState title="Preflight failed" description={wizard.preflightError} />;
         if (!wizard.preflightData) return null;
+        const recommendedWorkerStageBudgetMinutes = recommendWorkerStageBudgetMinutes(
+          wizard.preflightData.scopePayload.scopedCount ?? 0
+        );
         return (
           <>
             {wizard.submitError && (
@@ -928,9 +1059,19 @@ export const PBI = () => {
               ignoredCount={wizard.preflightData.ignoredRows.length}
               scopedCount={wizard.preflightData.scopePayload.scopedCount ?? 0}
               candidateTitles={wizard.preflightData.candidateTitles}
+              workerStageBudgetMinutes={wizard.workerStageBudgetMinutes}
+              recommendedWorkerStageBudgetMinutes={recommendedWorkerStageBudgetMinutes}
+              onWorkerStageBudgetMinutesChange={(minutes) => {
+                setWizard((s) => ({
+                  ...s,
+                  workerStageBudgetMinutes: minutes,
+                  workerStageBudgetDirty: true,
+                }));
+              }}
             />
           </>
         );
+      }
 
       default:
         return null;
@@ -1172,6 +1313,7 @@ export const PBI = () => {
           <AnalysisJobRunner
             workspaceId={activeWorkspace.id}
             batchId={analysisBatch.id}
+            workerStageBudgetMinutes={analysisBatch.workerStageBudgetMinutes}
             startOnOpen={analysisAutoRun}
             onComplete={() => {
               if (activeWorkspace) batchListQuery.execute({ workspaceId: activeWorkspace.id });

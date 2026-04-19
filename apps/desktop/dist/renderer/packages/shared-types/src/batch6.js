@@ -1,3 +1,16 @@
+export const MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 5;
+export const MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 180;
+export const DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 10;
+export function normalizeBatchAnalysisWorkerStageBudgetMinutes(value) {
+    if (value === null || value === undefined || value === '') {
+        return undefined;
+    }
+    const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return undefined;
+    }
+    return Math.min(MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, Math.max(MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, Math.round(parsed)));
+}
 export var AgentCommand;
 (function (AgentCommand) {
     AgentCommand["ANALYSIS_RUN"] = "agent.analysis.run";

@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { AppRoute, type AiViewContext } from '@kb-vault/shared-types';
 import { AiAssistantService } from '../src/main/services/ai-assistant-service';
 
-function createService(mode: 'cli' | 'mcp' = 'cli') {
+function createService(mode: 'cli' | 'mcp' | 'direct' = 'cli') {
   return new AiAssistantService(
     {} as never,
     {} as never,
@@ -508,6 +508,34 @@ test.describe('ai assistant service prompt builder', () => {
     expect(prompt).not.toContain('`app_get_form_schema`');
   });
 
+  test('builds a Direct-pure assistant prompt', () => {
+    const service = createService('direct') as unknown as {
+      buildAskPrompt: (
+        context: AiViewContext,
+        message: string,
+        messages: Array<{ role: string; messageKind: string; content: string }>,
+        includeTranscript: boolean,
+        kbAccessMode: 'cli' | 'mcp' | 'direct'
+      ) => string;
+    };
+
+    const prompt = service.buildAskPrompt(
+      createContext(),
+      'Explain checklist workflows.',
+      [],
+      false,
+      'direct'
+    );
+
+    expect(prompt).toContain('KB access mode: direct');
+    expect(prompt).toContain('`needs_action`');
+    expect(prompt).toContain('request `search_kb`');
+    expect(prompt).toContain('request `get_article`');
+    expect(prompt).not.toContain('kb search-kb');
+    expect(prompt).not.toContain('`app_patch_form`');
+    expect(prompt).not.toContain('`kb app patch-form`');
+  });
+
   test('Proposal Review guidance prefers proposal_patch over live form mutation', () => {
     const service = createService('mcp') as unknown as {
       buildAskPrompt: (
@@ -624,6 +652,45 @@ test.describe('ai assistant service prompt builder', () => {
 
     expect(prompt).toContain('`app_get_form_schema`');
     expect(prompt).toContain('`app_patch_form`');
+    expect(prompt).not.toContain('`kb app get-form-schema`');
+    expect(prompt).not.toContain('`kb app patch-form`');
+  });
+
+  test('Templates route uses direct patch actions in Direct mode', () => {
+    const service = createService('direct') as unknown as {
+      buildAskPrompt: (
+        context: AiViewContext,
+        message: string,
+        messages: Array<{ role: string; messageKind: string; content: string }>,
+        includeTranscript: boolean,
+        kbAccessMode: 'cli' | 'mcp' | 'direct'
+      ) => string;
+    };
+
+    const prompt = service.buildAskPrompt(
+      createContext({
+        route: AppRoute.TEMPLATES_AND_PROMPTS,
+        routeLabel: 'Templates & Prompts',
+        capabilities: {
+          canChat: true,
+          canCreateProposal: false,
+          canPatchProposal: false,
+          canPatchDraft: false,
+          canPatchTemplate: true,
+          canUseUnsavedWorkingState: true
+        },
+        backingData: { route: AppRoute.TEMPLATES_AND_PROMPTS }
+      }),
+      'Update the tone rules.',
+      [],
+      false,
+      'direct'
+    );
+
+    expect(prompt).toContain('request `patch_form`');
+    expect(prompt).toContain('After a successful `patch_form` action result');
+    expect(prompt).not.toContain('`app_get_form_schema`');
+    expect(prompt).not.toContain('`app_patch_form`');
     expect(prompt).not.toContain('`kb app get-form-schema`');
     expect(prompt).not.toContain('`kb app patch-form`');
   });
@@ -832,6 +899,54 @@ test.describe('ai assistant service prompt builder', () => {
     expect(prompt).toContain('Do not claim direct KB access is unavailable because it is not shown in a generic tool list');
     expect(prompt).not.toContain('fetch the current article with `get_article`');
     expect(prompt).not.toContain('`search_kb`');
+  });
+
+  test('article proposal guidance in Direct mode supports compact html mutations', () => {
+    const service = createService('direct') as unknown as {
+      buildAskPrompt: (
+        context: AiViewContext,
+        message: string,
+        messages: Array<{ role: string; messageKind: string; content: string }>,
+        includeTranscript: boolean,
+        kbAccessMode: 'cli' | 'mcp' | 'direct'
+      ) => string;
+    };
+
+    const prompt = service.buildAskPrompt(
+      createContext({
+        route: AppRoute.ARTICLE_EXPLORER,
+        routeLabel: 'Article Explorer',
+        subject: {
+          type: 'article',
+          id: 'locale-variant-1',
+          title: 'Add a Team Leader to a Team',
+          locale: 'en-us'
+        },
+        capabilities: {
+          canChat: true,
+          canCreateProposal: true,
+          canPatchProposal: false,
+          canPatchDraft: false,
+          canPatchTemplate: false,
+          canUseUnsavedWorkingState: false
+        },
+        backingData: {
+          route: AppRoute.ARTICLE_EXPLORER,
+          localeVariantId: 'locale-variant-1'
+        }
+      }),
+      'Add hello world to the bottom of this article and draft a proposal.',
+      [],
+      false,
+      'direct'
+    );
+
+    expect(prompt).toContain('request `get_article`');
+    expect(prompt).toContain('prefer targeted `payload.htmlMutations`');
+    expect(prompt).toContain('app will materialize the final HTML locally');
+    expect(prompt).toContain('Do not claim direct KB actions are unavailable');
+    expect(prompt).not.toContain('fetch the current article with `kb get-article`');
+    expect(prompt).not.toContain('`app_patch_form`');
   });
 
   test('article proposal prompt includes full current article HTML when it is already in context', () => {

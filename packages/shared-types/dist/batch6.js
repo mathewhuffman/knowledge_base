@@ -1,6 +1,20 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA = exports.MCP_GET_ARTICLE_HISTORY_INPUT_SCHEMA = exports.MCP_GET_PBI_SUBSET_INPUT_SCHEMA = exports.MCP_GET_PBI_INPUT_SCHEMA = exports.MCP_GET_BATCH_CONTEXT_INPUT_SCHEMA = exports.MCP_GET_TEMPLATE_INPUT_SCHEMA = exports.MCP_LIST_ARTICLE_TEMPLATES_INPUT_SCHEMA = exports.MCP_LIST_SECTIONS_INPUT_SCHEMA = exports.MCP_LIST_CATEGORIES_INPUT_SCHEMA = exports.MCP_FIND_RELATED_ARTICLES_INPUT_SCHEMA = exports.MCP_GET_LOCALE_VARIANT_INPUT_SCHEMA = exports.MCP_GET_ARTICLE_FAMILY_INPUT_SCHEMA = exports.MCP_GET_ARTICLE_INPUT_SCHEMA = exports.MCP_SEARCH_KB_INPUT_SCHEMA = exports.CliHealthFailure = exports.AgentCommand = void 0;
+exports.MCP_RECORD_AGENT_NOTES_INPUT_SCHEMA = exports.MCP_GET_ARTICLE_HISTORY_INPUT_SCHEMA = exports.MCP_GET_PBI_SUBSET_INPUT_SCHEMA = exports.MCP_GET_PBI_INPUT_SCHEMA = exports.MCP_GET_BATCH_CONTEXT_INPUT_SCHEMA = exports.MCP_GET_TEMPLATE_INPUT_SCHEMA = exports.MCP_LIST_ARTICLE_TEMPLATES_INPUT_SCHEMA = exports.MCP_LIST_SECTIONS_INPUT_SCHEMA = exports.MCP_LIST_CATEGORIES_INPUT_SCHEMA = exports.MCP_FIND_RELATED_ARTICLES_INPUT_SCHEMA = exports.MCP_GET_LOCALE_VARIANT_INPUT_SCHEMA = exports.MCP_GET_ARTICLE_FAMILY_INPUT_SCHEMA = exports.MCP_GET_ARTICLE_INPUT_SCHEMA = exports.MCP_SEARCH_KB_INPUT_SCHEMA = exports.CliHealthFailure = exports.AgentCommand = exports.DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = exports.MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = exports.MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = void 0;
+exports.normalizeBatchAnalysisWorkerStageBudgetMinutes = normalizeBatchAnalysisWorkerStageBudgetMinutes;
+exports.MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 5;
+exports.MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 180;
+exports.DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES = 10;
+function normalizeBatchAnalysisWorkerStageBudgetMinutes(value) {
+    if (value === null || value === undefined || value === '') {
+        return undefined;
+    }
+    const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return undefined;
+    }
+    return Math.min(exports.MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, Math.max(exports.MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, Math.round(parsed)));
+}
 var AgentCommand;
 (function (AgentCommand) {
     AgentCommand["ANALYSIS_RUN"] = "agent.analysis.run";

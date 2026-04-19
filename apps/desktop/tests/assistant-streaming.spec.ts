@@ -27,6 +27,33 @@ test.describe('assistant streaming helpers', () => {
     expect(streamed.hasRenderableFinalResponse).toBe(false);
   });
 
+  test('does not leak parseable assistant envelope JSON before response text exists', () => {
+    const streamed = extractStreamedAssistantEnvelope(
+      '{"command":"none","artifactType":"informational_response","completionState":"completed","isFinal":true}'
+    );
+
+    expect(streamed.responseText).toBe('');
+    expect(streamed.hasRenderableFinalResponse).toBe(false);
+  });
+
+  test('does not leak malformed assistant envelope fragments that are missing the opening brace', () => {
+    const streamed = extractStreamedAssistantEnvelope(
+      '"command":"none","artifactType":"informational_response","completionState":"completed","isFinal":true,'
+    );
+
+    expect(streamed.responseText).toBe('');
+    expect(streamed.hasRenderableFinalResponse).toBe(false);
+  });
+
+  test('extracts response text from malformed envelope fragments once the response field starts', () => {
+    const streamed = extractStreamedAssistantEnvelope(
+      '"command":"none","artifactType":"informational_response","completionState":"completed","isFinal":true,"response":"Streaming clean text'
+    );
+
+    expect(streamed.responseText).toBe('Streaming clean text');
+    expect(streamed.hasRenderableFinalResponse).toBe(true);
+  });
+
   test('treats envelope keys as structured stream text even when the leading brace is missing', () => {
     expect(
       looksLikeStructuredAssistantStream('"artifactType":"informational_response","completionState":"completed","response":"Hello')

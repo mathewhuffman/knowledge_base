@@ -168,6 +168,43 @@ test.describe('command registry review recovery', () => {
     });
   });
 
+  test('worker result selection prefers final blocked direct envelopes over stale needs_action text', () => {
+    const staleNeedsAction = JSON.stringify({
+      completionState: 'needs_action',
+      isFinal: false,
+      action: {
+        id: 'action-9',
+        type: 'search_kb',
+        args: {
+          query: 'Assign Trainers'
+        }
+      }
+    });
+    const blockedTerminal = JSON.stringify({
+      completionState: 'blocked',
+      isFinal: true,
+      message: 'Direct action loop exceeded 8 turns.'
+    });
+
+    const best = __commandRegistryTestables.selectBestResultText([
+      staleNeedsAction,
+      blockedTerminal
+    ], 'worker');
+
+    expect(best).toBe(blockedTerminal);
+    expect(__commandRegistryTestables.inspectDirectBatchEnvelope(best)).toEqual({
+      kind: 'terminal',
+      completionState: 'blocked'
+    });
+    expect(__commandRegistryTestables.shouldAwaitMoreStructuredBatchResult({
+      text: best,
+      expectedShape: 'worker',
+      parseable: false,
+      initialCandidateCount: 2,
+      transcriptCandidateCount: 1
+    })).toBe(false);
+  });
+
   test('salvages truncated plan review json into a parseable review payload', () => {
     const truncatedReview = [
       '{"summary":"Reviewer wants revisions.","verdict":"needs_revision","didAccountForEveryPbi":true,',

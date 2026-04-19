@@ -16,7 +16,7 @@ import type {
   WorkspaceSettingsRecord,
   RpcResponse,
 } from '@kb-vault/shared-types';
-import { CliHealthFailure } from '@kb-vault/shared-types';
+import { CliHealthFailure, KB_ACCESS_MODES, isKbAccessMode } from '@kb-vault/shared-types';
 import { Badge } from './Badge';
 import { StatusChip } from './StatusChip';
 import { ProviderBadge, RuntimeIndicator, RunHistoryBadge } from './ProviderBadge';
@@ -45,7 +45,7 @@ import { useIpc, useIpcMutation } from '../hooks/useIpc';
 import { BatchAnalysisInspector } from './batch-analysis/BatchAnalysisInspector';
 
 function parseModeFromUnknown(value: unknown): KbAccessMode | null {
-  return value === 'mcp' || value === 'cli' ? value : null;
+  return isKbAccessMode(value) ? value : null;
 }
 
 function parseRuntimeStatusFromUnknown(value: unknown): BatchAnalysisRuntimeStatus | null {
@@ -69,6 +69,10 @@ function parseRuntimeStatusFromUnknown(value: unknown): BatchAnalysisRuntimeStat
     approvedPlanId: typeof candidate.approvedPlanId === 'string' ? candidate.approvedPlanId : undefined,
     lastReviewVerdict: candidate.lastReviewVerdict,
     outstandingDiscoveredWorkCount: typeof candidate.outstandingDiscoveredWorkCount === 'number' ? candidate.outstandingDiscoveredWorkCount : 0,
+    activeQuestionSetId: typeof candidate.activeQuestionSetId === 'string' ? candidate.activeQuestionSetId : undefined,
+    activeQuestionSetStatus: candidate.activeQuestionSetStatus,
+    pausedForUserInput: Boolean(candidate.pausedForUserInput),
+    unansweredRequiredQuestionCount: typeof candidate.unansweredRequiredQuestionCount === 'number' ? candidate.unansweredRequiredQuestionCount : 0,
     executionCounts: candidate.executionCounts ?? {
       total: 0,
       create: 0,
@@ -127,15 +131,32 @@ function persistedRunStatusChip(status: string): { status: 'active' | 'live' | '
   }
 }
 
+function sessionTypeLabel(type: AgentSessionRecord['type']): string {
+  if (type === 'batch_analysis') {
+    return 'Batch Analysis';
+  }
+  if (type === 'assistant_chat') {
+    return 'Assistant Chat';
+  }
+  return 'Article Edit';
+}
+
+function sessionTypeBadgeVariant(type: AgentSessionRecord['type']): 'primary' | 'neutral' {
+  return type === 'batch_analysis' ? 'primary' : 'neutral';
+}
+
 function runtimeBadgeVariant(mode: KbAccessMode): 'primary' | 'warning' {
-  return mode === 'mcp' ? 'primary' : 'warning';
+  return mode === 'cli' ? 'warning' : 'primary';
 }
 
 function runtimeBadgeLabel(mode: KbAccessMode, expanded = false): string {
   if (mode === 'mcp') {
     return expanded ? 'MCP Runtime' : 'MCP';
   }
-  return expanded ? 'CLI Runtime' : 'CLI';
+  if (mode === 'cli') {
+    return expanded ? 'CLI Runtime' : 'CLI';
+  }
+  return expanded ? 'Direct Runtime' : 'Direct';
 }
 
 /* ---------- Failure copy & recovery guidance ---------- */
@@ -577,9 +598,11 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
       : false;
 
   const activeProvider = providerHealth ? providerHealth.providers[providerHealth.selectedMode] : null;
-  const inactiveProvider = providerHealth
-    ? providerHealth.providers[providerHealth.selectedMode === 'mcp' ? 'cli' : 'mcp']
-    : null;
+  const inactiveProviders = providerHealth
+    ? KB_ACCESS_MODES
+        .filter((mode) => mode !== providerHealth.selectedMode)
+        .map((mode) => providerHealth.providers[mode])
+    : [];
 
   return (
     <div className="card agent-health-card" role="region" aria-label="Agent health status">
@@ -668,24 +691,28 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
                     detail={mcpToolsetSummary(activeProvider).detail}
                   />
                 )}
-                {inactiveProvider && (
+                {inactiveProviders.map((provider) => (
                   <HealthCheckItem
-                    label={`${inactiveProvider.mode.toUpperCase()} Provider (manual switch only)`}
-                    ok={inactiveProvider.ok}
-                    detail={providerStatusSummary(inactiveProvider)}
-                    failureCode={inactiveProvider.failureCode}
+                    key={`provider-${provider.mode}`}
+                    label={`${runtimeBadgeLabel(provider.mode)} Provider (manual switch only)`}
+                    ok={provider.ok}
+                    detail={providerStatusSummary(provider)}
+                    failureCode={provider.failureCode}
                     recoverySteps={[]}
                   />
-                )}
-                {inactiveProvider && inactiveProvider.mode === 'cli' && inactiveProvider !== activeProvider && (
-                  <HealthCheckItem
-                    label="ACP Transport (manual switch only)"
-                    ok={acpTransportSummary(inactiveProvider).ok}
-                    detail={acpTransportSummary(inactiveProvider).detail}
-                    failureCode={acpTransportSummary(inactiveProvider).ok ? undefined : inactiveProvider.failureCode}
-                    recoverySteps={[]}
-                  />
-                )}
+                ))}
+                {inactiveProviders
+                  .filter((provider) => provider.mode === 'cli')
+                  .map((provider) => (
+                    <HealthCheckItem
+                      key={`transport-${provider.mode}`}
+                      label="ACP Transport (manual switch only)"
+                      ok={acpTransportSummary(provider).ok}
+                      detail={acpTransportSummary(provider).detail}
+                      failureCode={acpTransportSummary(provider).ok ? undefined : provider.failureCode}
+                      recoverySteps={[]}
+                    />
+                  ))}
               </>
             ) : legacyHealth ? (
               <>
@@ -756,14 +783,19 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
   const [switchError, setSwitchError] = useState<string | null>(null);
 
   const modeDescriptions: Record<KbAccessMode, { label: string; helper: string; icon: string }> = {
+    direct: {
+      label: 'Direct (App-Owned)',
+      helper: 'Recommended default. Uses the app-owned direct executor contract for assistant chat, article edit, and batch analysis.',
+      icon: 'zap',
+    },
     mcp: {
       label: 'MCP (Model Context Protocol)',
-      helper: 'Connects the AI agent directly to KB tools via the MCP server. KB Vault will not auto-switch providers.',
+      helper: 'Optional advanced mode for MCP-backed KB tools and compatibility workflows. KB Vault will not auto-switch providers.',
       icon: 'server',
     },
     cli: {
       label: 'CLI (Command Line)',
-      helper: 'Routes KB access through the local CLI loopback service. KB Vault will use CLI only when you select it.',
+      helper: 'Optional advanced mode for CLI-backed KB access and debugging. KB Vault will use CLI only when you select it.',
       icon: 'terminal',
     },
   };
@@ -824,7 +856,7 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
       </div>
 
       <div className="agent-mode-toggle-buttons" role="radiogroup" aria-labelledby="mode-toggle-label">
-        {(['mcp', 'cli'] as KbAccessMode[]).map((mode) => {
+        {KB_ACCESS_MODES.map((mode) => {
           const isSelected = mode === currentMode;
           const isAvailable = availableModes.includes(mode);
           return (
@@ -839,7 +871,11 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
               title={modeDescriptions[mode].helper}
             >
               <span className="agent-mode-btn-icon" aria-hidden="true">
-                {mode === 'mcp' ? <IconServer size={12} /> : <IconTerminal size={12} />}
+                {mode === 'mcp'
+                  ? <IconServer size={12} />
+                  : mode === 'cli'
+                    ? <IconTerminal size={12} />
+                    : <IconZap size={12} />}
               </span>
               {mode.toUpperCase()}
               {isSelected && (
@@ -1045,7 +1081,7 @@ export function SessionListPanel({ workspaceId, onSelectSession }: SessionListPa
           <EmptyState
             icon={<IconZap size={32} />}
             title="No sessions"
-            description="Sessions are created automatically when you run analysis or edit an article with AI."
+            description="Sessions are created automatically when you run analysis, chat, or edit an article with AI."
           />
         ) : (
           <div className="agent-session-list">
@@ -1066,11 +1102,9 @@ export function SessionListPanel({ workspaceId, onSelectSession }: SessionListPa
                 >
                   <div className="agent-session-row-main">
                     <div className="agent-session-row-type">
-                      {session.type === 'batch_analysis' ? (
-                        <Badge variant="primary">Batch Analysis</Badge>
-                      ) : (
-                        <Badge variant="neutral">Article Edit</Badge>
-                      )}
+                      <Badge variant={sessionTypeBadgeVariant(session.type)}>
+                        {sessionTypeLabel(session.type)}
+                      </Badge>
                       <ProviderBadge
                         mode={session.kbAccessMode}
                         size="inline"
@@ -1151,8 +1185,8 @@ export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDeta
           &larr; Sessions
         </button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-          <Badge variant={session.type === 'batch_analysis' ? 'primary' : 'neutral'}>
-            {session.type === 'batch_analysis' ? 'Batch Analysis' : 'Article Edit'}
+          <Badge variant={sessionTypeBadgeVariant(session.type)}>
+            {sessionTypeLabel(session.type)}
           </Badge>
           <ProviderBadge
             mode={session.kbAccessMode}
@@ -1248,7 +1282,7 @@ function TranscriptView({ lines, loading, error }: { lines: AgentTranscriptLine[
     }
   }, [mergedLines.length]);
 
-  if (loading) return <LoadingState message="Loading transcript..." />;
+  if (loading && mergedLines.length === 0) return <LoadingState message="Loading transcript..." />;
   if (error) return <ErrorState title="Transcript unavailable" description={error} />;
   if (mergedLines.length === 0) {
     return (
@@ -1357,7 +1391,7 @@ function ToolCallsView({
   error: string | null;
   mode: KbAccessMode;
 }) {
-  if (loading) return <LoadingState message="Loading tool calls..." />;
+  if (loading && calls.length === 0) return <LoadingState message="Loading tool calls..." />;
   if (error) return <ErrorState title="Tool calls unavailable" description={error} />;
   if (calls.length === 0) {
     return (
@@ -1367,7 +1401,9 @@ function ToolCallsView({
         description={
           mode === 'mcp'
             ? 'KB MCP tool calls made by the agent will appear here.'
-            : 'CLI runtime does not attach KB MCP tools. Inspect the transcript or ACP tools for `kb` command activity.'
+            : mode === 'cli'
+              ? 'CLI runtime does not attach KB MCP tools. Inspect the transcript or ACP tools for `kb` command activity.'
+              : 'Direct runtime keeps KB execution app-owned. Inspect the transcript or ACP tools for direct action and continuation details.'
         }
       />
     );
@@ -1393,7 +1429,7 @@ function ToolCallsView({
 }
 
 function AcpToolCallsView({ calls, loading, error }: { calls: AcpToolCallRecord[]; loading: boolean; error: string | null }) {
-  if (loading) return <LoadingState message="Loading ACP tool calls..." />;
+  if (loading && calls.length === 0) return <LoadingState message="Loading ACP tool calls..." />;
   if (error) return <ErrorState title="ACP tool calls unavailable" description={error} />;
   if (calls.length === 0) {
     return (
@@ -1436,11 +1472,18 @@ function AcpToolCallsView({ calls, loading, error }: { calls: AcpToolCallRecord[
 interface AnalysisJobRunnerProps {
   workspaceId: string;
   batchId: string;
+  workerStageBudgetMinutes?: number;
   startOnOpen?: boolean;
   onComplete?: () => void;
 }
 
-export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplete }: AnalysisJobRunnerProps) {
+export function AnalysisJobRunner({
+  workspaceId,
+  batchId,
+  workerStageBudgetMinutes,
+  startOnOpen,
+  onComplete,
+}: AnalysisJobRunnerProps) {
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<string>('');
   const [progress, setProgress] = useState(0);
@@ -1559,7 +1602,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
         window.kbv.invoke<BatchAnalysisEventStreamResponse>('batch.analysis.events.get', {
           workspaceId,
           batchId,
-          limit: 50,
+          limit: 250,
         }) as Promise<RpcResponse<BatchAnalysisEventStreamResponse>>,
       ]);
 
@@ -1599,21 +1642,38 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
 
     const handler = (event: { id: string; command: string; state: string; progress: number; message?: string }) => {
       if (event.command !== 'agent.analysis.run') return;
-      if (!jobIdRef.current || event.id !== jobIdRef.current) return;
+      const metadata = (event as {
+        metadata?: {
+          batchId?: unknown;
+          workspaceId?: unknown;
+          kbAccessMode?: unknown;
+          agentModelId?: unknown;
+          orchestration?: unknown;
+        };
+      }).metadata;
+      const eventBatchId = typeof metadata?.batchId === 'string' ? metadata.batchId : null;
+      const eventWorkspaceId = typeof metadata?.workspaceId === 'string' ? metadata.workspaceId : workspaceId;
+      const matchesCurrentBatch = eventBatchId === batchId && eventWorkspaceId === workspaceId;
+      if (!matchesCurrentBatch && (!jobIdRef.current || event.id !== jobIdRef.current)) return;
+      if (matchesCurrentBatch && event.id !== jobIdRef.current) {
+        jobIdRef.current = event.id;
+        setJobId(event.id);
+        terminalStateHandledRef.current = false;
+      }
       if (terminalStateHandledRef.current && (event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED')) {
         return;
       }
 
-      const eventMode = parseModeFromUnknown((event as { metadata?: { kbAccessMode?: unknown } })?.metadata?.kbAccessMode);
+      const eventMode = parseModeFromUnknown(metadata?.kbAccessMode);
       if (eventMode) {
         setCurrentRunMode(eventMode);
       }
-      const eventModel = (event as { metadata?: { agentModelId?: unknown } })?.metadata?.agentModelId;
+      const eventModel = metadata?.agentModelId;
       if (typeof eventModel === 'string' && eventModel.trim()) {
         setCurrentRunModel(eventModel.trim());
       }
       const orchestration = parseRuntimeStatusFromUnknown(
-        (event as { metadata?: { orchestration?: unknown } })?.metadata?.orchestration
+        metadata?.orchestration
       );
       if (orchestration) {
         setLiveRuntimeStatus(orchestration);
@@ -1638,7 +1698,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
           }
           if (payload.kind === 'session_started' && payload.data && typeof payload.data === 'object') {
             const sessionPayload = (payload.data as { session?: { kbAccessMode?: KbAccessMode } }).session;
-            if (sessionPayload?.kbAccessMode === 'mcp' || sessionPayload?.kbAccessMode === 'cli') {
+            if (isKbAccessMode(sessionPayload?.kbAccessMode)) {
               setCurrentRunMode(sessionPayload.kbAccessMode);
             }
           }
@@ -1695,7 +1755,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
         unsubscribe();
       }
     };
-  }, [refreshHistory, refreshPersistedHistory, refreshSessions, workspaceId]);
+  }, [batchId, onComplete, refreshHistory, refreshPersistedHistory, refreshSessions, workspaceId]);
 
   const latestBatchSession = useMemo(() => {
     const allSessions = sessionListData;
@@ -1781,7 +1841,11 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
     setProgress(0);
 
     try {
-      const response = await window.kbv.startJob('agent.analysis.run', { workspaceId, batchId });
+      const response = await window.kbv.startJob('agent.analysis.run', {
+        workspaceId,
+        batchId,
+        workerStageBudgetMinutes,
+      });
       if (response.jobId) {
         setJobId(response.jobId);
         jobIdRef.current = response.jobId;
@@ -2114,6 +2178,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
               runtimeStatus={liveRuntimeStatus ?? persistedRuntimeStatus}
               eventStream={persistedEventStream}
               isRunning={isRunning}
+              onRefresh={refreshPersistedHistory}
             />
           )}
 
@@ -2147,7 +2212,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
             {historyTab === 'transcript' ? (
               <TranscriptView
                 lines={transcriptLines}
-                loading={historyLoadingState || sessionListLoading}
+                loading={historyLoadingState}
                 error={historyErrorState}
               />
             ) : historyTab === 'kb_tools' ? (
@@ -2155,7 +2220,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, startOnOpen, onComplet
                 calls={toolCalls}
                 loading={historyLoadingState}
                 error={historyErrorState}
-                mode={runtimeMode ?? 'mcp'}
+                mode={runtimeMode ?? 'direct'}
               />
             ) : (
               <AcpToolCallsView

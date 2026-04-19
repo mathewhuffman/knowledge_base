@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test, expect } from '@playwright/test';
 import { CursorAcpRuntime, type AgentRuntimeToolContext } from '@kb-vault/agent-runtime';
+import { AppRoute } from '@kb-vault/shared-types';
 
 type LoggedRequest = {
   method: string;
@@ -61,6 +62,7 @@ async function createFakeAcpBinary(root: string, logPath: string): Promise<strin
   const binaryPath = path.join(root, 'fake-agent');
   const source = `#!/usr/bin/env node
 const fs = require('node:fs');
+const net = require('node:net');
 const readline = require('node:readline');
 
 const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
@@ -68,6 +70,34 @@ const sessionId = 'acp-session-test';
 
 function append(entry) {
   fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+function touchConfiguredMcpServers(params) {
+  const mcpServers = Array.isArray(params && params.mcpServers) ? params.mcpServers : [];
+  for (const server of mcpServers) {
+    const envEntries = Array.isArray(server && server.env) ? server.env : [];
+    const socketEntry = envEntries.find((entry) =>
+      entry
+      && entry.name === 'KBV_MCP_BRIDGE_SOCKET_PATH'
+      && typeof entry.value === 'string'
+      && entry.value.trim().length > 0
+    );
+    if (!socketEntry) {
+      continue;
+    }
+    const socket = net.createConnection(socketEntry.value, () => {
+      socket.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'fake-acp-tools-list',
+        method: 'tools/list',
+        params: {}
+      }) + '\\n');
+    });
+    socket.on('error', () => undefined);
+    socket.on('data', () => {
+      socket.end();
+    });
+  }
 }
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -91,12 +121,475 @@ rl.on('line', (line) => {
   }
 
   if (message.method === 'session/new') {
+    touchConfiguredMcpServers(message.params);
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
     return;
   }
 
   if (message.method === 'session/prompt') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { status: 'ok' } }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createDirectPlannerLoopAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-direct-planner-loop');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-direct-loop';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'direct-action-1',
+              type: 'get_batch_context',
+              args: {
+                batchId: 'batch-1'
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          summary: 'Direct planner complete.',
+          coverage: [
+            {
+              pbiId: 'pbi-1',
+              outcome: 'covered',
+              planItemIds: ['plan-1']
+            }
+          ],
+          items: [
+            {
+              planItemId: 'plan-1',
+              pbiIds: ['pbi-1'],
+              action: 'edit',
+              targetType: 'article',
+              targetArticleId: 'article-1',
+              targetTitle: 'Update Direct Mode',
+              reason: 'Batch context confirmed the affected KB article.',
+              evidence: [
+                {
+                  kind: 'pbi',
+                  ref: 'pbi:pbi-1',
+                  summary: 'Direct action loop supplied the batch context.'
+                }
+              ],
+              confidence: 0.82,
+              executionStatus: 'pending'
+            }
+          ],
+          openQuestions: []
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createDirectWorkerLoopAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-direct-worker-loop');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-direct-worker-loop';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'direct-worker-action-1',
+              type: 'create_proposals',
+              args: {
+                proposals: [
+                  {
+                    itemId: 'plan-1',
+                    action: 'edit',
+                    localeVariantId: 'article-1',
+                    targetTitle: 'Update Direct Worker',
+                    note: 'Update the article with the approved worker changes.',
+                    proposedHtml: '<h1>Update Direct Worker</h1><p>Updated by direct worker loop.</p>',
+                    confidenceScore: 0.83,
+                    relatedPbiIds: ['pbi-1']
+                  }
+                ]
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          summary: 'Direct worker complete.',
+          discoveredWork: []
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createDirectWorkerRecoveryAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-direct-worker-recovery');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-direct-worker-recovery';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: '{"completionState":"needs_action","isFinal":false,"action":{"id":"direct-worker-action-recovery","type":"create_proposals","args":{"proposals":[{"itemId":"plan-1","action":"edit","targetTitle":"Recovered Direct Worker"'
+        }
+      }) + '\\n');
+      return;
+    }
+
+    if (promptCount === 2) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'direct-worker-action-recovery',
+              type: 'create_proposals',
+              args: {
+                proposals: [
+                  {
+                    itemId: 'plan-1',
+                    action: 'edit',
+                    localeVariantId: 'article-1',
+                    targetTitle: 'Recovered Direct Worker',
+                    note: 'Resent after the runtime asked for complete JSON.',
+                    proposedHtml: '<h1>Recovered Direct Worker</h1><p>Recovered proposal payload.</p>',
+                    confidenceScore: 0.87,
+                    relatedPbiIds: ['pbi-1']
+                  }
+                ]
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          summary: 'Direct worker recovered and completed.',
+          discoveredWork: []
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createDirectWorkerMultiTurnAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-direct-worker-multi-turn');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-direct-worker-multi-turn';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'direct-worker-action-1',
+              type: 'get_batch_context',
+              args: {
+                batchId: 'batch-1'
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    if (promptCount === 2) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'direct-worker-action-2',
+              type: 'search_kb',
+              args: {
+                query: 'worker continuation compaction'
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          summary: 'Direct worker multi-turn complete.',
+          discoveredWork: []
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createDirectWorkerTurnLimitAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-direct-worker-turn-limit');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-direct-worker-turn-limit';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          completionState: 'needs_action',
+          isFinal: false,
+          action: {
+            id: 'direct-worker-action-' + promptCount,
+            type: 'search_kb',
+            args: {
+              query: 'turn limit ' + promptCount
+            }
+          }
+        })
+      }
+    }) + '\\n');
     return;
   }
 
@@ -887,6 +1380,251 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createAssistantChatDirectReadLoopAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-assistant-chat-direct-read-loop');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-assistant-direct-read-loop';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'assistant-direct-action-1',
+              type: 'search_kb',
+              args: {
+                query: 'waste checklist workflows'
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          command: 'none',
+          artifactType: 'informational_response',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'Waste workflows use checklist steps to capture the loss, review it, and submit it for reporting.'
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createAssistantChatDirectPatchFormAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-assistant-chat-direct-patch-form');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-assistant-direct-patch-form';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'assistant-direct-action-patch-1',
+              type: 'patch_form',
+              args: {
+                patch: {
+                  toneRules: 'Lead with the answer, then include concrete support.'
+                }
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          command: 'none',
+          artifactType: 'informational_response',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'I updated the template tone rules and confirmed the change in the app.'
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
+async function createArticleEditDirectLoopAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-article-edit-direct-loop');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-article-edit-direct-loop';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'article-direct-action-1',
+              type: 'get_article',
+              args: {
+                localeVariantId: 'locale-variant-1'
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          updatedHtml: '<h1>Article</h1><p>Direct article edit applied.</p>',
+          summary: 'Tightened the article wording.'
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
 async function createAssistantChatResetDuringContinuationAcpBinary(root: string, logPath: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-agent-assistant-chat-reset-during-continuation');
   const source = `#!/usr/bin/env node
@@ -1611,6 +2349,28 @@ async function readLoggedRequests(logPath: string): Promise<LoggedRequest[]> {
     .map((line) => JSON.parse(line) as LoggedRequest);
 }
 
+function parseRuntimeJsonPayload(resultPayload: unknown): Record<string, unknown> {
+  if (resultPayload && typeof resultPayload === 'object' && !Array.isArray(resultPayload)) {
+    const direct = resultPayload as Record<string, unknown>;
+    if (!Array.isArray(direct.content)) {
+      const textCandidate = typeof direct.finalText === 'string'
+        ? direct.finalText
+        : typeof direct.text === 'string'
+          ? direct.text
+          : null;
+      if (textCandidate) {
+        try {
+          return JSON.parse(textCandidate) as Record<string, unknown>;
+        } catch {
+          return direct;
+        }
+      }
+    }
+    return direct;
+  }
+  return {};
+}
+
 async function startFakeMcpBridgeServer(
   socketPath: string,
   toolNames: readonly string[]
@@ -1979,6 +2739,702 @@ test.describe('agent runtime provider modes', () => {
     } finally {
       await runtime.stop();
       await bridge.close();
+    }
+  });
+
+  test('health check exposes the direct provider as ready when the executor callback is configured', async () => {
+    const logPath = path.join(tempRoot, 'direct-health-log.jsonl');
+    const binaryPath = await createFakeAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for direct batch analysis stages'
+      })
+    });
+
+    try {
+      const health = await runtime.checkHealth('workspace-1', 'direct', 'direct');
+
+      expect(health.selectedMode).toBe('direct');
+      expect(health.providers.direct.mode).toBe('direct');
+      expect(health.providers.direct.provider).toBe('direct');
+      expect(health.providers.direct.ok).toBe(true);
+      expect(health.providers.direct.acpReachable).toBe(true);
+      expect(health.providers.direct.message).toContain('Direct executor ready');
+      expect(health.availableModes).toContain('direct');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct planner loops through one direct action and keeps the same ACP session', async () => {
+    const logPath = path.join(tempRoot, 'direct-planner-loop-log.jsonl');
+    const binaryPath = await createDirectPlannerLoopAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: Array<{ type: string; batchId?: string; sessionId?: string }> = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for direct batch analysis stages'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push({
+          type: request.action.type,
+          batchId: request.context.batchId,
+          sessionId: request.context.sessionId
+        });
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            batch: {
+              id: request.context.batchId
+            }
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'direct',
+          agentRole: 'planner',
+          sessionMode: 'plan',
+          prompt: 'Return only valid JSON.'
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.finalText).toContain('"summary":"Direct planner complete."');
+      expect(directActions).toEqual([
+        {
+          type: 'get_batch_context',
+          batchId: 'batch-1',
+          sessionId: result.sessionId
+        }
+      ]);
+      expect(result.toolCalls).toEqual([
+        expect.objectContaining({
+          toolName: 'direct.get_batch_context',
+          allowed: true
+        })
+      ]);
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(2);
+      const firstPromptText = ((promptRequests[0]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(firstPromptText).toContain('Allowed direct action types');
+      expect(firstPromptText).toContain('"completionState": "needs_action"');
+      expect(secondPromptText).toContain('"type": "action_result"');
+      expect(promptRequests[0]?.params?.sessionId).toBe(promptRequests[1]?.params?.sessionId);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct worker loops through mutating direct actions and keeps the same ACP session', async () => {
+    const logPath = path.join(tempRoot, 'direct-worker-loop-log.jsonl');
+    const binaryPath = await createDirectWorkerLoopAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: Array<{ type: string; batchId?: string; sessionId?: string }> = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for direct batch analysis stages'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push({
+          type: request.action.type,
+          batchId: request.context.batchId,
+          sessionId: request.context.sessionId
+        });
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            proposals: [
+              {
+                proposalId: 'proposal-1',
+                action: 'edit'
+              }
+            ]
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'direct',
+          agentRole: 'worker',
+          sessionMode: 'agent',
+          prompt: 'Sentinel worker brief: replay this full worker brief only once.'
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.finalText).toContain('"summary":"Direct worker complete."');
+      expect(directActions).toEqual([
+        {
+          type: 'create_proposals',
+          batchId: 'batch-1',
+          sessionId: result.sessionId
+        }
+      ]);
+      expect(result.toolCalls).toEqual([
+        expect.objectContaining({
+          toolName: 'direct.create_proposals',
+          allowed: true
+        })
+      ]);
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(2);
+      const firstPromptText = ((promptRequests[0]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(firstPromptText).toContain('create_proposals');
+      expect(firstPromptText).toContain('Approved plan target ids and titles already present in the prompt are authoritative execution inputs.');
+      expect(firstPromptText).toContain('familyId');
+      expect(firstPromptText).toContain('"completionState": "needs_action"');
+      expect(secondPromptText).toContain('"type": "action_result"');
+      expect(promptRequests[0]?.params?.sessionId).toBe(promptRequests[1]?.params?.sessionId);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct worker recovers when the proposal action envelope is truncated', async () => {
+    const logPath = path.join(tempRoot, 'direct-worker-recovery-log.jsonl');
+    const binaryPath = await createDirectWorkerRecoveryAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: Array<{ type: string; batchId?: string; sessionId?: string }> = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for truncated worker recovery coverage'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push({
+          type: request.action.type,
+          batchId: request.context.batchId,
+          sessionId: request.context.sessionId
+        });
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            proposals: [
+              {
+                proposalId: 'proposal-recovered-1',
+                action: 'edit'
+              }
+            ]
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'direct',
+          agentRole: 'worker',
+          sessionMode: 'agent',
+          prompt: 'Recover truncated direct worker proposal payloads without losing the batch.'
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.finalText).toContain('"summary":"Direct worker recovered and completed."');
+      expect(directActions).toEqual([
+        {
+          type: 'create_proposals',
+          batchId: 'batch-1',
+          sessionId: result.sessionId
+        }
+      ]);
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(3);
+      expect(promptRequests.every((entry) => entry.params?.sessionId === 'acp-session-direct-worker-recovery')).toBeTruthy();
+
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      const thirdPromptText = ((promptRequests[2]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(secondPromptText).toContain('Your previous reply was incomplete or malformed JSON');
+      expect(secondPromptText).toContain('create_proposals');
+      expect(thirdPromptText).toContain('"type":"action_result"');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct continuation prompts stop replaying the full worker brief after the first action turn', async () => {
+    const logPath = path.join(tempRoot, 'direct-worker-multi-turn-log.jsonl');
+    const binaryPath = await createDirectWorkerMultiTurnAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for multi-turn continuation coverage'
+      }),
+      executeDirectAction: async (request) => ({
+        actionId: request.action.id,
+        ok: true,
+        data: request.action.type === 'get_batch_context'
+          ? {
+              batch: {
+                id: request.context.batchId,
+                rows: Array.from({ length: 20 }, (_, index) => ({
+                  id: `pbi-${index + 1}`,
+                  title: `Continuation prompt coverage ${index + 1}`,
+                  description: 'x'.repeat(800)
+                }))
+              }
+            }
+          : {
+              results: Array.from({ length: 8 }, (_, index) => ({
+                id: `article-${index + 1}`,
+                title: `Continuation result ${index + 1}`,
+                summary: 'y'.repeat(600)
+              }))
+            }
+      })
+    });
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'direct',
+          agentRole: 'worker',
+          sessionMode: 'agent',
+          prompt: 'Sentinel worker brief: replay this full worker brief only once.'
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.finalText).toContain('"summary":"Direct worker multi-turn complete."');
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(3);
+      const firstPromptText = ((promptRequests[0]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      const thirdPromptText = ((promptRequests[2]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(firstPromptText).toContain('Sentinel worker brief: replay this full worker brief only once.');
+      expect(secondPromptText).toContain('Sentinel worker brief: replay this full worker brief only once.');
+      expect(thirdPromptText).not.toContain('Sentinel worker brief: replay this full worker brief only once.');
+      expect(thirdPromptText).toContain('"type":"action_result"');
+      expect(thirdPromptText.length).toBeLessThan(secondPromptText.length);
+      expect(promptRequests[0]?.params?.sessionId).toBe(promptRequests[1]?.params?.sessionId);
+      expect(promptRequests[1]?.params?.sessionId).toBe(promptRequests[2]?.params?.sessionId);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct worker surfaces terminal loop-limit failures instead of reporting success', async () => {
+    const logPath = path.join(tempRoot, 'direct-worker-turn-limit-log.jsonl');
+    const binaryPath = await createDirectWorkerTurnLimitAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: string[] = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for worker turn limit coverage'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push(request.action.id);
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            results: []
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runBatchAnalysis(
+        {
+          workspaceId: 'workspace-1',
+          batchId: 'batch-1',
+          kbAccessMode: 'direct',
+          agentRole: 'worker',
+          sessionMode: 'agent',
+          prompt: 'Approved plan targets are authoritative. Create proposals early.'
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('error');
+      expect(result.message).toContain('Direct action loop exceeded 8 turns.');
+      expect(result.toolCalls).toHaveLength(8);
+      expect(directActions).toHaveLength(8);
+      expect(result.resultPayload).toMatchObject({
+        text: expect.stringContaining('"completionState":"blocked"')
+      });
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(9);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct assistant chat loops through a read action and keeps the same ACP session', async () => {
+    const logPath = path.join(tempRoot, 'assistant-direct-read-loop-log.jsonl');
+    const binaryPath = await createAssistantChatDirectReadLoopAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: Array<{ type: string; sessionId?: string; sessionType?: string }> = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for assistant chat, article edit, and batch analysis'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push({
+          type: request.action.type,
+          sessionId: request.context.sessionId,
+          sessionType: request.context.sessionType
+        });
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            results: [
+              {
+                id: 'article-1',
+                title: 'Waste checklist workflow',
+                summary: 'Tracks how checklist steps move waste through review and submission.'
+              }
+            ]
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'locale-variant-1',
+          kbAccessMode: 'direct',
+          prompt: 'Route: kb_vault_home\nExplain waste checklist workflows.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.completionState).toBe('completed');
+      expect(result.isFinal).toBe(true);
+      const parsedResult = parseRuntimeJsonPayload(result.resultPayload);
+      expect(parsedResult).toMatchObject({
+        command: 'none',
+        artifactType: 'informational_response',
+        response: 'Waste workflows use checklist steps to capture the loss, review it, and submit it for reporting.'
+      });
+      expect(directActions).toEqual([
+        {
+          type: 'search_kb',
+          sessionId: result.sessionId,
+          sessionType: 'assistant_chat'
+        }
+      ]);
+      expect(result.toolCalls).toEqual([
+        expect.objectContaining({
+          toolName: 'direct.search_kb',
+          allowed: true
+        })
+      ]);
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(2);
+      const firstPromptText = ((promptRequests[0]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(firstPromptText).toContain('route-aware assistant in Direct mode');
+      expect(firstPromptText).toContain('Allowed direct action types');
+      expect(firstPromptText).toContain('needs_action');
+      expect(firstPromptText).not.toContain('kb search-kb');
+      expect(firstPromptText).not.toContain('`app_patch_form`');
+      expect(secondPromptText).toContain('"type": "action_result"');
+      expect(promptRequests[0]?.params?.sessionId).toBe(promptRequests[1]?.params?.sessionId);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct assistant chat template routes can request patch_form', async () => {
+    const logPath = path.join(tempRoot, 'assistant-direct-patch-form-log.jsonl');
+    const binaryPath = await createAssistantChatDirectPatchFormAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: Array<{
+      type: string;
+      route?: string;
+      entityId?: string;
+      versionToken?: string;
+      sessionType?: string;
+    }> = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for assistant chat, article edit, and batch analysis'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push({
+          type: request.action.type,
+          route: request.context.directContext?.route,
+          entityId: request.context.directContext?.entityId,
+          versionToken: request.context.directContext?.workingStateVersionToken,
+          sessionType: request.context.sessionType
+        });
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            applied: true,
+            nextVersionToken: 'template-1:2',
+            currentValues: {
+              toneRules: 'Lead with the answer, then include concrete support.'
+            }
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'locale-variant-1',
+          kbAccessMode: 'direct',
+          prompt: 'Route: templates_and_prompts\nTighten the tone rules.',
+          timeoutMs: 10_000,
+          directContext: {
+            route: AppRoute.TEMPLATES_AND_PROMPTS,
+            entityType: 'template_pack',
+            entityId: 'template-1',
+            workingStateVersionToken: 'template-1:1',
+            allowPatchForm: true
+          }
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      const parsedResult = parseRuntimeJsonPayload(result.resultPayload);
+      expect(parsedResult).toMatchObject({
+        command: 'none',
+        artifactType: 'informational_response',
+        response: 'I updated the template tone rules and confirmed the change in the app.'
+      });
+      expect(directActions).toEqual([
+        {
+          type: 'patch_form',
+          route: AppRoute.TEMPLATES_AND_PROMPTS,
+          entityId: 'template-1',
+          versionToken: 'template-1:1',
+          sessionType: 'assistant_chat'
+        }
+      ]);
+      expect(result.toolCalls).toEqual([
+        expect.objectContaining({
+          toolName: 'direct.patch_form',
+          allowed: true
+        })
+      ]);
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(2);
+      const firstPromptText = ((promptRequests[0]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(firstPromptText).toContain('patch_form');
+      expect(firstPromptText).not.toContain('`app_patch_form`');
+      expect(firstPromptText).not.toContain('`kb app patch-form`');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct article edit loops through one read action and keeps the same ACP session', async () => {
+    const logPath = path.join(tempRoot, 'article-edit-direct-loop-log.jsonl');
+    const binaryPath = await createArticleEditDirectLoopAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: Array<{ type: string; sessionId?: string; sessionType?: string }> = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for assistant chat, article edit, and batch analysis'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push({
+          type: request.action.type,
+          sessionId: request.context.sessionId,
+          sessionType: request.context.sessionType
+        });
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            article: {
+              localeVariantId: 'locale-variant-1',
+              html: '<h1>Article</h1><p>Original article.</p>'
+            }
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runArticleEdit(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'locale-variant-1',
+          kbAccessMode: 'direct',
+          prompt: 'Tighten this article.',
+          timeoutMs: 10_000,
+          directContext: {
+            route: AppRoute.ARTICLE_EXPLORER,
+            localeVariantIds: ['locale-variant-1'],
+            familyIds: ['family-1']
+          }
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      const parsedResult = parseRuntimeJsonPayload(result.resultPayload);
+      expect(parsedResult).toMatchObject({
+        updatedHtml: '<h1>Article</h1><p>Direct article edit applied.</p>',
+        summary: 'Tightened the article wording.'
+      });
+      expect(directActions).toEqual([
+        {
+          type: 'get_article',
+          sessionId: result.sessionId,
+          sessionType: 'article_edit'
+        }
+      ]);
+      expect(result.toolCalls).toEqual([
+        expect.objectContaining({
+          toolName: 'direct.get_article',
+          allowed: true
+        })
+      ]);
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(2);
+      const firstPromptText = ((promptRequests[0]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(firstPromptText).toContain('edit one article revision in Direct mode');
+      expect(firstPromptText).toContain('get_article');
+      expect(secondPromptText).toContain('"type": "action_result"');
+      expect(promptRequests[0]?.params?.sessionId).toBe(promptRequests[1]?.params?.sessionId);
+    } finally {
+      await runtime.stop();
     }
   });
 

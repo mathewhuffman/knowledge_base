@@ -5,6 +5,9 @@ import os from 'node:os';
 import { test, expect } from '@playwright/test';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
 import { BatchAnalysisOrchestrator } from '../src/main/services/batch-analysis-orchestrator';
+import { AppWorkingStateService } from '../src/main/services/app-working-state-service';
+import { DirectKbExecutor } from '../src/main/services/direct-kb-executor';
+import { KbActionService } from '../src/main/services/kb-action-service';
 import {
   ArticleAiPresetAction,
   DraftBranchStatus,
@@ -47,7 +50,7 @@ test.describe('workspace repository content model', () => {
     expect(firstGet.workspaceId).toBe(created.id);
     expect(firstGet.defaultLocale).toBe('en-us');
     expect(firstGet.enabledLocales).toEqual(['en-us', 'fr-fr']);
-    expect(firstGet.kbAccessMode).toBe('mcp');
+    expect(firstGet.kbAccessMode).toBe('direct');
 
     const updated = await repository.updateWorkspaceSettings({
       workspaceId: created.id,
@@ -147,7 +150,7 @@ test.describe('workspace repository content model', () => {
         workspaceId: created.id,
         kbAccessMode: 'broken' as 'mcp'
       })
-    ).rejects.toThrow('kbAccessMode must be mcp or cli');
+    ).rejects.toThrow('kbAccessMode must be direct, mcp, or cli');
   });
 
   test('persists batch analysis orchestration iterations and worker reports', async () => {
@@ -961,6 +964,262 @@ test.describe('workspace repository content model', () => {
     expect(inspection.transcriptLinks.some((entry) => entry.transcriptPath === 'transcripts/worker-session.jsonl')).toBeTruthy();
   });
 
+  test('persists batch-analysis question sets, answers, and resume-ready state in inspection reads', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchQuestions-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Questioned Batch',
+      'questioned-batch.csv',
+      'imports/questioned-batch.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const iteration = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'awaiting_user_input',
+      role: 'plan-reviewer',
+      status: 'needs_user_input',
+      summary: 'Waiting on required scope answers.'
+    });
+
+    const questionSetId = randomUUID();
+    await repository.recordBatchAnalysisQuestionSet({
+      id: questionSetId,
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      sourceStage: 'plan_reviewing',
+      sourceRole: 'plan-reviewer',
+      resumeStage: 'plan_revision',
+      resumeRole: 'planner',
+      status: 'waiting',
+      summary: 'Delete a Food List needs an explicit user decision before approval.',
+      planId: 'plan-questions-1',
+      reviewId: 'review-questions-1',
+      createdAtUtc: new Date().toISOString(),
+      updatedAtUtc: new Date().toISOString()
+    });
+
+    await repository.recordBatchAnalysisQuestions({
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      questionSetId,
+      questions: [
+        {
+          id: 'question-1',
+          questionSetId,
+          prompt: 'Should Delete a Food List be included in this batch or deferred?',
+          reason: 'Planner found the Delete a Food List scope gap before worker execution.',
+          requiresUserInput: true,
+          linkedPbiIds: ['pbi-1'],
+          linkedPlanItemIds: ['plan-item-1'],
+          linkedDiscoveryIds: [],
+          status: 'pending',
+          createdAtUtc: new Date().toISOString()
+        },
+        {
+          id: 'question-2',
+          questionSetId,
+          prompt: 'Should the article title be standardized?',
+          reason: 'Optional naming cleanup question.',
+          requiresUserInput: false,
+          linkedPbiIds: ['pbi-1'],
+          linkedPlanItemIds: ['plan-item-1'],
+          linkedDiscoveryIds: [],
+          status: 'pending',
+          createdAtUtc: new Date().toISOString()
+        }
+      ]
+    });
+
+    const pausedSnapshot = await repository.getBatchAnalysisSnapshot(created.id, batch.id);
+    const pausedInspection = await repository.getBatchAnalysisInspection(created.id, batch.id);
+    expect(pausedSnapshot.pausedForUserInput).toBe(true);
+    expect(pausedSnapshot.unansweredRequiredQuestionCount).toBe(1);
+    expect(pausedSnapshot.activeQuestionSet?.id).toBe(questionSetId);
+    expect(pausedInspection.questionSets).toHaveLength(1);
+    expect(pausedInspection.questions).toHaveLength(2);
+
+    const answered = await repository.answerBatchAnalysisQuestion({
+      workspaceId: created.id,
+      batchId: batch.id,
+      questionId: 'question-1',
+      answer: 'Include Delete a Food List in this batch as an edit to the existing article.'
+    });
+    expect(answered.question.status).toBe('answered');
+    expect(answered.question.answer).toContain('Include Delete a Food List');
+    expect(answered.unansweredRequiredQuestionCount).toBe(0);
+
+    const markedReady = await repository.markBatchAnalysisQuestionSetReadyToResume({
+      workspaceId: created.id,
+      questionSetId,
+    });
+    expect(markedReady.transitioned).toBe(true);
+    expect(markedReady.questionSet?.status).toBe('ready_to_resume');
+
+    const runtimeReady = await repository.getBatchAnalysisRuntimeStatus(created.id, batch.id);
+    expect(runtimeReady?.pausedForUserInput).toBe(true);
+    expect(runtimeReady?.activeQuestionSetStatus).toBe('ready_to_resume');
+    expect(runtimeReady?.unansweredRequiredQuestionCount).toBe(0);
+
+    const latestPending = await repository.getLatestPendingBatchAnalysisQuestionSet(created.id, batch.id);
+    expect(latestPending?.id).toBe(questionSetId);
+    expect(latestPending?.status).toBe('ready_to_resume');
+
+    const resolved = await repository.resolveBatchAnalysisQuestionSet({
+      workspaceId: created.id,
+      questionSetId,
+    });
+    expect(resolved?.status).toBe('resolved');
+
+    const resumedSnapshot = await repository.getBatchAnalysisSnapshot(created.id, batch.id);
+    expect(resumedSnapshot.pausedForUserInput).toBe(false);
+    expect(resumedSnapshot.activeQuestionSet).toBeNull();
+    expect(resumedSnapshot.unansweredRequiredQuestionCount).toBe(0);
+  });
+
+  test('scopes discovered work status updates to one batch and exposes the updated status in inspection reads', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchDiscoveryStatus-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batchOne = await repository.createPBIBatch(
+      created.id,
+      'Batch One',
+      'batch-one.csv',
+      'imports/batch-one.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+    const batchTwo = await repository.createPBIBatch(
+      created.id,
+      'Batch Two',
+      'batch-two.csv',
+      'imports/batch-two.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const iterationOne = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batchOne.id,
+      stage: 'building',
+      role: 'worker',
+      status: 'running',
+      summary: 'Worker pass for batch one.'
+    });
+    const iterationTwo = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batchTwo.id,
+      stage: 'building',
+      role: 'worker',
+      status: 'running',
+      summary: 'Worker pass for batch two.'
+    });
+
+    await repository.recordBatchWorkerExecutionReport({
+      id: 'worker-report-batch-one',
+      workspaceId: created.id,
+      batchId: batchOne.id,
+      iterationId: iterationOne.id,
+      iteration: iterationOne.iteration,
+      stage: 'building',
+      role: 'worker',
+      summary: 'Batch one found discovered work.',
+      status: 'needs_amendment',
+      executedItems: [],
+      discoveredWork: [{
+        discoveryId: 'dw-1',
+        sourceWorkerRunId: 'worker-report-batch-one',
+        discoveredAction: 'edit',
+        suspectedTarget: 'Batch One Article',
+        reason: 'Batch one adjacent scope.',
+        evidence: [],
+        linkedPbiIds: ['pbi-1'],
+        confidence: 0.71,
+        requiresPlanAmendment: true,
+        status: 'pending_review'
+      }],
+      blockerNotes: [],
+      createdAtUtc: new Date().toISOString()
+    });
+    await repository.recordBatchWorkerExecutionReport({
+      id: 'worker-report-batch-two',
+      workspaceId: created.id,
+      batchId: batchTwo.id,
+      iterationId: iterationTwo.id,
+      iteration: iterationTwo.iteration,
+      stage: 'building',
+      role: 'worker',
+      summary: 'Batch two found discovered work.',
+      status: 'needs_amendment',
+      executedItems: [],
+      discoveredWork: [{
+        discoveryId: 'dw-1',
+        sourceWorkerRunId: 'worker-report-batch-two',
+        discoveredAction: 'edit',
+        suspectedTarget: 'Batch Two Article',
+        reason: 'Batch two adjacent scope.',
+        evidence: [],
+        linkedPbiIds: ['pbi-2'],
+        confidence: 0.72,
+        requiresPlanAmendment: true,
+        status: 'pending_review'
+      }],
+      blockerNotes: [],
+      createdAtUtc: new Date().toISOString()
+    });
+
+    await repository.updateBatchAnalysisDiscoveredWorkStatuses({
+      workspaceId: created.id,
+      batchId: batchOne.id,
+      discoveryIds: ['dw-1'],
+      status: 'approved'
+    });
+
+    const batchOneInspection = await repository.getBatchAnalysisInspection(created.id, batchOne.id);
+    const batchTwoInspection = await repository.getBatchAnalysisInspection(created.id, batchTwo.id);
+    const batchOneSnapshot = await repository.getBatchAnalysisSnapshot(created.id, batchOne.id);
+
+    expect(batchOneInspection.discoveredWork[0]?.status).toBe('approved');
+    expect(batchOneSnapshot.discoveredWork[0]?.status).toBe('approved');
+    expect(batchTwoInspection.discoveredWork[0]?.status).toBe('pending_review');
+  });
+
   test('blocks final approval when hard correctness gates fail', async () => {
     const plan = {
       id: 'plan-1',
@@ -1217,6 +1476,113 @@ test.describe('workspace repository content model', () => {
     expect(visibleBatchList.batches[0]?.pendingReviewCount).toBe(1);
   });
 
+  test('replays direct worker create_proposals mutations idempotently', async () => {
+    const created = await repository.createWorkspace({
+      name: `DirectMutationIdempotency-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 43B',
+      'sprint-43b.csv',
+      'imports/sprint-43b.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.insertPBIRecords(created.id, batch.id, [
+      {
+        batchId: batch.id,
+        sourceRowNumber: 1,
+        externalId: 'PBI-43B',
+        title: 'Document direct worker idempotency',
+        description: 'Ensure repeated direct worker retries do not duplicate proposal records.'
+      }
+    ]);
+    const pbiId = (await repository.getPBIRecords(created.id, batch.id))[0]?.id;
+    expect(pbiId).toBeTruthy();
+
+    const kbActionService = new KbActionService({
+      workspaceRepository: repository,
+      appWorkingStateService: new AppWorkingStateService(() => undefined),
+      buildZendeskClient: async () => {
+        throw new Error('Zendesk client should not be used in this test');
+      }
+    });
+    const executor = new DirectKbExecutor({ kbActionService });
+    const createAction = {
+      type: 'create_proposals' as const,
+      args: {
+        proposals: [
+          {
+            itemId: 'plan-item-1',
+            action: 'create' as const,
+            targetTitle: 'Direct Worker Idempotency',
+            targetLocale: 'en-us',
+            note: 'KB create: article Direct Worker Idempotency',
+            rationale: 'This article is required for the direct worker idempotency test.',
+            proposedHtml: '<h1>Direct Worker Idempotency</h1><p>Direct worker output.</p>',
+            relatedPbiIds: [pbiId as string]
+          }
+        ]
+      }
+    };
+
+    const first = await executor.execute({
+      context: {
+        workspaceId: created.id,
+        batchId: batch.id,
+        sessionId: 'direct-worker-session-1',
+        sessionMode: 'agent',
+        agentRole: 'worker'
+      },
+      action: {
+        id: 'direct-action-1',
+        ...createAction
+      }
+    });
+    const second = await executor.execute({
+      context: {
+        workspaceId: created.id,
+        batchId: batch.id,
+        sessionId: 'direct-worker-session-1',
+        sessionMode: 'agent',
+        agentRole: 'worker'
+      },
+      action: {
+        id: 'direct-action-2',
+        ...createAction
+      }
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+
+    const firstData = first.data as { proposals: Array<{ proposalId: string; idempotencyKey: string }> };
+    const secondData = second.data as { proposals: Array<{ proposalId: string; idempotencyKey: string }> };
+    expect(firstData.proposals[0]?.proposalId).toBeTruthy();
+    expect(firstData.proposals[0]?.proposalId).toBe(secondData.proposals[0]?.proposalId);
+    expect(firstData.proposals[0]?.idempotencyKey).toBe(secondData.proposals[0]?.idempotencyKey);
+
+    const stagedProposals = await repository.listBatchProposalRecords(created.id, batch.id, {
+      includeStaged: true,
+      openOnly: true
+    });
+    expect(stagedProposals).toHaveLength(1);
+    expect(stagedProposals[0]?.reviewStatus).toBe(ProposalReviewStatus.STAGED_ANALYSIS);
+    expect(stagedProposals[0]?.targetTitle).toBe('Direct Worker Idempotency');
+  });
+
   test('marks terminal non-approved batch analysis attempts as analyzed instead of leaving the batch submitted', async () => {
     const created = await repository.createWorkspace({
       name: `TerminalBatchStatus-${randomUUID()}`,
@@ -1268,6 +1634,187 @@ test.describe('workspace repository content model', () => {
 
     const refreshedBatch = await repository.getPBIBatch(created.id, batch.id);
     expect(refreshedBatch.status).toBe(PBIBatchStatus.ANALYZED);
+  });
+
+  test('persists batch worker stage budget minutes on submit', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchWorkerBudget-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Long Running Batch',
+      'long-running.csv',
+      'imports/long-running.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const submitted = await repository.setPBIBatchStatus(
+      created.id,
+      batch.id,
+      PBIBatchStatus.SUBMITTED,
+      false,
+      { workerStageBudgetMinutes: 45 }
+    );
+
+    expect(submitted.workerStageBudgetMinutes).toBe(45);
+
+    const refreshedBatch = await repository.getPBIBatch(created.id, batch.id);
+    expect(refreshedBatch.workerStageBudgetMinutes).toBe(45);
+
+    const listedBatches = await repository.listPBIBatches(created.id);
+    expect(listedBatches.find((entry) => entry.id === batch.id)?.workerStageBudgetMinutes).toBe(45);
+  });
+
+  test('promotes latest staged worker proposals when human review ends the batch', async () => {
+    const created = await repository.createWorkspace({
+      name: `HumanReviewPromotion-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 46B',
+      'sprint-46b.csv',
+      'imports/sprint-46b.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.setPBIBatchStatus(created.id, batch.id, PBIBatchStatus.SUBMITTED);
+
+    const firstProposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      reviewStatus: ProposalReviewStatus.STAGED_ANALYSIS,
+      _sessionId: 'worker-session-human-review',
+      originPath: 'batch_analysis',
+      targetTitle: 'Human Review Edit',
+      targetLocale: 'en-us',
+      rationaleSummary: 'Worker created an edit proposal before escalation.',
+      proposedHtml: '<h1>Human Review Edit</h1><p>Updated content.</p>'
+    });
+    const secondProposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'create',
+      reviewStatus: ProposalReviewStatus.STAGED_ANALYSIS,
+      _sessionId: 'worker-session-human-review',
+      originPath: 'batch_analysis',
+      targetTitle: 'Human Review Create',
+      targetLocale: 'en-us',
+      rationaleSummary: 'Worker created a draft article before escalation.',
+      proposedHtml: '<h1>Human Review Create</h1><p>New article content.</p>'
+    });
+
+    const iteration = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'building',
+      role: 'worker',
+      status: 'running',
+      summary: 'Executing worker pass.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'worker-session-human-review'
+    });
+
+    await repository.recordBatchWorkerExecutionReport({
+      id: 'worker-report-human-review-promotion',
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'building',
+      role: 'worker',
+      summary: 'Worker created proposals but found follow-up ambiguity.',
+      status: 'needs_amendment',
+      planId: 'approved-plan-human-review',
+      executedItems: [
+        {
+          planItemId: 'plan-item-1',
+          action: 'edit',
+          targetTitle: 'Human Review Edit',
+          status: 'executed',
+          proposalId: firstProposal.id,
+          artifactIds: [firstProposal.id],
+          note: 'Matched latest staged edit proposal.'
+        },
+        {
+          planItemId: 'plan-item-2',
+          action: 'create',
+          targetTitle: 'Human Review Create',
+          status: 'executed',
+          proposalId: secondProposal.id,
+          artifactIds: [secondProposal.id],
+          note: 'Matched latest staged create proposal.'
+        }
+      ],
+      discoveredWork: [
+        {
+          discoveryId: 'dw-human-review-1',
+          sourceWorkerRunId: 'worker-session-human-review',
+          discoveredAction: 'edit',
+          suspectedTarget: 'Adjacent article ambiguity',
+          reason: 'Additional adjacent scope still needs a human decision.',
+          evidence: [],
+          linkedPbiIds: [],
+          confidence: 0.74,
+          requiresPlanAmendment: true,
+          status: 'pending_review'
+        }
+      ],
+      blockerNotes: [],
+      createdAtUtc: new Date().toISOString(),
+      sessionId: 'worker-session-human-review'
+    });
+
+    await repository.updateBatchAnalysisIteration({
+      workspaceId: created.id,
+      iterationId: iteration.id,
+      stage: 'needs_human_review',
+      role: 'final-reviewer',
+      status: 'needs_human_review',
+      summary: 'Final review requires a human decision before approval.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'final-reviewer-human-review',
+      endedAtUtc: new Date().toISOString()
+    });
+
+    const refreshedBatch = await repository.getPBIBatch(created.id, batch.id);
+    expect(refreshedBatch.status).toBe(PBIBatchStatus.REVIEW_IN_PROGRESS);
+
+    const proposalRecords = await repository.listBatchProposalRecords(created.id, batch.id, {
+      includeStaged: true,
+      openOnly: true
+    });
+    expect(proposalRecords).toHaveLength(2);
+    expect(proposalRecords.every((proposal) => proposal.reviewStatus === ProposalReviewStatus.PENDING_REVIEW)).toBe(true);
+
+    const queue = await repository.listProposalReviewQueue(created.id, batch.id);
+    expect(queue.summary.total).toBe(2);
+    expect(queue.summary.pendingReview).toBe(2);
+    expect(queue.queue.map((item) => item.proposalId)).toEqual([firstProposal.id, secondProposal.id]);
   });
 
   test('annotates batch-analysis proposal provenance without changing local proposal ownership', async () => {

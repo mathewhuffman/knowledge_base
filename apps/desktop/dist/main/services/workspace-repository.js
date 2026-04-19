@@ -14,7 +14,7 @@ const diff_engine_1 = require("@kb-vault/diff-engine");
 const db_1 = require("@kb-vault/db");
 const logger_1 = require("./logger");
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
-const DEFAULT_KB_ACCESS_MODE = 'mcp';
+const DEFAULT_KB_ACCESS_MODE = 'direct';
 const CATALOG_DB_PATH = node_path_1.default.join('.meta', 'catalog.sqlite');
 const WORKSPACE_SCOPED_DB_TABLES = [
     'article_families',
@@ -39,6 +39,8 @@ const WORKSPACE_SCOPED_DB_TABLES = [
     'batch_analysis_reviews',
     'batch_analysis_worker_reports',
     'batch_analysis_discovered_work',
+    'batch_analysis_question_sets',
+    'batch_analysis_questions',
     'batch_analysis_final_reviews',
     'batch_analysis_amendments',
     'batch_analysis_stage_events',
@@ -238,7 +240,7 @@ class WorkspaceRepository {
                 }
                 if (payload.kbAccessMode !== undefined &&
                     !isValidKbAccessMode(payload.kbAccessMode)) {
-                    throw new Error('kbAccessMode must be mcp or cli');
+                    throw new Error('kbAccessMode must be direct, mcp, or cli');
                 }
                 if (payload.defaultLocale !== undefined && !payload.defaultLocale.trim()) {
                     throw new Error('defaultLocale cannot be empty');
@@ -2326,11 +2328,11 @@ class WorkspaceRepository {
             workspaceDb.run(`INSERT INTO pbi_batches (
           id, workspace_id, name, source_file_name, source_row_count, imported_at, status,
           source_path, source_format, candidate_row_count, ignored_row_count, malformed_row_count,
-          duplicate_row_count, scoped_row_count, scope_mode, scope_payload
+          duplicate_row_count, scoped_row_count, scope_mode, scope_payload, analysis_worker_budget_minutes
         ) VALUES (
           @id, @workspaceId, @name, @sourceFileName, @sourceRowCount, @importedAt, @status,
           @sourcePath, @sourceFormat, @candidateRowCount, @ignoredRowCount, @malformedRowCount,
-          @duplicateRowCount, @scopedRowCount, @scopeMode, @scopePayload
+          @duplicateRowCount, @scopedRowCount, @scopeMode, @scopePayload, @workerStageBudgetMinutes
         )`, {
                 id,
                 workspaceId,
@@ -2347,7 +2349,8 @@ class WorkspaceRepository {
                 duplicateRowCount: counts.duplicateRowCount,
                 scopedRowCount: counts.scopedRowCount,
                 scopeMode,
-                scopePayload: scopePayload ?? null
+                scopePayload: scopePayload ?? null,
+                workerStageBudgetMinutes: null
             });
             return {
                 id,
@@ -2364,6 +2367,7 @@ class WorkspaceRepository {
                 scopedRowCount: counts.scopedRowCount,
                 scopeMode,
                 scopePayload,
+                workerStageBudgetMinutes: undefined,
                 importedAtUtc: now,
                 status
             };
@@ -2383,6 +2387,7 @@ class WorkspaceRepository {
                candidate_row_count as candidateRowCount, ignored_row_count as ignoredRowCount,
                malformed_row_count as malformedRowCount, duplicate_row_count as duplicateRowCount,
                scoped_row_count as scopedRowCount, scope_mode as scopeMode, scope_payload as scopePayload,
+               analysis_worker_budget_minutes as workerStageBudgetMinutes,
                imported_at as importedAtUtc, status
         FROM pbi_batches
         WHERE workspace_id = @workspaceId
@@ -2506,6 +2511,7 @@ class WorkspaceRepository {
     }
     async listPBIBatches(workspaceId) {
         const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
             return workspaceDb.all(`
@@ -2514,6 +2520,7 @@ class WorkspaceRepository {
                candidate_row_count as candidateRowCount, ignored_row_count as ignoredRowCount,
                malformed_row_count as malformedRowCount, duplicate_row_count as duplicateRowCount,
                scoped_row_count as scopedRowCount, scope_mode as scopeMode, scope_payload as scopePayload,
+               analysis_worker_budget_minutes as workerStageBudgetMinutes,
                imported_at as importedAtUtc, status
         FROM pbi_batches
         WHERE workspace_id = @workspaceId
@@ -2575,6 +2582,7 @@ class WorkspaceRepository {
     }
     async getPBIBatch(workspaceId, batchId) {
         const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
             const normalizedBatchId = batchId.trim();
@@ -2584,6 +2592,7 @@ class WorkspaceRepository {
                candidate_row_count as candidateRowCount, ignored_row_count as ignoredRowCount,
                malformed_row_count as malformedRowCount, duplicate_row_count as duplicateRowCount,
                scoped_row_count as scopedRowCount, scope_mode as scopeMode, scope_payload as scopePayload,
+               analysis_worker_budget_minutes as workerStageBudgetMinutes,
                imported_at as importedAtUtc, status
         FROM pbi_batches
         WHERE id = @batchId AND workspace_id = @workspaceId`, { batchId: normalizedBatchId, workspaceId });
@@ -2594,6 +2603,7 @@ class WorkspaceRepository {
                  candidate_row_count as candidateRowCount, ignored_row_count as ignoredRowCount,
                  malformed_row_count as malformedRowCount, duplicate_row_count as duplicateRowCount,
                  scoped_row_count as scopedRowCount, scope_mode as scopeMode, scope_payload as scopePayload,
+                 analysis_worker_budget_minutes as workerStageBudgetMinutes,
                  imported_at as importedAtUtc, status
           FROM pbi_batches
           WHERE workspace_id = @workspaceId
@@ -2718,7 +2728,7 @@ class WorkspaceRepository {
                 promptTemplate: params.promptTemplate ?? null,
                 transcriptPath: params.transcriptPath ?? null,
                 sessionId: params.sessionId ?? null,
-                kbAccessMode: params.kbAccessMode ?? 'mcp',
+                kbAccessMode: params.kbAccessMode ?? DEFAULT_KB_ACCESS_MODE,
                 agentModelId: params.agentModelId ?? null,
                 toolCallsJson: JSON.stringify(params.toolCalls ?? []),
                 rawOutputJson: params.rawOutput ? JSON.stringify(params.rawOutput) : null,
@@ -2729,7 +2739,7 @@ class WorkspaceRepository {
                 workspaceId: params.workspaceId,
                 batchId: params.batchId,
                 sessionId: params.sessionId,
-                kbAccessMode: params.kbAccessMode ?? 'mcp',
+                kbAccessMode: params.kbAccessMode ?? DEFAULT_KB_ACCESS_MODE,
                 agentModelId: params.agentModelId,
                 status: params.status,
                 startedAtUtc: params.startedAtUtc,
@@ -2838,6 +2848,147 @@ class WorkspaceRepository {
                 endedAtUtc: params.endedAtUtc,
                 createdAtUtc
             };
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async updateBatchAnalysisStageRun(params) {
+        const workspace = await this.getWorkspace(params.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const existing = workspaceDb.get(`SELECT id,
+                workspace_id as workspaceId,
+                batch_id as batchId,
+                iteration_id as iterationId,
+                iteration,
+                stage,
+                role,
+                attempt,
+                retry_type as retryType,
+                session_reuse_policy as sessionReusePolicy,
+                local_session_id as localSessionId,
+                acp_session_id as acpSessionId,
+                kb_access_mode as kbAccessMode,
+                agent_model_id as agentModelId,
+                status,
+                prompt_template as promptTemplate,
+                transcript_path as transcriptPath,
+                tool_call_count as toolCallCount,
+                tool_calls_json as toolCallsJson,
+                raw_output_json as rawOutputJson,
+                message,
+                parseable,
+                used_transcript_recovery as usedTranscriptRecovery,
+                initial_candidate_count as initialCandidateCount,
+                transcript_candidate_count as transcriptCandidateCount,
+                text_length as textLength,
+                result_text_preview as resultTextPreview,
+                started_at as startedAtUtc,
+                ended_at as endedAtUtc,
+                created_at as createdAtUtc
+           FROM batch_analysis_stage_runs
+          WHERE workspace_id = @workspaceId
+            AND id = @stageRunId
+          LIMIT 1`, {
+                workspaceId: params.workspaceId,
+                stageRunId: params.stageRunId
+            });
+            if (!existing) {
+                throw new Error(`Batch analysis stage run ${params.stageRunId} was not found`);
+            }
+            const toolCalls = params.toolCalls ?? this.parseBatchAnalysisToolCalls(existing.toolCallsJson);
+            const rawOutput = params.rawOutput ?? this.parseBatchAnalysisRawOutput(existing.rawOutputJson);
+            workspaceDb.run(`UPDATE batch_analysis_stage_runs
+            SET local_session_id = @localSessionId,
+                acp_session_id = @acpSessionId,
+                kb_access_mode = @kbAccessMode,
+                agent_model_id = @agentModelId,
+                status = @status,
+                prompt_template = @promptTemplate,
+                transcript_path = @transcriptPath,
+                tool_call_count = @toolCallCount,
+                tool_calls_json = @toolCallsJson,
+                raw_output_json = @rawOutputJson,
+                message = @message,
+                parseable = @parseable,
+                used_transcript_recovery = @usedTranscriptRecovery,
+                initial_candidate_count = @initialCandidateCount,
+                transcript_candidate_count = @transcriptCandidateCount,
+                text_length = @textLength,
+                result_text_preview = @resultTextPreview,
+                started_at = @startedAtUtc,
+                ended_at = @endedAtUtc
+          WHERE workspace_id = @workspaceId
+            AND id = @stageRunId`, {
+                workspaceId: params.workspaceId,
+                stageRunId: params.stageRunId,
+                localSessionId: params.localSessionId ?? existing.localSessionId ?? null,
+                acpSessionId: params.acpSessionId ?? existing.acpSessionId ?? null,
+                kbAccessMode: params.kbAccessMode ?? existing.kbAccessMode ?? null,
+                agentModelId: params.agentModelId ?? existing.agentModelId ?? null,
+                status: params.status ?? existing.status,
+                promptTemplate: params.promptTemplate ?? existing.promptTemplate ?? null,
+                transcriptPath: params.transcriptPath ?? existing.transcriptPath ?? null,
+                toolCallCount: toolCalls.length,
+                toolCallsJson: JSON.stringify(toolCalls),
+                rawOutputJson: rawOutput ? JSON.stringify(rawOutput) : null,
+                message: params.message ?? existing.message ?? null,
+                parseable: typeof params.parseable === 'boolean'
+                    ? (params.parseable ? 1 : 0)
+                    : existing.parseable,
+                usedTranscriptRecovery: typeof params.usedTranscriptRecovery === 'boolean'
+                    ? (params.usedTranscriptRecovery ? 1 : 0)
+                    : existing.usedTranscriptRecovery,
+                initialCandidateCount: params.initialCandidateCount ?? existing.initialCandidateCount ?? null,
+                transcriptCandidateCount: params.transcriptCandidateCount ?? existing.transcriptCandidateCount ?? null,
+                textLength: params.textLength ?? existing.textLength ?? null,
+                resultTextPreview: params.resultTextPreview ?? existing.resultTextPreview ?? null,
+                startedAtUtc: params.startedAtUtc ?? existing.startedAtUtc,
+                endedAtUtc: params.endedAtUtc ?? existing.endedAtUtc ?? null
+            });
+            const updated = workspaceDb.get(`SELECT id,
+                workspace_id as workspaceId,
+                batch_id as batchId,
+                iteration_id as iterationId,
+                iteration,
+                stage,
+                role,
+                attempt,
+                retry_type as retryType,
+                session_reuse_policy as sessionReusePolicy,
+                local_session_id as localSessionId,
+                acp_session_id as acpSessionId,
+                kb_access_mode as kbAccessMode,
+                agent_model_id as agentModelId,
+                status,
+                prompt_template as promptTemplate,
+                transcript_path as transcriptPath,
+                tool_call_count as toolCallCount,
+                tool_calls_json as toolCallsJson,
+                raw_output_json as rawOutputJson,
+                message,
+                parseable,
+                used_transcript_recovery as usedTranscriptRecovery,
+                initial_candidate_count as initialCandidateCount,
+                transcript_candidate_count as transcriptCandidateCount,
+                text_length as textLength,
+                result_text_preview as resultTextPreview,
+                started_at as startedAtUtc,
+                ended_at as endedAtUtc,
+                created_at as createdAtUtc
+           FROM batch_analysis_stage_runs
+          WHERE workspace_id = @workspaceId
+            AND id = @stageRunId
+          LIMIT 1`, {
+                workspaceId: params.workspaceId,
+                stageRunId: params.stageRunId
+            });
+            if (!updated) {
+                throw new Error(`Batch analysis stage run ${params.stageRunId} disappeared during update`);
+            }
+            return this.mapStageRunRow(updated);
         }
         finally {
             workspaceDb.close();
@@ -3138,7 +3289,7 @@ class WorkspaceRepository {
                 planVersion: plan.planVersion,
                 summary: plan.summary,
                 coverageJson: JSON.stringify(plan.coverage),
-                openQuestionsJson: JSON.stringify(plan.openQuestions),
+                openQuestionsJson: JSON.stringify(this.serializeBatchAnalysisPlanOpenQuestions(plan)),
                 payloadJson: JSON.stringify(plan),
                 supersedesPlanId: plan.supersedesPlanId ?? null,
                 sourceDiscoveryIdsJson: plan.sourceDiscoveryIds ? JSON.stringify(plan.sourceDiscoveryIds) : null,
@@ -3267,13 +3418,18 @@ class WorkspaceRepository {
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
             const statement = workspaceDb.prepare(`UPDATE batch_analysis_discovered_work
-            SET status = @status
-          WHERE workspace_id = @workspaceId AND discovery_id = @discoveryId`);
+            SET status = @status,
+                payload_json = CASE
+                  WHEN json_valid(payload_json) THEN json_set(payload_json, '$.status', @status)
+                  ELSE payload_json
+                END
+          WHERE workspace_id = @workspaceId AND batch_id = @batchId AND discovery_id = @discoveryId`);
             workspaceDb.exec('BEGIN IMMEDIATE');
             try {
                 for (const discoveryId of Array.from(new Set(params.discoveryIds))) {
                     statement.run({
                         workspaceId: params.workspaceId,
+                        batchId: params.batchId,
                         discoveryId,
                         status: params.status
                     });
@@ -3284,6 +3440,309 @@ class WorkspaceRepository {
                 workspaceDb.exec('ROLLBACK');
                 throw error;
             }
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async recordBatchAnalysisQuestionSet(questionSet) {
+        const workspace = await this.getWorkspace(questionSet.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            workspaceDb.run(`INSERT INTO batch_analysis_question_sets (
+          id, workspace_id, batch_id, iteration_id, source_stage, source_role, resume_stage, resume_role,
+          status, summary, plan_id, review_id, created_at, updated_at
+        ) VALUES (
+          @id, @workspaceId, @batchId, @iterationId, @sourceStage, @sourceRole, @resumeStage, @resumeRole,
+          @status, @summary, @planId, @reviewId, @createdAtUtc, @updatedAtUtc
+        )`, {
+                id: questionSet.id,
+                workspaceId: questionSet.workspaceId,
+                batchId: questionSet.batchId,
+                iterationId: questionSet.iterationId,
+                sourceStage: questionSet.sourceStage,
+                sourceRole: questionSet.sourceRole,
+                resumeStage: questionSet.resumeStage,
+                resumeRole: questionSet.resumeRole,
+                status: questionSet.status,
+                summary: questionSet.summary,
+                planId: questionSet.planId ?? null,
+                reviewId: questionSet.reviewId ?? null,
+                createdAtUtc: questionSet.createdAtUtc,
+                updatedAtUtc: questionSet.updatedAtUtc
+            });
+            return questionSet;
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async recordBatchAnalysisQuestions(params) {
+        if (params.questions.length === 0) {
+            return [];
+        }
+        const workspace = await this.getWorkspace(params.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const idAlreadyExists = workspaceDb.prepare('SELECT id FROM batch_analysis_questions WHERE id = @id LIMIT 1');
+            const reservedIds = new Set();
+            const persistedQuestions = params.questions.map((question) => {
+                const normalizedQuestionId = question.id?.trim() || (0, node_crypto_1.randomUUID)();
+                let persistedQuestionId = normalizedQuestionId;
+                if (reservedIds.has(persistedQuestionId) || idAlreadyExists.get({ id: persistedQuestionId })) {
+                    persistedQuestionId = `${params.questionSetId}:${normalizedQuestionId}`;
+                }
+                while (reservedIds.has(persistedQuestionId) || idAlreadyExists.get({ id: persistedQuestionId })) {
+                    persistedQuestionId = `${params.questionSetId}:${(0, node_crypto_1.randomUUID)()}`;
+                }
+                reservedIds.add(persistedQuestionId);
+                return {
+                    ...question,
+                    id: persistedQuestionId,
+                    questionSetId: params.questionSetId
+                };
+            });
+            workspaceDb.exec('BEGIN IMMEDIATE');
+            try {
+                persistedQuestions.forEach((question, index) => {
+                    workspaceDb.run(`INSERT INTO batch_analysis_questions (
+              id, question_set_id, workspace_id, batch_id, iteration_id, question_order, prompt, reason,
+              requires_user_input, linked_pbi_ids_json, linked_plan_item_ids_json, linked_discovery_ids_json,
+              answer, status, created_at, answered_at
+            ) VALUES (
+              @id, @questionSetId, @workspaceId, @batchId, @iterationId, @questionOrder, @prompt, @reason,
+              @requiresUserInput, @linkedPbiIdsJson, @linkedPlanItemIdsJson, @linkedDiscoveryIdsJson,
+              @answer, @status, @createdAtUtc, @answeredAtUtc
+            )`, {
+                        id: question.id,
+                        questionSetId: params.questionSetId,
+                        workspaceId: params.workspaceId,
+                        batchId: params.batchId,
+                        iterationId: params.iterationId,
+                        questionOrder: index,
+                        prompt: question.prompt,
+                        reason: question.reason,
+                        requiresUserInput: question.requiresUserInput ? 1 : 0,
+                        linkedPbiIdsJson: JSON.stringify(question.linkedPbiIds ?? []),
+                        linkedPlanItemIdsJson: JSON.stringify(question.linkedPlanItemIds ?? []),
+                        linkedDiscoveryIdsJson: JSON.stringify(question.linkedDiscoveryIds ?? []),
+                        answer: question.answer ?? null,
+                        status: question.status,
+                        createdAtUtc: question.createdAtUtc,
+                        answeredAtUtc: question.answeredAtUtc ?? null
+                    });
+                });
+                workspaceDb.exec('COMMIT');
+            }
+            catch (error) {
+                workspaceDb.exec('ROLLBACK');
+                throw error;
+            }
+            return persistedQuestions;
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async listBatchAnalysisQuestionSets(workspaceId, batchId) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return this.listBatchAnalysisQuestionSetsFromDb(workspaceDb, workspaceId, batchId);
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async listBatchAnalysisQuestions(workspaceId, batchId, questionSetId) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return this.listBatchAnalysisQuestionsFromDb(workspaceDb, workspaceId, batchId, questionSetId);
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async answerBatchAnalysisQuestion(request) {
+        const workspace = await this.getWorkspace(request.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        const trimmedAnswer = request.answer.trim();
+        if (!trimmedAnswer) {
+            throw new Error('Question answers cannot be empty.');
+        }
+        try {
+            workspaceDb.exec('BEGIN IMMEDIATE');
+            try {
+                const existingQuestion = workspaceDb.get(`SELECT id,
+                  question_set_id as questionSetId,
+                  workspace_id as workspaceId,
+                  batch_id as batchId,
+                  iteration_id as iterationId,
+                  question_order as questionOrder,
+                  prompt,
+                  reason,
+                  requires_user_input as requiresUserInput,
+                  linked_pbi_ids_json as linkedPbiIdsJson,
+                  linked_plan_item_ids_json as linkedPlanItemIdsJson,
+                  linked_discovery_ids_json as linkedDiscoveryIdsJson,
+                  answer,
+                  status,
+                  created_at as createdAtUtc,
+                  answered_at as answeredAtUtc
+             FROM batch_analysis_questions
+            WHERE workspace_id = @workspaceId AND batch_id = @batchId AND id = @questionId`, {
+                    workspaceId: request.workspaceId,
+                    batchId: request.batchId,
+                    questionId: request.questionId
+                });
+                if (!existingQuestion) {
+                    throw new Error('Question not found.');
+                }
+                const answeredAtUtc = new Date().toISOString();
+                workspaceDb.run(`UPDATE batch_analysis_questions
+              SET answer = @answer,
+                  status = 'answered',
+                  answered_at = @answeredAtUtc
+            WHERE workspace_id = @workspaceId AND batch_id = @batchId AND id = @questionId`, {
+                    workspaceId: request.workspaceId,
+                    batchId: request.batchId,
+                    questionId: request.questionId,
+                    answer: trimmedAnswer,
+                    answeredAtUtc
+                });
+                const questionSetRow = workspaceDb.get(`SELECT id,
+                  workspace_id as workspaceId,
+                  batch_id as batchId,
+                  iteration_id as iterationId,
+                  source_stage as sourceStage,
+                  source_role as sourceRole,
+                  resume_stage as resumeStage,
+                  resume_role as resumeRole,
+                  status,
+                  summary,
+                  plan_id as planId,
+                  review_id as reviewId,
+                  created_at as createdAtUtc,
+                  updated_at as updatedAtUtc
+             FROM batch_analysis_question_sets
+            WHERE workspace_id = @workspaceId AND id = @questionSetId`, {
+                    workspaceId: request.workspaceId,
+                    questionSetId: existingQuestion.questionSetId
+                });
+                if (!questionSetRow) {
+                    throw new Error('Question set not found.');
+                }
+                const questions = this.listBatchAnalysisQuestionsFromDb(workspaceDb, request.workspaceId, request.batchId, existingQuestion.questionSetId).map((question) => (question.id === request.questionId
+                    ? {
+                        ...question,
+                        answer: trimmedAnswer,
+                        status: 'answered',
+                        answeredAtUtc
+                    }
+                    : question));
+                const unansweredRequiredQuestionCount = questions.filter((question) => question.requiresUserInput
+                    && question.status !== 'answered'
+                    && question.status !== 'resolved').length;
+                workspaceDb.exec('COMMIT');
+                return {
+                    question: questions.find((question) => question.id === request.questionId),
+                    questionSet: this.mapBatchAnalysisQuestionSetRow(questionSetRow),
+                    unansweredRequiredQuestionCount
+                };
+            }
+            catch (error) {
+                workspaceDb.exec('ROLLBACK');
+                throw error;
+            }
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async markBatchAnalysisQuestionSetReadyToResume(params) {
+        return this.transitionBatchAnalysisQuestionSetStatus({
+            workspaceId: params.workspaceId,
+            questionSetId: params.questionSetId,
+            fromStatuses: ['waiting'],
+            toStatus: 'ready_to_resume'
+        });
+    }
+    async markBatchAnalysisQuestionSetResuming(params) {
+        return this.transitionBatchAnalysisQuestionSetStatus({
+            workspaceId: params.workspaceId,
+            questionSetId: params.questionSetId,
+            fromStatuses: ['ready_to_resume'],
+            toStatus: 'resuming'
+        });
+    }
+    async getLatestPendingBatchAnalysisQuestionSet(workspaceId, batchId) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return this.getLatestPendingBatchAnalysisQuestionSetFromDb(workspaceDb, workspaceId, batchId);
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async resolveBatchAnalysisQuestionSet(params) {
+        const workspace = await this.getWorkspace(params.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            workspaceDb.exec('BEGIN IMMEDIATE');
+            try {
+                const updatedAtUtc = new Date().toISOString();
+                workspaceDb.run(`UPDATE batch_analysis_question_sets
+              SET status = 'resolved',
+                  updated_at = @updatedAtUtc
+            WHERE workspace_id = @workspaceId AND id = @questionSetId`, {
+                    workspaceId: params.workspaceId,
+                    questionSetId: params.questionSetId,
+                    updatedAtUtc
+                });
+                workspaceDb.run(`UPDATE batch_analysis_questions
+              SET status = CASE
+                WHEN status = 'answered' THEN 'resolved'
+                ELSE status
+              END
+            WHERE workspace_id = @workspaceId AND question_set_id = @questionSetId`, {
+                    workspaceId: params.workspaceId,
+                    questionSetId: params.questionSetId
+                });
+                workspaceDb.exec('COMMIT');
+            }
+            catch (error) {
+                workspaceDb.exec('ROLLBACK');
+                throw error;
+            }
+            const row = workspaceDb.get(`SELECT id,
+                workspace_id as workspaceId,
+                batch_id as batchId,
+                iteration_id as iterationId,
+                source_stage as sourceStage,
+                source_role as sourceRole,
+                resume_stage as resumeStage,
+                resume_role as resumeRole,
+                status,
+                summary,
+                plan_id as planId,
+                review_id as reviewId,
+                created_at as createdAtUtc,
+                updated_at as updatedAtUtc
+           FROM batch_analysis_question_sets
+          WHERE workspace_id = @workspaceId AND id = @questionSetId`, {
+                workspaceId: params.workspaceId,
+                questionSetId: params.questionSetId
+            });
+            return row ? this.mapBatchAnalysisQuestionSetRow(row) : null;
         }
         finally {
             workspaceDb.close();
@@ -3410,16 +3869,20 @@ class WorkspaceRepository {
             const latestPlanReview = this.getLatestBatchAnalysisReviewFromDb(workspaceDb, workspaceId, batchId);
             const latestWorkerReport = this.getLatestBatchAnalysisWorkerReportFromDb(workspaceDb, workspaceId, batchId);
             const latestFinalReview = this.getLatestBatchAnalysisFinalReviewFromDb(workspaceDb, workspaceId, batchId);
-            const discoveredWork = workspaceDb.all(`SELECT payload_json as payloadJson
+            const activeQuestionSet = this.getLatestPendingBatchAnalysisQuestionSetFromDb(workspaceDb, workspaceId, batchId);
+            const questions = activeQuestionSet
+                ? this.listBatchAnalysisQuestionsFromDb(workspaceDb, workspaceId, batchId, activeQuestionSet.id)
+                : [];
+            const unansweredRequiredQuestionCount = questions.filter((question) => question.requiresUserInput
+                && question.status !== 'answered'
+                && question.status !== 'resolved').length;
+            const discoveredWork = workspaceDb.all(`SELECT payload_json as payloadJson,
+                status as status
            FROM batch_analysis_discovered_work
           WHERE workspace_id = @workspaceId AND batch_id = @batchId
           ORDER BY created_at DESC`, { workspaceId, batchId }).flatMap((row) => {
-                try {
-                    return [JSON.parse(row.payloadJson)];
-                }
-                catch {
-                    return [];
-                }
+                const item = this.parseBatchDiscoveredWorkRow(row);
+                return item ? [item] : [];
             });
             return {
                 workspaceId,
@@ -3429,7 +3892,11 @@ class WorkspaceRepository {
                 latestPlanReview,
                 latestWorkerReport,
                 latestFinalReview,
-                discoveredWork
+                discoveredWork,
+                activeQuestionSet,
+                questions,
+                pausedForUserInput: Boolean(activeQuestionSet),
+                unansweredRequiredQuestionCount
             };
         }
         finally {
@@ -3448,6 +3915,8 @@ class WorkspaceRepository {
             const reviews = this.listBatchAnalysisReviewsFromDb(workspaceDb, workspaceId, batchId);
             const workerReports = this.listBatchAnalysisWorkerReportsFromDb(workspaceDb, workspaceId, batchId);
             const discoveredWork = this.listBatchAnalysisDiscoveredWorkFromDb(workspaceDb, workspaceId, batchId);
+            const questionSets = this.listBatchAnalysisQuestionSetsFromDb(workspaceDb, workspaceId, batchId);
+            const questions = this.listBatchAnalysisQuestionsFromDb(workspaceDb, workspaceId, batchId);
             const amendments = this.listBatchAnalysisAmendmentsFromDb(workspaceDb, workspaceId, batchId);
             const finalReviews = this.listBatchAnalysisFinalReviewsFromDb(workspaceDb, workspaceId, batchId);
             const latestPlanId = plans[0]?.id;
@@ -3666,6 +4135,8 @@ class WorkspaceRepository {
                 reviewDeltas,
                 workerReports,
                 discoveredWork,
+                questionSets,
+                questions,
                 amendments,
                 finalReviews,
                 finalReviewReworkPlans,
@@ -3687,6 +4158,13 @@ class WorkspaceRepository {
             if (!latestIteration && !latestEvent) {
                 return null;
             }
+            const activeQuestionSet = this.getLatestPendingBatchAnalysisQuestionSetFromDb(workspaceDb, workspaceId, batchId);
+            const questions = activeQuestionSet
+                ? this.listBatchAnalysisQuestionsFromDb(workspaceDb, workspaceId, batchId, activeQuestionSet.id)
+                : [];
+            const unansweredRequiredQuestionCount = questions.filter((question) => question.requiresUserInput
+                && question.status !== 'answered'
+                && question.status !== 'resolved').length;
             return {
                 workspaceId,
                 batchId,
@@ -3700,6 +4178,10 @@ class WorkspaceRepository {
                 approvedPlanId: latestIteration?.approvedPlanId ?? latestEvent?.approvedPlanId,
                 lastReviewVerdict: latestIteration?.lastReviewVerdict ?? latestEvent?.lastReviewVerdict,
                 outstandingDiscoveredWorkCount: latestIteration?.outstandingDiscoveredWorkCount ?? latestEvent?.outstandingDiscoveredWorkCount ?? 0,
+                activeQuestionSetId: activeQuestionSet?.id,
+                activeQuestionSetStatus: activeQuestionSet?.status,
+                pausedForUserInput: Boolean(activeQuestionSet),
+                unansweredRequiredQuestionCount,
                 executionCounts: latestIteration?.executionCounts ?? latestEvent?.executionCounts ?? this.normalizeBatchAnalysisExecutionCounts(),
                 stageStartedAtUtc: latestEvent?.createdAtUtc ?? latestIteration?.startedAtUtc,
                 stageEndedAtUtc: latestIteration?.endedAtUtc,
@@ -4735,7 +5217,7 @@ class WorkspaceRepository {
             workspaceDb.close();
         }
     }
-    async setPBIBatchStatus(workspaceId, batchId, nextStatus, force = false) {
+    async setPBIBatchStatus(workspaceId, batchId, nextStatus, force = false, options) {
         const batch = await this.getPBIBatch(workspaceId, batchId);
         const currentStatus = batch.status;
         if (!this.isPBIBatchStatusTransitionAllowed(currentStatus, nextStatus, force)) {
@@ -4748,14 +5230,39 @@ class WorkspaceRepository {
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
+            const hasWorkerStageBudgetUpdate = Boolean(options && Object.prototype.hasOwnProperty.call(options, 'workerStageBudgetMinutes'));
+            let workerStageBudgetMinutes = undefined;
+            if (hasWorkerStageBudgetUpdate) {
+                if (options?.workerStageBudgetMinutes == null) {
+                    workerStageBudgetMinutes = null;
+                }
+                else {
+                    workerStageBudgetMinutes = (0, shared_types_1.normalizeBatchAnalysisWorkerStageBudgetMinutes)(options.workerStageBudgetMinutes);
+                    if (workerStageBudgetMinutes === undefined) {
+                        throw new Error('workerStageBudgetMinutes must be a positive number of minutes.');
+                    }
+                }
+            }
             workspaceDb.run(`UPDATE pbi_batches
-         SET status = @status
+         SET status = @status,
+             analysis_worker_budget_minutes = CASE
+               WHEN @hasWorkerStageBudgetUpdate = 1 THEN @workerStageBudgetMinutes
+               ELSE analysis_worker_budget_minutes
+             END
          WHERE id = @batchId AND workspace_id = @workspaceId`, {
                 status: nextStatus,
+                hasWorkerStageBudgetUpdate: hasWorkerStageBudgetUpdate ? 1 : 0,
+                workerStageBudgetMinutes: workerStageBudgetMinutes ?? null,
                 batchId,
                 workspaceId
             });
-            return { ...batch, status: nextStatus };
+            return {
+                ...batch,
+                status: nextStatus,
+                workerStageBudgetMinutes: hasWorkerStageBudgetUpdate
+                    ? (workerStageBudgetMinutes ?? undefined)
+                    : batch.workerStageBudgetMinutes
+            };
         }
         finally {
             workspaceDb.close();
@@ -5875,6 +6382,7 @@ class WorkspaceRepository {
         await promises_1.default.mkdir(node_path_1.default.dirname(dbPath), { recursive: true });
         this.repairWorkspaceDb(dbPath);
         this.ensureKbAccessModeColumn(dbPath);
+        this.ensurePBIBatchWorkerStageBudgetMinutesColumn(dbPath);
         this.ensureAgentModelIdColumn(dbPath);
         this.ensureAcpModelIdColumn(dbPath);
         this.ensureAiRunsAgentModelIdColumn(dbPath);
@@ -5924,8 +6432,12 @@ class WorkspaceRepository {
     normalizeWorkspaceDbIdentity(dbPath, workspaceId) {
         const db = this.openWorkspaceDbWithRecovery(dbPath);
         try {
+            const availableTables = new Set(db.all(`SELECT name FROM sqlite_master WHERE type = 'table'`).map((row) => row.name));
             const staleWorkspaceIds = new Set();
             for (const tableName of WORKSPACE_SCOPED_DB_TABLES) {
+                if (!availableTables.has(tableName)) {
+                    continue;
+                }
                 const rows = db.all(`SELECT DISTINCT workspace_id as workspaceId
            FROM ${tableName}
            WHERE workspace_id IS NOT NULL AND workspace_id != @workspaceId`, { workspaceId });
@@ -5943,6 +6455,9 @@ class WorkspaceRepository {
             db.exec('BEGIN IMMEDIATE TRANSACTION');
             for (const staleWorkspaceId of staleWorkspaceIds) {
                 for (const tableName of WORKSPACE_SCOPED_DB_TABLES) {
+                    if (!availableTables.has(tableName)) {
+                        continue;
+                    }
                     db.run(`UPDATE ${tableName}
              SET workspace_id = @workspaceId
              WHERE workspace_id = @staleWorkspaceId`, { workspaceId, staleWorkspaceId });
@@ -5970,7 +6485,19 @@ class WorkspaceRepository {
         try {
             const columns = db.all(`PRAGMA table_info(workspace_settings)`).map((c) => c.name);
             if (!columns.includes('kb_access_mode')) {
-                db.exec(`ALTER TABLE workspace_settings ADD COLUMN kb_access_mode TEXT NOT NULL DEFAULT 'mcp'`);
+                db.exec(`ALTER TABLE workspace_settings ADD COLUMN kb_access_mode TEXT NOT NULL DEFAULT 'direct'`);
+            }
+        }
+        finally {
+            db.close();
+        }
+    }
+    ensurePBIBatchWorkerStageBudgetMinutesColumn(dbPath) {
+        const db = (0, db_1.openWorkspaceDatabase)(dbPath);
+        try {
+            const columns = db.all(`PRAGMA table_info(pbi_batches)`).map((c) => c.name);
+            if (!columns.includes('analysis_worker_budget_minutes')) {
+                db.exec(`ALTER TABLE pbi_batches ADD COLUMN analysis_worker_budget_minutes INTEGER`);
             }
         }
         finally {
@@ -6121,6 +6648,7 @@ class WorkspaceRepository {
             WHERE workspace_id = @workspaceId AND plan_id = @planId`, { workspaceId, planId: row.id }).map((entry) => [entry.planItemId, entry.executionStatus]));
             return {
                 ...plan,
+                openQuestions: this.serializeBatchAnalysisPlanOpenQuestions(plan),
                 items: plan.items.map((item) => ({
                     ...item,
                     executionStatus: itemStatuses.get(item.planItemId) ?? item.executionStatus
@@ -6330,6 +6858,12 @@ class WorkspaceRepository {
             return null;
         }
     }
+    serializeBatchAnalysisPlanOpenQuestions(plan) {
+        const promptsFromQuestions = (plan.questions ?? [])
+            .map((question) => question.prompt?.trim())
+            .filter((prompt) => Boolean(prompt));
+        return Array.from(new Set([...(plan.openQuestions ?? []), ...promptsFromQuestions]));
+    }
     listBatchAnalysisIterationsFromDb(db, workspaceId, batchId) {
         const rows = db.all(`SELECT id,
               workspace_id as workspaceId,
@@ -6415,18 +6949,144 @@ class WorkspaceRepository {
         });
     }
     listBatchAnalysisDiscoveredWorkFromDb(db, workspaceId, batchId) {
-        const rows = db.all(`SELECT payload_json as payloadJson
+        const rows = db.all(`SELECT payload_json as payloadJson,
+              status as status
          FROM batch_analysis_discovered_work
         WHERE workspace_id = @workspaceId AND batch_id = @batchId
         ORDER BY created_at DESC`, { workspaceId, batchId });
         return rows.flatMap((row) => {
+            const item = this.parseBatchDiscoveredWorkRow(row);
+            return item ? [item] : [];
+        });
+    }
+    parseBatchDiscoveredWorkRow(row) {
+        if (!row.payloadJson) {
+            return null;
+        }
+        try {
+            const item = JSON.parse(row.payloadJson);
+            return row.status ? { ...item, status: row.status } : item;
+        }
+        catch {
+            return null;
+        }
+    }
+    mapBatchAnalysisQuestionSetRow(row) {
+        return {
+            id: row.id,
+            workspaceId: row.workspaceId,
+            batchId: row.batchId,
+            iterationId: row.iterationId,
+            sourceStage: row.sourceStage,
+            sourceRole: row.sourceRole,
+            resumeStage: row.resumeStage,
+            resumeRole: row.resumeRole,
+            status: row.status,
+            summary: row.summary,
+            planId: row.planId ?? undefined,
+            reviewId: row.reviewId ?? undefined,
+            createdAtUtc: row.createdAtUtc,
+            updatedAtUtc: row.updatedAtUtc
+        };
+    }
+    mapBatchAnalysisQuestionRow(row) {
+        const parseIdList = (value) => {
+            if (!value) {
+                return [];
+            }
             try {
-                return row.payloadJson ? [JSON.parse(row.payloadJson)] : [];
+                const parsed = JSON.parse(value);
+                return Array.isArray(parsed) ? parsed.filter((entry) => typeof entry === 'string') : [];
             }
             catch {
                 return [];
             }
+        };
+        return {
+            id: row.id,
+            questionSetId: row.questionSetId,
+            prompt: row.prompt,
+            reason: row.reason,
+            requiresUserInput: row.requiresUserInput === 1,
+            linkedPbiIds: parseIdList(row.linkedPbiIdsJson),
+            linkedPlanItemIds: parseIdList(row.linkedPlanItemIdsJson),
+            linkedDiscoveryIds: parseIdList(row.linkedDiscoveryIdsJson),
+            answer: row.answer ?? undefined,
+            status: row.status,
+            createdAtUtc: row.createdAtUtc,
+            answeredAtUtc: row.answeredAtUtc ?? undefined
+        };
+    }
+    listBatchAnalysisQuestionSetsFromDb(db, workspaceId, batchId) {
+        const rows = db.all(`SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration_id as iterationId,
+              source_stage as sourceStage,
+              source_role as sourceRole,
+              resume_stage as resumeStage,
+              resume_role as resumeRole,
+              status,
+              summary,
+              plan_id as planId,
+              review_id as reviewId,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+         FROM batch_analysis_question_sets
+        WHERE workspace_id = @workspaceId AND batch_id = @batchId
+        ORDER BY updated_at DESC, created_at DESC`, { workspaceId, batchId });
+        return rows.map((row) => this.mapBatchAnalysisQuestionSetRow(row));
+    }
+    listBatchAnalysisQuestionsFromDb(db, workspaceId, batchId, questionSetId) {
+        const rows = db.all(`SELECT id,
+              question_set_id as questionSetId,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration_id as iterationId,
+              question_order as questionOrder,
+              prompt,
+              reason,
+              requires_user_input as requiresUserInput,
+              linked_pbi_ids_json as linkedPbiIdsJson,
+              linked_plan_item_ids_json as linkedPlanItemIdsJson,
+              linked_discovery_ids_json as linkedDiscoveryIdsJson,
+              answer,
+              status,
+              created_at as createdAtUtc,
+              answered_at as answeredAtUtc
+         FROM batch_analysis_questions
+        WHERE workspace_id = @workspaceId
+          AND batch_id = @batchId
+          AND (@questionSetId IS NULL OR question_set_id = @questionSetId)
+        ORDER BY created_at DESC, question_order ASC`, {
+            workspaceId,
+            batchId,
+            questionSetId: questionSetId ?? null
         });
+        return rows.map((row) => this.mapBatchAnalysisQuestionRow(row));
+    }
+    getLatestPendingBatchAnalysisQuestionSetFromDb(db, workspaceId, batchId) {
+        const row = db.get(`SELECT id,
+              workspace_id as workspaceId,
+              batch_id as batchId,
+              iteration_id as iterationId,
+              source_stage as sourceStage,
+              source_role as sourceRole,
+              resume_stage as resumeStage,
+              resume_role as resumeRole,
+              status,
+              summary,
+              plan_id as planId,
+              review_id as reviewId,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+         FROM batch_analysis_question_sets
+        WHERE workspace_id = @workspaceId
+          AND batch_id = @batchId
+          AND status IN ('waiting', 'ready_to_resume', 'resuming')
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1`, { workspaceId, batchId });
+        return row ? this.mapBatchAnalysisQuestionSetRow(row) : null;
     }
     listBatchAnalysisAmendmentsFromDb(db, workspaceId, batchId) {
         const rows = db.all(`SELECT json_object(
@@ -6490,6 +7150,62 @@ class WorkspaceRepository {
             }
         });
     }
+    async transitionBatchAnalysisQuestionSetStatus(params) {
+        const workspace = await this.getWorkspace(params.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const current = workspaceDb.get(`SELECT id,
+                workspace_id as workspaceId,
+                batch_id as batchId,
+                iteration_id as iterationId,
+                source_stage as sourceStage,
+                source_role as sourceRole,
+                resume_stage as resumeStage,
+                resume_role as resumeRole,
+                status,
+                summary,
+                plan_id as planId,
+                review_id as reviewId,
+                created_at as createdAtUtc,
+                updated_at as updatedAtUtc
+           FROM batch_analysis_question_sets
+          WHERE workspace_id = @workspaceId AND id = @questionSetId`, {
+                workspaceId: params.workspaceId,
+                questionSetId: params.questionSetId
+            });
+            if (!current) {
+                return { questionSet: null, transitioned: false };
+            }
+            if (!params.fromStatuses.includes(current.status)) {
+                return {
+                    questionSet: this.mapBatchAnalysisQuestionSetRow(current),
+                    transitioned: false
+                };
+            }
+            const updatedAtUtc = new Date().toISOString();
+            workspaceDb.run(`UPDATE batch_analysis_question_sets
+            SET status = @status,
+                updated_at = @updatedAtUtc
+          WHERE workspace_id = @workspaceId AND id = @questionSetId`, {
+                workspaceId: params.workspaceId,
+                questionSetId: params.questionSetId,
+                status: params.toStatus,
+                updatedAtUtc
+            });
+            return {
+                questionSet: {
+                    ...this.mapBatchAnalysisQuestionSetRow(current),
+                    status: params.toStatus,
+                    updatedAtUtc
+                },
+                transitioned: true
+            };
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
     parseBatchAnalysisToolCalls(raw) {
         if (!raw) {
             return [];
@@ -6523,7 +7239,7 @@ class WorkspaceRepository {
             workspaceId: row.workspaceId,
             batchId: row.batchId,
             sessionId: row.sessionId ?? undefined,
-            kbAccessMode: row.kbAccessMode ?? 'mcp',
+            kbAccessMode: row.kbAccessMode ?? DEFAULT_KB_ACCESS_MODE,
             agentModelId: row.agentModelId?.trim() ? row.agentModelId.trim() : undefined,
             status: row.status,
             startedAtUtc: row.startedAtUtc,
@@ -6604,6 +7320,7 @@ class WorkspaceRepository {
             'planning',
             'plan_reviewing',
             'plan_revision',
+            'awaiting_user_input',
             'building',
             'worker_discovery_review',
             'final_reviewing',
@@ -8397,6 +9114,58 @@ class WorkspaceRepository {
        WHERE id = @batchId AND workspace_id = @workspaceId`, { status: nextStatus, batchId, workspaceId });
         return nextStatus;
     }
+    promoteLatestHumanReviewWorkerProposals(workspaceDb, workspaceId, batchId) {
+        const latestIteration = this.getLatestBatchAnalysisIterationFromDb(workspaceDb, workspaceId, batchId);
+        if (!latestIteration || latestIteration.status !== 'needs_human_review') {
+            return [];
+        }
+        const workerReport = this.getLatestBatchAnalysisWorkerReportForIterationFromDb(workspaceDb, latestIteration.id);
+        if (!workerReport) {
+            return [];
+        }
+        const proposalIds = Array.from(new Set(workerReport.executedItems.flatMap((item) => {
+            if (item.status !== 'executed') {
+                return [];
+            }
+            return [
+                item.proposalId?.trim(),
+                ...(item.artifactIds ?? []).map((artifactId) => artifactId.trim())
+            ].filter((proposalId) => Boolean(proposalId));
+        })));
+        if (proposalIds.length === 0) {
+            return [];
+        }
+        const updatedAt = new Date().toISOString();
+        workspaceDb.run(`UPDATE proposals
+       SET review_status = @nextStatus,
+           updated_at = @updatedAt
+       WHERE workspace_id = @workspaceId
+         AND batch_id = @batchId
+         AND review_status = @currentStatus
+         AND id IN (${proposalIds.map((_, index) => `@proposalId${index}`).join(', ')})`, proposalIds.reduce((acc, proposalId, index) => {
+            acc[`proposalId${index}`] = proposalId;
+            return acc;
+        }, {
+            workspaceId,
+            batchId,
+            currentStatus: shared_types_1.ProposalReviewStatus.STAGED_ANALYSIS,
+            nextStatus: shared_types_1.ProposalReviewStatus.PENDING_REVIEW,
+            updatedAt
+        }));
+        return workspaceDb.all(`SELECT id
+         FROM proposals
+        WHERE workspace_id = @workspaceId
+          AND batch_id = @batchId
+          AND review_status = @reviewStatus
+          AND id IN (${proposalIds.map((_, index) => `@proposalId${index}`).join(', ')})`, proposalIds.reduce((acc, proposalId, index) => {
+            acc[`proposalId${index}`] = proposalId;
+            return acc;
+        }, {
+            workspaceId,
+            batchId,
+            reviewStatus: shared_types_1.ProposalReviewStatus.PENDING_REVIEW
+        })).map((row) => row.id);
+    }
     async syncTerminalBatchAnalysisStatus(workspaceDb, workspaceId, batchId) {
         const batch = workspaceDb.get(`SELECT status
        FROM pbi_batches
@@ -8410,6 +9179,7 @@ class WorkspaceRepository {
             || batch.status === shared_types_1.PBIBatchStatus.ARCHIVED) {
             return batch.status;
         }
+        this.promoteLatestHumanReviewWorkerProposals(workspaceDb, workspaceId, batchId);
         return this.syncBatchReviewStatus(workspaceDb, workspaceId, batchId);
     }
 }
@@ -8957,9 +9727,7 @@ function normalizeProposalMetadata(value) {
     return value;
 }
 function normalizeProposalMetadataKbAccessMode(value) {
-    return value === 'mcp' || value === 'cli'
-        ? value
-        : undefined;
+    return (0, shared_types_1.isKbAccessMode)(value) ? value : undefined;
 }
 function normalizeProposalOriginPath(value) {
     return typeof value === 'string' && value.trim()
@@ -9351,7 +10119,7 @@ function normalizeLocales(locales) {
     return locales && locales.length > 0 ? locales : ['en-us'];
 }
 function isValidKbAccessMode(value) {
-    return value === 'mcp' || value === 'cli';
+    return (0, shared_types_1.isKbAccessMode)(value);
 }
 function normalizeKbAccessMode(value) {
     return isValidKbAccessMode(value ?? '') ? value : DEFAULT_KB_ACCESS_MODE;

@@ -23,5 +23,6 @@ __exportStar(require("./batch6"), exports);
 __exportStar(require("./batch7"), exports);
 __exportStar(require("./batch8"), exports);
 __exportStar(require("./batch9"), exports);
+__exportStar(require("./direct"), exports);
 __exportStar(require("./ai-assistant"), exports);
 __exportStar(require("./app-working-state"), exports);

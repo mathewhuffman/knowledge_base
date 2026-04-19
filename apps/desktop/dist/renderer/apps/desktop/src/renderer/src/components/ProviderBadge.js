@@ -1,18 +1,24 @@
 import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
-import { IconServer, IconTerminal } from './icons';
+import { IconServer, IconTerminal, IconZap } from './icons';
 /* ---------- Config ---------- */
 const providerConfig = {
     mcp: {
         label: 'MCP',
         expandedLabel: 'MCP Runtime',
-        description: 'Model Context Protocol — structured KB tool access via MCP server',
+        description: 'Model Context Protocol — optional advanced mode for structured KB tool access via MCP server',
         cssModifier: 'mcp',
     },
     cli: {
         label: 'CLI',
         expandedLabel: 'CLI Runtime',
-        description: 'Command Line — KB access via CLI loopback with terminal capability',
+        description: 'Command Line — optional advanced mode for KB access via CLI loopback with terminal capability',
         cssModifier: 'cli',
+    },
+    direct: {
+        label: 'Direct',
+        expandedLabel: 'Direct Runtime',
+        description: 'App-owned direct execution contract. Recommended default for assistant chat, article edit, and batch analysis.',
+        cssModifier: 'direct',
     },
 };
 /* ---------- Component ---------- */
@@ -23,7 +29,11 @@ export function ProviderBadge({ mode, size = 'inline', expanded = false, live = 
     if (size === 'dot') {
         return (_jsxs("span", { className: `provider-dot provider-dot--${config.cssModifier} ${className ?? ''}`, title: config.description, children: [_jsx("span", { className: `provider-dot-indicator ${live ? 'provider-dot-indicator--live' : ''}` }), _jsx("span", { className: "provider-dot-label", children: label })] }));
     }
-    return (_jsxs("span", { className: `provider-badge provider-badge--${config.cssModifier} provider-badge--${size} ${live ? 'provider-badge--live' : ''} ${className ?? ''}`, title: config.description, children: [_jsx("span", { className: "provider-badge-icon", children: mode === 'mcp' ? _jsx(IconServer, { size: iconSize }) : _jsx(IconTerminal, { size: iconSize }) }), _jsx("span", { className: "provider-badge-label", children: label }), live && _jsx("span", { className: "provider-badge-pulse" })] }));
+    return (_jsxs("span", { className: `provider-badge provider-badge--${config.cssModifier} provider-badge--${size} ${live ? 'provider-badge--live' : ''} ${className ?? ''}`, title: config.description, children: [_jsx("span", { className: "provider-badge-icon", children: mode === 'mcp'
+                    ? _jsx(IconServer, { size: iconSize })
+                    : mode === 'cli'
+                        ? _jsx(IconTerminal, { size: iconSize })
+                        : _jsx(IconZap, { size: iconSize }) }), _jsx("span", { className: "provider-badge-label", children: label }), live && _jsx("span", { className: "provider-badge-pulse" })] }));
 }
 const statusDisplay = {
     starting: { label: 'Starting', color: 'var(--color-warning)' },

@@ -53,8 +53,8 @@ interface PendingAssistantToolEvent {
 }
 
 function isFilteredAssistantToolName(value: string | undefined): boolean {
-  const normalized = value?.trim().toLowerCase();
-  return normalized === 'terminal' || normalized === 'shell';
+  void value;
+  return false;
 }
 
 export interface PendingAssistantTurn {

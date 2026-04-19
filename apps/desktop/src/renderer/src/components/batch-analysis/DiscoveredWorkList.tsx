@@ -28,11 +28,11 @@ export function DiscoveredWorkList({ items, compact }: DiscoveredWorkListProps) 
 
   return (
     <div className="ba-discoveries">
-      {displayItems.map((item) => {
+      {displayItems.map((item, index) => {
         const isRejected = item.status === 'rejected';
         return (
           <div
-            key={item.discoveryId}
+            key={`${item.sourceWorkerRunId}:${item.discoveryId}:${index}`}
             className={`ba-discovery-card ${item.status === 'escalated' ? 'ba-discovery-card--escalated' : ''} ${isRejected ? 'ba-discovery-card--rejected' : ''}`}
           >
             <div className="ba-discovery-header">
@@ -64,8 +64,8 @@ export function DiscoveredWorkList({ items, compact }: DiscoveredWorkListProps) 
               <>
                 {item.linkedPbiIds.length > 0 && (
                   <div className="ba-discovery-pbis">
-                    {item.linkedPbiIds.map((id) => (
-                      <span key={id} className="ba-pbi-tag">{id}</span>
+                    {item.linkedPbiIds.map((id, pbiIndex) => (
+                      <span key={`${item.discoveryId}:pbi:${id}:${pbiIndex}`} className="ba-pbi-tag">{id}</span>
                     ))}
                   </div>
                 )}

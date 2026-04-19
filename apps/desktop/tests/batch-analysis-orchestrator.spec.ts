@@ -1,6 +1,11 @@
 import { expect, test } from '@playwright/test';
 import type { LocaleVariantRecord } from '@kb-vault/shared-types';
-import type { BatchAnalysisPlan, BatchPlanReview, BatchPlannerPrefetch } from '@kb-vault/shared-types';
+import type {
+  BatchAnalysisIterationRecord,
+  BatchAnalysisPlan,
+  BatchPlanReview,
+  BatchPlannerPrefetch
+} from '@kb-vault/shared-types';
 import { BatchAnalysisOrchestrator } from '../src/main/services/batch-analysis-orchestrator';
 
 function createOrchestrator(overrides?: {
@@ -148,6 +153,114 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(repairPrompt).toContain(originalPrompt);
     expect(jsonRetryPrompt).toContain('Original planner instructions and batch context:');
     expect(jsonRetryPrompt).toContain(originalPrompt);
+  });
+
+  test('uniquifies duplicate worker discovery ids before persistence', () => {
+    const orchestrator = createOrchestrator();
+    const parsed = orchestrator.parseWorkerResult(
+      JSON.stringify({
+        summary: 'Found adjacent work.',
+        discoveredWork: [
+          {
+            discoveryId: 'dw-1',
+            discoveredAction: 'edit',
+            suspectedTarget: 'Article A',
+            reason: 'First discovery.',
+            evidence: [],
+            linkedPbiIds: ['pbi-1'],
+            confidence: 0.61,
+            requiresPlanAmendment: true
+          },
+          {
+            discoveryId: 'dw-1',
+            discoveredAction: 'edit',
+            suspectedTarget: 'Article B',
+            reason: 'Second discovery reused the same id.',
+            evidence: [],
+            linkedPbiIds: ['pbi-2'],
+            confidence: 0.62,
+            requiresPlanAmendment: true
+          },
+          {
+            discoveredAction: 'create',
+            suspectedTarget: 'Article C',
+            reason: 'Third discovery omitted an id.',
+            evidence: [],
+            linkedPbiIds: ['pbi-3'],
+            confidence: 0.63,
+            requiresPlanAmendment: true
+          }
+        ]
+      }),
+      'Worker completed.',
+      'worker-session-1'
+    );
+
+    expect(parsed.discoveredWork.map((item) => item.discoveryId)).toEqual([
+      'dw-1',
+      'dw-1-2',
+      'discovery-3'
+    ]);
+    expect(new Set(parsed.discoveredWork.map((item) => item.discoveryId)).size).toBe(parsed.discoveredWork.length);
+    expect(parsed.discoveredWork.every((item) => item.sourceWorkerRunId === 'worker-session-1')).toBe(true);
+  });
+
+  test('worker prompt includes authoritative execution hints and pre-resolved family targets', async () => {
+    const orchestrator = createOrchestrator({
+      getLocaleVariantsForFamily: async (_workspaceId, familyId) => [{
+        id: 'variant-training-plans',
+        familyId,
+        locale: 'en-us',
+        status: 'live'
+      }]
+    });
+
+    const prompt = await orchestrator.buildWorkerPrompt(createPlan({
+      coverage: [
+        {
+          pbiId: 'pbi-1',
+          outcome: 'covered',
+          planItemIds: ['item-1']
+        },
+        {
+          pbiId: 'pbi-2',
+          outcome: 'covered',
+          planItemIds: ['item-2']
+        }
+      ],
+      items: [
+        {
+          planItemId: 'item-1',
+          pbiIds: ['pbi-1'],
+          action: 'edit',
+          targetType: 'article_family',
+          targetFamilyId: 'family-training-plans',
+          targetTitle: 'Create & Edit Training Plans',
+          reason: 'Update the existing training plan family.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+          confidence: 0.88,
+          executionStatus: 'pending'
+        },
+        {
+          planItemId: 'item-2',
+          pbiIds: ['pbi-2'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'Assign Trainers to Course',
+          reason: 'Net-new article for the workflow.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-2', summary: 'Imported PBI.' }],
+          confidence: 0.82,
+          executionStatus: 'pending'
+        }
+      ]
+    }));
+
+    expect(prompt).toContain('Approved plan targets and execution hints below are authoritative.');
+    expect(prompt).toContain('"strategy": "family_id"');
+    expect(prompt).toContain('"familyId": "family-training-plans"');
+    expect(prompt).toContain('"preferredLocaleVariantId": "variant-training-plans"');
+    expect(prompt).toContain('"strategy": "target_title"');
+    expect(prompt).toContain('Do not spend lookup turns trying to discover a localeVariantId for net-new work first.');
   });
 
   test('repairs malformed plan PBI IDs and canonicalizes PBI evidence refs from uploaded batch rows', () => {
@@ -339,6 +452,43 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(result.plan.openQuestions[0]).toContain('variant-correct');
   });
 
+  test('fills missing target family IDs for article_family targets from a live locale variant', async () => {
+    const orchestrator = createOrchestrator({
+      getLocaleVariant: async (_workspaceId, variantId) => ({
+        id: variantId,
+        familyId: 'family-1',
+        locale: 'en-us',
+        status: 'live'
+      })
+    });
+
+    const result = await orchestrator.normalizePlanTargets({
+      workspaceId: 'workspace-1',
+      plan: createPlan({
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'edit',
+            targetType: 'article_family',
+            targetArticleId: 'variant-1',
+            targetTitle: 'Create & Edit Training Plans',
+            reason: 'Target the whole family rather than a single locale variant.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+            confidence: 0.86,
+            executionStatus: 'pending'
+          }
+        ]
+      })
+    });
+
+    expect(result.plan.items[0]?.targetFamilyId).toBe('family-1');
+    expect(result.repairs).toEqual([
+      'Filled missing target family ID for Create & Edit Training Plans with family-1 from locale variant variant-1.'
+    ]);
+    expect(result.unresolvedTargetIssues).toEqual([]);
+  });
+
   test('forces revision when a target resolves to a proposal-scoped draft family', async () => {
     const orchestrator = createOrchestrator({
       getLocaleVariant: async (_workspaceId, variantId) => ({
@@ -375,6 +525,44 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
 
     expect(result.unresolvedTargetIssues).toEqual([
       'Plan item item-1 (Duplicate a Food Item) points at proposal-scoped draft family proposal-123, which is generated draft output rather than live KB coverage.'
+    ]);
+  });
+
+  test('forces revision when an article_family target resolves to a proposal-scoped draft family', async () => {
+    const orchestrator = createOrchestrator({
+      getLocaleVariantsForFamily: async (_workspaceId, familyId) => [{
+        id: 'variant-family-live',
+        familyId,
+        locale: 'en-us',
+        status: 'live'
+      }],
+      getArticleFamily: async () => ({
+        externalKey: 'proposal-456'
+      })
+    });
+
+    const result = await orchestrator.normalizePlanTargets({
+      workspaceId: 'workspace-1',
+      plan: createPlan({
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'edit',
+            targetType: 'article_family',
+            targetFamilyId: 'family-proposal',
+            targetTitle: 'Create & Edit Training Plans',
+            reason: 'Update the live family.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+            confidence: 0.88,
+            executionStatus: 'pending'
+          }
+        ]
+      })
+    });
+
+    expect(result.unresolvedTargetIssues).toEqual([
+      'Plan item item-1 (Create & Edit Training Plans) points at proposal-scoped draft family proposal-456, which is generated draft output rather than live KB coverage.'
     ]);
   });
 
@@ -433,6 +621,128 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(result.review.delta?.requestedChanges).toContain(
       'Plan item item-1 evidence[0] references unknown uploaded PBI external Id:102456.'
     );
+  });
+
+  test('forces needs_user_input when a required Delete a Food List question remains unanswered', () => {
+    const orchestrator = createOrchestrator();
+    const deleteFoodListQuestion = {
+      id: 'question-delete-food-list',
+      questionSetId: 'question-set-delete-food-list',
+      prompt: 'Should Delete a Food List be included in this batch or explicitly deferred?',
+      reason: 'Planner found a known Delete a Food List scope gap that requires a user scope decision before approval.',
+      requiresUserInput: true,
+      linkedPbiIds: ['pbi-1'],
+      linkedPlanItemIds: ['item-1'],
+      linkedDiscoveryIds: [],
+      status: 'pending' as const,
+      createdAtUtc: new Date().toISOString()
+    };
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [deleteFoodListQuestion],
+        openQuestions: [deleteFoodListQuestion.prompt]
+      }),
+      review: createReview({
+        verdict: 'approved',
+        summary: 'Plan looks complete.'
+      })
+    });
+
+    expect(result.forcedRevision).toBe(false);
+    expect(result.blockingUserInputQuestions).toHaveLength(1);
+    expect(result.review.verdict).toBe('needs_user_input');
+    expect(result.review.questions?.[0]?.prompt).toContain('Delete a Food List');
+    expect(result.review.delta?.requestedChanges.some((change) => change.includes('Delete a Food List'))).toBe(true);
+  });
+
+  test('normalizes legacy gap coverage to covered when a plan item already accounts for the PBI', () => {
+    const orchestrator = createOrchestrator();
+    const iteration: BatchAnalysisIterationRecord = {
+      id: 'iteration-1',
+      workspaceId: 'workspace-1',
+      batchId: 'batch-1',
+      iteration: 1,
+      status: 'running',
+      stage: 'planning',
+      role: 'planner',
+      summary: 'Planning batch coverage.',
+      outstandingDiscoveredWorkCount: 0,
+      executionCounts: {
+        total: 0,
+        create: 0,
+        edit: 0,
+        retire: 0,
+        noImpact: 0,
+        executed: 0,
+        blocked: 0,
+        rejected: 0
+      },
+      startedAtUtc: new Date().toISOString(),
+      createdAtUtc: new Date().toISOString(),
+      updatedAtUtc: new Date().toISOString()
+    };
+
+    const plan = orchestrator.parsePlannerResult({
+      workspaceId: 'workspace-1',
+      batchId: 'batch-1',
+      iteration,
+      resultText: JSON.stringify({
+        summary: 'Planner used legacy net-new gap wording.',
+        coverage: [
+          {
+            pbiId: 'pbi-1',
+            outcome: 'gap',
+            planItemIds: ['item-1'],
+            notes: 'No existing article covers this flow, so a new article is planned.'
+          }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'create',
+            targetType: 'new_article',
+            targetTitle: 'New article',
+            reason: 'The plan already covers the PBI with a net-new article.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+            confidence: 0.89,
+            executionStatus: 'pending'
+          }
+        ],
+        openQuestions: []
+      }),
+      planVersion: 1
+    });
+
+    expect(plan.coverage[0]?.outcome).toBe('covered');
+    expect(orchestrator.validateApprovedPlan({
+      ...plan,
+      verdict: 'approved'
+    }).ok).toBe(true);
+  });
+
+  test('forces needs_revision when an approved review leaves a true coverage gap unresolved', () => {
+    const orchestrator = createOrchestrator();
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        coverage: [
+          {
+            pbiId: 'pbi-1',
+            outcome: 'gap',
+            planItemIds: []
+          }
+        ]
+      }),
+      review: createReview({
+        verdict: 'approved',
+        summary: 'Plan looks complete.'
+      })
+    });
+
+    expect(result.forcedRevision).toBe(true);
+    expect(result.invalidCoverageReasons).toContain('PBI pbi-1 is still marked as a gap.');
+    expect(result.review.verdict).toBe('needs_revision');
+    expect(result.review.delta?.requestedChanges).toContain('PBI pbi-1 is still marked as a gap.');
   });
 
   test('recordWorkerPass blocks stale rebinding when the current rework session creates a conflicting action', async () => {
@@ -540,7 +850,7 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(recordedReports).toHaveLength(1);
   });
 
-  test('forces revision when a create-only plan ignores strong existing article matches', () => {
+  test('keeps strong existing article matches advisory when the review otherwise approves the plan', () => {
     const orchestrator = createOrchestrator();
     const result = orchestrator.applyDeterministicPlanReviewGuard({
       plan: createPlan(),
@@ -582,14 +892,15 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
       })
     });
 
-    expect(result.forcedRevision).toBe(true);
-    expect(result.review.verdict).toBe('needs_revision');
-    expect(result.review.hasMissingEdits).toBe(true);
-    expect(result.review.underScopedKbImpact).toBe(true);
-    expect(result.review.delta?.missingEdits).toEqual([
+    expect(result.forcedRevision).toBe(false);
+    expect(result.review.verdict).toBe('approved');
+    expect(result.review.hasMissingEdits).toBe(false);
+    expect(result.review.underScopedKbImpact).toBe(false);
+    expect(result.missingEditTargets).toEqual([
       'Edit Team Dashboard',
       'Leadership Tile Settings'
     ]);
+    expect(result.review.delta?.missingEdits).toEqual([]);
   });
 
   test('does not force revision when the plan already includes the matched edit target', () => {
@@ -680,7 +991,7 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(result.missingEditTargets).toEqual([]);
   });
 
-  test('forces revision for an all-no-impact plan when deterministic prefetch shows likely edit targets', () => {
+  test('keeps all-no-impact heuristic edit suggestions advisory when no objective blocker exists', () => {
     const orchestrator = createOrchestrator();
     const result = orchestrator.applyDeterministicPlanReviewGuard({
       plan: createPlan({
@@ -721,12 +1032,13 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
       })
     });
 
-    expect(result.forcedRevision).toBe(true);
-    expect(result.review.verdict).toBe('needs_revision');
-    expect(result.review.delta?.missingEdits).toEqual(['Edit Team Dashboard']);
+    expect(result.forcedRevision).toBe(false);
+    expect(result.review.verdict).toBe('approved');
+    expect(result.missingEditTargets).toEqual(['Edit Team Dashboard']);
+    expect(result.review.delta?.missingEdits).toEqual([]);
   });
 
-  test('forces revision when deterministic prefetch shows a searched cluster with no existing article match and the plan never creates it', () => {
+  test('keeps zero-match missing-create heuristics advisory when the plan has no objective blocker', () => {
     const orchestrator = createOrchestrator();
     const result = orchestrator.applyDeterministicPlanReviewGuard({
       plan: createPlan({
@@ -786,12 +1098,12 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
       })
     });
 
-    expect(result.forcedRevision).toBe(true);
-    expect(result.review.verdict).toBe('needs_revision');
-    expect(result.review.hasMissingCreates).toBe(true);
-    expect(result.review.underScopedKbImpact).toBe(true);
+    expect(result.forcedRevision).toBe(false);
+    expect(result.review.verdict).toBe('approved');
+    expect(result.review.hasMissingCreates).toBe(false);
+    expect(result.review.underScopedKbImpact).toBe(false);
     expect(result.missingCreateTargets).toEqual(['Checklist escalation workflow']);
-    expect(result.review.delta?.missingCreates).toEqual(['Checklist escalation workflow']);
+    expect(result.review.delta?.missingCreates).toEqual([]);
   });
 
   test('does not force revision for a zero-match cluster when the plan already includes a create item', () => {
@@ -839,6 +1151,81 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
           }
         ],
         relationMatches: []
+      })
+    });
+
+    expect(result.forcedRevision).toBe(false);
+    expect(result.review.verdict).toBe('approved');
+    expect(result.missingCreateTargets).toEqual([]);
+  });
+
+  test('does not force missing creates when a zero-match cluster is already covered by a relation-backed article_family edit', () => {
+    const orchestrator = createOrchestrator();
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        coverage: [
+          {
+            pbiId: 'pbi-1',
+            outcome: 'covered',
+            planItemIds: ['item-1']
+          },
+          {
+            pbiId: 'pbi-2',
+            outcome: 'covered',
+            planItemIds: ['item-1']
+          }
+        ],
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1', 'pbi-2'],
+            action: 'edit',
+            targetType: 'article_family',
+            targetFamilyId: 'family-training-plans',
+            targetTitle: 'Create & Edit Training Plans',
+            reason: 'The work belongs in the existing training-plan family.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+            confidence: 0.82,
+            executionStatus: 'pending'
+          }
+        ]
+      }),
+      review: createReview({
+        verdict: 'approved'
+      }),
+      plannerPrefetch: createPlannerPrefetch({
+        topicClusters: [
+          {
+            clusterId: 'cluster-1',
+            label: 'Training plan workflow',
+            pbiIds: ['pbi-1', 'pbi-2'],
+            sampleTitles: ['Create a New Training Plan', 'Edit an Existing Training Plan'],
+            queries: ['Create a New Training Plan', 'Edit an Existing Training Plan']
+          }
+        ],
+        articleMatches: [
+          {
+            clusterId: 'cluster-1',
+            query: 'Create a New Training Plan',
+            total: 0,
+            topResults: []
+          },
+          {
+            clusterId: 'cluster-1',
+            query: 'Edit an Existing Training Plan',
+            total: 0,
+            topResults: []
+          }
+        ],
+        relationMatches: [
+          {
+            title: 'Create & Edit Training Plans',
+            familyId: 'family-training-plans',
+            relationType: 'related',
+            strengthScore: 0.66,
+            evidence: ['Family relation lookup matched the training plan article family.']
+          }
+        ]
       })
     });
 

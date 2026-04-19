@@ -2,6 +2,7 @@ import type { BatchAnalysisStageEventRecord, BatchAnalysisTimelineEntry } from '
 import { Badge } from '../Badge';
 import { EmptyState } from '../EmptyState';
 import {
+  buildTimelineEntriesWithSkippedStages,
   getVisibleStageLabel,
   STAGE_LABELS,
   ROLE_LABELS,
@@ -9,6 +10,7 @@ import {
   verdictBadgeVariant,
   formatTimestamp,
   humanizeAnalysisText,
+  type RenderableTimelineEntry,
 } from './helpers';
 
 interface TimelineViewProps {
@@ -37,7 +39,23 @@ function artifactTypeLabel(type: BatchAnalysisTimelineEntry['artifactType']): st
   }
 }
 
-function timelineDotClass(entry: BatchAnalysisTimelineEntry): string {
+function isSkippedStageEntry(entry: RenderableTimelineEntry): entry is Extract<RenderableTimelineEntry, { syntheticKind: 'skipped_stage' }> {
+  return 'syntheticKind' in entry && entry.syntheticKind === 'skipped_stage';
+}
+
+function renderableArtifactTypeLabel(entry: RenderableTimelineEntry): string {
+  if (isSkippedStageEntry(entry)) {
+    return 'Skipped Stage';
+  }
+
+  return artifactTypeLabel(entry.artifactType);
+}
+
+function timelineDotClass(entry: RenderableTimelineEntry): string {
+  if (isSkippedStageEntry(entry)) {
+    return 'ba-timeline-dot--neutral';
+  }
+
   if (TERMINAL_STAGES.has(entry.stage)) {
     if (entry.stage === 'approved') return 'ba-timeline-dot--success';
     if (entry.stage === 'failed' || entry.stage === 'canceled') return 'ba-timeline-dot--danger';
@@ -61,16 +79,19 @@ export function TimelineView({ entries, stageEvents = [] }: TimelineViewProps) {
     );
   }
 
+  const renderableEntries = buildTimelineEntriesWithSkippedStages(entries, stageEvents);
+
   return (
     <div className="ba-timeline" role="list" aria-label="Batch analysis timeline">
-      {entries.map((entry, idx) => {
+      {renderableEntries.map((entry, idx) => {
         const isTerminal = TERMINAL_STAGES.has(entry.stage);
-        const isLast = idx === entries.length - 1;
+        const isLast = idx === renderableEntries.length - 1;
+        const isSkippedStage = isSkippedStageEntry(entry);
 
         return (
           <div
             key={`${entry.artifactId}-${idx}`}
-            className={`ba-timeline-entry ${isLast ? 'ba-timeline-entry--last' : ''}`}
+            className={`ba-timeline-entry ${isLast ? 'ba-timeline-entry--last' : ''}${isSkippedStage ? ' ba-timeline-entry--skipped' : ''}`}
             role="listitem"
           >
             <div className={`ba-timeline-dot ${timelineDotClass(entry)} ${isTerminal ? 'ba-timeline-dot--terminal' : ''}`} />
@@ -81,14 +102,21 @@ export function TimelineView({ entries, stageEvents = [] }: TimelineViewProps) {
 
             <div className="ba-timeline-content">
               <span className="ba-timeline-type">
-                {artifactTypeLabel(entry.artifactType)}
+                {renderableArtifactTypeLabel(entry)}
               </span>
               {entry.summary && (
-                <span className="ba-timeline-summary">{humanizeAnalysisText(entry.summary)}</span>
+                <span className={`ba-timeline-summary${isSkippedStage ? ' ba-timeline-summary--multiline' : ''}`}>
+                  {humanizeAnalysisText(entry.summary)}
+                </span>
               )}
-              {entry.verdict && (
+              {!isSkippedStage && entry.verdict && (
                 <Badge variant={verdictBadgeVariant(entry.verdict)}>
                   {entry.verdict}
+                </Badge>
+              )}
+              {isSkippedStage && (
+                <Badge variant="neutral">
+                  skipped
                 </Badge>
               )}
             </div>
