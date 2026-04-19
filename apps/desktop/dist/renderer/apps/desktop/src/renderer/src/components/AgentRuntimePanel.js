@@ -255,20 +255,6 @@ function mcpToolsetSummary(health) {
         detail: 'Toolset verification did not complete'
     };
 }
-function streamingKindBadge(kind) {
-    switch (kind) {
-        case 'session_started': return 'primary';
-        case 'progress': return 'primary';
-        case 'tool_call': return 'neutral';
-        case 'tool_response': return 'neutral';
-        case 'result': return 'success';
-        case 'warning': return 'warning';
-        case 'error': return 'danger';
-        case 'timeout': return 'danger';
-        case 'canceled': return 'warning';
-        default: return 'neutral';
-    }
-}
 function parseSessionUpdatePayload(raw) {
     try {
         const parsed = JSON.parse(raw);
@@ -295,19 +281,6 @@ function shouldDisplayTranscriptLine(line) {
         return true;
     }
     return !isHiddenSessionUpdateType(parsed.updateType);
-}
-function shouldDisplayStreamingEvent(evt) {
-    if (evt.kind !== 'progress' || !evt.data) {
-        return true;
-    }
-    try {
-        const parsed = evt.data;
-        const updateType = typeof parsed?.update?.sessionUpdate === 'string' ? parsed.update.sessionUpdate : null;
-        return !isHiddenSessionUpdateType(updateType);
-    }
-    catch {
-        return true;
-    }
 }
 function normalizeToolCalls(data) {
     if (Array.isArray(data)) {
@@ -603,9 +576,9 @@ export function SessionDetailPanel({ workspaceId, session, onBack }) {
 /* ================================================================== */
 /* TranscriptView                                                      */
 /* ================================================================== */
-function TranscriptView({ lines, loading, error }) {
+function TranscriptView({ lines, loading, error, notice, }) {
     const scrollRef = useRef(null);
-    const mergedLines = useMemo(() => mergeTranscriptLines(lines).filter((line) => shouldDisplayTranscriptLine(line)), [lines]);
+    const mergedLines = useMemo(() => buildRenderableTranscriptLines(lines), [lines]);
     useEffect(() => {
         if (scrollRef.current) {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -618,34 +591,34 @@ function TranscriptView({ lines, loading, error }) {
     if (mergedLines.length === 0) {
         return (_jsx(EmptyState, { icon: _jsx(IconTerminal, { size: 32 }), title: "No transcript yet", description: "Transcript lines will appear once the session processes messages." }));
     }
-    return (_jsx("div", { className: "agent-transcript analysis-copyable", ref: scrollRef, children: mergedLines.map((line, i) => (_jsxs("div", { className: `agent-transcript-line agent-transcript-line--${line.direction}`, children: [_jsxs("div", { className: "agent-transcript-line-header", children: [_jsx("span", { className: "agent-transcript-line-time", children: formatTimestamp(line.atUtc) }), _jsx(Badge, { variant: line.direction === 'to_agent' ? 'primary' : line.direction === 'from_agent' ? 'success' : 'neutral', children: line.direction === 'to_agent' ? 'To Agent' : line.direction === 'from_agent' ? 'From Agent' : 'System' }), _jsx("span", { className: "agent-transcript-line-event", children: line.event })] }), _jsx("pre", { className: "agent-transcript-line-payload", children: formatPayload(line.payload) })] }, i))) }));
+    return (_jsxs(_Fragment, { children: [notice && (_jsx("div", { className: "agent-transcript-notice", children: notice })), _jsx("div", { className: "agent-transcript analysis-copyable", ref: scrollRef, children: mergedLines.map((line, i) => (_jsxs("div", { className: `agent-transcript-line agent-transcript-line--${line.direction}`, children: [_jsxs("div", { className: "agent-transcript-line-header", children: [_jsx("span", { className: "agent-transcript-line-time", children: formatTimestamp(line.atUtc) }), _jsx(Badge, { variant: line.direction === 'to_agent' ? 'primary' : line.direction === 'from_agent' ? 'success' : 'neutral', children: line.direction === 'to_agent' ? 'To Agent' : line.direction === 'from_agent' ? 'From Agent' : 'System' }), _jsx("span", { className: "agent-transcript-line-event", children: line.event })] }), _jsx("pre", { className: "agent-transcript-line-payload", children: formatPayload(line.payload) })] }, i))) })] }));
 }
 function mergeTranscriptLines(lines) {
     const merged = [];
     for (const line of lines) {
         if (line.event !== 'session_update') {
-            merged.push(line);
+            merged.push({ ...line });
             continue;
         }
         const parsedPayload = parseSessionUpdatePayload(line.payload);
         if (!parsedPayload) {
-            merged.push(line);
+            merged.push({ ...line });
             continue;
         }
         const { parsed, updateType, contentType, contentText } = parsedPayload;
         const mergeable = (updateType === 'agent_thought_chunk' || updateType === 'agent_message_chunk') && contentType === 'text';
         if (!mergeable || !contentText) {
-            merged.push(line);
+            merged.push({ ...line });
             continue;
         }
         const previous = merged[merged.length - 1];
         if (!previous || previous.direction !== line.direction || previous.event !== 'session_update') {
-            merged.push(line);
+            merged.push({ ...line });
             continue;
         }
         const previousParsedPayload = parseSessionUpdatePayload(previous.payload);
         if (!previousParsedPayload) {
-            merged.push(line);
+            merged.push({ ...line });
             continue;
         }
         const previousParsed = previousParsedPayload.parsed;
@@ -653,7 +626,7 @@ function mergeTranscriptLines(lines) {
         const previousContentType = previousParsedPayload.contentType;
         const previousText = previousParsedPayload.contentText;
         if (previousType !== updateType || previousContentType !== 'text' || previousText === null) {
-            merged.push(line);
+            merged.push({ ...line });
             continue;
         }
         previousParsed.update.content.text = `${previousText}${contentText}`;
@@ -661,6 +634,9 @@ function mergeTranscriptLines(lines) {
         previous.atUtc = line.atUtc;
     }
     return merged;
+}
+function buildRenderableTranscriptLines(lines) {
+    return mergeTranscriptLines(lines).filter((line) => shouldDisplayTranscriptLine(line));
 }
 function formatPayload(raw) {
     try {
@@ -698,11 +674,11 @@ function AcpToolCallsView({ calls, loading, error }) {
     }
     return (_jsx("div", { className: "agent-tool-calls analysis-copyable", children: calls.map((call) => (_jsxs("div", { className: "agent-tool-call-item", children: [_jsxs("div", { className: "agent-tool-call-header", children: [_jsx("code", { className: "agent-tool-call-name", children: summarizeAcpToolInput(call.title, call.rawInput) }), _jsx(Badge, { variant: call.status === 'completed' ? 'success' : call.status === 'in_progress' ? 'primary' : 'neutral', children: call.status }), _jsx("span", { className: "agent-tool-call-time", children: formatTimestamp(call.atUtc) })] }), _jsxs("div", { className: "agent-tool-call-reason", children: ["Kind: ", call.kind] }), call.rawInput !== undefined && (_jsx("pre", { className: "agent-tool-call-args", children: formatPayload(JSON.stringify(call.rawInput)) })), call.rawOutput !== undefined && (_jsx("pre", { className: "agent-tool-call-args", children: formatPayload(JSON.stringify(call.rawOutput)) }))] }, call.toolCallId))) }));
 }
+const LIVE_TRANSCRIPT_RENDER_LIMIT = 300;
 export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinutes, startOnOpen, onComplete, }) {
     const [jobId, setJobId] = useState(null);
     const [jobState, setJobState] = useState('');
     const [progress, setProgress] = useState(0);
-    const [events, setEvents] = useState([]);
     const [canceling, setCanceling] = useState(false);
     const [error, setError] = useState(null);
     const [copyStatus, setCopyStatus] = useState(null);
@@ -731,7 +707,6 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
     const terminalStateHandledRef = useRef(false);
     const sessionListInFlightRef = useRef(false);
     const autoStartIssuedRef = useRef(false);
-    const scrollRef = useRef(null);
     // Subscribe to job events
     const refreshSessions = useCallback(async () => {
         if (sessionListInFlightRef.current) {
@@ -894,9 +869,6 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
             if (event.message) {
                 try {
                     const payload = JSON.parse(event.message);
-                    if (shouldDisplayStreamingEvent(payload)) {
-                        setEvents((prev) => [...prev, payload]);
-                    }
                     if (payload.kind === 'session_started' && payload.data && typeof payload.data === 'object') {
                         const sessionPayload = payload.data.session;
                         if (isKbAccessMode(sessionPayload?.kbAccessMode)) {
@@ -927,13 +899,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
                     }
                 }
                 catch {
-                    // Non-JSON message, still useful
-                    setEvents((prev) => [...prev, {
-                            sessionId: '',
-                            kind: 'progress',
-                            message: event.message,
-                            atUtc: new Date().toISOString(),
-                        }]);
+                    // Ignore non-JSON progress payloads in the live panel. They are still persisted in run history.
                 }
             }
             if (event.state === 'SUCCEEDED' || event.state === 'FAILED' || event.state === 'CANCELED') {
@@ -1012,14 +978,8 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
         }
         void refreshHistory(activeLiveSessionId);
     }, [activeLiveSessionId, refreshHistory]);
-    useEffect(() => {
-        if (scrollRef.current) {
-            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-        }
-    }, [events.length]);
     const startJob = async () => {
         setError(null);
-        setEvents([]);
         setCurrentRunMode(null);
         setCurrentRunModel(null);
         setLiveRuntimeStatus(null);
@@ -1057,14 +1017,17 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
     };
     const isRunning = jobState === 'RUNNING' || jobState === 'QUEUED';
     const isDone = jobState === 'SUCCEEDED' || jobState === 'FAILED' || jobState === 'CANCELED';
-    const acpToolCalls = useMemo(() => extractAcpToolCalls(transcriptLines), [transcriptLines]);
-    const visibleTranscriptLines = useMemo(() => mergeTranscriptLines(transcriptLines).filter((line) => shouldDisplayTranscriptLine(line)), [transcriptLines]);
-    const visibleEvents = useMemo(() => events.filter((evt) => shouldDisplayStreamingEvent(evt)), [events]);
+    const acpToolCalls = useMemo(() => historyTab === 'acp_tools' ? extractAcpToolCalls(transcriptLines) : [], [historyTab, transcriptLines]);
+    const transcriptViewLines = useMemo(() => (shouldUseLiveHistory && historyTab === 'transcript' && transcriptLines.length > LIVE_TRANSCRIPT_RENDER_LIMIT
+        ? transcriptLines.slice(-LIVE_TRANSCRIPT_RENDER_LIMIT)
+        : transcriptLines), [historyTab, shouldUseLiveHistory, transcriptLines]);
+    const liveTranscriptNotice = shouldUseLiveHistory && historyTab === 'transcript' && transcriptLines.length > LIVE_TRANSCRIPT_RENDER_LIMIT
+        ? `Showing the most recent ${LIVE_TRANSCRIPT_RENDER_LIMIT} live transcript updates while analysis is running. Older updates remain available after the run completes.`
+        : undefined;
     const hasHistory = Boolean(activeLiveSessionId || persistedRun);
     const shouldShowStartButton = !isRunning && !(startOnOpen && !hasHistory && !isDone);
-    const canCopy = visibleTranscriptLines.length > 0
+    const canCopy = transcriptLines.length > 0
         || toolCalls.length > 0
-        || visibleEvents.length > 0
         || persistedRawOutput.length > 0
         || (persistedEventStream?.events.length ?? 0) > 0;
     useEffect(() => {
@@ -1090,6 +1053,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
         });
     }, [startOnOpen, hasHistory, isDone, isRunning, sessionListLoading, startJob]);
     const copyText = useCallback(() => {
+        const renderableTranscriptLines = buildRenderableTranscriptLines(transcriptLines);
         const chunks = [];
         chunks.push(`Batch: ${batchId}`);
         if (activeSession) {
@@ -1148,11 +1112,11 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
         chunks.push('');
         chunks.push('Transcript');
         chunks.push('----------');
-        if (visibleTranscriptLines.length === 0) {
+        if (renderableTranscriptLines.length === 0) {
             chunks.push('No transcript lines');
         }
         else {
-            visibleTranscriptLines.forEach((line) => {
+            renderableTranscriptLines.forEach((line) => {
                 chunks.push(`[${formatTimestamp(line.atUtc)}] ${line.direction} ${line.event}`);
                 chunks.push(formatPayload(line.payload));
             });
@@ -1185,18 +1149,6 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
             });
         }
         chunks.push('');
-        chunks.push('Events');
-        chunks.push('----------');
-        if (visibleEvents.length === 0) {
-            chunks.push('No events yet');
-        }
-        else {
-            visibleEvents.forEach((evt) => {
-                const suffix = evt.message ? `: ${evt.message}` : '';
-                chunks.push(`[${formatTimestamp(evt.atUtc)}] ${evt.kind}${suffix}`);
-            });
-        }
-        chunks.push('');
         chunks.push('Stage Events');
         chunks.push('------------');
         if (!persistedEventStream || persistedEventStream.events.length === 0) {
@@ -1218,7 +1170,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
             });
         }
         return chunks.join('\n');
-    }, [activeSession, batchId, inspectionCounts, jobState, orchestrationIteration, persistedEventStream, persistedRawOutput, persistedRun, progress, toolCalls, visibleEvents, visibleTranscriptLines]);
+    }, [activeSession, batchId, inspectionCounts, jobState, orchestrationIteration, persistedEventStream, persistedRawOutput, persistedRun, progress, toolCalls, transcriptLines]);
     const copyAnalysisContents = useCallback(() => {
         if (!canCopy) {
             return;
@@ -1242,19 +1194,7 @@ export function AnalysisJobRunner({ workspaceId, batchId, workerStageBudgetMinut
                                             ? sessionStatusChip(activeSession.status).label
                                             : persistedRun
                                                 ? persistedRunStatusChip(persistedRun.status).label
-                                                : 'Unknown' })] })] }), _jsxs("div", { className: "agent-session-detail-meta", children: [runtimeMode && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Runtime" }), _jsx(RuntimeIndicator, { mode: runtimeMode, status: activeSession?.status ?? 'idle' })] })), activeSession?.createdAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Created" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(activeSession.createdAtUtc) })] })), !activeSession && persistedRun?.startedAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Started" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(persistedRun.startedAtUtc) })] })), latestBatchSession?.updatedAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Updated" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(latestBatchSession.updatedAtUtc) })] })), runtimeModel && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Model" }), _jsx("span", { className: "agent-meta-value", style: { fontFamily: 'var(--font-mono)' }, children: runtimeModel })] })), !persistedInspection && orchestrationIteration?.iteration != null && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Iteration" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.iteration })] })), !persistedInspection && orchestrationIteration?.stage && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Stage" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.stage })] })), !persistedInspection && orchestrationIteration?.role && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Role" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.role })] })), !persistedInspection && orchestrationIteration && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Discoveries" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.outstandingDiscoveredWorkCount })] })), !persistedInspection && inspectionCounts && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Artifacts" }), _jsxs("span", { className: "agent-meta-value", children: [inspectionCounts.plans, " plans, ", inspectionCounts.reviews, " reviews, ", inspectionCounts.finalReviews, " finals, ", inspectionCounts.stageEvents, " stage events"] })] })), !activeSession && persistedRun?.endedAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Ended" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(persistedRun.endedAtUtc) })] }))] }), persistedInspection && (_jsx(BatchAnalysisInspector, { inspection: persistedInspection, runtimeStatus: liveRuntimeStatus ?? persistedRuntimeStatus, eventStream: persistedEventStream, isRunning: isRunning, onRefresh: refreshPersistedHistory })), _jsxs("div", { className: "tab-bar", children: [_jsxs("button", { className: `tab-item ${historyTab === 'transcript' ? 'active' : ''}`, onClick: () => setHistoryTab('transcript'), children: [_jsx(IconTerminal, { size: 12 }), "Transcript (", transcriptLines.length, ")"] }), runtimeMode === 'mcp' && (_jsxs("button", { className: `tab-item ${historyTab === 'kb_tools' ? 'active' : ''}`, onClick: () => setHistoryTab('kb_tools'), children: [_jsx(IconTool, { size: 12 }), "KB Tools (", toolCalls.length, ")"] })), _jsxs("button", { className: `tab-item ${historyTab === 'acp_tools' ? 'active' : ''}`, onClick: () => setHistoryTab('acp_tools'), children: [_jsx(IconTool, { size: 12 }), "ACP Tools (", acpToolCalls.length, ")"] })] }), _jsx("div", { className: "agent-session-detail-body", children: historyTab === 'transcript' ? (_jsx(TranscriptView, { lines: transcriptLines, loading: historyLoadingState, error: historyErrorState })) : historyTab === 'kb_tools' ? (_jsx(ToolCallsView, { calls: toolCalls, loading: historyLoadingState, error: historyErrorState, mode: runtimeMode ?? 'direct' })) : (_jsx(AcpToolCallsView, { calls: acpToolCalls, loading: historyLoadingState, error: historyErrorState })) })] })), _jsxs("div", { className: "agent-job-copy-row", children: [_jsx("button", { className: "btn btn-ghost btn-sm", onClick: copyAnalysisContents, disabled: !canCopy, children: "Copy analysis contents" }), copyStatus && _jsx("span", { className: "agent-job-copy-status", children: copyStatus })] }), _jsxs("div", { className: "agent-job-runner-controls", children: [shouldShowStartButton && !autoStartPending && !isDone && (_jsxs("button", { className: "btn btn-primary", onClick: startJob, children: [_jsx(IconPlay, { size: 14 }), hasHistory ? 'Run Again' : 'Run Analysis'] })), startOnOpen && !isRunning && !isDone && autoStartPending && (_jsx("span", { className: "agent-job-status", children: "Starting analysis..." })), isRunning && (_jsxs(_Fragment, { children: [_jsx(Badge, { variant: "primary", children: jobState }), _jsxs("button", { className: "btn btn-danger btn-sm", onClick: cancelJob, disabled: canceling, children: [_jsx(IconSquare, { size: 12 }), canceling ? 'Canceling...' : 'Cancel'] })] })), isDone && (_jsxs(_Fragment, { children: [_jsx(Badge, { variant: jobState === 'SUCCEEDED' ? 'success' : jobState === 'CANCELED' ? 'warning' : 'danger', children: jobState }), _jsxs("button", { className: "btn btn-ghost btn-sm", onClick: startJob, children: [_jsx(IconRefreshCw, { size: 12 }), "Run Again"] })] }))] }), error && (_jsxs("div", { className: "agent-job-error", children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("span", { children: error })] })), jobState && (_jsxs("div", { className: "agent-job-progress-section", children: [_jsxs("div", { className: "agent-job-progress-header", children: [_jsx("span", { className: "agent-job-progress-label", children: jobState === 'SUCCEEDED' ? 'Analysis complete' :
-                                    jobState === 'FAILED' ? 'Analysis failed' :
-                                        jobState === 'CANCELED' ? 'Analysis canceled' :
-                                            'Analyzing batch...' }), _jsxs("span", { className: "agent-job-progress-pct", children: [progress, "%"] })] }), _jsx("div", { className: "progress-bar", style: { height: 6 }, children: _jsx("div", { className: "progress-bar-fill", style: {
-                                width: `${progress}%`,
-                                background: jobState === 'FAILED'
-                                    ? 'var(--color-danger)'
-                                    : jobState === 'CANCELED'
-                                        ? 'var(--color-warning)'
-                                        : jobState === 'SUCCEEDED'
-                                            ? 'var(--color-success)'
-                                            : undefined,
-                            } }) })] })), visibleEvents.length > 0 && (_jsx("div", { className: "agent-job-event-log analysis-copyable", ref: scrollRef, children: visibleEvents.map((evt, i) => (_jsxs("div", { className: "agent-job-event", children: [_jsx(Badge, { variant: streamingKindBadge(evt.kind), children: evt.kind }), _jsx("span", { className: "agent-job-event-time", children: formatTimestamp(evt.atUtc) }), evt.message && _jsx("span", { className: "agent-job-event-msg", children: evt.message }), evt.kind === 'tool_call' && Boolean(evt.data) && (_jsx("code", { className: "agent-job-event-data", children: typeof evt.data === 'object' ? JSON.stringify(evt.data) : String(evt.data) }))] }, i))) }))] }));
+                                                : 'Unknown' })] })] }), _jsxs("div", { className: "agent-session-detail-meta", children: [runtimeMode && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Runtime" }), _jsx(RuntimeIndicator, { mode: runtimeMode, status: activeSession?.status ?? 'idle' })] })), activeSession?.createdAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Created" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(activeSession.createdAtUtc) })] })), !activeSession && persistedRun?.startedAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Started" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(persistedRun.startedAtUtc) })] })), latestBatchSession?.updatedAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Updated" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(latestBatchSession.updatedAtUtc) })] })), runtimeModel && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Model" }), _jsx("span", { className: "agent-meta-value", style: { fontFamily: 'var(--font-mono)' }, children: runtimeModel })] })), !persistedInspection && orchestrationIteration?.iteration != null && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Iteration" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.iteration })] })), !persistedInspection && orchestrationIteration?.stage && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Stage" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.stage })] })), !persistedInspection && orchestrationIteration?.role && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Role" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.role })] })), !persistedInspection && orchestrationIteration && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Discoveries" }), _jsx("span", { className: "agent-meta-value", children: orchestrationIteration.outstandingDiscoveredWorkCount })] })), !persistedInspection && inspectionCounts && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Artifacts" }), _jsxs("span", { className: "agent-meta-value", children: [inspectionCounts.plans, " plans, ", inspectionCounts.reviews, " reviews, ", inspectionCounts.finalReviews, " finals, ", inspectionCounts.stageEvents, " stage events"] })] })), !activeSession && persistedRun?.endedAtUtc && (_jsxs("div", { className: "agent-meta-pair", children: [_jsx("span", { className: "agent-meta-label", children: "Ended" }), _jsx("span", { className: "agent-meta-value", children: formatTimestamp(persistedRun.endedAtUtc) })] }))] }), persistedInspection && (_jsx(BatchAnalysisInspector, { inspection: persistedInspection, runtimeStatus: liveRuntimeStatus ?? persistedRuntimeStatus, eventStream: persistedEventStream, isRunning: isRunning, onRefresh: refreshPersistedHistory })), _jsxs("div", { className: "tab-bar", children: [_jsxs("button", { className: `tab-item ${historyTab === 'transcript' ? 'active' : ''}`, onClick: () => setHistoryTab('transcript'), children: [_jsx(IconTerminal, { size: 12 }), "Transcript (", transcriptLines.length, ")"] }), runtimeMode === 'mcp' && (_jsxs("button", { className: `tab-item ${historyTab === 'kb_tools' ? 'active' : ''}`, onClick: () => setHistoryTab('kb_tools'), children: [_jsx(IconTool, { size: 12 }), "KB Tools (", toolCalls.length, ")"] })), _jsxs("button", { className: `tab-item ${historyTab === 'acp_tools' ? 'active' : ''}`, onClick: () => setHistoryTab('acp_tools'), children: [_jsx(IconTool, { size: 12 }), "ACP Tools", historyTab === 'acp_tools' ? ` (${acpToolCalls.length})` : ''] })] }), _jsx("div", { className: "agent-session-detail-body", children: historyTab === 'transcript' ? (_jsx(TranscriptView, { lines: transcriptViewLines, loading: historyLoadingState, error: historyErrorState, notice: liveTranscriptNotice })) : historyTab === 'kb_tools' ? (_jsx(ToolCallsView, { calls: toolCalls, loading: historyLoadingState, error: historyErrorState, mode: runtimeMode ?? 'direct' })) : (_jsx(AcpToolCallsView, { calls: acpToolCalls, loading: historyLoadingState, error: historyErrorState })) })] })), _jsxs("div", { className: "agent-job-copy-row", children: [_jsx("button", { className: "btn btn-ghost btn-sm", onClick: copyAnalysisContents, disabled: !canCopy, children: "Copy analysis contents" }), copyStatus && _jsx("span", { className: "agent-job-copy-status", children: copyStatus })] }), _jsxs("div", { className: "agent-job-runner-controls", children: [shouldShowStartButton && !autoStartPending && !isDone && (_jsxs("button", { className: "btn btn-primary", onClick: startJob, children: [_jsx(IconPlay, { size: 14 }), hasHistory ? 'Run Again' : 'Run Analysis'] })), startOnOpen && !isRunning && !isDone && autoStartPending && (_jsx("span", { className: "agent-job-status", children: "Starting analysis..." })), isRunning && (_jsxs(_Fragment, { children: [_jsx(Badge, { variant: "primary", children: jobState }), _jsxs("button", { className: "btn btn-danger btn-sm", onClick: cancelJob, disabled: canceling, children: [_jsx(IconSquare, { size: 12 }), canceling ? 'Canceling...' : 'Cancel'] })] })), isDone && (_jsxs(_Fragment, { children: [_jsx(Badge, { variant: jobState === 'SUCCEEDED' ? 'success' : jobState === 'CANCELED' ? 'warning' : 'danger', children: jobState }), _jsxs("button", { className: "btn btn-ghost btn-sm", onClick: startJob, children: [_jsx(IconRefreshCw, { size: 12 }), "Run Again"] })] }))] }), error && (_jsxs("div", { className: "agent-job-error", children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("span", { children: error })] }))] }));
 }
 /* ================================================================== */
 /* CursorUnavailableBanner                                             */

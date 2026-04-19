@@ -3873,6 +3873,223 @@ test.describe('command registry content model transitions', () => {
     }
   });
 
+  test('uses needs_user_input instead of needs_human_review when the reviewer returns a concrete blocking question', async () => {
+    const harness = await createTestHarness();
+
+    try {
+      const workspace = await harness.createWorkspace();
+      const settingsResp = await harness.bus.execute({
+        method: 'workspace.settings.update',
+        payload: {
+          workspaceId: workspace.id,
+          kbAccessMode: 'cli'
+        }
+      });
+      expect(settingsResp.ok).toBe(true);
+
+      const importResp = await harness.bus.execute({
+        method: 'pbiBatch.import',
+        payload: {
+          workspaceId: workspace.id,
+          sourceFileName: 'reviewer-question.csv',
+          sourceContent: 'Id,Title,Description\n1,Escalation workflow,Exercise reviewer-authored blocking question precedence'
+        }
+      });
+      expect(importResp.ok).toBe(true);
+      const batchId = (importResp.data as { batch: { id: string } }).batch.id;
+
+      const rowsResp = await harness.bus.execute({
+        method: 'pbiBatch.rows.list',
+        payload: {
+          workspaceId: workspace.id,
+          batchId
+        }
+      });
+      expect(rowsResp.ok).toBe(true);
+      const uploadedPbis = (rowsResp.data as { rows: Array<{ id: string }> }).rows;
+      const firstPbiId = uploadedPbis[0]?.id;
+      expect(firstPbiId).toBeTruthy();
+
+      const agentRuntime = harness.services.agentRuntime as any;
+      agentRuntime.checkHealth = async (workspaceId: string, selectedMode?: string, workspaceMode?: string) => ({
+        checkedAtUtc: new Date().toISOString(),
+        workspaceId,
+        workspaceKbAccessMode: workspaceMode ?? 'cli',
+        selectedMode: selectedMode ?? workspaceMode ?? 'cli',
+        providers: {
+          direct: {
+            mode: 'direct',
+            provider: 'direct',
+            ok: false,
+            message: 'Direct executor disabled for this test'
+          },
+          mcp: {
+            mode: 'mcp',
+            provider: 'mcp',
+            ok: true,
+            message: 'MCP access ready'
+          },
+          cli: {
+            mode: 'cli',
+            provider: 'cli',
+            ok: true,
+            message: 'CLI access ready'
+          }
+        },
+        issues: [],
+        availableModes: ['mcp', 'cli']
+      });
+      agentRuntime.getTranscripts = async ({ workspaceId, sessionId }: { workspaceId: string; sessionId: string }) => ({
+        workspaceId,
+        sessionId,
+        lines: []
+      });
+
+      const runRequests: Array<{ role?: string }> = [];
+      agentRuntime.runBatchAnalysis = async (request: {
+        agentRole?: string;
+        kbAccessMode?: string;
+      }) => {
+        runRequests.push({ role: request.agentRole });
+        const startedAtUtc = new Date().toISOString();
+        const payloadByRole: Record<string, unknown> = request.agentRole === 'planner'
+          ? {
+              text: JSON.stringify({
+                summary: 'Planner produced a draft plan without user-facing questions.',
+                coverage: [
+                  {
+                    pbiId: firstPbiId,
+                    outcome: 'covered',
+                    planItemIds: ['item-1']
+                  }
+                ],
+                items: [
+                  {
+                    planItemId: 'item-1',
+                    pbiIds: [firstPbiId],
+                    action: 'create',
+                    targetType: 'new_article',
+                    targetTitle: 'Escalation workflow article',
+                    reason: 'The planner proposed a net-new article.',
+                    evidence: [
+                      {
+                        kind: 'pbi',
+                        ref: `pbi:${firstPbiId}`,
+                        summary: 'Imported PBI is the main source of evidence.'
+                      }
+                    ],
+                    confidence: 0.88,
+                    executionStatus: 'pending'
+                  }
+                ],
+                questions: [],
+                openQuestions: []
+              })
+            }
+          : request.agentRole === 'plan-reviewer'
+            ? {
+                text: JSON.stringify({
+                  summary: 'Reviewer wants escalation, but only after one user scope answer.',
+                  verdict: 'needs_human_review',
+                  didAccountForEveryPbi: true,
+                  hasMissingCreates: false,
+                  hasMissingEdits: false,
+                  hasTargetIssues: false,
+                  hasOverlapOrConflict: false,
+                  foundAdditionalArticleWork: false,
+                  underScopedKbImpact: false,
+                  questions: [
+                    {
+                      id: 'reviewer-question-1',
+                      prompt: 'Should the escalation workflow article be included in this batch or explicitly deferred?',
+                      reason: 'Reviewer found a concrete scope decision that the user can answer directly.',
+                      requiresUserInput: true,
+                      status: 'pending',
+                      linkedPbiIds: [firstPbiId],
+                      linkedPlanItemIds: ['item-1'],
+                      linkedDiscoveryIds: []
+                    }
+                  ],
+                  delta: {
+                    summary: 'Waiting on a concrete scope decision.',
+                    requestedChanges: [],
+                    missingPbiIds: [],
+                    missingCreates: [],
+                    missingEdits: [],
+                    additionalArticleWork: [],
+                    targetCorrections: [],
+                    overlapConflicts: []
+                  }
+                })
+              }
+            : {
+                text: JSON.stringify({
+                  summary: 'This stage should not run in the blocking-question test.'
+                })
+              };
+
+        return {
+          sessionId: `${request.agentRole}-session`,
+          kbAccessMode: request.kbAccessMode ?? 'cli',
+          status: 'ok',
+          transcriptPath: '',
+          rawOutput: [],
+          resultPayload: payloadByRole,
+          finalText: typeof (payloadByRole as { text?: string }).text === 'string' ? (payloadByRole as { text: string }).text : undefined,
+          toolCalls: [],
+          startedAtUtc,
+          endedAtUtc: startedAtUtc,
+          durationMs: 1,
+          message: 'Completed'
+        };
+      };
+
+      const job = await harness.jobs.start('agent.analysis.run', {
+        workspaceId: workspace.id,
+        batchId
+      });
+      expect(job.state).toBe('FAILED');
+
+      const inspectionResp = await harness.bus.execute({
+        method: 'batch.analysis.inspection.get',
+        payload: { workspaceId: workspace.id, batchId }
+      });
+      expect(inspectionResp.ok).toBe(true);
+      const inspection = inspectionResp.data as {
+        snapshot: {
+          pausedForUserInput: boolean;
+          unansweredRequiredQuestionCount: number;
+          latestIteration?: { stage: string; status: string } | null;
+        };
+        reviews: Array<{ verdict: string }>;
+        questionSets: Array<{ resumeStage: string; status: string }>;
+        questions: Array<{ prompt: string; status: string }>;
+        stageRuns: Array<{ role: string }>;
+      };
+
+      expect(inspection.snapshot.pausedForUserInput).toBe(true);
+      expect(inspection.snapshot.unansweredRequiredQuestionCount).toBe(1);
+      expect(inspection.snapshot.latestIteration?.stage).toBe('awaiting_user_input');
+      expect(inspection.snapshot.latestIteration?.status).toBe('needs_user_input');
+      expect(inspection.reviews.some((review) => review.verdict === 'needs_user_input')).toBe(true);
+      expect(inspection.questionSets[0]?.resumeStage).toBe('plan_revision');
+      expect(inspection.questionSets[0]?.status).toBe('waiting');
+      expect(inspection.questions).toEqual([
+        expect.objectContaining({
+          prompt: 'Should the escalation workflow article be included in this batch or explicitly deferred?',
+          status: 'pending'
+        })
+      ]);
+      expect(inspection.stageRuns.some((run) => run.role === 'worker')).toBe(false);
+      expect(runRequests).toEqual([
+        { role: 'planner' },
+        { role: 'plan-reviewer' }
+      ]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   test('does not start worker when approved review still leaves unresolved PBI gap coverage', async () => {
     const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'kb-vault-batch-analysis-unresolved-gap-'));
     const logPath = path.join(isolatedRoot, 'batch-analysis-unresolved-gap.jsonl');

@@ -4570,8 +4570,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             liveActiveQuestionSetStatus = params.questionSet.status;
             livePausedForUserInput = true;
             liveUnansweredRequiredQuestionCount = params.questions.filter((question) => question.requiresUserInput
-                && question.status !== 'answered'
-                && question.status !== 'resolved').length;
+                && question.status === 'pending'
+                && !question.answer?.trim()).length;
             await logAnalysisProgress(params.logMessage, {
                 stage: 'awaiting_user_input',
                 role: params.role
@@ -5040,11 +5040,16 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                     message: 'Reviewing plan for missed creates, edits, and target issues...',
                     metadata: buildStreamMetadata()
                 });
+                const reviewCandidateQuestions = batchAnalysisOrchestrator.buildReviewCandidateQuestions({
+                    plan: draftPlan,
+                    plannerPrefetch
+                });
                 const reviewPrompt = batchAnalysisOrchestrator.buildPlanReviewerPrompt({
                     batchContext,
                     uploadedPbis,
                     plan: draftPlan,
-                    plannerPrefetch
+                    plannerPrefetch,
+                    candidateQuestions: reviewCandidateQuestions
                 });
                 let reviewResult = await agentRuntime.runBatchAnalysis({
                     ...input,
@@ -5184,6 +5189,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 const deterministicReviewGuard = batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard({
                     plan: draftPlan,
                     review,
+                    candidateQuestions: reviewCandidateQuestions,
                     plannerPrefetch,
                     unresolvedTargetIssues: normalizedDraftPlanResult.unresolvedTargetIssues,
                     unresolvedReferenceIssues: normalizedBatchReferences.unresolvedReferenceIssues
@@ -5849,6 +5855,12 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 const amendmentReviewSession = ensurePlanningSession('plan-reviewer');
                 streamMetadata.role = 'plan-reviewer';
                 liveSessionId = amendmentReviewSession.sessionId;
+                const amendmentReviewCandidateQuestions = batchAnalysisOrchestrator.buildReviewCandidateQuestions({
+                    plan: amendmentDraftPlan,
+                    plannerPrefetch,
+                    existingQuestions: activeApprovedPlan.questions ?? [],
+                    discoveredWork: discoveredForAmendment
+                });
                 const amendmentReviewResult = await agentRuntime.runBatchAnalysis({
                     ...input,
                     sessionId: amendmentReviewSession.sessionId,
@@ -5859,7 +5871,8 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                         batchContext,
                         uploadedPbis,
                         plan: amendmentDraftPlan,
-                        plannerPrefetch
+                        plannerPrefetch,
+                        candidateQuestions: amendmentReviewCandidateQuestions
                     })
                 }, (stream) => {
                     emit({
@@ -5949,6 +5962,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
                 const deterministicAmendmentReviewGuard = batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard({
                     plan: amendmentDraftPlan,
                     review: amendmentReview,
+                    candidateQuestions: amendmentReviewCandidateQuestions,
                     plannerPrefetch,
                     unresolvedTargetIssues: normalizedAmendmentDraftPlanResult.unresolvedTargetIssues,
                     unresolvedReferenceIssues: normalizedAmendmentBatchReferences.unresolvedReferenceIssues

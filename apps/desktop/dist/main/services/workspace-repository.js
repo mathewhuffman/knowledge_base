@@ -3647,8 +3647,8 @@ class WorkspaceRepository {
                     }
                     : question));
                 const unansweredRequiredQuestionCount = questions.filter((question) => question.requiresUserInput
-                    && question.status !== 'answered'
-                    && question.status !== 'resolved').length;
+                    && question.status === 'pending'
+                    && !question.answer?.trim()).length;
                 workspaceDb.exec('COMMIT');
                 return {
                     question: questions.find((question) => question.id === request.questionId),
@@ -3874,8 +3874,8 @@ class WorkspaceRepository {
                 ? this.listBatchAnalysisQuestionsFromDb(workspaceDb, workspaceId, batchId, activeQuestionSet.id)
                 : [];
             const unansweredRequiredQuestionCount = questions.filter((question) => question.requiresUserInput
-                && question.status !== 'answered'
-                && question.status !== 'resolved').length;
+                && question.status === 'pending'
+                && !question.answer?.trim()).length;
             const discoveredWork = workspaceDb.all(`SELECT payload_json as payloadJson,
                 status as status
            FROM batch_analysis_discovered_work
@@ -4163,8 +4163,8 @@ class WorkspaceRepository {
                 ? this.listBatchAnalysisQuestionsFromDb(workspaceDb, workspaceId, batchId, activeQuestionSet.id)
                 : [];
             const unansweredRequiredQuestionCount = questions.filter((question) => question.requiresUserInput
-                && question.status !== 'answered'
-                && question.status !== 'resolved').length;
+                && question.status === 'pending'
+                && !question.answer?.trim()).length;
             return {
                 workspaceId,
                 batchId,

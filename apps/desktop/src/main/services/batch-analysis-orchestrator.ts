@@ -47,6 +47,7 @@ export interface BatchFinalReviewerProposalContext {
 }
 
 interface BatchPlanExecutionValidation {
+  finalQuestions: BatchAnalysisQuestion[];
   ok: boolean;
   needsUserInput: boolean;
   blockingUserInputQuestions: BatchAnalysisQuestion[];
@@ -57,6 +58,21 @@ interface BatchPlanExecutionValidation {
   advisoryMissingEditTargets: string[];
   advisoryMissingCreateTargets: string[];
 }
+
+interface QuestionMergeMeta {
+  explicitAnswer?: boolean;
+  explicitAnsweredAtUtc?: boolean;
+  explicitId?: boolean;
+  explicitPrompt?: boolean;
+  explicitQuestionSetId?: boolean;
+  explicitReason?: boolean;
+  explicitRequiresUserInput?: boolean;
+  explicitStatus?: boolean;
+}
+
+type MergeableBatchAnalysisQuestion = BatchAnalysisQuestion & {
+  __mergeMeta?: QuestionMergeMeta;
+};
 
 export class BatchAnalysisOrchestrator {
   constructor(private readonly workspaceRepository: WorkspaceRepository) {}
@@ -825,6 +841,7 @@ export class BatchAnalysisOrchestrator {
     uploadedPbis: unknown;
     plan: BatchAnalysisPlan;
     plannerPrefetch?: BatchPlannerPrefetch;
+    candidateQuestions?: BatchAnalysisQuestion[];
   }): string {
     return [
       'Return only valid JSON.',
@@ -835,25 +852,122 @@ export class BatchAnalysisOrchestrator {
       'Also do not approve an edit-only or edit-heavy plan when deterministic search coverage shows a topic cluster with no meaningful existing article match and the plan never explains why net-new documentation is unnecessary.',
       'Treat `gap` or `blocked` coverage as unresolved scope. Do not approve a plan while any PBI still has unresolved coverage.',
       'A PBI satisfied by a net-new article create should still be marked `covered`, not `gap`.',
-      'If the plan contains unresolved questions that require a user scope or product decision, set verdict to `needs_user_input` and emit structured questions.',
-      'Use `needs_revision` instead when the reviewer can name concrete plan corrections the planner should make without user help.',
+      'Planner and deterministic questions are candidate questions, not automatically user-facing questions. You are the gatekeeper for whether any question should actually be surfaced to the user.',
+      'You may keep a candidate question pending, resolve it, dismiss it, rewrite it while preserving its `id`, or add a brand-new question even if the planner emitted none.',
+      'Omission alone does not dismiss or resolve a candidate question. If you want to clear a candidate question, return it with `status: "resolved"` or `status: "dismissed"`.',
+      'If the plan contains unresolved questions that require a user scope or product decision, set verdict to `needs_user_input` and return the final structured questions.',
+      'Prefer `needs_user_input` when a short user answer would safely unblock the planner.',
+      'Use `needs_revision` when the planner can fix the issue without user help.',
+      'Reserve `needs_human_review` for issues that cannot be reduced to concrete user-answerable questions.',
+      'If you return `needs_user_input`, include at least one final structured question with `requiresUserInput: true` and `status: "pending"`.',
       'Do not execute proposals or mutate KB content in this stage.',
       'JSON shape:',
-      '{"summary":string,"verdict":"approved"|"needs_revision"|"needs_user_input"|"needs_human_review","didAccountForEveryPbi":boolean,"hasMissingCreates":boolean,"hasMissingEdits":boolean,"hasTargetIssues":boolean,"hasOverlapOrConflict":boolean,"foundAdditionalArticleWork":boolean,"underScopedKbImpact":boolean,"delta":{"summary":string,"requestedChanges":string[],"missingPbiIds":string[],"missingCreates":string[],"missingEdits":string[],"additionalArticleWork":string[],"targetCorrections":string[],"overlapConflicts":string[]},"questions":[{"id"?:string,"prompt":string,"reason":string,"requiresUserInput":boolean,"linkedPbiIds":string[],"linkedPlanItemIds":string[],"linkedDiscoveryIds":string[]}]}',
+      '{"summary":string,"verdict":"approved"|"needs_revision"|"needs_user_input"|"needs_human_review","didAccountForEveryPbi":boolean,"hasMissingCreates":boolean,"hasMissingEdits":boolean,"hasTargetIssues":boolean,"hasOverlapOrConflict":boolean,"foundAdditionalArticleWork":boolean,"underScopedKbImpact":boolean,"delta":{"summary":string,"requestedChanges":string[],"missingPbiIds":string[],"missingCreates":string[],"missingEdits":string[],"additionalArticleWork":string[],"targetCorrections":string[],"overlapConflicts":string[]},"questions":[{"id"?:string,"prompt":string,"reason":string,"requiresUserInput":boolean,"status":"pending"|"answered"|"resolved"|"dismissed","linkedPbiIds":string[],"linkedPlanItemIds":string[],"linkedDiscoveryIds":string[]}]}',
       'Batch context summary:',
       JSON.stringify(compactBatchContextForPrompt(params.batchContext), null, 2),
       'Uploaded PBI summary:',
       JSON.stringify(compactUploadedPbisForPrompt(params.uploadedPbis), null, 2),
       params.plannerPrefetch ? `Deterministic planner prefetch:\n${JSON.stringify(compactPlannerPrefetchForPrompt(params.plannerPrefetch), null, 2)}` : '',
+      `Candidate questions for reviewer adjudication:\n${JSON.stringify((params.candidateQuestions ?? []).map((question) => compactPlanQuestionForPrompt(question)), null, 2)}`,
       'Submitted plan summary:',
       JSON.stringify(compactPlanForPrompt(params.plan), null, 2)
     ].join('\n\n');
+  }
+
+  buildReviewCandidateQuestions(params: {
+    plan: BatchAnalysisPlan;
+    plannerPrefetch?: BatchPlannerPrefetch;
+    existingQuestions?: BatchAnalysisQuestion[];
+    discoveredWork?: BatchDiscoveredWorkItem[];
+  }): BatchAnalysisQuestion[] {
+    const baseQuestions = mergeStructuredQuestions(
+      params.existingQuestions ?? [],
+      params.plan.questions ?? []
+    );
+    const existingPromptKeys = new Set(baseQuestions.map((question) => normalizeQuestionPromptKey(question.prompt)));
+    const deterministicQuestions = this.synthesizeDeterministicReviewCandidateQuestions({
+      plan: params.plan,
+      plannerPrefetch: params.plannerPrefetch,
+      discoveredWork: params.discoveredWork
+    }).filter((question) => !existingPromptKeys.has(normalizeQuestionPromptKey(question.prompt)));
+
+    return mergeStructuredQuestions(baseQuestions, deterministicQuestions);
+  }
+
+  private synthesizeDeterministicReviewCandidateQuestions(params: {
+    plan: BatchAnalysisPlan;
+    plannerPrefetch?: BatchPlannerPrefetch;
+    discoveredWork?: BatchDiscoveredWorkItem[];
+  }): BatchAnalysisQuestion[] {
+    if (!params.plannerPrefetch) {
+      return [];
+    }
+
+    const createdAtUtc = new Date().toISOString();
+    const assessments = collectDeterministicClusterCoverageAssessments({
+      plan: params.plan,
+      plannerPrefetch: params.plannerPrefetch,
+      normalizeTitle: (value) => this.normalizeTitle(value)
+    });
+
+    return mergeStructuredQuestions(
+      assessments.flatMap((assessment): BatchAnalysisQuestion[] => {
+        const linkedPlanItemIds = assessment.relatedPlanItems.map((item) => item.planItemId);
+        const linkedDiscoveryIds = collectLinkedDiscoveryIds({
+          discoveredWork: params.discoveredWork ?? [],
+          linkedPbiIds: assessment.pbiIds,
+          targetTitles: [assessment.displayTitle, ...assessment.strongArticleTitles],
+          normalizeTitle: (value) => this.normalizeTitle(value)
+        });
+        const deterministicQuestions: BatchAnalysisQuestion[] = [];
+
+        if (shouldSynthesizeIncludeOrDeferQuestion(assessment)) {
+          deterministicQuestions.push({
+            id: createDeterministicQuestionId('include-or-defer', assessment.clusterId, assessment.displayTitle),
+            prompt: `Should ${assessment.displayTitle} be included in this batch or explicitly deferred?`,
+            reason: assessment.hasStrongArticleSignal
+              ? `Deterministic review found plausible KB impact for ${assessment.displayTitle}, but the plan does not yet make an explicit include-versus-defer scope decision for this batch.`
+              : `Deterministic review found no meaningful existing article match for ${assessment.displayTitle}, so the reviewer should decide whether this clearly real work belongs in this batch or should be explicitly deferred.`,
+            requiresUserInput: true,
+            linkedPbiIds: assessment.pbiIds,
+            linkedPlanItemIds,
+            linkedDiscoveryIds,
+            status: 'pending',
+            createdAtUtc
+          });
+        }
+
+        if (shouldSynthesizeStandaloneVsFoldQuestion(assessment)) {
+          const existingArticleTitle = assessment.strongArticleTitles[0];
+          if (existingArticleTitle) {
+            deterministicQuestions.push({
+              id: createDeterministicQuestionId(
+                'standalone-vs-fold',
+                assessment.clusterId,
+                `${assessment.displayTitle}:${existingArticleTitle}`
+              ),
+              prompt: `Should ${assessment.displayTitle} be a standalone article or folded into ${existingArticleTitle}?`,
+              reason: `Deterministic review found both net-new article coverage and a strong existing article match (${existingArticleTitle}), so editorial intent should decide whether to create a standalone article or expand the existing article.`,
+              requiresUserInput: true,
+              linkedPbiIds: assessment.pbiIds,
+              linkedPlanItemIds,
+              linkedDiscoveryIds,
+              status: 'pending',
+              createdAtUtc
+            });
+          }
+        }
+
+        return deterministicQuestions;
+      })
+    );
   }
 
   private normalizeStructuredQuestions(params: {
     rawQuestions: unknown;
     legacyOpenQuestions?: unknown;
     sourceRole: 'planner' | 'plan-reviewer';
+    preserveMergeMeta?: boolean;
   }): BatchAnalysisQuestion[] {
     const createdAtUtc = new Date().toISOString();
     const structuredQuestions = Array.isArray(params.rawQuestions)
@@ -875,7 +989,7 @@ export class BatchAnalysisOrchestrator {
             ? humanizeReadableText(candidate.answer)
             : undefined;
           const status = normalizeQuestionStatus(candidate.status, answer);
-          return [{
+          const normalizedQuestion: MergeableBatchAnalysisQuestion = {
             id: typeof candidate.id === 'string' && candidate.id.trim() ? candidate.id.trim() : randomUUID(),
             questionSetId: typeof candidate.questionSetId === 'string' && candidate.questionSetId.trim()
               ? candidate.questionSetId.trim()
@@ -896,7 +1010,20 @@ export class BatchAnalysisOrchestrator {
             status,
             createdAtUtc: typeof candidate.createdAtUtc === 'string' ? candidate.createdAtUtc : createdAtUtc,
             answeredAtUtc: typeof candidate.answeredAtUtc === 'string' ? candidate.answeredAtUtc : undefined
-          }];
+          };
+          if (params.preserveMergeMeta) {
+            normalizedQuestion.__mergeMeta = {
+              explicitAnswer: hasOwn(candidate, 'answer'),
+              explicitAnsweredAtUtc: hasOwn(candidate, 'answeredAtUtc'),
+              explicitId: hasOwn(candidate, 'id'),
+              explicitPrompt: hasOwn(candidate, 'prompt'),
+              explicitQuestionSetId: hasOwn(candidate, 'questionSetId'),
+              explicitReason: hasOwn(candidate, 'reason'),
+              explicitRequiresUserInput: hasOwn(candidate, 'requiresUserInput'),
+              explicitStatus: hasOwn(candidate, 'status')
+            };
+          }
+          return [normalizedQuestion];
         })
       : [];
     if (structuredQuestions.length > 0) {
@@ -916,7 +1043,17 @@ export class BatchAnalysisOrchestrator {
             linkedPlanItemIds: [],
             linkedDiscoveryIds: [],
             status: 'pending' as const,
-            createdAtUtc
+            createdAtUtc,
+            ...(params.preserveMergeMeta
+              ? {
+                  __mergeMeta: {
+                    explicitPrompt: true,
+                    explicitReason: true,
+                    explicitRequiresUserInput: true,
+                    explicitStatus: true
+                  }
+                }
+              : {})
           }))
       : [];
     return mergeStructuredQuestions(legacyQuestions);
@@ -997,7 +1134,8 @@ export class BatchAnalysisOrchestrator {
         : 'needs_revision';
     const questions = this.normalizeStructuredQuestions({
       rawQuestions: parsed.questions,
-      sourceRole: 'plan-reviewer'
+      sourceRole: 'plan-reviewer',
+      preserveMergeMeta: true
     });
     return {
       id: randomUUID(),
@@ -1030,11 +1168,16 @@ export class BatchAnalysisOrchestrator {
   validatePlanForExecution(params: {
     plan: BatchAnalysisPlan;
     review: BatchPlanReview;
+    candidateQuestions?: BatchAnalysisQuestion[];
     plannerPrefetch?: BatchPlannerPrefetch;
     unresolvedTargetIssues?: string[];
     unresolvedReferenceIssues?: string[];
   }): BatchPlanExecutionValidation {
-    const blockingUserInputQuestions = collectBlockingUserInputQuestions(params.plan, params.review);
+    const finalQuestions = mergeStructuredQuestions(
+      params.candidateQuestions ?? params.plan.questions ?? [],
+      params.review.questions ?? []
+    );
+    const blockingUserInputQuestions = collectBlockingUserInputQuestions(finalQuestions);
     const invalidCoverageReasons = this.validateApprovedPlan(params.plan).reasons;
     const conflictingTargets = this.findDeterministicTargetConflicts(params.plan);
     const unresolvedTargetIssues = dedupePlanReviewStrings(params.unresolvedTargetIssues ?? []).slice(0, 20);
@@ -1048,6 +1191,7 @@ export class BatchAnalysisOrchestrator {
       || unresolvedReferenceIssues.length > 0;
 
     return {
+      finalQuestions,
       ok: blockingUserInputQuestions.length === 0 && !hasObjectiveBlockingIssues,
       needsUserInput: blockingUserInputQuestions.length > 0,
       blockingUserInputQuestions,
@@ -1063,6 +1207,7 @@ export class BatchAnalysisOrchestrator {
   applyDeterministicPlanReviewGuard(params: {
     plan: BatchAnalysisPlan;
     review: BatchPlanReview;
+    candidateQuestions?: BatchAnalysisQuestion[];
     plannerPrefetch?: BatchPlannerPrefetch;
     unresolvedTargetIssues?: string[];
     unresolvedReferenceIssues?: string[];
@@ -1075,15 +1220,86 @@ export class BatchAnalysisOrchestrator {
     missingCreateTargets: string[];
     conflictingTargets: string[];
     unresolvedTargetIssues: string[];
-    unresolvedReferenceIssues: string[];
+      unresolvedReferenceIssues: string[];
   } {
     const validation = this.validatePlanForExecution(params);
     const missingEditTargets = validation.advisoryMissingEditTargets;
     const missingCreateTargets = validation.advisoryMissingCreateTargets;
+    const hadBlockingQuestions = validation.blockingUserInputQuestions.length > 0;
+    const malformedNeedsUserInput =
+      params.review.verdict === 'needs_user_input'
+      && validation.blockingUserInputQuestions.length === 0;
 
-    if (validation.ok || params.review.verdict === 'needs_human_review') {
+    if (hadBlockingQuestions) {
+      const issueSummaries: string[] = [
+        `waiting on ${validation.blockingUserInputQuestions.length} reviewer-approved required user answer(s)`
+      ];
+      const requestedChanges = [
+        ...(params.review.delta?.requestedChanges ?? []),
+        `Pause for user input and re-plan after answers are provided: ${validation.blockingUserInputQuestions.map((question) => question.prompt).join('; ')}`
+      ];
+      if (params.review.verdict === 'needs_human_review') {
+        issueSummaries.push('reviewer escalation retained after user-answerable questions are resolved');
+        requestedChanges.push(
+          'Reviewer requested human review, but deterministic validation found concrete user-answerable blocking questions that should be resolved first.'
+        );
+      }
+
       return {
-        review: params.review,
+        review: {
+          ...params.review,
+          verdict: 'needs_user_input',
+          summary: params.review.verdict === 'needs_user_input'
+            ? params.review.summary
+            : `Deterministic review found concrete user-answerable blocking questions: ${issueSummaries.join('; ')}.`,
+          questions: validation.finalQuestions,
+          delta: mergePlanReviewDelta(params.review.delta, {
+            summary: params.review.verdict === 'needs_human_review'
+              ? 'Reviewer escalated, but deterministic validation found concrete user-answerable questions that should be answered first.'
+              : 'Deterministic validation confirmed the final reviewer-approved blocking questions that require user input.',
+            requestedChanges,
+            targetCorrections: [],
+            overlapConflicts: [],
+            additionalArticleWork: [],
+            missingPbiIds: [],
+            missingCreates: [],
+            missingEdits: []
+          })
+        },
+        forcedRevision: false,
+        blockingUserInputQuestions: validation.blockingUserInputQuestions,
+        invalidCoverageReasons: validation.invalidCoverageReasons,
+        missingEditTargets,
+        missingCreateTargets,
+        conflictingTargets: validation.conflictingTargets,
+        unresolvedTargetIssues: validation.unresolvedTargetIssues,
+        unresolvedReferenceIssues: validation.unresolvedReferenceIssues
+      };
+    }
+
+    if (validation.ok && !malformedNeedsUserInput) {
+      return {
+        review: {
+          ...params.review,
+          questions: validation.finalQuestions
+        },
+        forcedRevision: false,
+        blockingUserInputQuestions: validation.blockingUserInputQuestions,
+        invalidCoverageReasons: validation.invalidCoverageReasons,
+        missingEditTargets,
+        missingCreateTargets,
+        conflictingTargets: validation.conflictingTargets,
+        unresolvedTargetIssues: validation.unresolvedTargetIssues,
+        unresolvedReferenceIssues: validation.unresolvedReferenceIssues
+      };
+    }
+
+    if (params.review.verdict === 'needs_human_review') {
+      return {
+        review: {
+          ...params.review,
+          questions: validation.finalQuestions
+        },
         forcedRevision: false,
         blockingUserInputQuestions: validation.blockingUserInputQuestions,
         invalidCoverageReasons: validation.invalidCoverageReasons,
@@ -1110,11 +1326,11 @@ export class BatchAnalysisOrchestrator {
     const targetCorrections = [...existingDelta.targetCorrections];
     const overlapConflicts = [...existingDelta.overlapConflicts];
     const issueSummaries: string[] = [];
-
-    if (validation.blockingUserInputQuestions.length > 0) {
-      const promptsSummary = validation.blockingUserInputQuestions.map((question) => question.prompt).join('; ');
-      issueSummaries.push(`waiting on ${validation.blockingUserInputQuestions.length} required user answer(s)`);
-      requestedChanges.push(`Pause for user input and re-plan after answers are provided: ${promptsSummary}`);
+    if (malformedNeedsUserInput) {
+      issueSummaries.push('reviewer requested user input without returning any final pending required questions');
+      requestedChanges.push(
+        'Return at least one final pending required structured question when using needs_user_input, or switch the verdict to needs_revision/needs_human_review.'
+      );
     }
 
     if (validation.invalidCoverageReasons.length > 0) {
@@ -1143,14 +1359,18 @@ export class BatchAnalysisOrchestrator {
     }
 
     const summaryText = issueSummaries.join('; ');
-    const forcedRevision = !validation.needsUserInput && params.review.verdict === 'approved';
-    const forcedNeedsUserInput = validation.needsUserInput;
+    const forcedRevision =
+      params.review.verdict === 'approved'
+      && (validation.invalidCoverageReasons.length > 0
+        || validation.conflictingTargets.length > 0
+        || validation.unresolvedTargetIssues.length > 0
+        || validation.unresolvedReferenceIssues.length > 0);
 
     return {
       review: {
         ...params.review,
-        verdict: forcedNeedsUserInput ? 'needs_user_input' : 'needs_revision',
-        summary: (forcedRevision || forcedNeedsUserInput)
+        verdict: 'needs_revision',
+        summary: (forcedRevision || malformedNeedsUserInput)
           ? `Deterministic review found ${summaryText}.`
           : params.review.summary,
         hasMissingCreates: params.review.hasMissingCreates,
@@ -1159,7 +1379,7 @@ export class BatchAnalysisOrchestrator {
         hasOverlapOrConflict: params.review.hasOverlapOrConflict || validation.conflictingTargets.length > 0,
         foundAdditionalArticleWork: params.review.foundAdditionalArticleWork || validation.invalidCoverageReasons.length > 0,
         underScopedKbImpact: params.review.underScopedKbImpact || validation.invalidCoverageReasons.length > 0,
-        questions: mergeStructuredQuestions(params.plan.questions ?? [], params.review.questions ?? []),
+        questions: validation.finalQuestions,
         delta: {
           summary: existingDelta.summary?.trim()
             ? existingDelta.summary
@@ -2394,6 +2614,35 @@ function humanizePlanReviewDelta(delta: BatchPlanReviewDelta): BatchPlanReviewDe
   };
 }
 
+function mergePlanReviewDelta(
+  existing: BatchPlanReviewDelta | undefined,
+  incoming: BatchPlanReviewDelta
+): BatchPlanReviewDelta {
+  const baseline: BatchPlanReviewDelta = existing ?? {
+    summary: '',
+    requestedChanges: [],
+    missingPbiIds: [],
+    missingCreates: [],
+    missingEdits: [],
+    additionalArticleWork: [],
+    targetCorrections: [],
+    overlapConflicts: []
+  };
+
+  return {
+    summary: incoming.summary?.trim()
+      ? humanizeReadableText(incoming.summary)
+      : baseline.summary,
+    requestedChanges: dedupePlanReviewStrings([...baseline.requestedChanges, ...incoming.requestedChanges]).slice(0, 20),
+    missingPbiIds: dedupePlanReviewStrings([...baseline.missingPbiIds, ...incoming.missingPbiIds]).slice(0, 20),
+    missingCreates: dedupePlanReviewStrings([...baseline.missingCreates, ...incoming.missingCreates]).slice(0, 20),
+    missingEdits: dedupePlanReviewStrings([...baseline.missingEdits, ...incoming.missingEdits]).slice(0, 20),
+    additionalArticleWork: dedupePlanReviewStrings([...baseline.additionalArticleWork, ...incoming.additionalArticleWork]).slice(0, 20),
+    targetCorrections: dedupePlanReviewStrings([...baseline.targetCorrections, ...incoming.targetCorrections]).slice(0, 20),
+    overlapConflicts: dedupePlanReviewStrings([...baseline.overlapConflicts, ...incoming.overlapConflicts]).slice(0, 20)
+  };
+}
+
 function dedupePlanReviewStrings(values: string[]): string[] {
   return Array.from(
     new Set(
@@ -2411,7 +2660,9 @@ interface DeterministicTargetSignal {
 }
 
 interface DeterministicClusterCoverageAssessment {
+  clusterId: string;
   displayTitle: string;
+  pbiIds: string[];
   relatedPlanItems: BatchPlanItem[];
   hasCreateCoverage: boolean;
   hasStrongArticleSignal: boolean;
@@ -2464,7 +2715,9 @@ function collectDeterministicClusterCoverageAssessments(params: {
       const hasNonZeroSearchHit = clusterMatches.some((match) => (match.total ?? 0) > 0 || (match.topResults?.length ?? 0) > 0);
 
       return {
+        clusterId: cluster.clusterId,
         displayTitle: humanizeReadableText(cluster.label || cluster.sampleTitles[0] || cluster.queries[0] || `Cluster ${cluster.clusterId}`),
+        pbiIds: cluster.pbiIds.map((pbiId) => pbiId.trim()).filter(Boolean),
         relatedPlanItems,
         hasCreateCoverage: relatedPlanItems.some((item) => item.action === 'create'),
         hasStrongArticleSignal: strongArticleSignals.length > 0,
@@ -2574,6 +2827,65 @@ function isStrongExistingArticleMatch(candidate: BatchPlannerArticleMatch['topRe
   return matchContext === 'title' || matchContext === 'metadata' || score >= 0.18;
 }
 
+function shouldSynthesizeIncludeOrDeferQuestion(assessment: DeterministicClusterCoverageAssessment): boolean {
+  const hasOnlyNonDecisiveCoverage =
+    assessment.relatedPlanItems.length === 0
+    || assessment.relatedPlanItems.every((item) => item.action === 'no_impact');
+  const hasConcreteCoverageSignal =
+    assessment.hasStrongArticleSignal
+    || (assessment.hasSearchCoverage && !assessment.hasNonZeroSearchHit);
+
+  return hasOnlyNonDecisiveCoverage && hasConcreteCoverageSignal;
+}
+
+function shouldSynthesizeStandaloneVsFoldQuestion(assessment: DeterministicClusterCoverageAssessment): boolean {
+  return assessment.hasCreateCoverage
+    && assessment.relatedPlanItems.length > 0
+    && assessment.relatedPlanItems.every((item) => item.action === 'create')
+    && assessment.hasStrongArticleSignal
+    && !assessment.hasStrongArticleCoverage
+    && assessment.strongArticleTitles.length === 1;
+}
+
+function createDeterministicQuestionId(kind: string, clusterId: string, title: string): string {
+  const normalizedTitle = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  return `deterministic-${kind}-${clusterId}-${normalizedTitle || 'question'}`;
+}
+
+function collectLinkedDiscoveryIds(params: {
+  discoveredWork: BatchDiscoveredWorkItem[];
+  linkedPbiIds: string[];
+  targetTitles: string[];
+  normalizeTitle: (value: string) => string;
+}): string[] {
+  if (params.discoveredWork.length === 0) {
+    return [];
+  }
+
+  const linkedPbiIds = new Set(params.linkedPbiIds.map((pbiId) => pbiId.trim()).filter(Boolean));
+  const targetTitleKeys = new Set(
+    params.targetTitles
+      .map((title) => title.trim())
+      .filter(Boolean)
+      .map((title) => params.normalizeTitle(title))
+  );
+
+  return dedupeIdList(
+    params.discoveredWork
+      .filter((item) => item.requiresPlanAmendment !== false)
+      .filter((item) =>
+        item.linkedPbiIds.some((pbiId) => linkedPbiIds.has(pbiId.trim()))
+        || targetTitleKeys.has(params.normalizeTitle(item.suspectedTarget))
+      )
+      .map((item) => item.discoveryId)
+  );
+}
+
 function applyTextualTargetReplacementsToPlan(params: {
   plan: BatchAnalysisPlan;
   replacements: Array<{ from: string; to: string }>;
@@ -2629,6 +2941,10 @@ function normalizeQuestionStatus(rawStatus: unknown, answer?: string): BatchAnal
   return answer ? 'answered' : 'pending';
 }
 
+function hasOwn(candidate: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(candidate, key);
+}
+
 function serializeOpenQuestionPrompts(questions: BatchAnalysisQuestion[], legacyOpenQuestions?: unknown): string[] {
   const prompts = questions
     .map((question) => question.prompt?.trim())
@@ -2640,40 +2956,123 @@ function serializeOpenQuestionPrompts(questions: BatchAnalysisQuestion[], legacy
 }
 
 function mergeStructuredQuestions(...questionGroups: BatchAnalysisQuestion[][]): BatchAnalysisQuestion[] {
-  const merged = new Map<string, BatchAnalysisQuestion>();
+  const merged = new Map<string, MergeableBatchAnalysisQuestion>();
+  const legacyKeys = new Map<string, string>();
+
   for (const question of questionGroups.flat()) {
-    const key = `${question.prompt.trim().toLowerCase()}|${question.reason.trim().toLowerCase()}|${question.requiresUserInput ? 'required' : 'optional'}`;
+    const mergeableQuestion = question as MergeableBatchAnalysisQuestion;
+    const questionId = typeof mergeableQuestion.id === 'string' && mergeableQuestion.id.trim()
+      ? mergeableQuestion.id.trim()
+      : '';
+    const legacyKey = questionId ? normalizeQuestionLegacyKey(mergeableQuestion) : normalizeQuestionLegacyKey(mergeableQuestion);
+    const key = questionId
+      ? `id:${questionId}`
+      : legacyKeys.get(legacyKey) ?? `legacy:${legacyKey}`;
     const existing = merged.get(key);
     if (!existing) {
-      merged.set(key, {
-        ...question,
-        linkedPbiIds: Array.from(new Set(question.linkedPbiIds ?? [])),
-        linkedPlanItemIds: Array.from(new Set(question.linkedPlanItemIds ?? [])),
-        linkedDiscoveryIds: Array.from(new Set(question.linkedDiscoveryIds ?? []))
-      });
+      const normalizedQuestion = normalizeQuestionForMerge(mergeableQuestion);
+      merged.set(key, normalizedQuestion);
+      legacyKeys.set(normalizeQuestionLegacyKey(normalizedQuestion), key);
       continue;
     }
-    merged.set(key, {
-      ...existing,
-      answer: existing.answer ?? question.answer,
-      answeredAtUtc: existing.answeredAtUtc ?? question.answeredAtUtc,
-      status: existing.status === 'resolved' ? existing.status : question.status,
-      linkedPbiIds: Array.from(new Set([...(existing.linkedPbiIds ?? []), ...(question.linkedPbiIds ?? [])])),
-      linkedPlanItemIds: Array.from(new Set([...(existing.linkedPlanItemIds ?? []), ...(question.linkedPlanItemIds ?? [])])),
-      linkedDiscoveryIds: Array.from(new Set([...(existing.linkedDiscoveryIds ?? []), ...(question.linkedDiscoveryIds ?? [])]))
-    });
+    const mergedQuestion = mergeTwoStructuredQuestions(existing, mergeableQuestion);
+    merged.set(key, mergedQuestion);
+    legacyKeys.set(normalizeQuestionLegacyKey(mergedQuestion), key);
   }
-  return Array.from(merged.values());
+  return Array.from(merged.values()).map(stripQuestionMergeMeta);
 }
 
-function collectBlockingUserInputQuestions(plan: BatchAnalysisPlan, review: BatchPlanReview): BatchAnalysisQuestion[] {
-  return mergeStructuredQuestions(plan.questions ?? [], review.questions ?? [])
-    .filter((question) =>
-      question.requiresUserInput
-      && question.status !== 'answered'
-      && question.status !== 'resolved'
-      && !question.answer?.trim()
-    );
+function collectBlockingUserInputQuestions(...questionGroups: BatchAnalysisQuestion[][]): BatchAnalysisQuestion[] {
+  return mergeStructuredQuestions(...questionGroups)
+    .filter((question) => isPendingRequiredUserInputQuestion(question));
+}
+
+function normalizeQuestionForMerge(question: MergeableBatchAnalysisQuestion): MergeableBatchAnalysisQuestion {
+  return {
+    ...question,
+    linkedPbiIds: dedupeIdList(question.linkedPbiIds),
+    linkedPlanItemIds: dedupeIdList(question.linkedPlanItemIds),
+    linkedDiscoveryIds: dedupeIdList(question.linkedDiscoveryIds)
+  };
+}
+
+function mergeTwoStructuredQuestions(
+  existing: MergeableBatchAnalysisQuestion,
+  incoming: MergeableBatchAnalysisQuestion
+): MergeableBatchAnalysisQuestion {
+  const merged: MergeableBatchAnalysisQuestion = {
+    ...existing,
+    id: existing.id?.trim() ? existing.id : incoming.id,
+    questionSetId: shouldUseIncomingQuestionField(incoming, 'explicitQuestionSetId') && incoming.questionSetId?.trim()
+      ? incoming.questionSetId.trim()
+      : existing.questionSetId,
+    prompt: shouldUseIncomingQuestionField(incoming, 'explicitPrompt') && incoming.prompt?.trim()
+      ? incoming.prompt
+      : existing.prompt,
+    reason: shouldUseIncomingQuestionField(incoming, 'explicitReason') && incoming.reason?.trim()
+      ? incoming.reason
+      : existing.reason,
+    requiresUserInput: shouldUseIncomingQuestionField(incoming, 'explicitRequiresUserInput')
+      ? incoming.requiresUserInput
+      : existing.requiresUserInput,
+    linkedPbiIds: dedupeIdList([...(existing.linkedPbiIds ?? []), ...(incoming.linkedPbiIds ?? [])]),
+    linkedPlanItemIds: dedupeIdList([...(existing.linkedPlanItemIds ?? []), ...(incoming.linkedPlanItemIds ?? [])]),
+    linkedDiscoveryIds: dedupeIdList([...(existing.linkedDiscoveryIds ?? []), ...(incoming.linkedDiscoveryIds ?? [])]),
+    answer: shouldUseIncomingQuestionField(incoming, 'explicitAnswer')
+      ? incoming.answer
+      : existing.answer,
+    answeredAtUtc: shouldUseIncomingQuestionField(incoming, 'explicitAnsweredAtUtc') && incoming.answeredAtUtc
+      ? incoming.answeredAtUtc
+      : shouldUseIncomingQuestionField(incoming, 'explicitAnswer') && incoming.answer?.trim()
+        ? incoming.answeredAtUtc ?? existing.answeredAtUtc
+        : existing.answeredAtUtc,
+    status: shouldUseIncomingQuestionField(incoming, 'explicitStatus') || shouldUseIncomingQuestionField(incoming, 'explicitAnswer')
+      ? incoming.status
+      : existing.status,
+    createdAtUtc: existing.createdAtUtc ?? incoming.createdAtUtc,
+    __mergeMeta: existing.__mergeMeta ?? incoming.__mergeMeta
+  };
+
+  return normalizeQuestionForMerge(merged);
+}
+
+function shouldUseIncomingQuestionField(
+  question: MergeableBatchAnalysisQuestion,
+  field: keyof QuestionMergeMeta
+): boolean {
+  if (!question.__mergeMeta) {
+    return true;
+  }
+  return Boolean(question.__mergeMeta[field]);
+}
+
+function stripQuestionMergeMeta(question: MergeableBatchAnalysisQuestion): BatchAnalysisQuestion {
+  const { __mergeMeta: _ignored, ...normalizedQuestion } = question;
+  return normalizedQuestion;
+}
+
+function normalizeQuestionLegacyKey(question: Pick<BatchAnalysisQuestion, 'prompt' | 'reason'>): string {
+  return `${normalizeQuestionPromptKey(question.prompt)}|${normalizeQuestionPromptKey(question.reason)}`;
+}
+
+function normalizeQuestionPromptKey(value: string): string {
+  return humanizeReadableText(value).trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function dedupeIdList(values: string[] | undefined): string[] {
+  return Array.from(
+    new Set(
+      (values ?? [])
+        .map((value) => value.trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function isPendingRequiredUserInputQuestion(question: BatchAnalysisQuestion): boolean {
+  return question.requiresUserInput
+    && question.status === 'pending'
+    && !question.answer?.trim();
 }
 
 function normalizePlanCoverage(item: BatchPlanCoverage): BatchPlanCoverage {

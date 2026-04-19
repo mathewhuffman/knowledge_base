@@ -84,6 +84,22 @@ function formatDate(utc) {
         return utc;
     }
 }
+function detectImportFormat(fileName) {
+    const normalized = fileName.trim().toLowerCase();
+    if (normalized.endsWith('.csv')) {
+        return 'csv';
+    }
+    if (normalized.endsWith('.html') || normalized.endsWith('.htm')) {
+        return 'html';
+    }
+    return null;
+}
+function hasDraggedFiles(dataTransfer) {
+    if (!dataTransfer) {
+        return false;
+    }
+    return Array.from(dataTransfer.types ?? []).includes('Files');
+}
 function recommendWorkerStageBudgetMinutes(scopedCount) {
     if (scopedCount >= 100) {
         return 60;
@@ -166,7 +182,10 @@ export const PBI = () => {
     const sessionListQuery = useIpc('agent.session.list');
     const fileInputRef = useRef(null);
     const jobStateByIdRef = useRef({});
+    const wizardRef = useRef(WIZARD_INITIAL);
+    const fileDragDepthRef = useRef(0);
     const [wizard, setWizard] = useState(WIZARD_INITIAL);
+    const [fileDragActive, setFileDragActive] = useState(false);
     const [batchToDelete, setBatchToDelete] = useState(null);
     const [deletingBatchId, setDeletingBatchId] = useState(null);
     const [deleteBatchError, setDeleteBatchError] = useState(null);
@@ -193,6 +212,9 @@ export const PBI = () => {
             setCachedSessions(sessionListQuery.data.sessions);
         }
     }, [sessionListQuery.data]);
+    useEffect(() => {
+        wizardRef.current = wizard;
+    }, [wizard]);
     // Fetch batch list on mount
     useEffect(() => {
         if (activeWorkspace) {
@@ -300,7 +322,14 @@ export const PBI = () => {
         setAnalysisAutoRun(false);
         setWizard({ ...WIZARD_INITIAL, open: true });
     }, []);
+    const openWizardForFileDrag = useCallback(() => {
+        setAnalysisBatch(null);
+        setAnalysisAutoRun(false);
+        setWizard((current) => (current.open ? current : { ...WIZARD_INITIAL, open: true }));
+    }, []);
     const closeWizard = useCallback(() => {
+        fileDragDepthRef.current = 0;
+        setFileDragActive(false);
         setWizard(WIZARD_INITIAL);
         // Refresh batch list after close
         if (activeWorkspace) {
@@ -457,12 +486,26 @@ export const PBI = () => {
     const handleFileSelect = useCallback(async (file) => {
         if (!activeWorkspace)
             return;
-        setWizard((s) => ({ ...s, importing: true, importError: null }));
+        const format = detectImportFormat(file.name);
+        if (!format) {
+            setWizard((s) => ({
+                ...s,
+                open: true,
+                step: 'upload',
+                importing: false,
+                importError: 'Unsupported file type. Please drop a CSV or HTML export.',
+            }));
+            return;
+        }
+        setWizard((s) => ({
+            ...s,
+            open: true,
+            step: 'upload',
+            importing: true,
+            importError: null,
+        }));
         try {
             const content = await file.text();
-            const format = file.name.toLowerCase().endsWith('.html') || file.name.toLowerCase().endsWith('.htm')
-                ? 'html'
-                : 'csv';
             const res = await window.kbv.invoke('pbiBatch.import', {
                 workspaceId: activeWorkspace.id,
                 sourceFileName: file.name,
@@ -501,13 +544,55 @@ export const PBI = () => {
         // Reset input value so the same file can be re-selected
         e.target.value = '';
     }, [handleFileSelect]);
-    const handleDrop = useCallback((e) => {
-        e.preventDefault();
-        const file = e.dataTransfer.files[0];
+    const handlePageDragEnter = useCallback((event) => {
+        if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+            return;
+        }
+        event.preventDefault();
+        fileDragDepthRef.current += 1;
+        setFileDragActive(true);
+        if (!wizardRef.current.open) {
+            openWizardForFileDrag();
+        }
+    }, [activeWorkspace, openWizardForFileDrag]);
+    const handlePageDragOver = useCallback((event) => {
+        if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+            return;
+        }
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'copy';
+        if (!fileDragActive) {
+            setFileDragActive(true);
+        }
+        if (!wizardRef.current.open) {
+            openWizardForFileDrag();
+        }
+    }, [activeWorkspace, fileDragActive, openWizardForFileDrag]);
+    const handlePageDragLeave = useCallback((event) => {
+        if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+            return;
+        }
+        event.preventDefault();
+        fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+        if (fileDragDepthRef.current === 0) {
+            setFileDragActive(false);
+        }
+    }, [activeWorkspace]);
+    const handlePageDrop = useCallback((event) => {
+        if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+            return;
+        }
+        event.preventDefault();
+        fileDragDepthRef.current = 0;
+        setFileDragActive(false);
+        if (wizardRef.current.step !== 'upload') {
+            return;
+        }
+        const file = event.dataTransfer.files[0];
         if (file) {
             void handleFileSelect(file);
         }
-    }, [handleFileSelect]);
+    }, [activeWorkspace, handleFileSelect]);
     // ---- Scope step ----
     const handleScopeSet = useCallback(async () => {
         if (!activeWorkspace || !wizard.importResult)
@@ -632,7 +717,7 @@ export const PBI = () => {
     const renderWizardContent = () => {
         switch (wizard.step) {
             case 'upload':
-                return (_jsxs(_Fragment, { children: [wizard.importError && (_jsxs("div", { className: "preflight-warning-banner", style: { marginBottom: 'var(--space-4)' }, children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("span", { children: wizard.importError })] })), wizard.importing ? (_jsx(LoadingState, { message: "Parsing file..." })) : (_jsxs("div", { className: "upload-zone", onClick: () => fileInputRef.current?.click(), onDragOver: (e) => e.preventDefault(), onDrop: handleDrop, role: "button", tabIndex: 0, onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ')
+                return (_jsxs(_Fragment, { children: [wizard.importError && (_jsxs("div", { className: "preflight-warning-banner", style: { marginBottom: 'var(--space-4)' }, children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("span", { children: wizard.importError })] })), wizard.importing ? (_jsx(LoadingState, { message: "Parsing file..." })) : (_jsxs("div", { className: `upload-zone${fileDragActive ? ' drag-over' : ''}`, onClick: () => fileInputRef.current?.click(), onDragOver: (e) => e.preventDefault(), role: "button", tabIndex: 0, onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ')
                                 fileInputRef.current?.click(); }, children: [_jsx(IconUpload, { size: 32, className: "upload-zone-icon" }), _jsx("div", { className: "upload-zone-title", children: "Drop a CSV or HTML file here" }), _jsx("div", { className: "upload-zone-hint", children: "or click to browse. Accepts Azure DevOps exports in CSV or HTML table format." })] })), _jsx("input", { ref: fileInputRef, type: "file", accept: ".csv,.html,.htm", style: { display: 'none' }, onChange: handleFileInputChange })] }));
             case 'summary':
                 if (!wizard.importResult)
@@ -685,7 +770,7 @@ export const PBI = () => {
     if (!activeWorkspace) {
         return (_jsxs(_Fragment, { children: [_jsx(PageHeader, { title: "PBI Batches", subtitle: "No workspace selected" }), _jsx("div", { className: "route-content", children: _jsx(EmptyState, { icon: _jsx(IconUpload, { size: 48 }), title: "No workspace open", description: "Open or create a workspace to import PBI batches." }) })] }));
     }
-    return (_jsxs(_Fragment, { children: [_jsx(PageHeader, { title: "PBI Batches", subtitle: "Import and analyze bulk product backlog items", actions: _jsxs("button", { className: "btn btn-primary", onClick: openWizard, children: [_jsx(IconPlus, { size: 14 }), "Import Batch"] }) }), _jsx("div", { className: "route-content", children: batchListQuery.loading ? (_jsx(LoadingState, { message: "Loading batches..." })) : batchListQuery.error ? (_jsx(ErrorState, { title: "Failed to load batches", description: batchListQuery.error, action: _jsx("button", { className: "btn btn-primary", onClick: () => batchListQuery.execute({ workspaceId: activeWorkspace.id }), children: "Retry" }) })) : batches.length === 0 ? (_jsx(EmptyState, { icon: _jsx(IconUpload, { size: 48 }), title: "No batches imported", description: "Upload a CSV or HTML export from Azure DevOps to start analyzing product backlog items against your KB articles.", action: _jsxs("button", { className: "btn btn-primary", onClick: openWizard, children: [_jsx(IconPlus, { size: 14 }), "Import CSV"] }) })) : (_jsx("div", { className: "table-wrapper", children: _jsxs("table", { className: "table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Batch" }), _jsx("th", { children: "Imported" }), _jsx("th", { children: "Rows" }), _jsx("th", { children: "Candidates" }), _jsx("th", { children: "Scoped" }), _jsx("th", { children: "Status" }), _jsx("th", { children: "Actions" })] }) }), _jsx("tbody", { children: batches.map((b) => {
+    return (_jsxs("div", { className: `pbi-batches-page${fileDragActive ? ' pbi-batches-page--dragging' : ''}`, onDragEnterCapture: handlePageDragEnter, onDragOverCapture: handlePageDragOver, onDragLeaveCapture: handlePageDragLeave, onDropCapture: handlePageDrop, children: [_jsx(PageHeader, { title: "PBI Batches", subtitle: "Import and analyze bulk product backlog items", actions: _jsxs("button", { className: "btn btn-primary", onClick: openWizard, children: [_jsx(IconPlus, { size: 14 }), "Import Batch"] }) }), _jsx("div", { className: "route-content", children: batchListQuery.loading ? (_jsx(LoadingState, { message: "Loading batches..." })) : batchListQuery.error ? (_jsx(ErrorState, { title: "Failed to load batches", description: batchListQuery.error, action: _jsx("button", { className: "btn btn-primary", onClick: () => batchListQuery.execute({ workspaceId: activeWorkspace.id }), children: "Retry" }) })) : batches.length === 0 ? (_jsx(EmptyState, { icon: _jsx(IconUpload, { size: 48 }), title: "No batches imported", description: "Upload a CSV or HTML export from Azure DevOps to start analyzing product backlog items against your KB articles.", action: _jsxs("button", { className: "btn btn-primary", onClick: openWizard, children: [_jsx(IconPlus, { size: 14 }), "Import CSV"] }) })) : (_jsx("div", { className: "table-wrapper", children: _jsxs("table", { className: "table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Batch" }), _jsx("th", { children: "Imported" }), _jsx("th", { children: "Rows" }), _jsx("th", { children: "Candidates" }), _jsx("th", { children: "Scoped" }), _jsx("th", { children: "Status" }), _jsx("th", { children: "Actions" })] }) }), _jsx("tbody", { children: batches.map((b) => {
                                     const displayStatus = getDisplayBatchStatus(b);
                                     return (_jsxs("tr", { className: "pbi-batch-table-row", onClick: () => { void openAnalysisFromRow(b); }, onKeyDown: (event) => handleRowKeyDown(event, b), role: "button", tabIndex: 0, children: [_jsxs("td", { style: { fontWeight: 'var(--weight-medium)' }, children: [_jsx("div", { children: b.name }), _jsx("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }, children: b.sourceFileName })] }), _jsx("td", { style: { color: 'var(--color-text-secondary)' }, children: formatDate(b.importedAtUtc) }), _jsx("td", { children: b.sourceRowCount }), _jsx("td", { children: b.candidateRowCount }), _jsx("td", { children: b.scopedRowCount }), _jsx("td", { children: _jsx(Badge, { variant: batchStatusVariant(displayStatus), children: STATUS_LABEL[displayStatus] ?? displayStatus }) }), _jsxs("td", { className: "pbi-batch-table-actions-cell", children: [canRunAnalysis(b) && (_jsxs("button", { className: "btn btn-primary btn-xs", onClick: (event) => {
                                                             event.stopPropagation();

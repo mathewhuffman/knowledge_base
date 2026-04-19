@@ -31,8 +31,8 @@ function normalizeMessages(messages) {
     return deduped;
 }
 function isFilteredAssistantToolName(value) {
-    const normalized = value?.trim().toLowerCase();
-    return normalized === 'terminal' || normalized === 'shell';
+    void value;
+    return false;
 }
 function findSharedPrefixLength(left, right) {
     const max = Math.min(left.length, right.length);

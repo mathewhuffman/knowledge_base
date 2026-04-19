@@ -121,6 +121,24 @@ function formatDate(utc: string): string {
   }
 }
 
+function detectImportFormat(fileName: string): 'csv' | 'html' | null {
+  const normalized = fileName.trim().toLowerCase();
+  if (normalized.endsWith('.csv')) {
+    return 'csv';
+  }
+  if (normalized.endsWith('.html') || normalized.endsWith('.htm')) {
+    return 'html';
+  }
+  return null;
+}
+
+function hasDraggedFiles(dataTransfer: DataTransfer | null): boolean {
+  if (!dataTransfer) {
+    return false;
+  }
+  return Array.from(dataTransfer.types ?? []).includes('Files');
+}
+
 function recommendWorkerStageBudgetMinutes(scopedCount: number): number {
   if (scopedCount >= 100) {
     return 60;
@@ -428,8 +446,11 @@ export const PBI = () => {
   const sessionListQuery = useIpc<{ workspaceId: string; sessions: AgentSessionRecord[] }>('agent.session.list');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jobStateByIdRef = useRef<Record<string, string>>({});
+  const wizardRef = useRef(WIZARD_INITIAL);
+  const fileDragDepthRef = useRef(0);
 
   const [wizard, setWizard] = useState<WizardState>(WIZARD_INITIAL);
+  const [fileDragActive, setFileDragActive] = useState(false);
   const [batchToDelete, setBatchToDelete] = useState<PBIBatchRecord | null>(null);
   const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
   const [deleteBatchError, setDeleteBatchError] = useState<string | null>(null);
@@ -458,6 +479,10 @@ export const PBI = () => {
       setCachedSessions(sessionListQuery.data.sessions);
     }
   }, [sessionListQuery.data]);
+
+  useEffect(() => {
+    wizardRef.current = wizard;
+  }, [wizard]);
 
   // Fetch batch list on mount
   useEffect(() => {
@@ -585,7 +610,15 @@ export const PBI = () => {
     setWizard({ ...WIZARD_INITIAL, open: true });
   }, []);
 
+  const openWizardForFileDrag = useCallback(() => {
+    setAnalysisBatch(null);
+    setAnalysisAutoRun(false);
+    setWizard((current) => (current.open ? current : { ...WIZARD_INITIAL, open: true }));
+  }, []);
+
   const closeWizard = useCallback(() => {
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
     setWizard(WIZARD_INITIAL);
     // Refresh batch list after close
     if (activeWorkspace) {
@@ -760,13 +793,28 @@ export const PBI = () => {
   const handleFileSelect = useCallback(async (file: File) => {
     if (!activeWorkspace) return;
 
-    setWizard((s) => ({ ...s, importing: true, importError: null }));
+    const format = detectImportFormat(file.name);
+    if (!format) {
+      setWizard((s) => ({
+        ...s,
+        open: true,
+        step: 'upload',
+        importing: false,
+        importError: 'Unsupported file type. Please drop a CSV or HTML export.',
+      }));
+      return;
+    }
+
+    setWizard((s) => ({
+      ...s,
+      open: true,
+      step: 'upload',
+      importing: true,
+      importError: null,
+    }));
 
     try {
       const content = await file.text();
-      const format = file.name.toLowerCase().endsWith('.html') || file.name.toLowerCase().endsWith('.htm')
-        ? 'html'
-        : 'csv';
 
       const res = await window.kbv.invoke<PBIBatchImportSummary>('pbiBatch.import', {
         workspaceId: activeWorkspace.id,
@@ -807,13 +855,58 @@ export const PBI = () => {
     e.target.value = '';
   }, [handleFileSelect]);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    const file = e.dataTransfer.files[0];
+  const handlePageDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    fileDragDepthRef.current += 1;
+    setFileDragActive(true);
+    if (!wizardRef.current.open) {
+      openWizardForFileDrag();
+    }
+  }, [activeWorkspace, openWizardForFileDrag]);
+
+  const handlePageDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    if (!fileDragActive) {
+      setFileDragActive(true);
+    }
+    if (!wizardRef.current.open) {
+      openWizardForFileDrag();
+    }
+  }, [activeWorkspace, fileDragActive, openWizardForFileDrag]);
+
+  const handlePageDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) {
+      setFileDragActive(false);
+    }
+  }, [activeWorkspace]);
+
+  const handlePageDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!activeWorkspace || !hasDraggedFiles(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    if (wizardRef.current.step !== 'upload') {
+      return;
+    }
+    const file = event.dataTransfer.files[0];
     if (file) {
       void handleFileSelect(file);
     }
-  }, [handleFileSelect]);
+  }, [activeWorkspace, handleFileSelect]);
 
   // ---- Scope step ----
   const handleScopeSet = useCallback(async () => {
@@ -954,10 +1047,9 @@ export const PBI = () => {
               <LoadingState message="Parsing file..." />
             ) : (
               <div
-                className="upload-zone"
+                className={`upload-zone${fileDragActive ? ' drag-over' : ''}`}
                 onClick={() => fileInputRef.current?.click()}
                 onDragOver={(e) => e.preventDefault()}
-                onDrop={handleDrop}
                 role="button"
                 tabIndex={0}
                 onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click(); }}
@@ -1148,7 +1240,13 @@ export const PBI = () => {
   }
 
   return (
-    <>
+    <div
+      className={`pbi-batches-page${fileDragActive ? ' pbi-batches-page--dragging' : ''}`}
+      onDragEnterCapture={handlePageDragEnter}
+      onDragOverCapture={handlePageDragOver}
+      onDragLeaveCapture={handlePageDragLeave}
+      onDropCapture={handlePageDrop}
+    >
       <PageHeader
         title="PBI Batches"
         subtitle="Import and analyze bulk product backlog items"
@@ -1322,6 +1420,6 @@ export const PBI = () => {
           />
         )}
       </Drawer>
-      </>
+    </div>
   );
 };

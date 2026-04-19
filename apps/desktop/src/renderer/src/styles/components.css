@@ -548,6 +548,10 @@
   padding: var(--space-6);
 }
 
+.pbi-batches-page {
+  min-height: 100%;
+}
+
 /* ---- Buttons ---- */
 .btn {
   display: inline-flex;
@@ -2671,6 +2675,10 @@
   animation: slideUp var(--transition-normal);
 }
 
+.pbi-batches-page--dragging .wizard-panel {
+  box-shadow: var(--shadow-xl), 0 0 0 1px var(--color-primary);
+}
+
 .wizard-header {
   padding: var(--space-4) var(--space-5);
   border-bottom: 1px solid var(--color-border);
@@ -3307,6 +3315,15 @@ code.agent-meta-value {
 }
 
 /* ---- Transcript ---- */
+.agent-transcript-notice {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid rgba(59, 130, 246, 0.24);
+  border-radius: var(--radius-md);
+  background: rgba(59, 130, 246, 0.08);
+  color: var(--gray-200);
+  font-size: var(--text-xs);
+}
+
 .agent-transcript {
   max-height: 480px;
   overflow-y: auto;
@@ -3477,83 +3494,6 @@ code.agent-meta-value {
   border-radius: var(--radius-md);
   font-size: var(--text-sm);
   color: var(--color-danger);
-}
-
-.agent-job-progress-section {
-  padding: var(--space-2) 0;
-}
-
-.agent-job-progress-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: var(--space-1);
-}
-
-.agent-job-progress-label {
-  font-size: var(--text-xs);
-  color: var(--color-text-secondary);
-}
-
-.agent-job-progress-pct {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  color: var(--color-text);
-}
-
-/* ---- Job event log ---- */
-.agent-job-event-log {
-  max-height: 300px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  background: var(--color-bg-subtle);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-}
-
-.agent-job-event {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-1) 0;
-  border-bottom: 1px solid rgba(0,0,0,0.04);
-  flex-wrap: wrap;
-}
-
-.agent-job-event:last-child {
-  border-bottom: none;
-}
-
-.agent-job-event-time {
-  font-size: 10px;
-  color: var(--color-text-muted);
-  font-family: var(--font-mono);
-}
-
-.agent-job-event-msg {
-  font-size: var(--text-xs);
-  color: var(--color-text-secondary);
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-job-event-data {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--color-text-muted);
-  background: var(--color-bg-muted);
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* ---- Cursor unavailable banner ---- */

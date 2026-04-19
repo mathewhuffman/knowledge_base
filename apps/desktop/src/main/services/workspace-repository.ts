@@ -4848,8 +4848,8 @@ export class WorkspaceRepository {
         ));
         const unansweredRequiredQuestionCount = questions.filter((question) =>
           question.requiresUserInput
-          && question.status !== 'answered'
-          && question.status !== 'resolved'
+          && question.status === 'pending'
+          && !question.answer?.trim()
         ).length;
         workspaceDb.exec('COMMIT');
         return {
@@ -5104,8 +5104,8 @@ export class WorkspaceRepository {
         : [];
       const unansweredRequiredQuestionCount = questions.filter((question) =>
         question.requiresUserInput
-        && question.status !== 'answered'
-        && question.status !== 'resolved'
+        && question.status === 'pending'
+        && !question.answer?.trim()
       ).length;
       const discoveredWork = workspaceDb.all<{ payloadJson: string; status: BatchDiscoveredWorkItem['status'] | null }>(
         `SELECT payload_json as payloadJson,
@@ -5400,8 +5400,8 @@ export class WorkspaceRepository {
         : [];
       const unansweredRequiredQuestionCount = questions.filter((question) =>
         question.requiresUserInput
-        && question.status !== 'answered'
-        && question.status !== 'resolved'
+        && question.status === 'pending'
+        && !question.answer?.trim()
       ).length;
       return {
         workspaceId,

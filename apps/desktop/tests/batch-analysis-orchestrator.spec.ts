@@ -3,6 +3,7 @@ import type { LocaleVariantRecord } from '@kb-vault/shared-types';
 import type {
   BatchAnalysisIterationRecord,
   BatchAnalysisPlan,
+  BatchAnalysisQuestion,
   BatchPlanReview,
   BatchPlannerPrefetch
 } from '@kb-vault/shared-types';
@@ -106,6 +107,21 @@ function createReview(overrides?: Partial<BatchPlanReview>): BatchPlanReview {
     createdAtUtc: new Date().toISOString(),
     planId: 'plan-1',
     sessionId: 'session-1',
+    ...overrides
+  };
+}
+
+function createQuestion(overrides?: Partial<BatchAnalysisQuestion>): BatchAnalysisQuestion {
+  return {
+    id: 'question-1',
+    prompt: 'Should Delete a Food List be included in this batch or explicitly deferred?',
+    reason: 'Planner found a scope decision that requires explicit confirmation before approval.',
+    requiresUserInput: true,
+    linkedPbiIds: ['pbi-1'],
+    linkedPlanItemIds: ['item-1'],
+    linkedDiscoveryIds: [],
+    status: 'pending',
+    createdAtUtc: new Date().toISOString(),
     ...overrides
   };
 }
@@ -625,18 +641,11 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
 
   test('forces needs_user_input when a required Delete a Food List question remains unanswered', () => {
     const orchestrator = createOrchestrator();
-    const deleteFoodListQuestion = {
+    const deleteFoodListQuestion = createQuestion({
       id: 'question-delete-food-list',
       questionSetId: 'question-set-delete-food-list',
-      prompt: 'Should Delete a Food List be included in this batch or explicitly deferred?',
-      reason: 'Planner found a known Delete a Food List scope gap that requires a user scope decision before approval.',
-      requiresUserInput: true,
-      linkedPbiIds: ['pbi-1'],
-      linkedPlanItemIds: ['item-1'],
-      linkedDiscoveryIds: [],
-      status: 'pending' as const,
-      createdAtUtc: new Date().toISOString()
-    };
+      reason: 'Planner found a known Delete a Food List scope gap that requires a user scope decision before approval.'
+    });
     const result = orchestrator.applyDeterministicPlanReviewGuard({
       plan: createPlan({
         questions: [deleteFoodListQuestion],
@@ -653,6 +662,195 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(result.review.verdict).toBe('needs_user_input');
     expect(result.review.questions?.[0]?.prompt).toContain('Delete a Food List');
     expect(result.review.delta?.requestedChanges.some((change) => change.includes('Delete a Food List'))).toBe(true);
+  });
+
+  test('prefers needs_user_input over needs_human_review when a planner candidate question remains pending', () => {
+    const orchestrator = createOrchestrator();
+    const plannerQuestion = createQuestion({ id: 'planner-question-1' });
+
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [plannerQuestion],
+        openQuestions: [plannerQuestion.prompt]
+      }),
+      review: createReview({
+        verdict: 'needs_human_review',
+        summary: 'This needs manual escalation.'
+      })
+    });
+
+    expect(result.review.verdict).toBe('needs_user_input');
+    expect(result.blockingUserInputQuestions).toHaveLength(1);
+    expect(result.review.delta?.requestedChanges).toContain(
+      'Reviewer requested human review, but deterministic validation found concrete user-answerable blocking questions that should be resolved first.'
+    );
+  });
+
+  test('prefers needs_user_input over needs_human_review when the reviewer adds a new pending required question', () => {
+    const orchestrator = createOrchestrator();
+    const reviewerQuestion = createQuestion({
+      id: 'reviewer-question-1',
+      prompt: 'Should the dashboard rollout notes be included in this batch or deferred?',
+      reason: 'Reviewer identified a concrete scope decision that the user can answer quickly.'
+    });
+
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [],
+        openQuestions: []
+      }),
+      review: createReview({
+        verdict: 'needs_human_review',
+        questions: [reviewerQuestion]
+      })
+    });
+
+    expect(result.review.verdict).toBe('needs_user_input');
+    expect(result.blockingUserInputQuestions).toHaveLength(1);
+    expect(result.blockingUserInputQuestions[0]?.id).toBe('reviewer-question-1');
+  });
+
+  test('keeps needs_human_review when there are no final pending required questions', () => {
+    const orchestrator = createOrchestrator();
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [],
+        openQuestions: []
+      }),
+      review: createReview({
+        verdict: 'needs_human_review',
+        summary: 'Human review is still required.'
+      })
+    });
+
+    expect(result.review.verdict).toBe('needs_human_review');
+    expect(result.blockingUserInputQuestions).toHaveLength(0);
+  });
+
+  test('reviewer can dismiss a planner candidate question without leaving a blocker', () => {
+    const orchestrator = createOrchestrator();
+    const plannerQuestion = createQuestion({ id: 'planner-question-dismiss' });
+
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [plannerQuestion],
+        openQuestions: [plannerQuestion.prompt]
+      }),
+      review: createReview({
+        verdict: 'approved',
+        questions: [
+          {
+            ...plannerQuestion,
+            status: 'dismissed'
+          }
+        ]
+      })
+    });
+
+    expect(result.review.verdict).toBe('approved');
+    expect(result.blockingUserInputQuestions).toHaveLength(0);
+    expect(result.review.questions?.[0]?.status).toBe('dismissed');
+  });
+
+  test('reviewer can resolve a planner candidate question without leaving a blocker', () => {
+    const orchestrator = createOrchestrator();
+    const plannerQuestion = createQuestion({ id: 'planner-question-resolve' });
+
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [plannerQuestion],
+        openQuestions: [plannerQuestion.prompt]
+      }),
+      review: createReview({
+        verdict: 'approved',
+        questions: [
+          {
+            ...plannerQuestion,
+            status: 'resolved'
+          }
+        ]
+      })
+    });
+
+    expect(result.review.verdict).toBe('approved');
+    expect(result.blockingUserInputQuestions).toHaveLength(0);
+    expect(result.review.questions?.[0]?.status).toBe('resolved');
+  });
+
+  test('reviewer can rewrite a planner candidate question while preserving identity', () => {
+    const orchestrator = createOrchestrator();
+    const plannerQuestion = createQuestion({ id: 'planner-question-rewrite' });
+
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [plannerQuestion],
+        openQuestions: [plannerQuestion.prompt]
+      }),
+      review: createReview({
+        verdict: 'approved',
+        questions: [
+          {
+            ...plannerQuestion,
+            prompt: 'Should Delete a Food List stay in this batch or be explicitly deferred to a later batch?',
+            reason: 'Reviewer rewrote the scope question for clarity while preserving the same decision.',
+            status: 'pending'
+          }
+        ]
+      })
+    });
+
+    expect(result.review.verdict).toBe('needs_user_input');
+    expect(result.blockingUserInputQuestions).toHaveLength(1);
+    expect(result.review.questions?.[0]).toMatchObject({
+      id: 'planner-question-rewrite',
+      prompt: 'Should Delete a Food List stay in this batch or be explicitly deferred to a later batch?',
+      reason: 'Reviewer rewrote the scope question for clarity while preserving the same decision.',
+      status: 'pending'
+    });
+  });
+
+  test('reviewer can add a new pending required question when the planner emitted none', () => {
+    const orchestrator = createOrchestrator();
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [],
+        openQuestions: []
+      }),
+      review: createReview({
+        verdict: 'approved',
+        questions: [
+          createQuestion({
+            id: 'reviewer-added-question',
+            prompt: 'Should release-note cleanup be included in this batch or deferred?',
+            reason: 'Reviewer surfaced a missing scope decision.'
+          })
+        ]
+      })
+    });
+
+    expect(result.review.verdict).toBe('needs_user_input');
+    expect(result.blockingUserInputQuestions).toHaveLength(1);
+    expect(result.review.questions?.[0]?.id).toBe('reviewer-added-question');
+  });
+
+  test('normalizes malformed needs_user_input verdicts that have no final pending required questions', () => {
+    const orchestrator = createOrchestrator();
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        questions: [],
+        openQuestions: []
+      }),
+      review: createReview({
+        verdict: 'needs_user_input',
+        questions: []
+      })
+    });
+
+    expect(result.review.verdict).toBe('needs_revision');
+    expect(result.blockingUserInputQuestions).toHaveLength(0);
+    expect(result.review.delta?.requestedChanges).toContain(
+      'Return at least one final pending required structured question when using needs_user_input, or switch the verdict to needs_revision/needs_human_review.'
+    );
   });
 
   test('normalizes legacy gap coverage to covered when a plan item already accounts for the PBI', () => {
@@ -1236,6 +1434,13 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
 
   test('includes deterministic prefetch evidence in the reviewer prompt', () => {
     const orchestrator = createOrchestrator();
+    const candidateQuestions = [
+      createQuestion({
+        id: 'candidate-question-1',
+        prompt: 'Should checklist escalation workflow be included in this batch or explicitly deferred?',
+        reason: 'Deterministic review surfaced a candidate scope decision.'
+      })
+    ];
     const prompt = orchestrator.buildPlanReviewerPrompt({
       batchContext: { batch: { id: 'batch-1' } },
       uploadedPbis: { rows: [{ id: 'pbi-1', title: 'Update dashboard' }] },
@@ -1258,13 +1463,152 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
             ]
           }
         ]
-      })
+      }),
+      candidateQuestions
     });
 
     expect(prompt).toContain('Deterministic planner prefetch:');
     expect(prompt).toContain('Edit Team Dashboard');
     expect(prompt).toContain('Do not approve a create-only or create-heavy plan');
     expect(prompt).toContain('edit-only or edit-heavy plan');
+    expect(prompt).toContain('Candidate questions for reviewer adjudication:');
+    expect(prompt).toContain('preserving its `id`');
+  });
+
+  test('deterministic candidate question kept by reviewer becomes the blocking user-input question', () => {
+    const orchestrator = createOrchestrator();
+    const plan = createPlan({
+      items: [
+        {
+          planItemId: 'item-1',
+          pbiIds: ['pbi-1'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'Checklist escalation workflow',
+          reason: 'The planner chose a net-new article.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+          confidence: 0.84,
+          executionStatus: 'pending'
+        }
+      ]
+    });
+    const plannerPrefetch = createPlannerPrefetch({
+      topicClusters: [
+        {
+          clusterId: 'cluster-1',
+          label: 'Checklist escalation workflow',
+          pbiIds: ['pbi-1'],
+          sampleTitles: ['Checklist escalation workflow'],
+          queries: ['Checklist escalation workflow']
+        }
+      ],
+      articleMatches: [
+        {
+          clusterId: 'cluster-1',
+          query: 'Checklist escalation workflow',
+          total: 1,
+          topResults: [
+            {
+              title: 'Escalation Operations Overview',
+              familyId: 'family-ops',
+              localeVariantId: 'variant-ops',
+              score: 0.31,
+              matchContext: 'title',
+              snippet: 'Existing escalation workflow overview.'
+            }
+          ]
+        }
+      ]
+    });
+    const candidateQuestions = orchestrator.buildReviewCandidateQuestions({
+      plan,
+      plannerPrefetch
+    });
+
+    expect(candidateQuestions).toHaveLength(1);
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan,
+      review: createReview({
+        verdict: 'approved',
+        questions: [candidateQuestions[0]!]
+      }),
+      candidateQuestions,
+      plannerPrefetch
+    });
+
+    expect(result.review.verdict).toBe('needs_user_input');
+    expect(result.blockingUserInputQuestions).toHaveLength(1);
+    expect(result.blockingUserInputQuestions[0]?.prompt).toContain('standalone article or folded into Escalation Operations Overview');
+  });
+
+  test('deterministic candidate question dismissed by reviewer does not block the run', () => {
+    const orchestrator = createOrchestrator();
+    const plan = createPlan({
+      items: [
+        {
+          planItemId: 'item-1',
+          pbiIds: ['pbi-1'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'Checklist escalation workflow',
+          reason: 'The planner chose a net-new article.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+          confidence: 0.84,
+          executionStatus: 'pending'
+        }
+      ]
+    });
+    const plannerPrefetch = createPlannerPrefetch({
+      topicClusters: [
+        {
+          clusterId: 'cluster-1',
+          label: 'Checklist escalation workflow',
+          pbiIds: ['pbi-1'],
+          sampleTitles: ['Checklist escalation workflow'],
+          queries: ['Checklist escalation workflow']
+        }
+      ],
+      articleMatches: [
+        {
+          clusterId: 'cluster-1',
+          query: 'Checklist escalation workflow',
+          total: 1,
+          topResults: [
+            {
+              title: 'Escalation Operations Overview',
+              familyId: 'family-ops',
+              localeVariantId: 'variant-ops',
+              score: 0.31,
+              matchContext: 'title',
+              snippet: 'Existing escalation workflow overview.'
+            }
+          ]
+        }
+      ]
+    });
+    const candidateQuestions = orchestrator.buildReviewCandidateQuestions({
+      plan,
+      plannerPrefetch
+    });
+
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan,
+      review: createReview({
+        verdict: 'approved',
+        questions: [
+          {
+            ...candidateQuestions[0]!,
+            status: 'dismissed'
+          }
+        ]
+      }),
+      candidateQuestions,
+      plannerPrefetch
+    });
+
+    expect(result.review.verdict).toBe('approved');
+    expect(result.blockingUserInputQuestions).toHaveLength(0);
+    expect(result.review.questions?.[0]?.status).toBe('dismissed');
   });
 
   test('forces revision when multiple plan items target the same existing article', () => {

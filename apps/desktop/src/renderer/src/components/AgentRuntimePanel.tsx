@@ -304,21 +304,6 @@ function mcpToolsetSummary(health: KbAccessHealth): { ok: boolean; detail: strin
   };
 }
 
-function streamingKindBadge(kind: AgentStreamingPayload['kind']): 'primary' | 'success' | 'warning' | 'danger' | 'neutral' {
-  switch (kind) {
-    case 'session_started': return 'primary';
-    case 'progress': return 'primary';
-    case 'tool_call': return 'neutral';
-    case 'tool_response': return 'neutral';
-    case 'result': return 'success';
-    case 'warning': return 'warning';
-    case 'error': return 'danger';
-    case 'timeout': return 'danger';
-    case 'canceled': return 'warning';
-    default: return 'neutral';
-  }
-}
-
 function parseSessionUpdatePayload(raw: string): {
   updateType: string | null;
   contentType: string | null;
@@ -353,20 +338,6 @@ function shouldDisplayTranscriptLine(line: AgentTranscriptLine): boolean {
   }
 
   return !isHiddenSessionUpdateType(parsed.updateType);
-}
-
-function shouldDisplayStreamingEvent(evt: AgentStreamingPayload): boolean {
-  if (evt.kind !== 'progress' || !evt.data) {
-    return true;
-  }
-
-  try {
-    const parsed = evt.data as { update?: { sessionUpdate?: unknown } };
-    const updateType = typeof parsed?.update?.sessionUpdate === 'string' ? parsed.update.sessionUpdate : null;
-    return !isHiddenSessionUpdateType(updateType);
-  } catch {
-    return true;
-  }
 }
 
 type AgentToolCallListResponse = {
@@ -1269,10 +1240,20 @@ export function SessionDetailPanel({ workspaceId, session, onBack }: SessionDeta
 /* TranscriptView                                                      */
 /* ================================================================== */
 
-function TranscriptView({ lines, loading, error }: { lines: AgentTranscriptLine[]; loading: boolean; error: string | null }) {
+function TranscriptView({
+  lines,
+  loading,
+  error,
+  notice,
+}: {
+  lines: AgentTranscriptLine[];
+  loading: boolean;
+  error: string | null;
+  notice?: string;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const mergedLines = useMemo(
-    () => mergeTranscriptLines(lines).filter((line) => shouldDisplayTranscriptLine(line)),
+    () => buildRenderableTranscriptLines(lines),
     [lines],
   );
 
@@ -1295,22 +1276,29 @@ function TranscriptView({ lines, loading, error }: { lines: AgentTranscriptLine[
   }
 
   return (
-    <div className="agent-transcript analysis-copyable" ref={scrollRef}>
-      {mergedLines.map((line, i) => (
-        <div key={i} className={`agent-transcript-line agent-transcript-line--${line.direction}`}>
-          <div className="agent-transcript-line-header">
-            <span className="agent-transcript-line-time">{formatTimestamp(line.atUtc)}</span>
-            <Badge
-              variant={line.direction === 'to_agent' ? 'primary' : line.direction === 'from_agent' ? 'success' : 'neutral'}
-            >
-              {line.direction === 'to_agent' ? 'To Agent' : line.direction === 'from_agent' ? 'From Agent' : 'System'}
-            </Badge>
-            <span className="agent-transcript-line-event">{line.event}</span>
-          </div>
-          <pre className="agent-transcript-line-payload">{formatPayload(line.payload)}</pre>
+    <>
+      {notice && (
+        <div className="agent-transcript-notice">
+          {notice}
         </div>
-      ))}
-    </div>
+      )}
+      <div className="agent-transcript analysis-copyable" ref={scrollRef}>
+        {mergedLines.map((line, i) => (
+          <div key={i} className={`agent-transcript-line agent-transcript-line--${line.direction}`}>
+            <div className="agent-transcript-line-header">
+              <span className="agent-transcript-line-time">{formatTimestamp(line.atUtc)}</span>
+              <Badge
+                variant={line.direction === 'to_agent' ? 'primary' : line.direction === 'from_agent' ? 'success' : 'neutral'}
+              >
+                {line.direction === 'to_agent' ? 'To Agent' : line.direction === 'from_agent' ? 'From Agent' : 'System'}
+              </Badge>
+              <span className="agent-transcript-line-event">{line.event}</span>
+            </div>
+            <pre className="agent-transcript-line-payload">{formatPayload(line.payload)}</pre>
+          </div>
+        ))}
+      </div>
+    </>
   );
 }
 
@@ -1319,13 +1307,13 @@ function mergeTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine
 
   for (const line of lines) {
     if (line.event !== 'session_update') {
-      merged.push(line);
+      merged.push({ ...line });
       continue;
     }
 
     const parsedPayload = parseSessionUpdatePayload(line.payload);
     if (!parsedPayload) {
-      merged.push(line);
+      merged.push({ ...line });
       continue;
     }
 
@@ -1333,19 +1321,19 @@ function mergeTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine
     const mergeable = (updateType === 'agent_thought_chunk' || updateType === 'agent_message_chunk') && contentType === 'text';
 
     if (!mergeable || !contentText) {
-      merged.push(line);
+      merged.push({ ...line });
       continue;
     }
 
     const previous = merged[merged.length - 1];
     if (!previous || previous.direction !== line.direction || previous.event !== 'session_update') {
-      merged.push(line);
+      merged.push({ ...line });
       continue;
     }
 
     const previousParsedPayload = parseSessionUpdatePayload(previous.payload);
     if (!previousParsedPayload) {
-      merged.push(line);
+      merged.push({ ...line });
       continue;
     }
 
@@ -1355,7 +1343,7 @@ function mergeTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine
     const previousText = previousParsedPayload.contentText;
 
     if (previousType !== updateType || previousContentType !== 'text' || previousText === null) {
-      merged.push(line);
+      merged.push({ ...line });
       continue;
     }
 
@@ -1365,6 +1353,10 @@ function mergeTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine
   }
 
   return merged;
+}
+
+function buildRenderableTranscriptLines(lines: AgentTranscriptLine[]): AgentTranscriptLine[] {
+  return mergeTranscriptLines(lines).filter((line) => shouldDisplayTranscriptLine(line));
 }
 
 function formatPayload(raw: string): string {
@@ -1477,6 +1469,8 @@ interface AnalysisJobRunnerProps {
   onComplete?: () => void;
 }
 
+const LIVE_TRANSCRIPT_RENDER_LIMIT = 300;
+
 export function AnalysisJobRunner({
   workspaceId,
   batchId,
@@ -1487,7 +1481,6 @@ export function AnalysisJobRunner({
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<string>('');
   const [progress, setProgress] = useState(0);
-  const [events, setEvents] = useState<AgentStreamingPayload[]>([]);
   const [canceling, setCanceling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
@@ -1516,7 +1509,6 @@ export function AnalysisJobRunner({
   const terminalStateHandledRef = useRef(false);
   const sessionListInFlightRef = useRef(false);
   const autoStartIssuedRef = useRef(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Subscribe to job events
   const refreshSessions = useCallback(async () => {
@@ -1693,9 +1685,6 @@ export function AnalysisJobRunner({
       if (event.message) {
         try {
           const payload = JSON.parse(event.message) as AgentStreamingPayload;
-          if (shouldDisplayStreamingEvent(payload)) {
-            setEvents((prev) => [...prev, payload]);
-          }
           if (payload.kind === 'session_started' && payload.data && typeof payload.data === 'object') {
             const sessionPayload = (payload.data as { session?: { kbAccessMode?: KbAccessMode } }).session;
             if (isKbAccessMode(sessionPayload?.kbAccessMode)) {
@@ -1725,13 +1714,7 @@ export function AnalysisJobRunner({
             }
           }
         } catch {
-          // Non-JSON message, still useful
-          setEvents((prev) => [...prev, {
-            sessionId: '',
-            kind: 'progress',
-            message: event.message,
-            atUtc: new Date().toISOString(),
-          }]);
+          // Ignore non-JSON progress payloads in the live panel. They are still persisted in run history.
         }
       }
 
@@ -1823,15 +1806,8 @@ export function AnalysisJobRunner({
     void refreshHistory(activeLiveSessionId);
   }, [activeLiveSessionId, refreshHistory]);
 
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [events.length]);
-
   const startJob = async () => {
     setError(null);
-    setEvents([]);
     setCurrentRunMode(null);
     setCurrentRunModel(null);
     setLiveRuntimeStatus(null);
@@ -1869,21 +1845,26 @@ export function AnalysisJobRunner({
 
   const isRunning = jobState === 'RUNNING' || jobState === 'QUEUED';
   const isDone = jobState === 'SUCCEEDED' || jobState === 'FAILED' || jobState === 'CANCELED';
-  const acpToolCalls = useMemo(() => extractAcpToolCalls(transcriptLines), [transcriptLines]);
-  const visibleTranscriptLines = useMemo(
-    () => mergeTranscriptLines(transcriptLines).filter((line) => shouldDisplayTranscriptLine(line)),
-    [transcriptLines],
+  const acpToolCalls = useMemo(
+    () => historyTab === 'acp_tools' ? extractAcpToolCalls(transcriptLines) : [],
+    [historyTab, transcriptLines],
   );
-  const visibleEvents = useMemo(
-    () => events.filter((evt) => shouldDisplayStreamingEvent(evt)),
-    [events],
+  const transcriptViewLines = useMemo(
+    () => (
+      shouldUseLiveHistory && historyTab === 'transcript' && transcriptLines.length > LIVE_TRANSCRIPT_RENDER_LIMIT
+        ? transcriptLines.slice(-LIVE_TRANSCRIPT_RENDER_LIMIT)
+        : transcriptLines
+    ),
+    [historyTab, shouldUseLiveHistory, transcriptLines],
   );
+  const liveTranscriptNotice = shouldUseLiveHistory && historyTab === 'transcript' && transcriptLines.length > LIVE_TRANSCRIPT_RENDER_LIMIT
+    ? `Showing the most recent ${LIVE_TRANSCRIPT_RENDER_LIMIT} live transcript updates while analysis is running. Older updates remain available after the run completes.`
+    : undefined;
   const hasHistory = Boolean(activeLiveSessionId || persistedRun);
   const shouldShowStartButton = !isRunning && !(startOnOpen && !hasHistory && !isDone);
   const canCopy =
-    visibleTranscriptLines.length > 0
+    transcriptLines.length > 0
     || toolCalls.length > 0
-    || visibleEvents.length > 0
     || persistedRawOutput.length > 0
     || (persistedEventStream?.events.length ?? 0) > 0;
 
@@ -1912,6 +1893,7 @@ export function AnalysisJobRunner({
   }, [startOnOpen, hasHistory, isDone, isRunning, sessionListLoading, startJob]);
 
   const copyText = useCallback(() => {
+    const renderableTranscriptLines = buildRenderableTranscriptLines(transcriptLines);
     const chunks: string[] = [];
     chunks.push(`Batch: ${batchId}`);
     if (activeSession) {
@@ -1970,10 +1952,10 @@ export function AnalysisJobRunner({
     chunks.push('');
     chunks.push('Transcript');
     chunks.push('----------');
-    if (visibleTranscriptLines.length === 0) {
+    if (renderableTranscriptLines.length === 0) {
       chunks.push('No transcript lines');
     } else {
-      visibleTranscriptLines.forEach((line) => {
+      renderableTranscriptLines.forEach((line) => {
         chunks.push(`[${formatTimestamp(line.atUtc)}] ${line.direction} ${line.event}`);
         chunks.push(formatPayload(line.payload));
       });
@@ -2007,18 +1989,6 @@ export function AnalysisJobRunner({
     }
 
     chunks.push('');
-    chunks.push('Events');
-    chunks.push('----------');
-    if (visibleEvents.length === 0) {
-      chunks.push('No events yet');
-    } else {
-      visibleEvents.forEach((evt) => {
-        const suffix = evt.message ? `: ${evt.message}` : '';
-        chunks.push(`[${formatTimestamp(evt.atUtc)}] ${evt.kind}${suffix}`);
-      });
-    }
-
-    chunks.push('');
     chunks.push('Stage Events');
     chunks.push('------------');
     if (!persistedEventStream || persistedEventStream.events.length === 0) {
@@ -2040,7 +2010,7 @@ export function AnalysisJobRunner({
     }
 
     return chunks.join('\n');
-  }, [activeSession, batchId, inspectionCounts, jobState, orchestrationIteration, persistedEventStream, persistedRawOutput, persistedRun, progress, toolCalls, visibleEvents, visibleTranscriptLines]);
+  }, [activeSession, batchId, inspectionCounts, jobState, orchestrationIteration, persistedEventStream, persistedRawOutput, persistedRun, progress, toolCalls, transcriptLines]);
 
   const copyAnalysisContents = useCallback(() => {
     if (!canCopy) {
@@ -2204,16 +2174,17 @@ export function AnalysisJobRunner({
               onClick={() => setHistoryTab('acp_tools')}
             >
               <IconTool size={12} />
-              ACP Tools ({acpToolCalls.length})
+              ACP Tools{historyTab === 'acp_tools' ? ` (${acpToolCalls.length})` : ''}
             </button>
           </div>
 
           <div className="agent-session-detail-body">
             {historyTab === 'transcript' ? (
               <TranscriptView
-                lines={transcriptLines}
+                lines={transcriptViewLines}
                 loading={historyLoadingState}
                 error={historyErrorState}
+                notice={liveTranscriptNotice}
               />
             ) : historyTab === 'kb_tools' ? (
               <ToolCallsView
@@ -2280,55 +2251,6 @@ export function AnalysisJobRunner({
         </div>
       )}
 
-      {/* Progress */}
-      {jobState && (
-        <div className="agent-job-progress-section">
-          <div className="agent-job-progress-header">
-            <span className="agent-job-progress-label">
-              {jobState === 'SUCCEEDED' ? 'Analysis complete' :
-               jobState === 'FAILED' ? 'Analysis failed' :
-               jobState === 'CANCELED' ? 'Analysis canceled' :
-               'Analyzing batch...'}
-            </span>
-            <span className="agent-job-progress-pct">{progress}%</span>
-          </div>
-          <div className="progress-bar" style={{ height: 6 }}>
-            <div
-              className="progress-bar-fill"
-              style={{
-                width: `${progress}%`,
-                background: jobState === 'FAILED'
-                  ? 'var(--color-danger)'
-                  : jobState === 'CANCELED'
-                    ? 'var(--color-warning)'
-                    : jobState === 'SUCCEEDED'
-                      ? 'var(--color-success)'
-                      : undefined,
-              }}
-            />
-          </div>
-        </div>
-      )}
-
-      {/* Streaming event log */}
-      {visibleEvents.length > 0 && (
-        <div className="agent-job-event-log analysis-copyable" ref={scrollRef}>
-          {visibleEvents.map((evt, i) => (
-            <div key={i} className="agent-job-event">
-              <Badge variant={streamingKindBadge(evt.kind)}>
-                {evt.kind}
-              </Badge>
-              <span className="agent-job-event-time">{formatTimestamp(evt.atUtc)}</span>
-              {evt.message && <span className="agent-job-event-msg">{evt.message}</span>}
-              {evt.kind === 'tool_call' && Boolean(evt.data) && (
-                <code className="agent-job-event-data">
-                  {typeof evt.data === 'object' ? JSON.stringify(evt.data) : String(evt.data)}
-                </code>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

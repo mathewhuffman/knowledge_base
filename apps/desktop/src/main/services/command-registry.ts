@@ -5309,8 +5309,8 @@ export function registerCoreCommands(
       livePausedForUserInput = true;
       liveUnansweredRequiredQuestionCount = params.questions.filter((question) =>
         question.requiresUserInput
-        && question.status !== 'answered'
-        && question.status !== 'resolved'
+        && question.status === 'pending'
+        && !question.answer?.trim()
       ).length;
       await logAnalysisProgress(params.logMessage, {
         stage: 'awaiting_user_input',
@@ -5825,11 +5825,16 @@ export function registerCoreCommands(
         message: 'Reviewing plan for missed creates, edits, and target issues...',
         metadata: buildStreamMetadata()
       });
+      const reviewCandidateQuestions = batchAnalysisOrchestrator.buildReviewCandidateQuestions({
+        plan: draftPlan,
+        plannerPrefetch
+      });
       const reviewPrompt = batchAnalysisOrchestrator.buildPlanReviewerPrompt({
         batchContext,
         uploadedPbis,
         plan: draftPlan,
-        plannerPrefetch
+        plannerPrefetch,
+        candidateQuestions: reviewCandidateQuestions
       });
       let reviewResult = await agentRuntime.runBatchAnalysis(
         {
@@ -5989,6 +5994,7 @@ export function registerCoreCommands(
       const deterministicReviewGuard = batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard({
         plan: draftPlan,
         review,
+        candidateQuestions: reviewCandidateQuestions,
         plannerPrefetch,
         unresolvedTargetIssues: normalizedDraftPlanResult.unresolvedTargetIssues,
         unresolvedReferenceIssues: normalizedBatchReferences.unresolvedReferenceIssues
@@ -6727,6 +6733,12 @@ export function registerCoreCommands(
       const amendmentReviewSession = ensurePlanningSession('plan-reviewer');
       streamMetadata.role = 'plan-reviewer';
       liveSessionId = amendmentReviewSession.sessionId;
+      const amendmentReviewCandidateQuestions = batchAnalysisOrchestrator.buildReviewCandidateQuestions({
+        plan: amendmentDraftPlan,
+        plannerPrefetch,
+        existingQuestions: activeApprovedPlan.questions ?? [],
+        discoveredWork: discoveredForAmendment
+      });
       const amendmentReviewResult = await agentRuntime.runBatchAnalysis(
         {
           ...input,
@@ -6738,7 +6750,8 @@ export function registerCoreCommands(
             batchContext,
             uploadedPbis,
             plan: amendmentDraftPlan,
-            plannerPrefetch
+            plannerPrefetch,
+            candidateQuestions: amendmentReviewCandidateQuestions
           })
         },
         (stream: AgentStreamingPayload) => {
@@ -6837,6 +6850,7 @@ export function registerCoreCommands(
       const deterministicAmendmentReviewGuard = batchAnalysisOrchestrator.applyDeterministicPlanReviewGuard({
         plan: amendmentDraftPlan,
         review: amendmentReview,
+        candidateQuestions: amendmentReviewCandidateQuestions,
         plannerPrefetch,
         unresolvedTargetIssues: normalizedAmendmentDraftPlanResult.unresolvedTargetIssues,
         unresolvedReferenceIssues: normalizedAmendmentBatchReferences.unresolvedReferenceIssues
