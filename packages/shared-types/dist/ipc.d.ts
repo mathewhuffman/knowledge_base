@@ -6,6 +6,12 @@ export declare const IPC_CHANNELS: {
     JOB_EVENT: string;
     APP_WORKING_STATE_EVENT: string;
     AI_ASSISTANT_EVENT: string;
+    AI_ASSISTANT_PRESENTATION_EVENT: string;
+    AI_ASSISTANT_CONTEXT_EVENT: string;
+    AI_ASSISTANT_WINDOW_MOVE: string;
+    AI_ASSISTANT_WINDOW_RESIZE: string;
+    AI_ASSISTANT_WINDOW_DRAG_END: string;
+    APP_NAVIGATION_EVENT: string;
 };
 export interface RpcRequest {
     method: string;

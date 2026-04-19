@@ -20,6 +20,9 @@ const PROPOSAL_FIELDS = [
     { key: 'rationaleSummary', type: 'string', label: 'Rationale Summary' },
     { key: 'aiNotes', type: 'string', label: 'AI Notes' }
 ];
+const DRAFT_BRANCH_FIELDS = [
+    { key: 'html', type: 'string', label: 'HTML', required: true }
+];
 class AppWorkingStateService {
     emitPatchApplied;
     registrations = new Map();
@@ -175,6 +178,9 @@ class AppWorkingStateService {
         if (registration.route === shared_types_1.AppRoute.PROPOSAL_REVIEW && registration.entityType === 'proposal') {
             return this.validateStringFieldPatch(registration.currentValues, patch, PROPOSAL_FIELDS);
         }
+        if (registration.route === shared_types_1.AppRoute.DRAFTS && registration.entityType === 'draft_branch') {
+            return this.validateStringFieldPatch(registration.currentValues, patch, DRAFT_BRANCH_FIELDS);
+        }
         return {
             appliedPatch: {},
             ignoredKeys: [],
@@ -187,6 +193,9 @@ class AppWorkingStateService {
         }
         if (route === shared_types_1.AppRoute.PROPOSAL_REVIEW && entityType === 'proposal') {
             return PROPOSAL_FIELDS;
+        }
+        if (route === shared_types_1.AppRoute.DRAFTS && entityType === 'draft_branch') {
+            return DRAFT_BRANCH_FIELDS;
         }
         throw new Error(`Unsupported form schema target: ${route}/${entityType}`);
     }

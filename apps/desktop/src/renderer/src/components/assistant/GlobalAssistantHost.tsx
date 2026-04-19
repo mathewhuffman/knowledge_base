@@ -1,5 +1,10 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
-import type { AiArtifactType, AiMessageRecord } from '@kb-vault/shared-types';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import {
+  AI_ASSISTANT_DETACHED_PANEL_WINDOW_SIZE,
+  AI_ASSISTANT_LAUNCHER_BUTTON_SIZE,
+  type AiArtifactType,
+  type AiMessageRecord
+} from '@kb-vault/shared-types';
 import { useAiAssistant } from './AssistantContext';
 import { AssistantLauncher } from './AssistantLauncher';
 import { AssistantHeader } from './AssistantHeader';
@@ -8,16 +13,16 @@ import { AssistantArtifactCard } from './AssistantArtifactCard';
 import { AssistantComposer } from './AssistantComposer';
 import { AssistantEmptyState } from './AssistantEmptyState';
 import { AssistantHistoryList } from './AssistantHistoryList';
-import { IconAlertCircle, IconRefreshCw } from '../icons';
+import { IconAlertCircle, IconArrowUpRight, IconPanelRight, IconRefreshCw } from '../icons';
 
-const AI_LAUNCHER_SIZE = 48;
+const AI_LAUNCHER_SIZE = AI_ASSISTANT_LAUNCHER_BUTTON_SIZE;
 const AI_LAUNCHER_MARGIN = 24;
 const AI_PANEL_GAP = 12;
 const AI_PANEL_MIN_MARGIN = 24;
 const AI_PANEL_WIDTH_CLOSED = 420;
 const AI_PANEL_WIDTH_HISTORY = 700;
 const AI_PANEL_MAX_HEIGHT = 740;
-const AI_LAUNCHER_POSITION_KEY = 'kbv:ai-launcher-position';
+const AI_DETACHED_HISTORY_WIDTH_DELTA = AI_PANEL_WIDTH_HISTORY - AI_PANEL_WIDTH_CLOSED;
 const AI_PROPOSAL_DISMISS_DELAY_MS = 10_000;
 
 type LauncherPosition = {
@@ -43,20 +48,6 @@ function clampLauncherPosition(position: LauncherPosition): LauncherPosition {
   };
 }
 
-function loadLauncherPosition(): LauncherPosition {
-  try {
-    const raw = window.localStorage.getItem(AI_LAUNCHER_POSITION_KEY);
-    if (!raw) return getDefaultLauncherPosition();
-    const parsed = JSON.parse(raw) as Partial<LauncherPosition>;
-    if (typeof parsed.left !== 'number' || typeof parsed.top !== 'number') {
-      return getDefaultLauncherPosition();
-    }
-    return clampLauncherPosition({ left: parsed.left, top: parsed.top });
-  } catch {
-    return getDefaultLauncherPosition();
-  }
-}
-
 function extractMessageArtifactMeta(message: AiMessageRecord): {
   artifactId?: string;
   artifactType?: AiArtifactType;
@@ -73,18 +64,109 @@ function extractMessageArtifactMeta(message: AiMessageRecord): {
   return { artifactId, artifactType };
 }
 
-export function AssistantPanelContent({
-  embedded = false,
-  style,
-  onClose,
-  launcherPosition,
-  onLauncherPositionChange
+function useDetachedWindowDrag(): (position: { x: number; y: number }) => void {
+  const frameRef = useRef<number | null>(null);
+  const pendingPositionRef = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => () => {
+    if (frameRef.current != null) {
+      window.cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+  }, []);
+
+  return useCallback((position: { x: number; y: number }) => {
+    pendingPositionRef.current = position;
+    if (frameRef.current != null) {
+      return;
+    }
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = null;
+      const nextPosition = pendingPositionRef.current;
+      pendingPositionRef.current = null;
+      if (nextPosition) {
+        window.kbv?.moveAssistantWindow?.(nextPosition);
+      }
+    });
+  }, []);
+}
+
+function finishDetachedWindowDrag(): void {
+  window.kbv?.finishAssistantWindowDrag?.();
+}
+
+function resizeDetachedWindow(payload: { width: number; height?: number }): void {
+  window.kbv?.resizeAssistantWindow?.({
+    ...payload,
+    anchor: 'bottom_right'
+  });
+}
+
+function AssistantDockAction({
+  mode,
+  onAction
 }: {
-  embedded?: boolean;
+  mode: 'out' | 'in';
+  onAction: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const handleClick = useCallback(() => {
+    if (busy) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    void onAction()
+      .catch((detachError: unknown) => {
+        setError(detachError instanceof Error ? detachError.message : String(detachError));
+      })
+      .finally(() => {
+        setBusy(false);
+      });
+  }, [busy, onAction]);
+
+  const isPopOut = mode === 'out';
+  const title = isPopOut ? 'Pop out the assistant' : 'Pop the assistant back into the app';
+  const icon = isPopOut ? <IconArrowUpRight size={12} /> : <IconPanelRight size={12} />;
+
+  return (
+    <>
+      <button
+        type="button"
+        className={[
+          'ai-header__detach',
+          busy && 'ai-header__detach--busy'
+        ].filter(Boolean).join(' ')}
+        onClick={handleClick}
+        title={title}
+        aria-label={title}
+      >
+        {icon}
+      </button>
+      {error && (
+        <div className="ai-header__detach-error" role="alert">
+          {error}
+        </div>
+      )}
+    </>
+  );
+}
+
+export function AssistantPanelContent({
+  hostMode = 'embedded',
+  style,
+  dragHandle,
+  onWindowDrag,
+  onWindowDragEnd,
+  onClose
+}: {
+  hostMode?: 'embedded' | 'detached';
   style?: CSSProperties;
+  dragHandle?: ReactNode;
+  onWindowDrag?: (position: { x: number; y: number }) => void;
+  onWindowDragEnd?: () => void;
   onClose?: () => void;
-  launcherPosition: LauncherPosition;
-  onLauncherPositionChange: (position: LauncherPosition) => void;
 }) {
   const {
     routeContext,
@@ -173,14 +255,14 @@ export function AssistantPanelContent({
     <aside
       className={[
         'ai-panel',
-        embedded && 'ai-panel--embedded',
+        hostMode === 'embedded' && 'ai-panel--embedded',
+        hostMode === 'detached' && 'ai-panel--detached',
         historyOpen && 'ai-panel--history-open'
       ].filter(Boolean).join(' ')}
       style={style}
       role="complementary"
       aria-label="AI Assistant"
     >
-      {/* History sidebar — slides in from the left */}
       <div className={`ai-panel__history-sidebar${historyOpen ? ' open' : ''}`}>
         <div className="ai-panel__history-sidebar-inner">
           <AssistantHistoryList
@@ -195,7 +277,6 @@ export function AssistantPanelContent({
         </div>
       </div>
 
-      {/* Main chat column */}
       <div className="ai-panel__chat">
         <AssistantHeader
           context={routeContext}
@@ -204,11 +285,12 @@ export function AssistantPanelContent({
           loading={loading}
           historyOpen={historyOpen}
           sessionCount={sessions.length}
+          dragHandle={dragHandle}
+          onWindowDrag={onWindowDrag}
+          onWindowDragEnd={onWindowDragEnd}
           onCreateSession={() => void createSession()}
           onToggleHistory={() => setHistoryOpen(!historyOpen)}
           onClose={() => onClose?.()}
-          launcherPosition={launcherPosition}
-          onLauncherPositionChange={onLauncherPositionChange}
         />
 
         <div className="ai-panel__body">
@@ -249,9 +331,9 @@ export function AssistantPanelContent({
             <button
               type="button"
               className="ai-panel__error-retry"
-            onClick={() => void resetSession()}
-            title="Reset and retry"
-          >
+              onClick={() => void resetSession()}
+              title="Reset and retry"
+            >
               <IconRefreshCw size={12} />
             </button>
           </div>
@@ -268,27 +350,50 @@ export function AssistantPanelContent({
 }
 
 export function GlobalAssistantHost() {
-  const { open, setOpen, hasUnread, loading, sending, historyOpen } = useAiAssistant();
-  const [launcherPosition, setLauncherPosition] = useState<LauncherPosition>(() => loadLauncherPosition());
+  const {
+    presentation,
+    open,
+    setOpen,
+    hasUnread,
+    loading,
+    sending,
+    historyOpen,
+    embeddedLauncherPosition,
+    setEmbeddedLauncherPosition,
+    detachPanel
+  } = useAiAssistant();
 
-  const handleToggle = useCallback(() => setOpen(!open), [open, setOpen]);
-
-  const handlePositionChange = useCallback((position: LauncherPosition) => {
-    setLauncherPosition(clampLauncherPosition(position));
-  }, []);
+  const launcherPosition = useMemo(
+    () => clampLauncherPosition(embeddedLauncherPosition ?? getDefaultLauncherPosition()),
+    [embeddedLauncherPosition]
+  );
 
   useEffect(() => {
-    window.localStorage.setItem(AI_LAUNCHER_POSITION_KEY, JSON.stringify(launcherPosition));
-  }, [launcherPosition]);
+    if (
+      embeddedLauncherPosition?.left !== launcherPosition.left
+      || embeddedLauncherPosition?.top !== launcherPosition.top
+    ) {
+      void setEmbeddedLauncherPosition(launcherPosition);
+    }
+  }, [embeddedLauncherPosition?.left, embeddedLauncherPosition?.top, launcherPosition, setEmbeddedLauncherPosition]);
 
   useEffect(() => {
     const handleResize = () => {
-      setLauncherPosition((current) => clampLauncherPosition(current));
+      const clamped = clampLauncherPosition(launcherPosition);
+      if (clamped.left !== launcherPosition.left || clamped.top !== launcherPosition.top) {
+        void setEmbeddedLauncherPosition(clamped);
+      }
     };
 
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, []);
+  }, [launcherPosition, setEmbeddedLauncherPosition]);
+
+  const handleToggle = useCallback(() => setOpen(!open), [open, setOpen]);
+
+  const handlePositionChange = useCallback((position: LauncherPosition) => {
+    void setEmbeddedLauncherPosition(clampLauncherPosition(position));
+  }, [setEmbeddedLauncherPosition]);
 
   const launcherStyle = useMemo<CSSProperties>(() => ({
     left: `${launcherPosition.left}px`,
@@ -297,28 +402,53 @@ export function GlobalAssistantHost() {
     bottom: 'auto'
   }), [launcherPosition.left, launcherPosition.top]);
 
-  const panelStyle = useMemo<CSSProperties>(() => {
+  const panelLayout = useMemo(() => {
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
-    const closedPanelWidth = Math.min(AI_PANEL_WIDTH_CLOSED, viewportWidth - 48);
+    const panelWidth = Math.min(historyOpen ? AI_PANEL_WIDTH_HISTORY : AI_PANEL_WIDTH_CLOSED, viewportWidth - 48);
     const panelHeight = Math.min(AI_PANEL_MAX_HEIGHT, viewportHeight * 0.72);
     const panelRightEdge = clamp(
       launcherPosition.left + AI_LAUNCHER_SIZE,
-      AI_PANEL_MIN_MARGIN + closedPanelWidth,
+      AI_PANEL_MIN_MARGIN + panelWidth,
       viewportWidth - AI_PANEL_MIN_MARGIN
+    );
+    const top = clamp(
+      launcherPosition.top - panelHeight - AI_PANEL_GAP,
+      AI_PANEL_MIN_MARGIN,
+      viewportHeight - panelHeight - AI_PANEL_MIN_MARGIN
     );
 
     return {
+      viewportWidth,
+      top,
+      panelRightEdge
+    };
+  }, [historyOpen, launcherPosition.left, launcherPosition.top]);
+
+  const panelStyle = useMemo<CSSProperties>(() => {
+    return {
       left: 'auto',
-      top: `${clamp(
-        launcherPosition.top - panelHeight - AI_PANEL_GAP,
-        AI_PANEL_MIN_MARGIN,
-        viewportHeight - panelHeight - AI_PANEL_MIN_MARGIN
-      )}px`,
-      right: `${viewportWidth - panelRightEdge}px`,
+      top: `${panelLayout.top}px`,
+      right: `${panelLayout.viewportWidth - panelLayout.panelRightEdge}px`,
       bottom: 'auto'
     };
-  }, [launcherPosition.left, launcherPosition.top]);
+  }, [panelLayout]);
+
+  const handlePopOut = useCallback(async () => {
+    const detachedWidth = AI_ASSISTANT_DETACHED_PANEL_WINDOW_SIZE.width + (historyOpen ? AI_DETACHED_HISTORY_WIDTH_DELTA : 0);
+    const detachedHeight = AI_ASSISTANT_DETACHED_PANEL_WINDOW_SIZE.height;
+    const detachedX = window.screenX + panelLayout.panelRightEdge - detachedWidth;
+    const detachedY = window.screenY + panelLayout.top;
+
+    await detachPanel({
+      x: detachedX + detachedWidth / 2,
+      y: detachedY + detachedHeight / 2
+    });
+  }, [detachPanel, historyOpen, panelLayout.panelRightEdge, panelLayout.top]);
+
+  if (presentation.dockMode === 'detached') {
+    return null;
+  }
 
   return (
     <>
@@ -334,12 +464,83 @@ export function GlobalAssistantHost() {
 
       {open && (
         <AssistantPanelContent
+          hostMode="embedded"
           style={panelStyle}
+          dragHandle={(
+            <AssistantDockAction mode="out" onAction={handlePopOut} />
+          )}
           onClose={() => setOpen(false)}
-          launcherPosition={launcherPosition}
-          onLauncherPositionChange={handlePositionChange}
         />
       )}
     </>
+  );
+}
+
+export function DetachedAssistantWindowHost() {
+  const {
+    presentation,
+    open,
+    setOpen,
+    hasUnread,
+    loading,
+    sending,
+    historyOpen,
+    reattachEmbeddedOpen
+  } = useAiAssistant();
+  const moveDetachedWindow = useDetachedWindowDrag();
+
+  useLayoutEffect(() => {
+    if (presentation.dockMode !== 'detached' || !open || presentation.surfaceMode !== 'panel') {
+      return;
+    }
+    const targetWidth = AI_ASSISTANT_DETACHED_PANEL_WINDOW_SIZE.width + (historyOpen ? AI_DETACHED_HISTORY_WIDTH_DELTA : 0);
+    const currentWidth = presentation.detachedPanelBounds?.width ?? AI_ASSISTANT_DETACHED_PANEL_WINDOW_SIZE.width;
+    if (currentWidth === targetWidth) {
+      return;
+    }
+
+    resizeDetachedWindow({
+      width: targetWidth
+    });
+  }, [historyOpen, open, presentation.detachedPanelBounds?.width, presentation.dockMode, presentation.surfaceMode]);
+
+  const handlePopIn = useCallback(async () => {
+    await reattachEmbeddedOpen();
+  }, [reattachEmbeddedOpen]);
+
+  if (presentation.dockMode !== 'detached') {
+    return null;
+  }
+
+  return (
+    <div className="assistant-window">
+      <div
+        className={[
+          'assistant-window__panel-shell',
+          open ? 'assistant-window__panel-shell--visible' : 'assistant-window__panel-shell--hidden'
+        ].join(' ')}
+        aria-hidden={!open}
+      >
+        <AssistantPanelContent
+          hostMode="detached"
+          dragHandle={(
+            <AssistantDockAction mode="in" onAction={handlePopIn} />
+          )}
+          onWindowDrag={moveDetachedWindow}
+          onWindowDragEnd={finishDetachedWindowDrag}
+          onClose={() => setOpen(false)}
+        />
+      </div>
+      <div className="assistant-window__launcher-slot">
+        <AssistantLauncher
+          open={open}
+          loading={loading || sending}
+          hasUnread={hasUnread}
+          onWindowDrag={moveDetachedWindow}
+          onWindowDragEnd={finishDetachedWindowDrag}
+          onToggle={() => setOpen(!open)}
+        />
+      </div>
+    </div>
   );
 }

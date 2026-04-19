@@ -1,6 +1,11 @@
 import {
+  type AiAssistantContextChangedEvent,
+  type AiAssistantDetachedWindowMoveRequest,
+  type AiAssistantDetachedWindowResizeRequest,
+  type AiAssistantPresentationChangedEvent,
   JobEvent,
   type AiAssistantStreamEvent,
+  type AppNavigationEvent,
   type AppWorkingStatePatchAppliedEvent,
   type RpcResponse,
   type JobPayload
@@ -13,6 +18,12 @@ export interface KbvApi {
   emitJobEvents: (handler: (event: JobEvent) => void) => () => void;
   emitAppWorkingStateEvents: (handler: (event: AppWorkingStatePatchAppliedEvent) => void) => () => void;
   emitAiAssistantEvents: (handler: (event: AiAssistantStreamEvent) => void) => () => void;
+  emitAiAssistantPresentationEvents: (handler: (event: AiAssistantPresentationChangedEvent) => void) => () => void;
+  emitAiAssistantContextEvents: (handler: (event: AiAssistantContextChangedEvent) => void) => () => void;
+  emitAppNavigationEvents: (handler: (event: AppNavigationEvent) => void) => () => void;
+  moveAssistantWindow: (payload: AiAssistantDetachedWindowMoveRequest) => void;
+  resizeAssistantWindow: (payload: AiAssistantDetachedWindowResizeRequest) => void;
+  finishAssistantWindowDrag: () => void;
 }
 
 declare global {

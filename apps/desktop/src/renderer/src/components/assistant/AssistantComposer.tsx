@@ -80,8 +80,12 @@ export function AssistantComposer({ context, loading, onSend }: AssistantCompose
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
+    if (!draft) {
+      el.style.height = '36px';
+      return;
+    }
     el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    el.style.height = `${Math.max(36, Math.min(el.scrollHeight, 160))}px`;
   }, [draft]);
 
   return (

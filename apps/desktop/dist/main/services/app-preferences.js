@@ -6,6 +6,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getSidebarCollapsedPreference = getSidebarCollapsedPreference;
 exports.getStoredSidebarCollapsedPreference = getStoredSidebarCollapsedPreference;
 exports.setSidebarCollapsedPreference = setSidebarCollapsedPreference;
+exports.getAssistantPresentationPreferences = getAssistantPresentationPreferences;
+exports.setAssistantPresentationPreferences = setAssistantPresentationPreferences;
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
 const electron_1 = require("electron");
@@ -24,7 +26,8 @@ function readPreferences() {
         const parsed = JSON.parse(raw);
         logger_1.logger.info('app-preferences.read.success', {
             filePath,
-            sidebarCollapsed: parsed?.ui?.sidebarCollapsed ?? null
+            sidebarCollapsed: parsed?.ui?.sidebarCollapsed ?? null,
+            assistantPreferences: Boolean(parsed?.ui?.assistant)
         });
         return parsed && typeof parsed === 'object' ? parsed : {};
     }
@@ -42,7 +45,8 @@ function writePreferences(preferences) {
     node_fs_1.default.writeFileSync(filePath, JSON.stringify(preferences, null, 2), 'utf8');
     logger_1.logger.info('app-preferences.write.success', {
         filePath,
-        sidebarCollapsed: preferences.ui?.sidebarCollapsed ?? null
+        sidebarCollapsed: preferences.ui?.sidebarCollapsed ?? null,
+        assistantPreferences: Boolean(preferences.ui?.assistant)
     });
 }
 function getSidebarCollapsedPreference() {
@@ -64,6 +68,38 @@ function setSidebarCollapsedPreference(collapsed) {
         ui: {
             ...preferences.ui,
             sidebarCollapsed: collapsed
+        }
+    });
+}
+function getAssistantPresentationPreferences() {
+    const preferences = readPreferences().ui?.assistant;
+    if (!preferences || typeof preferences !== 'object') {
+        logger_1.logger.info('app-preferences.getAssistantPresentationPreferences.empty');
+        return {};
+    }
+    logger_1.logger.info('app-preferences.getAssistantPresentationPreferences.success', {
+        hasEmbeddedLauncherPosition: Boolean(preferences.embeddedLauncherPosition),
+        hasDetachedLauncherBounds: Boolean(preferences.detachedLauncherBounds),
+        hasDetachedPanelBounds: Boolean(preferences.detachedPanelBounds),
+        detachedDisplayId: preferences.detachedDisplayId ?? null,
+        lastDetachedSurfaceMode: preferences.lastDetachedSurfaceMode ?? null
+    });
+    return preferences;
+}
+function setAssistantPresentationPreferences(nextPreferences) {
+    logger_1.logger.info('app-preferences.setAssistantPresentationPreferences.begin', {
+        hasEmbeddedLauncherPosition: Boolean(nextPreferences.embeddedLauncherPosition),
+        hasDetachedLauncherBounds: Boolean(nextPreferences.detachedLauncherBounds),
+        hasDetachedPanelBounds: Boolean(nextPreferences.detachedPanelBounds),
+        detachedDisplayId: nextPreferences.detachedDisplayId ?? null,
+        lastDetachedSurfaceMode: nextPreferences.lastDetachedSurfaceMode ?? null
+    });
+    const preferences = readPreferences();
+    writePreferences({
+        ...preferences,
+        ui: {
+            ...preferences.ui,
+            assistant: nextPreferences
         }
     });
 }

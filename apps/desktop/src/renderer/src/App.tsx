@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AppRoute, type RpcResponse } from '@kb-vault/shared-types';
+import { AppRoute, type AiAssistantRendererWindowRole, type AppNavigationEvent, type RpcResponse } from '@kb-vault/shared-types';
 import { routeToComponent } from './routes/routeMap';
 import { Sidebar } from './components/Sidebar';
 import { WorkspaceProvider, useWorkspace } from './context/WorkspaceContext';
 import type { KbvApi } from './types/window';
 import { AiAssistantProvider } from './components/assistant/AssistantContext';
-import { GlobalAssistantHost } from './components/assistant/GlobalAssistantHost';
+import { DetachedAssistantWindowHost, GlobalAssistantHost } from './components/assistant/GlobalAssistantHost';
 
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'kbv:sidebar-collapsed';
@@ -142,10 +142,21 @@ function AppShell() {
     }
   }, [activeWorkspace, activeRoute]);
 
-  const openProposalReview = (proposalId: string) => {
+  const openProposalReview = useCallback((proposalId: string) => {
     window.sessionStorage.setItem(PROPOSAL_REVIEW_TARGET_KEY, proposalId);
     setActiveRoute(AppRoute.PROPOSAL_REVIEW);
-  };
+  }, []);
+
+  useEffect(() => {
+    if (!window.kbv?.emitAppNavigationEvents) {
+      return;
+    }
+    return window.kbv.emitAppNavigationEvents((event: AppNavigationEvent) => {
+      if (event.action.type === 'open_proposal_review') {
+        openProposalReview(event.action.proposalId);
+      }
+    });
+  }, [openProposalReview]);
 
   const Active = routeToComponent[activeRoute];
 
@@ -161,9 +172,9 @@ function AppShell() {
       />
       {bootError ? <p style={{ padding: '16px', color: 'crimson' }}>{bootError}</p> : null}
       <AiAssistantProvider
+        windowRole="main"
         activeRoute={activeRoute}
         workspaceId={activeWorkspace?.id}
-        onOpenProposalReview={openProposalReview}
       >
         <main className="main-content">
           <Active />
@@ -174,7 +185,31 @@ function AppShell() {
   );
 }
 
+function DetachedAssistantApp() {
+  useEffect(() => {
+    document.body.classList.add('body--assistant-detached');
+    return () => {
+      document.body.classList.remove('body--assistant-detached');
+    };
+  }, []);
+
+  return (
+    <AiAssistantProvider windowRole="assistant_detached">
+      <DetachedAssistantWindowHost />
+    </AiAssistantProvider>
+  );
+}
+
+function getRendererWindowRole(): AiAssistantRendererWindowRole {
+  const rawRole = new URLSearchParams(window.location.search).get('windowRole');
+  return rawRole === 'assistant_detached' ? 'assistant_detached' : 'main';
+}
+
 export function App() {
+  if (getRendererWindowRole() === 'assistant_detached') {
+    return <DetachedAssistantApp />;
+  }
+
   return (
     <WorkspaceProvider>
       <AppShell />

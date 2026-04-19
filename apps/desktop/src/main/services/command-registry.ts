@@ -125,8 +125,12 @@ import {
   type TemplatePackListRequest,
   type TemplatePackUpsertRequest,
   type AiAssistantArtifactDecisionRequest,
+  type AiAssistantContextGetResponse,
+  type AiAssistantContextPublishRequest,
   type AiAssistantContextGetRequest,
   type AiAssistantMessageSendRequest,
+  type AiAssistantPresentationGetResponse,
+  type AiAssistantPresentationTransitionRequest,
   type AiAssistantSessionCreateRequest,
   type AiAssistantSessionDeleteRequest,
   type AiAssistantSessionGetRequest,
@@ -134,6 +138,8 @@ import {
   type AiAssistantSessionOpenRequest,
   type AiAssistantSessionResetRequest,
   type AiAssistantStreamEvent,
+  type AppNavigationDispatchRequest,
+  type AppNavigationEvent,
   type AppWorkingStatePatchAppliedEvent,
   type AppWorkingStatePatchRequest,
   type AppWorkingStateRegistration,
@@ -152,6 +158,8 @@ import { KbCliLoopbackService } from './kb-cli-loopback-service';
 import { KbCliRuntimeService } from './kb-cli-runtime-service';
 import { AiAssistantService } from './ai-assistant-service';
 import { AppWorkingStateService } from './app-working-state-service';
+import { AssistantPresentationService } from './assistant-presentation-service';
+import { AssistantViewContextService } from './assistant-view-context-service';
 import { BatchAnalysisOrchestrator, type BatchFinalReviewerProposalContext } from './batch-analysis-orchestrator';
 import { KbActionService } from './kb-action-service';
 import { DirectKbExecutor } from './direct-kb-executor';
@@ -2411,7 +2419,10 @@ export function registerCoreCommands(
   jobs: JobRegistry,
   workspaceRoot: string,
   emitAppWorkingStateEvent?: (event: AppWorkingStatePatchAppliedEvent) => void,
-  emitAiAssistantEvent?: (event: AiAssistantStreamEvent) => void
+  emitAiAssistantEvent?: (event: AiAssistantStreamEvent) => void,
+  assistantPresentationService?: AssistantPresentationService,
+  assistantViewContextService?: AssistantViewContextService,
+  dispatchAppNavigation?: (event: AppNavigationEvent) => void
 ) {
   const workspaceRepository = new WorkspaceRepository(workspaceRoot);
   const batchAnalysisOrchestrator = new BatchAnalysisOrchestrator(workspaceRepository);
@@ -4137,6 +4148,73 @@ export function registerCoreCommands(
     }
   });
 
+  bus.register('ai.assistant.context.current', async () => {
+    try {
+      const data: AiAssistantContextGetResponse = assistantViewContextService
+        ? assistantViewContextService.getCurrent()
+        : {};
+      return { ok: true, data };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.context.publish', async (payload) => {
+    try {
+      const input = payload as AiAssistantContextPublishRequest;
+      if (!assistantViewContextService) {
+        return createErrorResult(AppErrorCode.INTERNAL_ERROR, 'Assistant context publishing is not available.');
+      }
+      if (!input?.sourceWindowRole) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.context.publish requires sourceWindowRole');
+      }
+      return {
+        ok: true,
+        data: assistantViewContextService.publish(input)
+      };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.presentation.get', async () => {
+    try {
+      const data: AiAssistantPresentationGetResponse = {
+        state: assistantPresentationService?.getState() ?? {
+          dockMode: 'embedded',
+          surfaceMode: 'closed',
+          state: 'embedded_closed',
+          hasUnread: false,
+          updatedAtUtc: new Date().toISOString(),
+          lastDetachedSurfaceMode: 'launcher'
+        }
+      };
+      return { ok: true, data };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('ai.assistant.presentation.transition', async (payload) => {
+    try {
+      const input = payload as AiAssistantPresentationTransitionRequest;
+      if (!assistantPresentationService) {
+        return createErrorResult(AppErrorCode.INTERNAL_ERROR, 'Assistant presentation is not available.');
+      }
+      if (!input?.transition?.type) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'ai.assistant.presentation.transition requires a transition');
+      }
+      return {
+        ok: true,
+        data: {
+          state: assistantPresentationService.transition(input.transition)
+        } satisfies AiAssistantPresentationGetResponse
+      };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
   bus.register('ai.assistant.session.get', async (payload) => {
     try {
       const input = payload as AiAssistantSessionGetRequest;
@@ -4268,6 +4346,26 @@ export function registerCoreCommands(
       if ((error as Error).message.includes('not found')) {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
       }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('app.navigation.dispatch', async (payload) => {
+    try {
+      const input = payload as AppNavigationDispatchRequest;
+      if (!input?.action?.type) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'app.navigation.dispatch requires an action');
+      }
+      const event: AppNavigationEvent = {
+        action: input.action,
+        atUtc: new Date().toISOString()
+      };
+      dispatchAppNavigation?.(event);
+      return {
+        ok: true,
+        data: event
+      };
+    } catch (error) {
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
     }
   });

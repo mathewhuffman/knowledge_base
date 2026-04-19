@@ -3,6 +3,11 @@ import {
   AppRoute,
   type AiArtifactRecord,
   type AiAssistantArtifactDecisionResponse,
+  type AiAssistantContextGetResponse,
+  type AiAssistantPresentationGetResponse,
+  type AiAssistantPresentationState,
+  type AiAssistantPresentationTransitionRequest,
+  type AiAssistantRendererWindowRole,
   type AiAssistantSessionGetResponse,
   type AiAssistantSessionListResponse,
   type AiAssistantStreamEvent,
@@ -136,12 +141,22 @@ type RouteRegistration = {
   applyWorkingStatePatch?: (patch: Record<string, unknown>, event: AppWorkingStatePatchAppliedEvent) => void;
 };
 
+type PublishedContextState = AiAssistantContextGetResponse;
+
 type AssistantContextValue = {
+  windowRole: AiAssistantRendererWindowRole;
+  presentation: AiAssistantPresentationState;
   open: boolean;
   setOpen: (open: boolean) => void;
   hasUnread: boolean;
   historyOpen: boolean;
   setHistoryOpen: (open: boolean) => void;
+  embeddedLauncherPosition?: { left: number; top: number };
+  setEmbeddedLauncherPosition: (position: { left: number; top: number }) => Promise<void>;
+  detachLauncher: (anchorPoint: { x: number; y: number }) => Promise<void>;
+  detachPanel: (anchorPoint: { x: number; y: number }) => Promise<void>;
+  reattachEmbeddedOpen: () => Promise<void>;
+  reattachEmbeddedClosed: () => Promise<void>;
   routeContext: AiViewContext | null;
   session: AiSessionRecord | null;
   sessions: AiSessionRecord[];
@@ -188,19 +203,28 @@ const ROUTE_LABELS: Record<AppRoute, string> = {
   [AppRoute.SETTINGS]: 'Settings'
 };
 
+const DEFAULT_PRESENTATION_STATE: AiAssistantPresentationState = {
+  dockMode: 'embedded',
+  surfaceMode: 'closed',
+  state: 'embedded_closed',
+  hasUnread: false,
+  updatedAtUtc: new Date().toISOString(),
+  lastDetachedSurfaceMode: 'launcher'
+};
+
 export function AiAssistantProvider({
+  windowRole,
   activeRoute,
   workspaceId,
-  onOpenProposalReview,
   children
 }: {
-  activeRoute: AppRoute;
+  windowRole: AiAssistantRendererWindowRole;
+  activeRoute?: AppRoute;
   workspaceId?: string;
-  onOpenProposalReview?: (proposalId: string) => void;
   children: ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
-  const [lastSeenAssistantMessageId, setLastSeenAssistantMessageId] = useState<string | null>(null);
+  const [presentation, setPresentation] = useState<AiAssistantPresentationState>(DEFAULT_PRESENTATION_STATE);
+  const [publishedContext, setPublishedContext] = useState<PublishedContextState>({});
   const [historyOpen, setHistoryOpen] = useState(false);
   const [registration, setRegistration] = useState<RouteRegistration | null>(null);
   const [session, setSession] = useState<AiSessionRecord | null>(null);
@@ -233,7 +257,7 @@ export function AiAssistantProvider({
   }, [pendingTurn]);
 
   const fallbackContext = useMemo<AiViewContext | null>(() => {
-    if (!workspaceId) return null;
+    if (windowRole !== 'main' || !workspaceId || !activeRoute) return null;
     return {
       workspaceId,
       route: activeRoute,
@@ -258,29 +282,77 @@ export function AiAssistantProvider({
         route: activeRoute
       }
     };
-  }, [activeRoute, workspaceId]);
+  }, [activeRoute, windowRole, workspaceId]);
 
-  const routeContext = registration?.context ?? fallbackContext;
+  const routeContext = windowRole === 'main'
+    ? (registration?.context ?? fallbackContext)
+    : (publishedContext.context ?? null);
 
-  const latestAssistantMessageId = useMemo(() => {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (messages[index]?.role === 'assistant') {
-        return messages[index].id;
-      }
-    }
-    return null;
-  }, [messages]);
-
-  const hasUnread = useMemo(() => (
-    latestAssistantMessageId !== null && latestAssistantMessageId !== lastSeenAssistantMessageId
-  ), [lastSeenAssistantMessageId, latestAssistantMessageId]);
+  const assistantWorkspaceId = routeContext?.workspaceId;
+  const open = useMemo(() => (
+    windowRole === 'main'
+      ? presentation.state === 'embedded_open'
+      : presentation.state === 'detached_panel'
+  ), [presentation.state, windowRole]);
+  const hasUnread = presentation.hasUnread;
 
   useEffect(() => {
-    if (!open || !latestAssistantMessageId) return;
-    setLastSeenAssistantMessageId((current) => (
-      current === latestAssistantMessageId ? current : latestAssistantMessageId
-    ));
-  }, [latestAssistantMessageId, open]);
+    if (!window.kbv?.invoke) {
+      return;
+    }
+
+    void window.kbv.invoke<AiAssistantPresentationGetResponse>('ai.assistant.presentation.get')
+      .then((response) => {
+        if (response.ok && response.data?.state) {
+          setPresentation(response.data.state);
+        }
+      })
+      .catch((invokeError: unknown) => {
+        console.warn('[assistant.chat] failed to load presentation state', String(invokeError));
+      });
+
+    void window.kbv.invoke<AiAssistantContextGetResponse>('ai.assistant.context.current')
+      .then((response) => {
+        if (response.ok && response.data) {
+          setPublishedContext(response.data);
+        }
+      })
+      .catch((invokeError: unknown) => {
+        console.warn('[assistant.chat] failed to load published context', String(invokeError));
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!window.kbv?.emitAiAssistantPresentationEvents) {
+      return;
+    }
+    return window.kbv.emitAiAssistantPresentationEvents((event) => {
+      setPresentation(event.state);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!window.kbv?.emitAiAssistantContextEvents) {
+      return;
+    }
+    return window.kbv.emitAiAssistantContextEvents((event) => {
+      setPublishedContext(event);
+    });
+  }, []);
+
+  const routeContextSignature = JSON.stringify(routeContext);
+
+  useEffect(() => {
+    if (windowRole !== 'main' || !window.kbv?.invoke) {
+      return;
+    }
+    void window.kbv.invoke('ai.assistant.context.publish', {
+      context: routeContext ?? null,
+      sourceWindowRole: windowRole
+    }).catch((invokeError: unknown) => {
+      console.warn('[assistant.chat] failed to publish assistant context', String(invokeError));
+    });
+  }, [routeContextSignature, routeContext, windowRole]);
 
   useEffect(() => {
     if (!window.kbv?.invoke) {
@@ -340,7 +412,7 @@ export function AiAssistantProvider({
       return;
     }
     const unsubscribe = window.kbv.emitAiAssistantEvents((event) => {
-      if (!workspaceId || event.workspaceId !== workspaceId) {
+      if (!assistantWorkspaceId || event.workspaceId !== assistantWorkspaceId) {
         return;
       }
 
@@ -398,7 +470,7 @@ export function AiAssistantProvider({
 
         if (event.kind === 'turn_error') {
           logAssistantConsole('turn_error', {
-            workspaceId,
+            workspaceId: assistantWorkspaceId,
             turnId: event.turnId,
             sessionId: current.sessionId,
             error: event.error ?? event.message ?? 'Assistant run failed.',
@@ -430,17 +502,22 @@ export function AiAssistantProvider({
       });
     });
     return () => unsubscribe();
-  }, [workspaceId]);
+  }, [assistantWorkspaceId]);
 
   const runUiActions = useCallback((actions: AiAssistantUiAction[]) => {
     if (actions.length === 0) return;
     for (const action of actions) {
       if (action.type === 'show_proposal_created') {
-        onOpenProposalReview?.(action.proposalId);
+        void window.kbv.invoke('app.navigation.dispatch', {
+          action: {
+            type: 'open_proposal_review',
+            proposalId: action.proposalId
+          }
+        });
       }
     }
     applyActionsRef.current?.(actions);
-  }, [onOpenProposalReview]);
+  }, []);
 
   const upsertSession = useCallback((nextSession: AiSessionRecord | null) => {
     if (!nextSession) return;
@@ -484,7 +561,7 @@ export function AiAssistantProvider({
     const list = await loadSessionList(workspaceIdToLoad);
     const targetSessionId = preferredSessionId ?? list.activeSessionId ?? null;
     const currentSession = await hydrateSession(workspaceIdToLoad, targetSessionId);
-    if (!currentSession && list.sessions.length === 0) {
+    if (!currentSession && list.sessions.length === 0 && windowRole === 'main') {
       const created = await window.kbv.invoke<AiAssistantSessionGetResponse>('ai.assistant.session.create', {
         workspaceId: workspaceIdToLoad
       });
@@ -496,23 +573,22 @@ export function AiAssistantProvider({
       setMessages(created.data.messages ?? []);
       setArtifact(created.data.artifact ?? null);
     }
-  }, [hydrateSession, loadSessionList, upsertSession]);
+  }, [hydrateSession, loadSessionList, upsertSession, windowRole]);
 
   useEffect(() => {
-    if (!workspaceId) {
+    if (!assistantWorkspaceId) {
       setSession(null);
       setSessions([]);
       setMessages([]);
       setArtifact(null);
       setPendingTurn(null);
-      setLastSeenAssistantMessageId(null);
       setSending(false);
       setHistoryOpen(false);
       return;
     }
     setLoading(true);
     setError(null);
-    void refreshWorkspaceAssistant(workspaceId)
+    void refreshWorkspaceAssistant(assistantWorkspaceId)
       .catch((err) => {
         setError(err instanceof Error ? err.message : String(err));
         setSession(null);
@@ -520,11 +596,10 @@ export function AiAssistantProvider({
         setMessages([]);
         setArtifact(null);
         setPendingTurn(null);
-        setLastSeenAssistantMessageId(null);
         setSending(false);
       })
       .finally(() => setLoading(false));
-  }, [refreshWorkspaceAssistant, workspaceId]);
+  }, [assistantWorkspaceId, refreshWorkspaceAssistant]);
 
   const createSession = useCallback(async () => {
     if (!routeContext) return;
@@ -799,12 +874,77 @@ export function AiAssistantProvider({
     };
   }, []);
 
+  const transitionPresentation = useCallback(async (transition: AiAssistantPresentationTransitionRequest['transition']) => {
+    if (!window.kbv?.invoke) {
+      throw new Error('Assistant IPC bridge is unavailable.');
+    }
+    const response = await window.kbv.invoke<AiAssistantPresentationGetResponse>('ai.assistant.presentation.transition', {
+      transition
+    });
+    if (!response.ok || !response.data?.state) {
+      throw new Error(response.error?.message ?? 'Failed to update assistant presentation.');
+    }
+    setPresentation(response.data.state);
+  }, []);
+
+  const setOpen = useCallback((nextOpen: boolean) => {
+    const transition = windowRole === 'main'
+      ? { type: nextOpen ? 'open_embedded_panel' : 'close_embedded_panel' } as const
+      : { type: nextOpen ? 'open_detached_panel' : 'collapse_detached_to_launcher' } as const;
+    void transitionPresentation(transition).catch((transitionError: unknown) => {
+      setError((current) => current ?? String(transitionError));
+    });
+  }, [transitionPresentation, windowRole]);
+
+  const setEmbeddedLauncherPosition = useCallback(async (position: { left: number; top: number }) => {
+    await transitionPresentation({
+      type: 'set_embedded_launcher_position',
+      position
+    });
+  }, [transitionPresentation]);
+
+  const detachLauncher = useCallback(async (anchorPoint: { x: number; y: number }) => {
+    await transitionPresentation({
+      type: 'detach_launcher',
+      anchorPoint
+    });
+  }, [transitionPresentation]);
+
+  const detachPanel = useCallback(async (anchorPoint: { x: number; y: number }) => {
+    await transitionPresentation({
+      type: 'detach_panel',
+      anchorPoint
+    });
+  }, [transitionPresentation]);
+
+  const reattachEmbeddedOpen = useCallback(async () => {
+    await transitionPresentation({
+      type: 'reattach_embedded_open',
+      reason: 'user_request'
+    });
+  }, [transitionPresentation]);
+
+  const reattachEmbeddedClosed = useCallback(async () => {
+    await transitionPresentation({
+      type: 'reattach_embedded_closed',
+      reason: 'user_request'
+    });
+  }, [transitionPresentation]);
+
   const value = useMemo<AssistantContextValue>(() => ({
+    windowRole,
+    presentation,
     open,
     setOpen,
     hasUnread,
     historyOpen,
     setHistoryOpen,
+    embeddedLauncherPosition: presentation.embeddedLauncherPosition,
+    setEmbeddedLauncherPosition,
+    detachLauncher,
+    detachPanel,
+    reattachEmbeddedOpen,
+    reattachEmbeddedClosed,
     routeContext,
     session,
     sessions,
@@ -827,6 +967,10 @@ export function AiAssistantProvider({
     artifact,
     createSession,
     deleteSession,
+    detachLauncher,
+    detachPanel,
+    reattachEmbeddedOpen,
+    reattachEmbeddedClosed,
     error,
     handleArtifactDecision,
     historyOpen,
@@ -837,13 +981,17 @@ export function AiAssistantProvider({
     open,
     openSession,
     pendingTurn,
+    presentation,
     registerView,
     resetSession,
     routeContext,
     rerunLastMessage,
     sendMessage,
     session,
-    sessions
+    sessions,
+    setEmbeddedLauncherPosition,
+    setOpen,
+    windowRole
   ]);
 
   return <AssistantContext.Provider value={value}>{children}</AssistantContext.Provider>;

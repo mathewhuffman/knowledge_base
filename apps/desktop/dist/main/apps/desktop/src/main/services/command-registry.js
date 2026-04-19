@@ -1908,7 +1908,7 @@ function buildArticleAiPrompt(params) {
         `User request: ${params.request.message.trim()}`
     ].filter(Boolean).join('\n\n');
 }
-function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent) {
+function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent, assistantPresentationService, assistantViewContextService, dispatchAppNavigation) {
     const workspaceRepository = new workspace_repository_1.WorkspaceRepository(workspaceRoot);
     const batchAnalysisOrchestrator = new batch_analysis_orchestrator_1.BatchAnalysisOrchestrator(workspaceRepository);
     const zendeskSyncService = new zendesk_sync_service_1.ZendeskSyncService(workspaceRepository);
@@ -3545,6 +3545,73 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
         }
     });
+    bus.register('ai.assistant.context.current', async () => {
+        try {
+            const data = assistantViewContextService
+                ? assistantViewContextService.getCurrent()
+                : {};
+            return { ok: true, data };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('ai.assistant.context.publish', async (payload) => {
+        try {
+            const input = payload;
+            if (!assistantViewContextService) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, 'Assistant context publishing is not available.');
+            }
+            if (!input?.sourceWindowRole) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.context.publish requires sourceWindowRole');
+            }
+            return {
+                ok: true,
+                data: assistantViewContextService.publish(input)
+            };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('ai.assistant.presentation.get', async () => {
+        try {
+            const data = {
+                state: assistantPresentationService?.getState() ?? {
+                    dockMode: 'embedded',
+                    surfaceMode: 'closed',
+                    state: 'embedded_closed',
+                    hasUnread: false,
+                    updatedAtUtc: new Date().toISOString(),
+                    lastDetachedSurfaceMode: 'launcher'
+                }
+            };
+            return { ok: true, data };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('ai.assistant.presentation.transition', async (payload) => {
+        try {
+            const input = payload;
+            if (!assistantPresentationService) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, 'Assistant presentation is not available.');
+            }
+            if (!input?.transition?.type) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'ai.assistant.presentation.transition requires a transition');
+            }
+            return {
+                ok: true,
+                data: {
+                    state: assistantPresentationService.transition(input.transition)
+                }
+            };
+        }
+        catch (error) {
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
     bus.register('ai.assistant.session.get', async (payload) => {
         try {
             const input = payload;
@@ -3677,6 +3744,26 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             if (error.message.includes('not found')) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, error.message);
             }
+            return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
+        }
+    });
+    bus.register('app.navigation.dispatch', async (payload) => {
+        try {
+            const input = payload;
+            if (!input?.action?.type) {
+                return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'app.navigation.dispatch requires an action');
+            }
+            const event = {
+                action: input.action,
+                atUtc: new Date().toISOString()
+            };
+            dispatchAppNavigation?.(event);
+            return {
+                ok: true,
+                data: event
+            };
+        }
+        catch (error) {
             return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INTERNAL_ERROR, String(error.message || error));
         }
     });

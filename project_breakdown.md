@@ -309,15 +309,26 @@ Depending on proposal type:
 
 ## 7.7 Edit with AI at article level
 1. User opens a live article, draft branch, proposal review screen, or template pack.
-2. User opens the global AI assistant from the bottom-right launcher.
-3. The app registers the current route and subject as assistant context.
-4. User can have a normal back-and-forth conversation in ask mode without creating changes.
-5. If the user asks for content changes:
+2. User opens the global AI assistant from the in-app launcher or from an already detached assistant window.
+3. The assistant can live in one of four presentation states:
+   - `embedded_closed`
+   - `embedded_open`
+   - `detached_launcher`
+   - `detached_panel`
+4. The user can drag the embedded launcher out of the main app window to create a detached launcher window.
+5. The user can drag the embedded open panel out of the main app window to create a detached panel window.
+6. Native window close on the detached launcher or detached panel reattaches the assistant to the main app in `embedded_closed`.
+7. Clicking the assistant UI close button behaves differently by state:
+   - embedded panel close -> `embedded_closed`
+   - detached panel close -> `detached_launcher`
+8. The app registers the current route and subject as assistant context in the main window and publishes that context so the detached window stays route-aware and entity-aware.
+9. User can have a normal back-and-forth conversation in ask mode without creating changes.
+10. If the user asks for content changes:
    - from a live article, AI creates a proposal candidate that the user can `Create Proposal` or `Dismiss`
-   - from a draft, AI returns a draft patch that updates the working copy
+   - from a draft, AI returns a draft patch that updates the working copy through the shared app working-state mutation/event flow
    - from Proposal Review, AI returns a proposal patch that updates the review working copy
    - from Templates & Prompts, AI uses the currently selected KB access mode to execute an app working-state mutation against the desktop app
-6. User remains the explicit decision-maker for any persisted change.
+11. User remains the explicit decision-maker for any persisted change.
 
 ## 7.8 Publish selected drafts
 1. User selects one or more draft branches for publish.
@@ -387,7 +398,7 @@ The article detail surface must support:
 - publish history
 - asset placeholders
 - manual edit mode
-- global AI assistant panel with route-aware context
+- global AI assistant that can be embedded in the app shell or detached into a real desktop window while preserving route-aware context
 
 ## 8.4 PBI import requirements
 The import pipeline must:
@@ -606,7 +617,7 @@ The editor should support:
 ## 8.11 Article-level AI editing
 From any live article, draft branch, proposal review screen, or template pack, the user can ask the AI to:
 
-- open the global assistant panel with route-aware context
+- open the global assistant in embedded or detached mode with route-aware context
 - type a freeform request to the LLM in natural language
 - receive an AI response grounded in the current article or branch context
 - have the AI perform the requested improvement within that chat flow
@@ -621,6 +632,27 @@ From any live article, draft branch, proposal review screen, or template pack, t
 - insert image placeholders
 
 This should feel like an in-context editing chat, not a hidden backend action. The user should be able to describe the requested change in their own words, review the AI response, and then accept or reject the resulting patch or proposal.
+
+The assistant presentation model must support:
+
+- `embedded_closed`
+  - only the in-app launcher is visible
+  - clicking it opens the embedded panel
+  - dragging it out of the main window detaches into `detached_launcher`
+- `embedded_open`
+  - the in-app panel is visible
+  - clicking the panel close button returns to `embedded_closed`
+  - dragging the panel out of the main window detaches into `detached_panel`
+- `detached_launcher`
+  - a small standalone assistant launcher window
+  - clicking it opens `detached_panel`
+  - native window close reattaches the assistant as `embedded_closed`
+- `detached_panel`
+  - the full standalone assistant chat window
+  - clicking the assistant UI close button collapses to `detached_launcher`
+  - native window close reattaches the assistant as `embedded_closed`
+
+When the assistant is detached, the main app must not render a competing embedded launcher or embedded panel. The main window remains the source of truth for route/entity context, navigation, and live working-state registration so detached turns still stream, preserve history, preserve unread state, update Drafts live, update Proposal Review live, update Templates & Prompts live, and navigate the main window when a proposal is created.
 
 The assistant must support two distinct modes inside the same panel:
 
@@ -655,6 +687,8 @@ Draft and proposal working-copy changes may update the visible screen immediatel
 
 Template and other form-based working-state changes must not be inferred from assistant prose.  
 They should update only after the assistant successfully executes a real app mutation command and the desktop app confirms the applied patch.
+
+Draft working-copy updates must use that same shared mutation/event path so detached assistant turns update the visible Drafts screen without relying on window-local callbacks.
 
 ## 8.12 Templates and prompt packs
 The workspace must provide editable template and prompt management.
@@ -1537,7 +1571,14 @@ Users must be able to directly edit:
 ## 17.2 AI editing within an article
 The article screen must support access to the global AI assistant while the article viewer is open.
 
-The launcher lives in the bottom-right corner of the app shell and must remain visible above the article viewer.
+The embedded launcher lives in the bottom-right corner of the app shell and must remain visible above the article viewer whenever the assistant is not detached.
+
+The user must be able to:
+
+- click the embedded launcher to open the embedded panel
+- drag the embedded launcher out of the app window to create a detached launcher window
+- drag the embedded open panel out of the app window to create a detached assistant panel window
+- close the detached window natively and see the assistant reattach in the app as `embedded_closed`
 
 When the current context is a live article:
 

@@ -5,7 +5,7 @@ import {
   DraftCommitSource,
   AppRoute,
   ArticleAiPresetAction,
-  type AiAssistantUiAction,
+  buildAppWorkingStateVersionToken,
   type DraftBranchGetResponse,
   type DraftBranchListResponse,
   type DraftBranchSummary,
@@ -687,7 +687,16 @@ export const Drafts = () => {
       },
       workingState: {
         kind: 'article_html',
-        versionToken: selected?.branch.headRevisionId ?? `draft:${selected?.branch.id ?? 'unknown'}`,
+        versionToken: selected
+          ? buildAppWorkingStateVersionToken({
+              route: AppRoute.DRAFTS,
+              entityType: 'draft_branch',
+              entityId: selected.branch.id,
+              currentValues: {
+                html: draftHtml
+              }
+            })
+          : `draft:${selectedBranchId ?? 'unknown'}`,
         payload: { html: draftHtml }
       },
       capabilities: {
@@ -705,12 +714,10 @@ export const Drafts = () => {
         sourceHtml: originalHtml
       }
     },
-    applyUiActions: (actions: AiAssistantUiAction[]) => {
-      actions.forEach((action) => {
-        if (action.type === 'replace_working_html' && action.target === 'draft') {
-          setDraftHtml(action.html);
-        }
-      });
+    applyWorkingStatePatch: (patch) => {
+      if (typeof patch.html === 'string') {
+        setDraftHtml(patch.html);
+      }
     }
   });
 

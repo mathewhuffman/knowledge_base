@@ -4,14 +4,16 @@ import quillSnowCss from 'quill/dist/quill.snow.css?raw';
 import { buildArticlePreviewDocument, buildArticlePreviewStyles, normalizePreviewHtml } from '../../utils/previewDocument';
 
 /* Register a custom Quill blot so <hr> elements survive clipboard conversion */
-const BlockEmbed = Quill.import('blots/block/embed') as typeof import('parchment').EmbedBlot;
+const BlockEmbed = Quill.import('blots/block/embed') as unknown as new (...args: unknown[]) => {
+  statics?: Record<string, unknown>;
+};
 
 class HorizontalRuleBlot extends BlockEmbed {
   static blotName = 'hr';
   static tagName = 'hr';
 }
 
-Quill.register(HorizontalRuleBlot, true);
+Quill.register('formats/hr', HorizontalRuleBlot as unknown as Record<string, unknown>, true);
 
 export type ArticleSurfaceMode = 'preview' | 'edit';
 

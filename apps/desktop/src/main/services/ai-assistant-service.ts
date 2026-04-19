@@ -720,6 +720,45 @@ export class AiAssistantService {
   }
 
   private async applyArtifactSideEffects(context: AiViewContext | undefined, artifact: AiArtifactRecord): Promise<void> {
+    if (artifact.artifactType === 'draft_patch') {
+      const payload = artifact.payload as DraftPatchPayload;
+      if (!artifact.entityId) {
+        throw new Error('Draft patch artifacts require a draft branch entity id.');
+      }
+      const response = this.appWorkingStateService.patchForm({
+        workspaceId: artifact.workspaceId,
+        route: AppRoute.DRAFTS,
+        entityType: 'draft_branch',
+        entityId: artifact.entityId,
+        versionToken: artifact.baseVersionToken,
+        patch: {
+          html: payload.html
+        }
+      });
+      if (!response.ok || !response.applied) {
+        throw new Error(response.validationErrors[0]?.message ?? 'Draft patch could not be applied to the current working state.');
+      }
+      return;
+    }
+
+    if (artifact.artifactType === 'template_patch') {
+      if (!artifact.entityId) {
+        throw new Error('Template patch artifacts require a template pack entity id.');
+      }
+      const response = this.appWorkingStateService.patchForm({
+        workspaceId: artifact.workspaceId,
+        route: AppRoute.TEMPLATES_AND_PROMPTS,
+        entityType: 'template_pack',
+        entityId: artifact.entityId,
+        versionToken: artifact.baseVersionToken,
+        patch: artifact.payload as Record<string, unknown>
+      });
+      if (!response.ok || !response.applied) {
+        throw new Error(response.validationErrors[0]?.message ?? 'Template patch could not be applied to the current working state.');
+      }
+      return;
+    }
+
     if (artifact.artifactType !== 'proposal_patch') {
       return;
     }
@@ -1196,7 +1235,7 @@ export class AiAssistantService {
   }
 
   private buildUiActions(context: AiViewContext, artifact: AiArtifactRecord): AiAssistantUiAction[] {
-    const stale = artifact.baseVersionToken && context.workingState?.versionToken && artifact.baseVersionToken !== context.workingState.versionToken;
+    const stale = this.isArtifactStale(context, artifact);
     if (stale) {
       return [{ type: 'show_stale_warning', baseVersionToken: artifact.baseVersionToken }];
     }
@@ -1204,21 +1243,17 @@ export class AiAssistantService {
   }
 
   private buildUiActionsFromArtifact(artifact: AiArtifactRecord): AiAssistantUiAction[] {
-    if (artifact.artifactType === 'draft_patch') {
-      const payload = artifact.payload as DraftPatchPayload;
-      return [{ type: 'replace_working_html', target: 'draft', html: payload.html }];
-    }
     if (artifact.artifactType === 'proposal_patch') {
       return [{ type: 'none' }];
-    }
-    if (artifact.artifactType === 'template_patch') {
-      return [{ type: 'replace_template_form', payload: artifact.payload as TemplatePatchPayload }];
     }
     return [{ type: 'none' }];
   }
 
   private shouldAutoApplyArtifact(context: AiViewContext, artifact: AiArtifactRecord, uiActions: AiAssistantUiAction[]): boolean {
     if (uiActions.some((action) => action.type === 'show_stale_warning')) {
+      return false;
+    }
+    if ((artifact.artifactType === 'draft_patch' || artifact.artifactType === 'template_patch') && !this.canAutoApplyWorkingStatePatch(context)) {
       return false;
     }
     return (
@@ -1623,6 +1658,7 @@ export class AiAssistantService {
     }
     if (
       (context.route !== AppRoute.PROPOSAL_REVIEW || subject.type !== 'proposal')
+      && (context.route !== AppRoute.DRAFTS || subject.type !== 'draft_branch')
       && (context.route !== AppRoute.TEMPLATES_AND_PROMPTS || subject.type !== 'template_pack')
     ) {
       return false;
@@ -1639,6 +1675,53 @@ export class AiAssistantService {
     } catch {
       return false;
     }
+  }
+
+  private isArtifactStale(context: AiViewContext, artifact: AiArtifactRecord): boolean {
+    if (!artifact.baseVersionToken) {
+      return false;
+    }
+
+    if (artifact.artifactType === 'draft_patch' || artifact.artifactType === 'template_patch') {
+      try {
+        const currentVersionToken = this.currentWorkingStateVersion(context);
+        return Boolean(currentVersionToken && currentVersionToken !== artifact.baseVersionToken);
+      } catch {
+        return true;
+      }
+    }
+
+    return Boolean(
+      context.workingState?.versionToken
+      && artifact.baseVersionToken !== context.workingState.versionToken
+    );
+  }
+
+  private canAutoApplyWorkingStatePatch(context: AiViewContext): boolean {
+    try {
+      return Boolean(this.currentWorkingStateVersion(context));
+    } catch {
+      return false;
+    }
+  }
+
+  private currentWorkingStateVersion(context: AiViewContext): string | undefined {
+    const subject = context.subject;
+    if (!subject?.id || !context.workingState?.versionToken) {
+      return context.workingState?.versionToken;
+    }
+    if (
+      (context.route === AppRoute.DRAFTS && subject.type === 'draft_branch')
+      || (context.route === AppRoute.TEMPLATES_AND_PROMPTS && subject.type === 'template_pack')
+    ) {
+      return this.appWorkingStateService.getFormSchema({
+        workspaceId: context.workspaceId,
+        route: context.route,
+        entityType: subject.type,
+        entityId: subject.id
+      }).versionToken;
+    }
+    return context.workingState.versionToken;
   }
 
 

@@ -6,7 +6,13 @@ export const IPC_CHANNELS = {
   JOB_CANCEL: 'kbv:job:cancel',
   JOB_EVENT: 'kbv:job:event',
   APP_WORKING_STATE_EVENT: 'kbv:app-working-state:event',
-  AI_ASSISTANT_EVENT: 'kbv:ai-assistant:event'
+  AI_ASSISTANT_EVENT: 'kbv:ai-assistant:event',
+  AI_ASSISTANT_PRESENTATION_EVENT: 'kbv:ai-assistant:presentation:event',
+  AI_ASSISTANT_CONTEXT_EVENT: 'kbv:ai-assistant:context:event',
+  AI_ASSISTANT_WINDOW_MOVE: 'kbv:ai-assistant:window:move',
+  AI_ASSISTANT_WINDOW_RESIZE: 'kbv:ai-assistant:window:resize',
+  AI_ASSISTANT_WINDOW_DRAG_END: 'kbv:ai-assistant:window:drag-end',
+  APP_NAVIGATION_EVENT: 'kbv:app:navigation:event'
 };
 
 export interface RpcRequest {

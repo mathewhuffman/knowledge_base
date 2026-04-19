@@ -6,19 +6,95 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
+const shared_types_1 = require("@kb-vault/shared-types");
 const workspace_root_1 = require("./config/workspace-root");
 const config_loader_1 = require("./config/config-loader");
 const logger_1 = require("./services/logger");
 const command_bus_1 = require("./services/command-bus");
 const job_runner_1 = require("./services/job-runner");
-const shared_types_1 = require("@kb-vault/shared-types");
 const command_registry_1 = require("./services/command-registry");
 const mcp_bridge_service_1 = require("./services/mcp-bridge-service");
 const app_preferences_1 = require("./services/app-preferences");
+const assistant_presentation_service_1 = require("./services/assistant-presentation-service");
+const assistant_view_context_service_1 = require("./services/assistant-view-context-service");
+const assistant_window_manager_1 = require("./services/assistant-window-manager");
 const commandBus = new command_bus_1.CommandBus();
 const jobs = new job_runner_1.JobRegistry();
 let mcpBridge = null;
 let kbCliLoopback = null;
+let mainWindow = null;
+let assistantWindowManager = null;
+function broadcast(channel, payload) {
+    electron_1.BrowserWindow.getAllWindows().forEach((window) => {
+        if (!window.isDestroyed()) {
+            window.webContents.send(channel, payload);
+        }
+    });
+}
+function loadRendererWindow(window, role) {
+    const appRoot = electron_1.app.isPackaged ? electron_1.app.getAppPath() : process.cwd();
+    const rendererDist = node_path_1.default.join(appRoot, 'dist', 'renderer', 'index.html');
+    const rendererSource = node_path_1.default.join(appRoot, 'index.html');
+    const packagedRenderer = rendererDist;
+    const viteUrl = process.env.VITE_DEV_SERVER_URL;
+    if (electron_1.app.isPackaged) {
+        void window.loadFile(packagedRenderer, {
+            query: { windowRole: role }
+        });
+        return;
+    }
+    if (viteUrl) {
+        const url = new URL(viteUrl);
+        url.searchParams.set('windowRole', role);
+        logger_1.logger.info('Loading renderer from VITE_DEV_SERVER_URL', { viteUrl: url.toString(), role });
+        void window.loadURL(url.toString());
+        return;
+    }
+    if (node_fs_1.default.existsSync(rendererDist)) {
+        void window.loadFile(rendererDist, {
+            query: { windowRole: role }
+        });
+        return;
+    }
+    void window.loadFile(rendererSource, {
+        query: { windowRole: role }
+    });
+}
+function createMainWindow() {
+    const appRoot = electron_1.app.isPackaged ? electron_1.app.getAppPath() : process.cwd();
+    const window = new electron_1.BrowserWindow({
+        width: 1280,
+        height: 860,
+        title: 'KB Vault',
+        webPreferences: {
+            preload: node_path_1.default.join(appRoot, 'dist', 'preload', 'index.js'),
+            contextIsolation: true,
+            nodeIntegration: false
+        }
+    });
+    mainWindow = window;
+    window.webContents.on('console-message', (_event, level, message, lineNumber, sourceId) => {
+        if (message.includes('Third-party cookie will be blocked')) {
+            return;
+        }
+        logger_1.logger.info('renderer-console', {
+            level,
+            sourceId,
+            lineNumber,
+            message
+        });
+    });
+    window.on('closed', () => {
+        if (mainWindow === window) {
+            mainWindow = null;
+        }
+    });
+    loadRendererWindow(window, 'main');
+    if (!electron_1.app.isPackaged) {
+        window.webContents.openDevTools({ mode: 'detach' });
+    }
+    return window;
+}
 function registerIpcHandlers() {
     electron_1.ipcMain.handle(shared_types_1.IPC_CHANNELS.INVOKE, async (_event, request) => {
         const startedAt = Date.now();
@@ -45,20 +121,42 @@ function registerIpcHandlers() {
         logger_1.logger.info('JOB cancel', { jobId });
         return jobs.cancel(jobId);
     });
+    electron_1.ipcMain.on(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_WINDOW_MOVE, (event, payload) => {
+        assistantWindowManager?.handleMoveRequest(event.sender, payload);
+    });
+    electron_1.ipcMain.on(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_WINDOW_RESIZE, (event, payload) => {
+        assistantWindowManager?.handleResizeRequest(event.sender, payload);
+    });
+    electron_1.ipcMain.on(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_WINDOW_DRAG_END, (event) => {
+        assistantWindowManager?.handleMoveEnd(event.sender);
+    });
     jobs.setEmitter((event) => {
-        electron_1.BrowserWindow.getAllWindows().forEach((win) => {
-            win.webContents.send(shared_types_1.IPC_CHANNELS.JOB_EVENT, event);
-        });
+        broadcast(shared_types_1.IPC_CHANNELS.JOB_EVENT, event);
     });
 }
 async function bootstrapApp() {
     const config = (0, config_loader_1.loadConfig)();
     const workspaceRoot = (0, workspace_root_1.resolveAppWorkspaceRoot)(process.env.KB_VAULT_WORKSPACE_ROOT, config);
     const appRoot = electron_1.app.isPackaged ? electron_1.app.getAppPath() : process.cwd();
+    const assistantPresentationService = new assistant_presentation_service_1.AssistantPresentationService((0, app_preferences_1.getAssistantPresentationPreferences)(), app_preferences_1.setAssistantPresentationPreferences);
+    const assistantViewContextService = new assistant_view_context_service_1.AssistantViewContextService();
     logger_1.logger.info('Booting KB Vault', {
         workspaceRoot,
         featureFlags: config.featureFlags,
         environment: process.env.NODE_ENV ?? 'development'
+    });
+    assistantPresentationService.subscribe((state) => {
+        const event = { state };
+        broadcast(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_PRESENTATION_EVENT, event);
+    });
+    assistantViewContextService.subscribe((event) => {
+        broadcast(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_CONTEXT_EVENT, event);
+    });
+    assistantWindowManager = new assistant_window_manager_1.AssistantWindowManager({
+        loadRendererWindow,
+        preloadPath: node_path_1.default.join(appRoot, 'dist', 'preload', 'index.js'),
+        presentationService: assistantPresentationService,
+        getMainWindow: () => mainWindow
     });
     commandBus.register('system.boot', async () => {
         return {
@@ -103,16 +201,27 @@ async function bootstrapApp() {
     }));
     process.env.KBV_ACP_CWD = appRoot;
     const emitAppWorkingStateEvent = (event) => {
-        electron_1.BrowserWindow.getAllWindows().forEach((win) => {
-            win.webContents.send(shared_types_1.IPC_CHANNELS.APP_WORKING_STATE_EVENT, event);
-        });
+        broadcast(shared_types_1.IPC_CHANNELS.APP_WORKING_STATE_EVENT, event);
     };
     const emitAiAssistantEvent = (event) => {
-        electron_1.BrowserWindow.getAllWindows().forEach((win) => {
-            win.webContents.send(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_EVENT, event);
-        });
+        if (event.kind === 'turn_finished' && event.messageId) {
+            assistantPresentationService.handleAssistantReplyFinished();
+        }
+        broadcast(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_EVENT, event);
     };
-    const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = (0, command_registry_1.registerCoreCommands)(commandBus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent);
+    const dispatchAppNavigation = (event) => {
+        const window = mainWindow;
+        if (!window || window.isDestroyed()) {
+            return;
+        }
+        if (window.isMinimized()) {
+            window.restore();
+        }
+        window.show();
+        window.focus();
+        window.webContents.send(shared_types_1.IPC_CHANNELS.APP_NAVIGATION_EVENT, event);
+    };
+    const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = (0, command_registry_1.registerCoreCommands)(commandBus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent, assistantPresentationService, assistantViewContextService, dispatchAppNavigation);
     kbCliLoopback = cliLoopback;
     mcpBridge = new mcp_bridge_service_1.McpBridgeService(agentRuntime);
     await mcpBridge.start();
@@ -139,59 +248,13 @@ async function bootstrapApp() {
         }
     ]);
 }
-function createWindow() {
-    const appRoot = electron_1.app.isPackaged ? electron_1.app.getAppPath() : process.cwd();
-    const window = new electron_1.BrowserWindow({
-        width: 1280,
-        height: 860,
-        title: 'KB Vault',
-        webPreferences: {
-            preload: node_path_1.default.join(appRoot, 'dist', 'preload', 'index.js'),
-            contextIsolation: true,
-            nodeIntegration: false
-        }
-    });
-    window.webContents.on('console-message', (_event, level, message, lineNumber, sourceId) => {
-        if (message.includes('Third-party cookie will be blocked')) {
-            return;
-        }
-        logger_1.logger.info('renderer-console', {
-            level,
-            sourceId,
-            lineNumber,
-            message
-        });
-    });
-    if (electron_1.app.isPackaged) {
-        const packagedRenderer = node_path_1.default.join(appRoot, 'dist', 'renderer', 'index.html');
-        window.loadFile(packagedRenderer);
-    }
-    else {
-        const rendererDist = node_path_1.default.join(appRoot, 'dist', 'renderer', 'index.html');
-        const rendererSource = node_path_1.default.join(appRoot, 'index.html');
-        const viteUrl = process.env.VITE_DEV_SERVER_URL;
-        if (viteUrl) {
-            logger_1.logger.info('Loading renderer from VITE_DEV_SERVER_URL', { viteUrl });
-            window.loadURL(viteUrl);
-        }
-        else if (node_fs_1.default.existsSync(rendererDist)) {
-            window.loadFile(rendererDist);
-        }
-        else {
-            window.loadFile(rendererSource);
-        }
-    }
-    if (!electron_1.app.isPackaged) {
-        window.webContents.openDevTools({ mode: 'detach' });
-    }
-}
 electron_1.app.whenReady().then(async () => {
     await bootstrapApp();
     registerIpcHandlers();
-    createWindow();
+    createMainWindow();
     electron_1.app.on('activate', () => {
-        if (electron_1.BrowserWindow.getAllWindows().length === 0) {
-            createWindow();
+        if (!mainWindow || mainWindow.isDestroyed()) {
+            createMainWindow();
         }
     });
 });
@@ -201,6 +264,7 @@ electron_1.app.on('window-all-closed', () => {
     }
 });
 electron_1.app.on('before-quit', () => {
+    assistantWindowManager?.handleBeforeQuit();
     void mcpBridge?.stop();
     void kbCliLoopback?.stop();
 });

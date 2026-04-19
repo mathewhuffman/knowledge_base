@@ -19,7 +19,7 @@ It must:
 
 Location:
 
-- bottom-right of the application shell on every route
+- bottom-right of the application shell on every route when the assistant is embedded
 
 Needs:
 
@@ -27,6 +27,7 @@ Needs:
 - hover/focus state
 - unread/pending state if useful
 - busy/running state
+- explicit pop-out action that intentionally detaches the assistant into a desktop assistant window
 
 ### 2. Assistant Panel / Drawer
 
@@ -38,8 +39,27 @@ Needs:
 - quick actions/presets
 - action footer / apply-reject CTAs when an artifact exists
 - compact state when context is missing
+- clear pop-out control in the header so the embedded panel can be detached into a desktop panel without moving the launcher button
 
-### 3. Context Header Variants
+### 3. Detached Desktop Launcher
+
+Needs:
+
+- small standalone assistant launcher window
+- same unread/busy communication as the embedded launcher
+- click to expand into the detached desktop panel
+- native close should reattach the assistant back into the main app in embedded closed state
+
+### 4. Detached Desktop Panel
+
+Needs:
+
+- full assistant panel content in a real Electron window
+- same transcript/composer/artifact behavior as the embedded panel
+- assistant UI close collapses to detached launcher
+- native close reattaches the assistant back into the main app in embedded closed state
+
+### 5. Context Header Variants
 
 Contexts to visually distinguish:
 
@@ -51,7 +71,7 @@ Contexts to visually distinguish:
 
 The user should always know what the assistant is acting on.
 
-### 4. Proposal Review Live-Update UX
+### 6. Proposal Review Live-Update UX
 
 When user chats while reviewing a proposal:
 
@@ -59,14 +79,14 @@ When user chats while reviewing a proposal:
 - changed vs original state must remain obvious
 - user should understand that changes are not final until they choose an action
 
-### 5. Draft Live-Update UX
+### 7. Draft Live-Update UX
 
 When user chats on a draft:
 
 - AI changes should appear in the current draft working copy
 - distinction between unsaved manual changes and AI-applied working changes must remain understandable
 
-### 6. Template Live-Update UX
+### 8. Template Live-Update UX
 
 When user chats while editing a template:
 
@@ -74,7 +94,7 @@ When user chats while editing a template:
 - save affordance should remain explicit
 - AI-generated vs manual edits should feel trackable
 
-### 7. Empty / Error / Stale States
+### 9. Empty / Error / Stale States
 
 Required states:
 
@@ -91,6 +111,7 @@ Required states:
 2. Generated changes should feel provisional until saved or accepted.
 3. Proposal review should remain the highest-trust environment.
 4. The assistant should reduce context switching, not add more.
+5. Detaching must never create two competing active assistant surfaces.
 
 ## Specific UX Questions Claude Should Solve
 
@@ -132,6 +153,10 @@ Claude should not reinvent the backend model or action taxonomy.
 - launcher open, proposal context with pending patch
 - launcher open, draft context with working-copy patch
 - launcher open, template context with working-copy patch
+- detached launcher
+- detached panel
+- detached panel collapsed back to detached launcher
+- detached native close reattached into embedded launcher
 - run in progress
 - stale result warning
 - error / retry

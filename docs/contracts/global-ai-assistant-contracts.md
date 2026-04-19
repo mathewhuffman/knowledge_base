@@ -48,6 +48,38 @@ interface AiSessionRecord {
 }
 ```
 
+## Presentation Contract
+
+```ts
+type AiAssistantDockMode = 'embedded' | 'detached';
+type AiAssistantSurfaceMode = 'closed' | 'launcher' | 'panel';
+
+interface AiAssistantPresentationState {
+  dockMode: AiAssistantDockMode;
+  surfaceMode: AiAssistantSurfaceMode;
+  state: 'embedded_closed' | 'embedded_open' | 'detached_launcher' | 'detached_panel';
+  hasUnread: boolean;
+  embeddedLauncherPosition?: { left: number; top: number };
+  detachedLauncherBounds?: { x: number; y: number; width: number; height: number };
+  detachedPanelBounds?: { x: number; y: number; width: number; height: number };
+  detachedDisplayId?: number;
+  lastDetachedSurfaceMode?: 'launcher' | 'panel';
+  updatedAtUtc: string;
+}
+```
+
+Behavior rules:
+
+- assistant UI close:
+  - `embedded_open -> embedded_closed`
+  - `detached_panel -> detached_launcher`
+- native detached window close:
+  - `detached_launcher -> embedded_closed`
+  - `detached_panel -> embedded_closed`
+- no duplicate active assistant surfaces:
+  - when detached, the main app must not render an active embedded launcher or panel
+- route/entity context remains owned by the main window and is published to the detached window
+
 ## Message Record
 
 ```ts
@@ -101,6 +133,45 @@ Request:
 Response:
 
 - `AiViewContext`
+
+### `ai.assistant.context.current`
+
+Response:
+
+- latest published `AiViewContext`
+- publish timestamp
+- publishing window role
+
+### `ai.assistant.context.publish`
+
+Request:
+
+- latest `AiViewContext | null`
+- publishing window role
+
+Response:
+
+- published context snapshot
+
+### `ai.assistant.presentation.get`
+
+Response:
+
+- `AiAssistantPresentationState`
+
+### `ai.assistant.presentation.transition`
+
+Request:
+
+- typed presentation transition such as:
+  - open embedded panel
+  - close embedded panel
+  - detach launcher
+  - detach panel
+  - open detached panel
+  - collapse detached panel to launcher
+  - reattach embedded closed
+  - update detached bounds
 
 ### `ai.assistant.session.get`
 

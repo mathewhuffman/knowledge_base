@@ -1,15 +1,15 @@
-import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
-import type { AiViewContext, AiSessionRecord, AiArtifactRecord } from '@kb-vault/shared-types';
+import { useCallback, useRef, useState, type ReactNode, type PointerEvent as ReactPointerEvent } from 'react';
+import type { AiArtifactRecord, AiSessionRecord, AiViewContext } from '@kb-vault/shared-types';
 import { AppRoute } from '@kb-vault/shared-types';
 import { IconGlobe, IconFileText, IconGitBranch, IconEye, IconTool, IconClock, IconPlus, IconX } from '../icons';
 
-const DRAG_THRESHOLD_PX = 4;
+const WINDOW_DRAG_THRESHOLD_PX = 8;
 
-const ROUTE_ICONS: Partial<Record<AppRoute, React.ReactNode>> = {
+const ROUTE_ICONS: Partial<Record<AppRoute, ReactNode>> = {
   [AppRoute.ARTICLE_EXPLORER]: <IconFileText size={14} />,
   [AppRoute.DRAFTS]: <IconGitBranch size={14} />,
   [AppRoute.PROPOSAL_REVIEW]: <IconEye size={14} />,
-  [AppRoute.TEMPLATES_AND_PROMPTS]: <IconTool size={14} />,
+  [AppRoute.TEMPLATES_AND_PROMPTS]: <IconTool size={14} />
 };
 
 function capabilityTags(ctx: AiViewContext): string[] {
@@ -35,11 +35,12 @@ interface AssistantHeaderProps {
   loading: boolean;
   historyOpen: boolean;
   sessionCount: number;
+  dragHandle?: ReactNode;
+  onWindowDrag?: (position: { x: number; y: number }) => void;
+  onWindowDragEnd?: () => void;
   onCreateSession: () => void;
   onToggleHistory: () => void;
   onClose: () => void;
-  launcherPosition: { left: number; top: number };
-  onLauncherPositionChange: (position: { left: number; top: number }) => void;
 }
 
 export function AssistantHeader({
@@ -49,67 +50,80 @@ export function AssistantHeader({
   loading,
   historyOpen,
   sessionCount,
+  dragHandle,
+  onWindowDrag,
+  onWindowDragEnd,
   onCreateSession,
   onToggleHistory,
-  onClose,
-  launcherPosition,
-  onLauncherPositionChange
+  onClose
 }: AssistantHeaderProps) {
   const routeIcon = context ? ROUTE_ICONS[context.route] ?? <IconGlobe size={14} /> : <IconGlobe size={14} />;
   const status = statusLabel(session, artifact);
   const caps = context ? capabilityTags(context) : [];
-  const [dragging, setDragging] = useState(false);
+  const [draggingWindow, setDraggingWindow] = useState(false);
   const dragStateRef = useRef<{
     pointerId: number;
-    startX: number;
-    startY: number;
-    startLeft: number;
-    startTop: number;
+    startScreenX: number;
+    startScreenY: number;
+    windowStartX: number;
+    windowStartY: number;
     moved: boolean;
   } | null>(null);
 
   const handlePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.pointerType === 'mouse' && event.button !== 0) return;
-    if ((event.target as HTMLElement).closest('button, a, input, textarea, select')) return;
+    if (!onWindowDrag) {
+      return;
+    }
+    if (event.pointerType === 'mouse' && event.button !== 0) {
+      return;
+    }
+    const target = event.target;
+    if (target instanceof Element && target.closest('button, a, input, textarea, select, [role="button"]')) {
+      return;
+    }
     dragStateRef.current = {
       pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      startLeft: launcherPosition.left,
-      startTop: launcherPosition.top,
+      startScreenX: event.screenX,
+      startScreenY: event.screenY,
+      windowStartX: window.screenX,
+      windowStartY: window.screenY,
       moved: false
     };
     event.currentTarget.setPointerCapture(event.pointerId);
-  }, [launcherPosition.left, launcherPosition.top]);
+  }, [onWindowDrag]);
 
   const handlePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const dragState = dragStateRef.current;
-    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    if (!dragState || dragState.pointerId !== event.pointerId || !onWindowDrag) {
+      return;
+    }
 
-    const deltaX = event.clientX - dragState.startX;
-    const deltaY = event.clientY - dragState.startY;
-
-    if (!dragState.moved && (Math.abs(deltaX) >= DRAG_THRESHOLD_PX || Math.abs(deltaY) >= DRAG_THRESHOLD_PX)) {
+    const deltaX = event.screenX - dragState.startScreenX;
+    const deltaY = event.screenY - dragState.startScreenY;
+    if (!dragState.moved && (Math.abs(deltaX) >= WINDOW_DRAG_THRESHOLD_PX || Math.abs(deltaY) >= WINDOW_DRAG_THRESHOLD_PX)) {
       dragState.moved = true;
-      setDragging(true);
+      setDraggingWindow(true);
     }
 
     if (dragState.moved) {
-      onLauncherPositionChange({
-        left: dragState.startLeft + deltaX,
-        top: dragState.startTop + deltaY
+      onWindowDrag({
+        x: dragState.windowStartX + deltaX,
+        y: dragState.windowStartY + deltaY
       });
     }
-  }, [onLauncherPositionChange]);
+  }, [onWindowDrag]);
 
   const endDrag = useCallback((pointerId: number) => {
     const dragState = dragStateRef.current;
-    if (!dragState || dragState.pointerId !== pointerId) return;
+    if (!dragState || dragState.pointerId !== pointerId) {
+      return;
+    }
     dragStateRef.current = null;
     if (dragState.moved) {
-      setDragging(false);
+      onWindowDragEnd?.();
     }
-  }, []);
+    setDraggingWindow(false);
+  }, [onWindowDragEnd]);
 
   const handlePointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     endDrag(event.pointerId);
@@ -121,7 +135,11 @@ export function AssistantHeader({
 
   return (
     <div
-      className={`ai-header${dragging ? ' ai-header--dragging' : ''}`}
+      className={[
+        'ai-header',
+        onWindowDrag && 'ai-header--window-draggable',
+        draggingWindow && 'ai-header--window-dragging'
+      ].filter(Boolean).join(' ')}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
@@ -150,6 +168,7 @@ export function AssistantHeader({
           >
             <IconPlus size={12} />
           </button>
+          {dragHandle}
         </div>
         <div className="ai-header__context">
           <span className="ai-header__route-badge">
