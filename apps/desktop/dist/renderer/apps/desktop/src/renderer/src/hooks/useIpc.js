@@ -41,27 +41,29 @@ export function useIpc(method) {
 export function useIpcMutation(method) {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
-    const mutate = useCallback(async (payload) => {
+    const mutateDetailed = useCallback(async (payload) => {
         setLoading(true);
         setError(null);
         try {
             const response = await window.kbv.invoke(method, payload);
             setLoading(false);
             if (response.ok && response.data !== undefined) {
-                return response.data;
+                return { data: response.data, error: null };
             }
-            else {
-                const errMsg = response.error?.message ?? `IPC mutation "${method}" failed`;
-                setError(errMsg);
-                return null;
-            }
+            const errMsg = response.error?.message ?? `IPC mutation "${method}" failed`;
+            setError(errMsg);
+            return { data: null, error: errMsg };
         }
         catch (err) {
             setLoading(false);
             const errMsg = err instanceof Error ? err.message : String(err);
             setError(errMsg);
-            return null;
+            return { data: null, error: errMsg };
         }
     }, [method]);
-    return { mutate, loading, error };
+    const mutate = useCallback(async (payload) => {
+        const result = await mutateDetailed(payload);
+        return result.data;
+    }, [mutateDetailed]);
+    return { mutate, mutateDetailed, loading, error };
 }

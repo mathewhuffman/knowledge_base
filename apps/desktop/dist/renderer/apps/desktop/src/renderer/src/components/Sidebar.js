@@ -1,10 +1,11 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useState, useRef, useEffect } from 'react';
 import { AppRoute } from '@kb-vault/shared-types';
-import { IconHome, IconFolder, IconUpload, IconArchive, IconCheckCircle, IconGitBranch, IconSend, IconLayout, IconSettings, IconChevronDown, IconChevronLeft, IconChevronRight, } from './icons';
+import { IconHome, IconFolder, IconUpload, IconArchive, IconCheckCircle, IconGitBranch, IconLayers, IconSend, IconLayout, IconSettings, IconChevronDown, IconChevronLeft, IconChevronRight, } from './icons';
 const mainNav = [
     { id: AppRoute.KB_VAULT_HOME, label: 'Home', icon: _jsx(IconHome, {}) },
     { id: AppRoute.ARTICLE_EXPLORER, label: 'Articles', icon: _jsx(IconFolder, {}) },
+    { id: AppRoute.RELATIONS_GRAPH, label: 'Feature Map', icon: _jsx(IconLayers, {}) },
     { id: AppRoute.PBI_BATCHES, label: 'PBI Batches', icon: _jsx(IconUpload, {}) },
     { id: AppRoute.PBI_LIBRARY, label: 'PBI Library', icon: _jsx(IconArchive, {}) },
     { id: AppRoute.PROPOSAL_REVIEW, label: 'Proposal Review', icon: _jsx(IconCheckCircle, {}) },

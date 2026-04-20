@@ -37,7 +37,13 @@ import {
   type ZendeskSectionsListRequest,
   type ZendeskSearchArticlesRequest,
   type ArticleDetailRequest,
+  type CoverageQueryRequest,
+  type GraphQueryRequest,
+  type FeatureMapSummaryRequest,
+  type FeatureScopeRequest,
+  type ArticleNeighborhoodRequest,
   type ArticleRelationDeleteRequest,
+  type ArticleRelationFeedbackRecordRequest,
   type ArticleRelationRefreshRequest,
   type ArticleRelationsListRequest,
   type ArticleRelationUpsertRequest,
@@ -93,6 +99,7 @@ import {
   type BatchPlannerArticleMatchResult,
   type BatchPlannerPrefetch,
   type BatchPlannerPrefetchCluster,
+  type BatchPlannerRelationEvidence,
   type BatchPlannerRelationMatch,
   type BatchAnalysisStageStatus,
   type BatchPlanReview,
@@ -166,6 +173,7 @@ import { AssistantViewContextService } from './assistant-view-context-service';
 import { BatchAnalysisOrchestrator, type BatchFinalReviewerProposalContext } from './batch-analysis-orchestrator';
 import { KbActionService } from './kb-action-service';
 import { DirectKbExecutor } from './direct-kb-executor';
+import type { ArticleRelationsV2RebuildRequest } from './article-relations-v2/types';
 import {
   KbAccessModePreflightError,
   requireHealthyKbAccessModeSelection,
@@ -880,6 +888,223 @@ const summarizeRelationEvidence = (value: unknown): string[] => {
     .slice(0, 3);
 };
 
+const summarizeCoverageEvidence = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return '';
+      }
+      const record = item as { snippet?: unknown; sourceRef?: unknown; evidenceType?: unknown };
+      if (typeof record.snippet === 'string' && record.snippet.trim()) {
+        return record.snippet.trim();
+      }
+      if (typeof record.sourceRef === 'string' && record.sourceRef.trim()) {
+        return record.sourceRef.trim();
+      }
+      if (typeof record.evidenceType === 'string' && record.evidenceType.trim()) {
+        return record.evidenceType.trim();
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .slice(0, 3);
+};
+
+const normalizePlannerComparableText = (value: string): string =>
+  value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+const selectCoverageMatchContext = (result: { evidence?: unknown; relationEligible?: unknown }): string | undefined => {
+  const evidence = Array.isArray(result.evidence)
+    ? result.evidence as Array<{ evidenceType?: unknown }>
+    : [];
+  const evidenceTypes = new Set(
+    evidence
+      .map((item) => typeof item?.evidenceType === 'string' ? item.evidenceType : '')
+      .filter(Boolean)
+  );
+
+  if (evidenceTypes.has('external_key_exact') || evidenceTypes.has('alias_exact')) {
+    return 'metadata';
+  }
+  if (evidenceTypes.has('title_fts') || evidenceTypes.has('heading_fts')) {
+    return 'title';
+  }
+  if (evidenceTypes.has('explicit_link')) {
+    return 'link';
+  }
+  if (result.relationEligible === true) {
+    return 'coverage';
+  }
+
+  return undefined;
+};
+
+const buildPlannerCoverageDisplay = (
+  result: Record<string, unknown>,
+  canonicalTitle: string | null
+): {
+  title: string;
+  matchContext?: string;
+  snippet: string;
+} => {
+  const rawTitle = typeof result.title === 'string' && result.title.trim()
+    ? result.title.trim()
+    : 'Untitled article';
+  const title = canonicalTitle?.trim() || rawTitle;
+  const matchContext = selectCoverageMatchContext(result);
+  const evidenceSnippets = summarizeCoverageEvidence(result.evidence);
+  const normalizedRawTitle = normalizePlannerComparableText(rawTitle);
+  const normalizedCanonicalTitle = normalizePlannerComparableText(title);
+  const titleMismatch = Boolean(
+    normalizedRawTitle
+    && normalizedCanonicalTitle
+    && normalizedRawTitle !== normalizedCanonicalTitle
+  );
+
+  if (!titleMismatch) {
+    return {
+      title,
+      matchContext,
+      snippet: evidenceSnippets[0] ?? ''
+    };
+  }
+
+  const safeSnippet = evidenceSnippets.find((snippet) => {
+    const normalizedSnippet = normalizePlannerComparableText(snippet);
+    return normalizedSnippet && !normalizedSnippet.includes(normalizedRawTitle);
+  });
+
+  return {
+    title,
+    matchContext: matchContext === 'title' ? 'content' : matchContext,
+    snippet: safeSnippet ?? `Canonical KB title: ${title}`
+  };
+};
+
+const normalizePlannerRelationEvidence = (value: unknown): BatchPlannerRelationEvidence[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => {
+      const record = item as {
+        evidenceType?: unknown;
+        sourceRef?: unknown;
+        snippet?: unknown;
+        weight?: unknown;
+        metadata?: unknown;
+      };
+      return {
+        evidenceType: typeof record.evidenceType === 'string' ? record.evidenceType : 'unknown',
+        sourceRef: typeof record.sourceRef === 'string' ? record.sourceRef : undefined,
+        snippet: typeof record.snippet === 'string' ? record.snippet : undefined,
+        weight: typeof record.weight === 'number' ? record.weight : 0,
+        metadata: record.metadata
+      };
+    })
+    .sort((left, right) => right.weight - left.weight)
+    .slice(0, 4);
+};
+
+const isPlannerCoverageExpansionCandidate = (result: {
+  familyId?: unknown;
+  finalScore?: unknown;
+  relationEligible?: unknown;
+  evidence?: unknown;
+}): result is {
+  familyId: string;
+  finalScore: number;
+  relationEligible?: boolean;
+  evidence?: unknown;
+} => {
+  if (typeof result.familyId !== 'string' || !result.familyId.trim()) {
+    return false;
+  }
+
+  const finalScore = typeof result.finalScore === 'number' ? result.finalScore : 0;
+  const matchContext = selectCoverageMatchContext(result);
+  return result.relationEligible === true || finalScore >= 1 || matchContext === 'title' || matchContext === 'metadata' || matchContext === 'link';
+};
+
+const pickPreferredPlannerLocaleVariantId = (
+  variants: LocaleVariantRecord[],
+  preferredLocale: string,
+  allowedVariantIds: Set<string>
+): string => {
+  const allowedVariants = allowedVariantIds.size > 0
+    ? variants.filter((variant) => allowedVariantIds.has(variant.id))
+    : variants;
+
+  const pickVariant = (pool: LocaleVariantRecord[]): LocaleVariantRecord | undefined =>
+    pool.find((variant) => !variant.retiredAtUtc && variant.status === RevisionState.LIVE && variant.locale === preferredLocale) ??
+    pool.find((variant) => !variant.retiredAtUtc && variant.status === RevisionState.LIVE) ??
+    pool.find((variant) => !variant.retiredAtUtc && variant.locale === preferredLocale) ??
+    pool.find((variant) => !variant.retiredAtUtc) ??
+    pool.find((variant) => variant.status === RevisionState.LIVE && variant.locale === preferredLocale) ??
+    pool.find((variant) => variant.status === RevisionState.LIVE) ??
+    pool.find((variant) => variant.locale === preferredLocale) ??
+    pool[0];
+
+  return (
+    pickVariant(allowedVariants)?.id ??
+    pickVariant(variants)?.id ??
+    Array.from(allowedVariantIds)[0] ??
+    ''
+  );
+};
+
+const mapPlannerRelationMatches = (
+  relationResponses: Array<{ seedFamilyId: string; relations: Array<Record<string, unknown>> }>
+): BatchPlannerRelationMatch[] => {
+  const matchesByFamilyId = new Map<string, BatchPlannerRelationMatch>();
+
+  for (const response of relationResponses) {
+    for (const relation of response.relations) {
+      const sourceFamily = asRecord((relation as { sourceFamily?: unknown }).sourceFamily);
+      const targetFamily = asRecord((relation as { targetFamily?: unknown }).targetFamily);
+      const sourceFamilyId = typeof sourceFamily?.id === 'string' ? sourceFamily.id : undefined;
+      const targetFamilyId = typeof targetFamily?.id === 'string' ? targetFamily.id : undefined;
+      const counterpart =
+        sourceFamilyId === response.seedFamilyId
+          ? targetFamily
+          : targetFamilyId === response.seedFamilyId
+            ? sourceFamily
+            : targetFamily ?? sourceFamily;
+
+      const familyId = typeof counterpart?.id === 'string' ? counterpart.id.trim() : '';
+      const title = typeof counterpart?.title === 'string' ? counterpart.title.trim() : '';
+      if (!familyId || !title) {
+        continue;
+      }
+
+      const typedEvidence = normalizePlannerRelationEvidence((relation as { evidence?: unknown }).evidence);
+      const nextMatch: BatchPlannerRelationMatch = {
+        title,
+        familyId,
+        strengthScore: typeof relation.strengthScore === 'number' ? relation.strengthScore : 0,
+        relationType: typeof relation.relationType === 'string' ? relation.relationType : 'related',
+        evidence: summarizeRelationEvidence((relation as { evidence?: unknown }).evidence),
+        relationEligible: true,
+        typedEvidence
+      };
+
+      const existing = matchesByFamilyId.get(familyId);
+      if (!existing || nextMatch.strengthScore > existing.strengthScore) {
+        matchesByFamilyId.set(familyId, nextMatch);
+      }
+    }
+  }
+
+  return Array.from(matchesByFamilyId.values())
+    .sort((left, right) => right.strengthScore - left.strengthScore || left.title.localeCompare(right.title))
+    .slice(0, 12);
+};
+
 const buildPlannerPrefetch = async (
   workspaceRepository: WorkspaceRepository,
   workspaceId: string,
@@ -887,45 +1112,136 @@ const buildPlannerPrefetch = async (
   uploadedPbis: unknown
 ): Promise<BatchPlannerPrefetch> => {
   const topicClusters = buildPlannerTopicClusters(uploadedPbis);
-  const [inspection, relationResponse, articleMatches] = await Promise.all([
+  const workspaceSettingsPromise = workspaceRepository.getWorkspaceSettings(workspaceId).catch(() => null);
+  const familyVariantsByFamilyId = new Map<string, Promise<LocaleVariantRecord[]>>();
+  const familyTitlesByFamilyId = new Map<string, Promise<string | null>>();
+  const getFamilyVariants = (familyId: string): Promise<LocaleVariantRecord[]> => {
+    const normalizedFamilyId = familyId.trim();
+    if (!normalizedFamilyId) {
+      return Promise.resolve([]);
+    }
+
+    const existing = familyVariantsByFamilyId.get(normalizedFamilyId);
+    if (existing) {
+      return existing;
+    }
+
+    const next = workspaceRepository.getLocaleVariantsForFamily(workspaceId, normalizedFamilyId).catch(() => []);
+    familyVariantsByFamilyId.set(normalizedFamilyId, next);
+    return next;
+  };
+  const getCanonicalFamilyTitle = (familyId: string): Promise<string | null> => {
+    const normalizedFamilyId = familyId.trim();
+    if (!normalizedFamilyId) {
+      return Promise.resolve(null);
+    }
+
+    const existing = familyTitlesByFamilyId.get(normalizedFamilyId);
+    if (existing) {
+      return existing;
+    }
+
+    const repositoryWithFamilyLookup = workspaceRepository as WorkspaceRepository & {
+      getArticleFamily?: (workspaceId: string, familyId: string) => Promise<{ title?: string }>;
+    };
+    const next = typeof repositoryWithFamilyLookup.getArticleFamily === 'function'
+      ? repositoryWithFamilyLookup
+        .getArticleFamily(workspaceId, normalizedFamilyId)
+        .then((family) => typeof family?.title === 'string' && family.title.trim() ? family.title.trim() : null)
+        .catch(() => null)
+      : Promise.resolve(null);
+    familyTitlesByFamilyId.set(normalizedFamilyId, next);
+    return next;
+  };
+  const resolvePlannerCoverageLocaleVariantId = async (result: Record<string, unknown>): Promise<string> => {
+    const familyId = typeof result.familyId === 'string' ? result.familyId.trim() : '';
+    const allowedVariantIds = new Set(
+      Array.isArray(result.localeVariantIds)
+        ? dedupeStrings(result.localeVariantIds.filter((value): value is string => typeof value === 'string'))
+        : []
+    );
+    if (!familyId) {
+      return Array.from(allowedVariantIds)[0] ?? '';
+    }
+
+    const [workspaceSettings, familyVariants] = await Promise.all([
+      workspaceSettingsPromise,
+      getFamilyVariants(familyId)
+    ]);
+    return pickPreferredPlannerLocaleVariantId(
+      familyVariants,
+      workspaceSettings?.defaultLocale ?? '',
+      allowedVariantIds
+    );
+  };
+  const [inspection, articleMatchResponses] = await Promise.all([
     workspaceRepository.getBatchAnalysisInspection(workspaceId, batchId).catch(() => null),
-    workspaceRepository.listArticleRelations(workspaceId, {
-      workspaceId,
-      batchId,
-      limit: 12,
-      minScore: 0.15,
-      includeEvidence: true
-    }).catch(() => ({ relations: [] })),
     Promise.all(
       topicClusters.slice(0, 12).flatMap((cluster) =>
         cluster.queries.slice(0, 4).map(async (query) => {
-          const search = await workspaceRepository.searchArticles(workspaceId, {
+          const coverage = await workspaceRepository.queryArticleRelationCoverage({
             workspaceId,
             query,
-            scope: 'all',
-            includeArchived: true
-          }).catch(() => ({ total: 0, results: [] as Array<Record<string, unknown>> }));
-          const topResults: BatchPlannerArticleMatchResult[] = Array.isArray(search.results)
-            ? search.results.slice(0, 3).map((result) => ({
-                title: typeof result.title === 'string' ? result.title : 'Untitled article',
-                familyId: typeof result.familyId === 'string' ? result.familyId : '',
-                localeVariantId: typeof result.localeVariantId === 'string' ? result.localeVariantId : '',
-                score: typeof result.score === 'number' ? result.score : 0,
-                matchContext: typeof result.matchContext === 'string' ? result.matchContext : undefined,
-                snippet: typeof result.snippet === 'string' ? result.snippet.trim() : ''
-              }))
+            maxResults: 5,
+            minScore: 0.08,
+            includeEvidence: true
+          }).catch(() => ({ results: [] as Array<Record<string, unknown>> }));
+
+          const results = Array.isArray((coverage as { results?: unknown[] }).results)
+            ? (coverage as { results: Array<Record<string, unknown>> }).results
             : [];
-          const articleMatch: BatchPlannerArticleMatch = {
-            clusterId: cluster.clusterId,
-            query,
-            total: typeof search.total === 'number' ? search.total : 0,
-            topResults
+          const topResults: BatchPlannerArticleMatchResult[] = await Promise.all(results.slice(0, 3).map(async (result) => {
+            const familyId = typeof result.familyId === 'string' ? result.familyId : '';
+            const canonicalTitle = familyId
+              ? await getCanonicalFamilyTitle(familyId)
+              : null;
+            const display = buildPlannerCoverageDisplay(result, canonicalTitle);
+
+            return {
+              title: display.title,
+              familyId,
+              localeVariantId: await resolvePlannerCoverageLocaleVariantId(result),
+              score: typeof result.finalScore === 'number' ? result.finalScore : 0,
+              matchContext: display.matchContext,
+              snippet: display.snippet
+            };
+          }));
+
+          return {
+            articleMatch: {
+              clusterId: cluster.clusterId,
+              query,
+              total: results.length,
+              topResults
+            } satisfies BatchPlannerArticleMatch,
+            expansionFamilyIds: results
+              .filter(isPlannerCoverageExpansionCandidate)
+              .map((result) => result.familyId)
+              .slice(0, 3)
           };
-          return articleMatch;
         })
       )
     )
   ]);
+
+  const articleMatches = articleMatchResponses.map((response) => response.articleMatch);
+  const relationSeedFamilyIds = dedupeStrings(
+    articleMatchResponses.flatMap((response) => response.expansionFamilyIds)
+  ).slice(0, 12);
+  const relationResponses = await Promise.all(
+    relationSeedFamilyIds.map(async (seedFamilyId) => ({
+      seedFamilyId,
+      relations: (
+        await workspaceRepository.listArticleRelations(workspaceId, {
+          workspaceId,
+          familyId: seedFamilyId,
+          limit: 6,
+          minScore: 0.35,
+          includeEvidence: true
+        }).catch(() => ({ relations: [] }))
+      ).relations as Array<Record<string, unknown>>
+    }))
+  );
 
   return {
     priorAnalysis: inspection
@@ -938,19 +1254,7 @@ const buildPlannerPrefetch = async (
       : null,
     topicClusters,
     articleMatches,
-    relationMatches: Array.isArray((relationResponse as { relations?: unknown[] }).relations)
-      ? ((relationResponse as { relations: Array<Record<string, unknown>> }).relations).slice(0, 12).map((relation): BatchPlannerRelationMatch => ({
-          title: typeof relation.targetFamily === 'object' && relation.targetFamily && typeof (relation.targetFamily as { title?: unknown }).title === 'string'
-            ? (relation.targetFamily as { title: string }).title
-            : 'Untitled family',
-          familyId: typeof relation.targetFamily === 'object' && relation.targetFamily && typeof (relation.targetFamily as { id?: unknown }).id === 'string'
-            ? (relation.targetFamily as { id: string }).id
-            : '',
-          strengthScore: typeof relation.strengthScore === 'number' ? relation.strengthScore : 0,
-          relationType: typeof relation.relationType === 'string' ? relation.relationType : 'related',
-          evidence: summarizeRelationEvidence(relation.evidence)
-        }))
-      : []
+    relationMatches: mapPlannerRelationMatches(relationResponses)
   };
 };
 
@@ -2073,6 +2377,7 @@ const extractResultText = (payload: unknown): string =>
 
 export const __commandRegistryTestables = {
   buildPlannerTopicClusters,
+  buildPlannerPrefetch,
   extractTranscriptResultTextCandidates,
   extractStructuredBatchRecoveryAbortReason,
   summarizePlannerRecoveryContext,
@@ -3318,6 +3623,120 @@ export function registerCoreCommands(
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.status requires workspaceId');
       }
       const response = await workspaceRepository.getArticleRelationsStatus(workspaceId);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.coverage.query', async (payload) => {
+    try {
+      const input = payload as CoverageQueryRequest | undefined;
+      const hasSignals = Boolean(input?.query?.trim())
+        || (input?.seedFamilyIds?.some((value) => value.trim()) ?? false)
+        || (input?.batchQueries?.some((value) => value.trim()) ?? false);
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.coverage.query requires workspaceId');
+      }
+      if (!hasSignals) {
+        return createErrorResult(
+          AppErrorCode.INVALID_REQUEST,
+          'article.relations.coverage.query requires query, seedFamilyIds, or batchQueries'
+        );
+      }
+      const response = await workspaceRepository.queryArticleRelationCoverage(input);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.graph', async (payload) => {
+    try {
+      const input = payload as GraphQueryRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.graph requires workspaceId');
+      }
+      if (!input.familyId && !input.sectionId && !input.categoryId && input.minScore === undefined) {
+        return createErrorResult(
+          AppErrorCode.INVALID_REQUEST,
+          'article.relations.graph requires a filter or an explicit minScore for workspace overview mode'
+        );
+      }
+      const response = await workspaceRepository.queryArticleRelationGraph(input);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.feature-map.summary', async (payload) => {
+    try {
+      const input = payload as FeatureMapSummaryRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.feature-map.summary requires workspaceId');
+      }
+      const response = await workspaceRepository.getArticleRelationFeatureMapSummary(input);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.feature-map.scope', async (payload) => {
+    try {
+      const input = payload as FeatureScopeRequest | undefined;
+      if (!input?.workspaceId || !input.scopeType) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.feature-map.scope requires workspaceId and scopeType');
+      }
+      const response = await workspaceRepository.getArticleRelationFeatureScope(input);
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.neighborhood', async (payload) => {
+    try {
+      const input = payload as ArticleNeighborhoodRequest | undefined;
+      if (!input?.workspaceId || !input.familyId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.neighborhood requires workspaceId and familyId');
+      }
+      const response = await workspaceRepository.getArticleRelationNeighborhood(input);
+      return { ok: true, data: response };
+    } catch (error) {
+      if ((error as Error).message === 'Article family not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Article family not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.rebuild', async (payload) => {
+    try {
+      const input = payload as ArticleRelationsV2RebuildRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'article.relations.rebuild requires workspaceId');
+      }
+      const response = await workspaceRepository.rebuildArticleRelationCoverageIndex(input.workspaceId, {
+        forceFullRebuild: input.forceFullRebuild
+      });
+      return { ok: true, data: response };
+    } catch (error) {
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('article.relations.feedback.record', async (payload) => {
+    try {
+      const input = payload as ArticleRelationFeedbackRecordRequest | undefined;
+      if (!input?.workspaceId || !input.leftFamilyId || !input.rightFamilyId || !input.feedbackType) {
+        return createErrorResult(
+          AppErrorCode.INVALID_REQUEST,
+          'article.relations.feedback.record requires workspaceId, leftFamilyId, rightFamilyId, and feedbackType'
+        );
+      }
+      const response = await workspaceRepository.recordArticleRelationFeedback(input);
       return { ok: true, data: response };
     } catch (error) {
       return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
@@ -6317,8 +6736,12 @@ export function registerCoreCommands(
       }
 
       if (review.verdict === 'approved') {
+        const reconciledApprovedDraftPlan = batchAnalysisOrchestrator.reconcilePlanQuestionState(
+          draftPlan,
+          review.questions ?? []
+        );
         const approvedPlan = {
-          ...draftPlan,
+          ...reconciledApprovedDraftPlan,
           id: randomUUID(),
           verdict: 'approved' as const,
           createdAtUtc: new Date().toISOString(),
@@ -7220,8 +7643,12 @@ export function registerCoreCommands(
         break;
       }
 
+      const reconciledApprovedAmendmentDraftPlan = batchAnalysisOrchestrator.reconcilePlanQuestionState(
+        amendmentDraftPlan,
+        amendmentReview.questions ?? []
+      );
       const approvedAmendmentPlan: BatchAnalysisPlan = {
-        ...amendmentDraftPlan,
+        ...reconciledApprovedAmendmentDraftPlan,
         id: randomUUID(),
         verdict: 'approved',
         createdAtUtc: new Date().toISOString(),

@@ -416,10 +416,21 @@ export interface AiAssistantSessionListResponse {
   sessions: AiSessionRecord[];
 }
 
-export type AppNavigationAction = {
-  type: 'open_proposal_review';
-  proposalId: string;
-};
+export type AppNavigationAction =
+  | {
+      type: 'open_proposal_review';
+      proposalId: string;
+    }
+  | {
+      type: 'open_route';
+      route: AppRoute;
+    }
+  | {
+      type: 'open_article_explorer';
+      familyId: string;
+      localeVariantId?: string;
+      tab?: 'preview' | 'relations';
+    };
 
 export interface AppNavigationDispatchRequest {
   action: AppNavigationAction;

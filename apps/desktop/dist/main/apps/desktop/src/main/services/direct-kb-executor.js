@@ -49,6 +49,10 @@ class DirectKbExecutor {
     async execute(request) {
         try {
             this.assertActionAllowed(request.action, request.context);
+            const validationError = (0, shared_types_1.validateDirectActionArgs)(request.action.type, request.action.args);
+            if (validationError) {
+                throw new Error(validationError);
+            }
             const data = await this.dispatch(request);
             return {
                 actionId: request.action.id,
@@ -103,6 +107,8 @@ class DirectKbExecutor {
                     localeVariantIds: this.mergeScopedIds(request.action.args.localeVariantIds, request.context.scope?.localeVariantIds, 'localeVariantIds'),
                     familyIds: this.mergeScopedIds(request.action.args.familyIds, request.context.scope?.familyIds, 'familyIds')
                 });
+            case 'get_explorer_tree':
+                return this.deps.kbActionService.getExplorerTree(workspaceId);
             case 'get_batch_context': {
                 const batchId = this.requireBatchId(request.action.args.batchId, request.context.batchId);
                 return this.deps.kbActionService.getBatchContext({ workspaceId, batchId });

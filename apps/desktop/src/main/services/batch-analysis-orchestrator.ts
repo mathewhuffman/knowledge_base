@@ -1165,6 +1165,21 @@ export class BatchAnalysisOrchestrator {
     };
   }
 
+  reconcilePlanQuestionState(
+    plan: BatchAnalysisPlan,
+    reviewQuestions?: BatchAnalysisQuestion[]
+  ): BatchAnalysisPlan {
+    const questions = mergeStructuredQuestions(
+      plan.questions ?? [],
+      reviewQuestions ?? []
+    );
+    return {
+      ...plan,
+      questions,
+      openQuestions: serializeOpenQuestionPrompts(questions, plan.openQuestions)
+    };
+  }
+
   validatePlanForExecution(params: {
     plan: BatchAnalysisPlan;
     review: BatchPlanReview;
@@ -1829,6 +1844,7 @@ export class BatchAnalysisOrchestrator {
   }
 
   private async buildWorkerPlanPromptPayload(plan: BatchAnalysisPlan): Promise<Record<string, unknown>> {
+    const promptVisibleQuestions = filterPromptVisibleQuestions(plan.questions ?? []);
     return {
       planId: plan.id,
       verdict: plan.verdict,
@@ -1839,8 +1855,8 @@ export class BatchAnalysisOrchestrator {
         ...compactPlanItemForPrompt(item),
         executionTarget: await this.buildWorkerExecutionTargetHint(plan.workspaceId, item)
       }))),
-      questions: (plan.questions ?? []).map((question) => compactPlanQuestionForPrompt(question)),
-      openQuestions: serializeOpenQuestionPrompts(plan.questions ?? [], plan.openQuestions)
+      questions: promptVisibleQuestions.map((question) => compactPlanQuestionForPrompt(question)),
+      openQuestions: serializeOpenQuestionPrompts(promptVisibleQuestions, plan.openQuestions)
     };
   }
 
@@ -2241,6 +2257,7 @@ function compactPbiForPrompt(row: unknown): Record<string, unknown> {
 }
 
 function compactPlanForPrompt(plan: BatchAnalysisPlan): Record<string, unknown> {
+  const promptVisibleQuestions = filterPromptVisibleQuestions(plan.questions ?? []);
   return {
     planId: plan.id,
     verdict: plan.verdict,
@@ -2248,8 +2265,8 @@ function compactPlanForPrompt(plan: BatchAnalysisPlan): Record<string, unknown> 
     summary: plan.summary,
     coverage: plan.coverage.map((item) => compactPlanCoverageForPrompt(item)),
     items: plan.items.map((item) => compactPlanItemForPrompt(item)),
-    questions: (plan.questions ?? []).map((question) => compactPlanQuestionForPrompt(question)),
-    openQuestions: serializeOpenQuestionPrompts(plan.questions ?? [], plan.openQuestions)
+    questions: promptVisibleQuestions.map((question) => compactPlanQuestionForPrompt(question)),
+    openQuestions: serializeOpenQuestionPrompts(promptVisibleQuestions, plan.openQuestions)
   };
 }
 
@@ -2946,13 +2963,28 @@ function hasOwn(candidate: Record<string, unknown>, key: string): boolean {
 }
 
 function serializeOpenQuestionPrompts(questions: BatchAnalysisQuestion[], legacyOpenQuestions?: unknown): string[] {
+  const structuredQuestionByKey = new Map(
+    questions
+      .map((question) => [normalizeQuestionPromptKey(question.prompt), question] as const)
+  );
   const prompts = questions
+    .filter((question) => shouldSurfaceQuestionPromptAsOpen(question))
     .map((question) => question.prompt?.trim())
     .filter((prompt): prompt is string => Boolean(prompt));
   const legacy = Array.isArray(legacyOpenQuestions)
-    ? legacyOpenQuestions.filter((entry): entry is string => typeof entry === 'string').map((entry) => humanizeReadableText(entry))
+    ? legacyOpenQuestions
+        .filter((entry): entry is string => typeof entry === 'string')
+        .map((entry) => humanizeReadableText(entry))
+        .filter((prompt) => {
+          const matchingStructuredQuestion = structuredQuestionByKey.get(normalizeQuestionPromptKey(prompt));
+          return !matchingStructuredQuestion || shouldSurfaceQuestionPromptAsOpen(matchingStructuredQuestion);
+        })
     : [];
   return Array.from(new Set([...prompts, ...legacy]));
+}
+
+function filterPromptVisibleQuestions(questions: BatchAnalysisQuestion[]): BatchAnalysisQuestion[] {
+  return questions.filter((question) => shouldIncludeQuestionInPrompt(question));
 }
 
 function mergeStructuredQuestions(...questionGroups: BatchAnalysisQuestion[][]): BatchAnalysisQuestion[] {
@@ -3073,6 +3105,16 @@ function isPendingRequiredUserInputQuestion(question: BatchAnalysisQuestion): bo
   return question.requiresUserInput
     && question.status === 'pending'
     && !question.answer?.trim();
+}
+
+function shouldSurfaceQuestionPromptAsOpen(question: BatchAnalysisQuestion): boolean {
+  return question.status === 'pending'
+    && !question.answer?.trim();
+}
+
+function shouldIncludeQuestionInPrompt(question: BatchAnalysisQuestion): boolean {
+  return question.status !== 'dismissed'
+    && question.status !== 'resolved';
 }
 
 function normalizePlanCoverage(item: BatchPlanCoverage): BatchPlanCoverage {

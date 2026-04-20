@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.KB_ACCESS_MODES = exports.ArticleRelationEvidenceType = exports.ArticleRelationStatus = exports.ArticleRelationOrigin = exports.ArticleRelationDirection = exports.ArticleRelationType = exports.PublishStatus = exports.PBIValidationStatus = exports.PBIImportFormat = exports.PBIBatchScopeMode = exports.PBIBatchStatus = exports.ProposalDecision = exports.ProposalAction = exports.RevisionStatus = exports.RevisionState = exports.WorkspaceState = void 0;
+exports.KB_ACCESS_MODES = exports.ArticleRelationFeedbackSource = exports.ArticleRelationFeedbackType = exports.ArticleRelationIndexStateStatus = exports.ArticleRelationEvidenceType = exports.ArticleRelationStatus = exports.ArticleRelationOrigin = exports.ArticleRelationDirection = exports.ArticleRelationType = exports.PublishStatus = exports.PBIValidationStatus = exports.PBIImportFormat = exports.PBIBatchScopeMode = exports.PBIBatchStatus = exports.ProposalDecision = exports.ProposalAction = exports.RevisionStatus = exports.RevisionState = exports.WorkspaceState = void 0;
 exports.isKbAccessMode = isKbAccessMode;
 var WorkspaceState;
 (function (WorkspaceState) {
@@ -111,6 +111,26 @@ var ArticleRelationEvidenceType;
     ArticleRelationEvidenceType["MANUAL_NOTE"] = "manual_note";
     ArticleRelationEvidenceType["HEURISTIC"] = "heuristic";
 })(ArticleRelationEvidenceType || (exports.ArticleRelationEvidenceType = ArticleRelationEvidenceType = {}));
+var ArticleRelationIndexStateStatus;
+(function (ArticleRelationIndexStateStatus) {
+    ArticleRelationIndexStateStatus["INDEXED"] = "indexed";
+    ArticleRelationIndexStateStatus["STALE"] = "stale";
+    ArticleRelationIndexStateStatus["ERROR"] = "error";
+})(ArticleRelationIndexStateStatus || (exports.ArticleRelationIndexStateStatus = ArticleRelationIndexStateStatus = {}));
+var ArticleRelationFeedbackType;
+(function (ArticleRelationFeedbackType) {
+    ArticleRelationFeedbackType["ADD"] = "add";
+    ArticleRelationFeedbackType["REMOVE"] = "remove";
+    ArticleRelationFeedbackType["MISSED"] = "missed";
+    ArticleRelationFeedbackType["BAD_SUGGESTION"] = "bad_suggestion";
+    ArticleRelationFeedbackType["GOOD_SUGGESTION"] = "good_suggestion";
+})(ArticleRelationFeedbackType || (exports.ArticleRelationFeedbackType = ArticleRelationFeedbackType = {}));
+var ArticleRelationFeedbackSource;
+(function (ArticleRelationFeedbackSource) {
+    ArticleRelationFeedbackSource["MANUAL_RELATION"] = "manual_relation";
+    ArticleRelationFeedbackSource["UI"] = "ui";
+    ArticleRelationFeedbackSource["SYSTEM"] = "system";
+})(ArticleRelationFeedbackSource || (exports.ArticleRelationFeedbackSource = ArticleRelationFeedbackSource = {}));
 exports.KB_ACCESS_MODES = ['direct', 'mcp', 'cli'];
 function isKbAccessMode(value) {
     return typeof value === 'string' && exports.KB_ACCESS_MODES.includes(value);

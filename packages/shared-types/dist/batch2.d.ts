@@ -94,6 +94,74 @@ export declare enum ArticleRelationEvidenceType {
     MANUAL_NOTE = "manual_note",
     HEURISTIC = "heuristic"
 }
+export declare enum ArticleRelationIndexStateStatus {
+    INDEXED = "indexed",
+    STALE = "stale",
+    ERROR = "error"
+}
+export declare enum ArticleRelationFeedbackType {
+    ADD = "add",
+    REMOVE = "remove",
+    MISSED = "missed",
+    BAD_SUGGESTION = "bad_suggestion",
+    GOOD_SUGGESTION = "good_suggestion"
+}
+export declare enum ArticleRelationFeedbackSource {
+    MANUAL_RELATION = "manual_relation",
+    UI = "ui",
+    SYSTEM = "system"
+}
+export type KBScopeType = 'category' | 'section';
+export type KBScopeLabelSource = 'catalog' | 'override' | 'fallback';
+export type ArticleTaxonomySource = 'zendesk_article' | 'zendesk_section_parent' | 'inferred_existing_scope' | 'inferred_local_scope' | 'manual_override' | 'none';
+export interface KBScopeCatalogRecord {
+    workspaceId: EntityId;
+    scopeType: KBScopeType;
+    scopeId: string;
+    parentScopeId?: string;
+    displayName: string;
+    source: string;
+    updatedAtUtc: string;
+}
+export interface KBScopeCatalogUpsertInput {
+    workspaceId: EntityId;
+    scopeType: KBScopeType;
+    scopeId: string;
+    parentScopeId?: string | null;
+    displayName: string;
+    source: string;
+}
+export interface KBScopeCatalogQuery {
+    scopeType?: KBScopeType;
+    scopeIds?: string[];
+}
+export interface KBScopeOverrideRecord {
+    id: EntityId;
+    workspaceId: EntityId;
+    scopeType: KBScopeType;
+    scopeId: string;
+    displayName?: string;
+    parentScopeId?: string;
+    isHidden: boolean;
+    createdAtUtc: string;
+    updatedAtUtc: string;
+}
+export interface KBScopeOverrideQuery {
+    scopeType?: KBScopeType;
+    scopeIds?: string[];
+}
+export interface KBScopeDisplayNameInput {
+    scopeType: KBScopeType;
+    scopeId?: string;
+}
+export interface KBScopeDisplayNameRecord {
+    scopeType: KBScopeType;
+    scopeId?: string;
+    displayName: string;
+    labelSource: KBScopeLabelSource;
+    parentScopeId?: string;
+    isHidden: boolean;
+}
 export interface WorkspaceRecord {
     id: EntityId;
     name: string;
@@ -168,6 +236,13 @@ export interface ArticleFamilyRecord {
     title: string;
     sectionId?: string;
     categoryId?: string;
+    sourceSectionId?: string;
+    sourceCategoryId?: string;
+    sectionSource?: ArticleTaxonomySource;
+    categorySource?: ArticleTaxonomySource;
+    taxonomyConfidence?: number;
+    taxonomyUpdatedAt?: string;
+    taxonomyNote?: string;
     retiredAtUtc?: string;
 }
 export interface LocaleVariantRecord {
@@ -197,6 +272,13 @@ export interface ArticleFamilyCreateRequest {
     title: string;
     sectionId?: string;
     categoryId?: string;
+    sourceSectionId?: string;
+    sourceCategoryId?: string;
+    sectionSource?: ArticleTaxonomySource;
+    categorySource?: ArticleTaxonomySource;
+    taxonomyConfidence?: number | null;
+    taxonomyUpdatedAt?: string | null;
+    taxonomyNote?: string | null;
     retiredAtUtc?: string;
 }
 export interface ArticleFamilyUpdateRequest {
@@ -205,6 +287,13 @@ export interface ArticleFamilyUpdateRequest {
     title?: string;
     sectionId?: string | null;
     categoryId?: string | null;
+    sourceSectionId?: string | null;
+    sourceCategoryId?: string | null;
+    sectionSource?: ArticleTaxonomySource;
+    categorySource?: ArticleTaxonomySource;
+    taxonomyConfidence?: number | null;
+    taxonomyUpdatedAt?: string | null;
+    taxonomyNote?: string | null;
     retiredAtUtc?: string | null;
 }
 export interface LocaleVariantCreateRequest {
@@ -637,12 +726,326 @@ export interface ArticleRelationRecord {
     };
     evidence: ArticleRelationEvidence[];
 }
+export interface ArticleRelationIndexStateRecord {
+    workspaceId: EntityId;
+    localeVariantId: EntityId;
+    familyId: EntityId;
+    revisionId: EntityId;
+    contentHash: string;
+    engineVersion: string;
+    status: ArticleRelationIndexStateStatus;
+    lastIndexedAtUtc?: string;
+    lastError?: string;
+}
+export interface ArticleRelationFeedbackRecord {
+    id: EntityId;
+    workspaceId: EntityId;
+    leftFamilyId: EntityId;
+    rightFamilyId: EntityId;
+    feedbackType: ArticleRelationFeedbackType;
+    source: ArticleRelationFeedbackSource;
+    note?: string;
+    createdAtUtc: string;
+}
+export interface ArticleRelationFeedbackRecordRequest {
+    workspaceId: EntityId;
+    leftFamilyId: EntityId;
+    rightFamilyId: EntityId;
+    feedbackType: ArticleRelationFeedbackType;
+    source?: ArticleRelationFeedbackSource;
+    note?: string;
+}
+export interface ArticleRelationIndexStats {
+    engineVersion?: string;
+    documentCount: number;
+    chunkCount: number;
+    aliasCount: number;
+    linkCount: number;
+    lastBuiltAtUtc?: string;
+}
+export interface RelationDocumentHeading {
+    level: number;
+    text: string;
+    path: string;
+}
+export interface RelationDocumentLink {
+    href: string;
+    text?: string;
+    targetFamilyId?: string;
+    targetExternalKey?: string;
+}
+export interface RelationDocumentChunk {
+    chunkId: string;
+    ordinal: number;
+    headingPath?: string;
+    text: string;
+}
+export interface RelationDocument {
+    workspaceId: EntityId;
+    familyId: EntityId;
+    localeVariantId: EntityId;
+    locale: string;
+    revisionId: EntityId;
+    contentHash: string;
+    title: string;
+    externalKey: string;
+    categoryId?: string;
+    categoryName?: string;
+    categorySource?: ArticleTaxonomySource;
+    sectionId?: string;
+    sectionName?: string;
+    sectionSource?: ArticleTaxonomySource;
+    taxonomyConfidence?: number;
+    headings: RelationDocumentHeading[];
+    aliases: string[];
+    explicitLinks: RelationDocumentLink[];
+    bodyText: string;
+    chunks: RelationDocumentChunk[];
+}
+export interface ArticleRelationCorpusExportRequest {
+    workspaceId: EntityId;
+    familyIds?: EntityId[];
+    localeVariantIds?: EntityId[];
+    locales?: string[];
+}
+export interface ArticleRelationCorpusExportResponse {
+    workspaceId: EntityId;
+    engineVersion: string;
+    exportedAtUtc: string;
+    documentCount: number;
+    documents: RelationDocument[];
+}
+export interface CoverageQueryRequest {
+    workspaceId: EntityId;
+    query?: string;
+    seedFamilyIds?: EntityId[];
+    batchQueries?: string[];
+    maxResults?: number;
+    minScore?: number;
+    includeEvidence?: boolean;
+}
+export interface CoverageQueryEvidence {
+    evidenceType: string;
+    sourceRef?: string;
+    snippet?: string;
+    weight: number;
+    metadata?: unknown;
+}
+export interface CoverageQueryResult {
+    familyId: EntityId;
+    localeVariantIds: EntityId[];
+    title: string;
+    externalKey?: string;
+    finalScore: number;
+    relationEligible: boolean;
+    evidence: CoverageQueryEvidence[];
+}
+export interface CoverageQueryResponse {
+    workspaceId: EntityId;
+    engineVersion: string;
+    results: CoverageQueryResult[];
+}
+export interface GraphQueryRequest {
+    workspaceId: EntityId;
+    familyId?: EntityId;
+    sectionId?: string;
+    categoryId?: string;
+    minScore?: number;
+    includeSuppressed?: boolean;
+    limitNodes?: number;
+}
+export interface GraphQueryResponse {
+    workspaceId: EntityId;
+    nodes: Array<{
+        familyId: EntityId;
+        title: string;
+        externalKey?: string;
+        sectionId?: string;
+        categoryId?: string;
+        sectionSource?: ArticleTaxonomySource;
+        categorySource?: ArticleTaxonomySource;
+        taxonomyConfidence?: number;
+    }>;
+    edges: Array<{
+        relationId: EntityId;
+        leftFamilyId: EntityId;
+        rightFamilyId: EntityId;
+        relationType: string;
+        origin: string;
+        status: string;
+        strengthScore: number;
+        evidence: ArticleRelationEvidence[];
+    }>;
+}
+export interface FeatureMapSummaryRequest {
+    workspaceId: EntityId;
+}
+export interface FeatureMapScopeSummary {
+    articleCount: number;
+    clusterCount: number;
+    internalEdgeCount: number;
+    bridgeEdgeCount: number;
+    staleDocumentCount: number;
+    manualEdgeCount: number;
+    inferredEdgeCount: number;
+}
+export interface FeatureMapTaxonomyStatus {
+    status: 'missing' | 'partial' | 'ready';
+    totalScopeCount: number;
+    catalogScopeCount: number;
+    overrideScopeCount: number;
+    fallbackScopeCount: number;
+}
+export interface FeatureMapSummaryResponse {
+    workspaceId: EntityId;
+    generatedAtUtc: string;
+    taxonomyStatus: FeatureMapTaxonomyStatus;
+    categories: Array<{
+        categoryId?: string;
+        categoryName: string;
+        categoryLabel: KBScopeDisplayNameRecord;
+        articleCount: number;
+        sectionCount: number;
+        clusterCount: number;
+        internalEdgeCount: number;
+        bridgeEdgeCount: number;
+        staleDocumentCount: number;
+        manualEdgeCount: number;
+        inferredEdgeCount: number;
+        sections: Array<{
+            sectionId?: string;
+            sectionName: string;
+            sectionLabel: KBScopeDisplayNameRecord;
+            articleCount: number;
+            clusterCount: number;
+            internalEdgeCount: number;
+            bridgeEdgeCount: number;
+            staleDocumentCount: number;
+            manualEdgeCount: number;
+            inferredEdgeCount: number;
+        }>;
+    }>;
+}
+export interface FeatureScopeRequest {
+    workspaceId: EntityId;
+    scopeType: 'section' | 'category';
+    scopeId?: string;
+    includeBridges?: boolean;
+    includeSuppressed?: boolean;
+    minScore?: number;
+}
+export type FeatureClusterLabelSource = 'derived_keywords' | 'representative_article' | 'manual';
+export interface FeatureScopeResponse {
+    workspaceId: EntityId;
+    scope: {
+        scopeType: KBScopeType;
+        scopeId?: string;
+        scopeName: string;
+        scopeLabel: KBScopeDisplayNameRecord;
+    };
+    summary: FeatureMapScopeSummary;
+    articles: Array<{
+        familyId: string;
+        title: string;
+        sectionId?: string;
+        categoryId?: string;
+        sectionSource?: ArticleTaxonomySource;
+        categorySource?: ArticleTaxonomySource;
+        taxonomyConfidence?: number;
+        totalEdgeCount: number;
+        internalEdgeCount: number;
+        bridgeEdgeCount: number;
+    }>;
+    relations: Array<{
+        relationId: string;
+        leftFamilyId: string;
+        rightFamilyId: string;
+        relationType: string;
+        origin: string;
+        status: string;
+        strengthScore: number;
+        evidence: ArticleRelationEvidence[];
+    }>;
+    clusters: Array<{
+        clusterId: string;
+        label: string;
+        labelSource: FeatureClusterLabelSource;
+        articleIds: string[];
+        articleCount: number;
+        internalEdgeCount: number;
+        bridgeEdgeCount: number;
+        representativeArticleIds: string[];
+    }>;
+    bridges: Array<{
+        sourceClusterId: string;
+        sourceClusterLabel: string;
+        targetScopeType: KBScopeType;
+        targetScopeId?: string;
+        targetScopeName: string;
+        targetScopeLabel: KBScopeDisplayNameRecord;
+        summary: string;
+        edgeCount: number;
+        maxStrengthScore: number;
+        examples: Array<{
+            leftFamilyId: string;
+            leftTitle?: string;
+            rightFamilyId: string;
+            rightTitle?: string;
+            relationType: string;
+            strengthScore: number;
+        }>;
+    }>;
+}
+export interface ArticleNeighborhoodRequest {
+    workspaceId: EntityId;
+    familyId: EntityId;
+    includeSuppressed?: boolean;
+    minScore?: number;
+    hopCount?: 1 | 2;
+}
+export interface ArticleNeighborhoodResponse {
+    workspaceId: EntityId;
+    centerArticle: {
+        familyId: string;
+        title: string;
+        sectionId?: string;
+        categoryId?: string;
+        sectionSource?: ArticleTaxonomySource;
+        categorySource?: ArticleTaxonomySource;
+        taxonomyConfidence?: number;
+    };
+    nodes: Array<{
+        familyId: string;
+        title: string;
+        sectionId?: string;
+        categoryId?: string;
+        sectionSource?: ArticleTaxonomySource;
+        categorySource?: ArticleTaxonomySource;
+        taxonomyConfidence?: number;
+        degree: number;
+    }>;
+    edges: Array<{
+        relationId: string;
+        leftFamilyId: string;
+        rightFamilyId: string;
+        relationType: string;
+        origin: string;
+        status: string;
+        strengthScore: number;
+        evidence: ArticleRelationEvidence[];
+    }>;
+}
 export interface ArticleRelationSummary {
     totalActive: number;
     inferred: number;
     manual: number;
     lastRefreshedAtUtc?: string;
     latestRunState?: 'running' | 'complete' | 'failed' | 'canceled';
+    engineVersion?: string;
+    indexedDocumentCount?: number;
+    staleDocumentCount?: number;
+    degradedMode?: boolean;
+    indexStats?: ArticleRelationIndexStats;
 }
 export interface ArticleRelationsListRequest {
     workspaceId: EntityId;
@@ -683,6 +1086,12 @@ export interface ArticleRelationRefreshSummary {
     inferredRelations: number;
     manualRelations: number;
     suppressedRelations: number;
+    engineVersion?: string;
+    indexedDocumentCount?: number;
+    staleDocumentCount?: number;
+    degradedMode?: boolean;
+    thresholdsUsed?: Record<string, number>;
+    error?: string;
 }
 export interface ArticleRelationRefreshRun {
     id: EntityId;
@@ -693,6 +1102,11 @@ export interface ArticleRelationRefreshRun {
     startedAtUtc: string;
     endedAtUtc?: string;
     agentSessionId?: string;
+    engineVersion?: string;
+    indexedDocumentCount?: number;
+    staleDocumentCount?: number;
+    degradedMode?: boolean;
+    thresholdsUsed?: Record<string, number>;
     summary?: ArticleRelationRefreshSummary;
 }
 export interface ArticleRelationRefreshStatusResponse {

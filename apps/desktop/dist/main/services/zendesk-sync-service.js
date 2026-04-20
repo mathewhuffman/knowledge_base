@@ -11,6 +11,9 @@ const shared_types_1 = require("@kb-vault/shared-types");
 const zendesk_client_1 = require("@kb-vault/zendesk-client");
 const shared_types_2 = require("@kb-vault/shared-types");
 const logger_1 = require("./logger");
+function isSyncCancelledError(error) {
+    return error instanceof Error && error.message === 'sync_cancelled';
+}
 class ZendeskSyncService {
     workspaceRepository;
     static REQUEST_TIMEOUT_MS = 30_000;
@@ -74,7 +77,7 @@ class ZendeskSyncService {
             }
             emitProgress(10, `Starting ${input.mode} sync`);
             const targetLocales = input.locale ? [input.locale] : settings.enabledLocales;
-            totals = await this.syncAllLocales(input.workspaceId, targetLocales, client, input.mode, emitProgress, retryPolicy, ensureActive);
+            totals = await this.syncAllLocales(input.workspaceId, targetLocales, settings.defaultLocale, client, input.mode, emitProgress, retryPolicy, ensureActive);
             const endedAtUtc = new Date().toISOString();
             await this.workspaceRepository.logSyncRunComplete(input.workspaceId, runId, shared_types_1.JobState.SUCCEEDED, totals.syncedArticles, totals.skippedArticles, totals.createdFamilies, totals.createdVariants, totals.createdRevisions, undefined, totals.cursorSummary ? JSON.stringify(totals.cursorSummary) : undefined);
             emit({
@@ -88,7 +91,7 @@ class ZendeskSyncService {
             });
         }
         catch (error) {
-            if (error instanceof Error && error.message === 'sync_cancelled') {
+            if (isSyncCancelledError(error)) {
                 const endedAtUtc = new Date().toISOString();
                 await this.workspaceRepository.logSyncRunComplete(input.workspaceId, runId, shared_types_1.JobState.CANCELED, totals.syncedArticles, totals.skippedArticles, totals.createdFamilies, totals.createdVariants, totals.createdRevisions, undefined, totals.cursorSummary ? JSON.stringify(totals.cursorSummary) : undefined);
                 emit({
@@ -126,7 +129,7 @@ class ZendeskSyncService {
             throw error;
         }
     }
-    async syncAllLocales(workspaceId, locales, client, mode, emitProgress, retryPolicy, ensureActive) {
+    async syncAllLocales(workspaceId, locales, defaultLocale, client, mode, emitProgress, retryPolicy, ensureActive) {
         ensureActive();
         const accumulator = {
             syncedArticles: 0,
@@ -142,7 +145,7 @@ class ZendeskSyncService {
             ensureActive();
             emitProgress(15 + Math.floor(((index + 1) / totalLocales) * 20), 'Syncing locale', locale);
             const checkpoint = mode === 'incremental' ? await this.workspaceRepository.getSyncCheckpoint(workspaceId, locale) : null;
-            const synced = await this.syncLocale(workspaceId, locale, client, mode, checkpoint?.lastSyncedAt, (progress, message) => {
+            const synced = await this.syncLocale(workspaceId, locale, defaultLocale, client, mode, checkpoint?.lastSyncedAt, (progress, message) => {
                 const localeShare = (index + 1) / totalLocales;
                 const localeContribution = Math.floor(40 * localeShare);
                 emitProgress(35 + localeContribution + Math.min(40, progress), message, locale);
@@ -160,7 +163,7 @@ class ZendeskSyncService {
         }
         return accumulator;
     }
-    async syncLocale(workspaceId, locale, client, mode, since, emitProgress, retryPolicy, ensureActive) {
+    async syncLocale(workspaceId, locale, defaultLocale, client, mode, since, emitProgress, retryPolicy, ensureActive) {
         const workspace = await this.workspaceRepository.getWorkspace(workspaceId);
         const sectionId = (article) => {
             const value = article.section_id;
@@ -178,6 +181,23 @@ class ZendeskSyncService {
             createdRevisions: 0,
             remoteFamilyKeys: []
         };
+        let syncedScopeCatalog = false;
+        try {
+            syncedScopeCatalog = await this.syncScopeCatalog(workspaceId, locale, defaultLocale, client, retryPolicy, ensureActive, emitProgress);
+        }
+        catch (error) {
+            if (isSyncCancelledError(error)) {
+                throw error;
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            logger_1.logger.warn('zendesk-sync-service taxonomy sync failed; continuing article sync', {
+                workspaceId,
+                locale,
+                defaultLocale,
+                message
+            });
+            emitProgress(0, `Category/section name refresh failed; continuing article sync (${message})`);
+        }
         let page = 1;
         let hasMore = true;
         let lastCursor;
@@ -200,25 +220,25 @@ class ZendeskSyncService {
                         workspaceId,
                         externalKey: familyExternalKey,
                         title: article.title,
-                        sectionId: sectionId(article),
-                        categoryId: categoryId(article)
+                        sourceSectionId: sectionId(article),
+                        sourceCategoryId: categoryId(article)
                     });
+                    family = await this.workspaceRepository.resolveEffectiveArticleTaxonomyPlacement(workspaceId, family.id);
                     metrics.createdFamilies += 1;
                 }
                 else {
                     const shouldRename = (family.title ?? '').trim() !== (article.title ?? '').trim();
-                    const shouldRebindSection = String(family.sectionId ?? '') !== (article.section_id != null ? String(article.section_id) : '');
-                    const shouldRebindCategory = String(family.categoryId ?? '') !== (article.category_id != null ? String(article.category_id) : '');
+                    const shouldRebindSection = String(family.sourceSectionId ?? '') !== (article.section_id != null ? String(article.section_id) : '');
+                    const shouldRebindCategory = String(family.sourceCategoryId ?? '') !== (article.category_id != null ? String(article.category_id) : '');
                     if (shouldRename || shouldRebindSection || shouldRebindCategory) {
-                        const nextSectionId = shouldRebindSection ? (sectionId(article) ?? null) : undefined;
-                        const nextCategoryId = shouldRebindCategory ? (categoryId(article) ?? null) : undefined;
                         await this.workspaceRepository.updateArticleFamily({
                             workspaceId,
                             familyId: family.id,
                             title: shouldRename ? article.title : undefined,
-                            sectionId: nextSectionId,
-                            categoryId: nextCategoryId
+                            sourceSectionId: shouldRebindSection ? (sectionId(article) ?? null) : undefined,
+                            sourceCategoryId: shouldRebindCategory ? (categoryId(article) ?? null) : undefined
                         });
+                        family = await this.workspaceRepository.resolveEffectiveArticleTaxonomyPlacement(workspaceId, family.id);
                     }
                 }
                 metrics.remoteFamilyKeys.push(family.externalKey);
@@ -237,7 +257,7 @@ class ZendeskSyncService {
                         workspaceId,
                         variantId: variant.id,
                         status: shared_types_2.RevisionState.LIVE,
-                        retiredAtUtc: undefined
+                        retiredAtUtc: null
                     });
                 }
                 const existingLive = await this.workspaceRepository.getLatestRevision(workspaceId, variant.id, shared_types_2.RevisionState.LIVE);
@@ -273,6 +293,9 @@ class ZendeskSyncService {
             page += 1;
             emitProgress(Math.min(100, Math.max(0, Math.floor((articles.length / Math.max(articles.length, 1)) * 100))), `Page ${page - 1} complete`);
         }
+        if (syncedScopeCatalog) {
+            await this.workspaceRepository.reconcileEffectiveArticleTaxonomyPlacements(workspaceId);
+        }
         if (mode === 'incremental' && since) {
             return {
                 ...metrics,
@@ -285,6 +308,50 @@ class ZendeskSyncService {
             remoteFamilyKeys: metrics.remoteFamilyKeys,
             lastCursor: lastCursor ?? `${locale}:${new Date().toISOString()}`
         };
+    }
+    async syncScopeCatalog(workspaceId, locale, defaultLocale, client, retryPolicy, ensureActive, emitProgress) {
+        ensureActive();
+        const normalizedLocale = locale.trim().toLowerCase();
+        const normalizedDefaultLocale = defaultLocale.trim().toLowerCase();
+        if (!normalizedLocale || normalizedLocale !== normalizedDefaultLocale) {
+            return false;
+        }
+        const categories = await this.retrySyncCall(() => client.listCategories(locale), `listCategories ${locale}`, retryPolicy, emitProgress, locale);
+        const entries = [];
+        for (const category of categories) {
+            ensureActive();
+            if (typeof category.id !== 'number') {
+                continue;
+            }
+            if ((category.name ?? '').trim()) {
+                entries.push({
+                    workspaceId,
+                    scopeType: 'category',
+                    scopeId: String(category.id),
+                    displayName: category.name,
+                    source: `zendesk:${normalizedDefaultLocale}`
+                });
+            }
+            const sections = await this.retrySyncCall(() => client.listSections(category.id, locale), `listSections ${locale} category ${category.id}`, retryPolicy, emitProgress, locale);
+            for (const section of sections) {
+                ensureActive();
+                if (typeof section.id !== 'number' || !(section.name ?? '').trim()) {
+                    continue;
+                }
+                entries.push({
+                    workspaceId,
+                    scopeType: 'section',
+                    scopeId: String(section.id),
+                    parentScopeId: String(section.category_id ?? category.id),
+                    displayName: section.name,
+                    source: `zendesk:${normalizedDefaultLocale}`
+                });
+            }
+        }
+        if (entries.length > 0) {
+            await this.workspaceRepository.upsertKbScopeCatalogEntries(workspaceId, entries);
+        }
+        return true;
     }
     async retrySyncCall(operation, context, retryPolicy, emitProgress, locale) {
         let attempt = 0;

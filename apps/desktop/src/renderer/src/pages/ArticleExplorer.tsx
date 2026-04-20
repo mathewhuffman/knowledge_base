@@ -55,6 +55,7 @@ type DetailTab = 'preview' | 'source' | 'history' | 'lineage' | 'publish' | 'pbi
 
 type PreviewStyleResponse = { css: string; sourcePath: string };
 const EXPANDED_FOLDER_STORAGE_KEY_PREFIX = 'kbv.articleExplorer.expandedFolders';
+const ARTICLE_EXPLORER_TARGET_KEY = 'kbv:article-explorer-target';
 
 const DETAIL_TAB_CONFIG: { id: DetailTab; label: string; icon: typeof IconEye }[] = [
   { id: 'preview', label: 'Preview', icon: IconEye },
@@ -274,6 +275,32 @@ function relationVariant(relation: ArticleRelationRecord): 'primary' | 'neutral'
   return relation.origin === 'manual' ? 'primary' : 'neutral';
 }
 
+function relationEvidenceLabel(type: string): string {
+  switch (type) {
+    case 'explicit_link': return 'Explicit Link';
+    case 'external_key_exact': return 'External Key';
+    case 'alias_exact': return 'Alias Match';
+    case 'title_fts': return 'Title Match';
+    case 'heading_fts': return 'Heading Match';
+    case 'body_chunk_fts': return 'Body Match';
+    case 'same_section': return 'Same Section';
+    case 'same_category': return 'Same Category';
+    case 'manual_note': return 'Manual Note';
+    default:
+      return type.replace(/_/g, ' ');
+  }
+}
+
+function formatRelationEvidenceMetadata(metadata: unknown): string | null {
+  if (!metadata) return null;
+  if (typeof metadata === 'string') return metadata;
+  try {
+    return JSON.stringify(metadata);
+  } catch {
+    return null;
+  }
+}
+
 function RelationsPanel({
   workspaceId,
   familyId,
@@ -410,8 +437,44 @@ function RelationsPanel({
                   Score {Math.round(relation.strengthScore * 100)}%
                 </div>
                 {relation.evidence.length > 0 && (
-                  <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginTop: 'var(--space-2)', lineHeight: 1.5 }}>
-                    {relation.evidence.slice(0, 2).map((evidence) => evidence.snippet).filter(Boolean).join(' • ')}
+                  <div style={{ display: 'grid', gap: 'var(--space-2)', marginTop: 'var(--space-3)' }}>
+                    {relation.evidence.slice(0, 5).map((evidence) => {
+                      const metadataText = formatRelationEvidenceMetadata(evidence.metadata);
+                      return (
+                        <div
+                          key={evidence.id}
+                          style={{
+                            border: '1px solid rgba(15, 23, 42, 0.08)',
+                            borderRadius: 10,
+                            padding: 'var(--space-2)',
+                            display: 'grid',
+                            gap: 4
+                          }}
+                        >
+                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--space-2)' }}>
+                            <Badge variant="neutral">{relationEvidenceLabel(evidence.evidenceType)}</Badge>
+                            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                              weight {evidence.weight.toFixed(2)}
+                            </span>
+                          </div>
+                          {evidence.snippet ? (
+                            <div style={{ fontSize: 'var(--text-sm)', lineHeight: 1.5 }}>
+                              {evidence.snippet}
+                            </div>
+                          ) : null}
+                          {evidence.sourceRef ? (
+                            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                              source: {evidence.sourceRef}
+                            </div>
+                          ) : null}
+                          {metadataText ? (
+                            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                              meta: {metadataText}
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1454,6 +1517,38 @@ export const ArticleExplorer = () => {
     }
     await openArticleDetail(node, 'relations');
   }, [tree, openArticleDetail]);
+
+  useEffect(() => {
+    if (!activeWorkspace || tree.length === 0) {
+      return;
+    }
+
+    const rawTarget = window.sessionStorage.getItem(ARTICLE_EXPLORER_TARGET_KEY);
+    if (!rawTarget) {
+      return;
+    }
+
+    window.sessionStorage.removeItem(ARTICLE_EXPLORER_TARGET_KEY);
+    try {
+      const parsed = JSON.parse(rawTarget) as {
+        familyId?: string;
+        localeVariantId?: string;
+        tab?: DetailTab;
+      };
+      if (!parsed.familyId) {
+        return;
+      }
+
+      const node = tree.find((item) => item.familyId === parsed.familyId);
+      if (!node) {
+        return;
+      }
+
+      void openArticleDetail(node, parsed.tab ?? 'preview', parsed.localeVariantId);
+    } catch {
+      window.sessionStorage.removeItem(ARTICLE_EXPLORER_TARGET_KEY);
+    }
+  }, [activeWorkspace?.id, openArticleDetail, tree]);
 
   useEffect(() => {
     if (!detailPanel.detail) return;

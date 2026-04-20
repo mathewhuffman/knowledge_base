@@ -586,7 +586,7 @@ function buildAssistantChatContinuePrompt(mode) {
         ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
         : mode === 'cli'
             ? 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
-            : 'If you still need KB access, return exactly one `needs_action` direct-action JSON envelope. Do not use MCP tools, CLI commands, shell commands, or filesystem exploration in this follow-up.';
+            : 'If one final KB lookup or confirmed app mutation is still required, return exactly one `needs_action` direct-action JSON envelope. Do not describe transport internals or ad-hoc environment exploration in this follow-up.';
     return [
         'Complete the same user request using the existing session context.',
         'Return the final user-facing answer now.',
@@ -620,6 +620,21 @@ function getDirectActionTypesForSession(session) {
     }
     return null;
 }
+function buildDirectActionCatalog(actionTypes) {
+    if (!actionTypes?.length) {
+        return '- No direct actions are available in this session.';
+    }
+    return actionTypes
+        .map((actionType) => {
+        const definition = shared_types_2.DIRECT_ACTION_DEFINITIONS[actionType];
+        if (!definition) {
+            return `- \`${actionType}\``;
+        }
+        const usage = definition.usageHint ? ` Guidance: ${definition.usageHint}` : '';
+        return `- \`${actionType}\`: ${definition.description} Args: ${definition.argsHint}${usage}`;
+    })
+        .join('\n');
+}
 function buildDirectTaskPrompt(session, taskPayload, extras) {
     const batchId = typeof taskPayload.batchId === 'string' ? taskPayload.batchId : session.batchId ?? '';
     const locale = typeof taskPayload.locale === 'string' ? taskPayload.locale : session.locale ?? 'default';
@@ -637,9 +652,11 @@ function buildDirectTaskPrompt(session, taskPayload, extras) {
     const directProtocolBase = [
         'KB Vault direct-mode protocol:',
         '- The app is the sole authority for KB reads and writes. You do not execute tools or commands yourself.',
-        '- Never mention MCP, CLI, shell, terminal, filesystem exploration, or tool discovery in direct mode.',
+        '- Stay inside the direct-action contract described here. Do not discuss transport internals or ad-hoc environment exploration.',
         '- If prompt context is insufficient, request exactly one direct action by returning a JSON object with `completionState="needs_action"` and `isFinal=false`.',
         `- Allowed direct action types in this stage: ${allowedActions}.`,
+        'Direct action catalog:',
+        buildDirectActionCatalog(allowedActionTypes),
         '- Use direct actions only for concrete unresolved ambiguities. Reuse prior action results instead of repeating the same request.',
         '- Each direct action turn may request only one action object.',
         '- The app derives workspace ownership, route ownership, batch ownership, session ownership, and idempotency. Do not invent those fields yourself.',
@@ -794,7 +811,7 @@ function buildDirectTaskPrompt(session, taskPayload, extras) {
         `Locale: ${locale}`,
         '',
         'Important constraints:',
-        '- Do not use MCP tools, kb CLI commands, shell commands, terminal commands, or filesystem exploration.',
+        '- Stay inside the direct-action contract for this session.',
         '- Return a blocked JSON envelope explaining that this direct-mode route is not enabled for the current session.',
         '',
         explicitPrompt ? `Task instructions:\n${explicitPrompt}` : '',
@@ -2478,34 +2495,49 @@ class CursorAcpRuntime {
                 },
                 message: `direct_action:${actionEnvelope.action.type}`
             }));
-            const execution = await executeDirectAction({
-                context: {
-                    workspaceId: session.workspaceId,
-                    batchId: session.batchId,
-                    sessionId: session.id,
-                    sessionType: session.type,
-                    sessionMode: session.mode,
-                    agentRole: session.role,
-                    locale: session.locale,
-                    scope: session.scope,
-                    directContext: session.directContext
-                },
-                action: actionEnvelope.action
-            });
-            const resultEnvelope = {
-                type: 'action_result',
-                actionId: execution.actionId,
-                ok: execution.ok,
-                ...(execution.ok ? { data: execution.data } : { error: execution.error ?? { message: 'Direct action failed' } })
-            };
-            const actionReason = execution.ok ? undefined : resultEnvelope.error?.message;
+            const validationError = (0, shared_types_2.validateDirectActionArgs)(actionEnvelope.action.type, actionEnvelope.action.args);
+            let resultEnvelope;
+            if (validationError) {
+                resultEnvelope = {
+                    type: 'action_result',
+                    actionId: actionEnvelope.action.id,
+                    ok: false,
+                    error: {
+                        code: 'INVALID_DIRECT_ACTION_INPUT',
+                        message: validationError
+                    }
+                };
+            }
+            else {
+                const execution = await executeDirectAction({
+                    context: {
+                        workspaceId: session.workspaceId,
+                        batchId: session.batchId,
+                        sessionId: session.id,
+                        sessionType: session.type,
+                        sessionMode: session.mode,
+                        agentRole: session.role,
+                        locale: session.locale,
+                        scope: session.scope,
+                        directContext: session.directContext
+                    },
+                    action: actionEnvelope.action
+                });
+                resultEnvelope = {
+                    type: 'action_result',
+                    actionId: execution.actionId,
+                    ok: execution.ok,
+                    ...(execution.ok ? { data: execution.data } : { error: execution.error ?? { message: 'Direct action failed' } })
+                };
+            }
+            const actionReason = resultEnvelope.ok ? undefined : resultEnvelope.error?.message;
             const auditEntry = {
                 workspaceId: session.workspaceId,
                 sessionId: session.id,
                 toolName: `direct.${actionEnvelope.action.type}`,
                 args: actionEnvelope.action.args,
                 calledAtUtc: requestedAtUtc,
-                allowed: execution.ok,
+                allowed: resultEnvelope.ok,
                 reason: actionReason
             };
             this.toolCallAudit.push(auditEntry);
@@ -2522,15 +2554,15 @@ class CursorAcpRuntime {
                 message: `direct_result:${actionEnvelope.action.type}`
             }));
             this.markSessionActivity(session.id);
-            if (execution.ok
+            if (resultEnvelope.ok
                 && actionEnvelope.action.type === 'patch_form'
                 && session.directContext
-                && execution.data
-                && typeof execution.data === 'object'
-                && typeof execution.data.nextVersionToken === 'string') {
+                && resultEnvelope.data
+                && typeof resultEnvelope.data === 'object'
+                && typeof resultEnvelope.data.nextVersionToken === 'string') {
                 session.directContext = {
                     ...session.directContext,
-                    workingStateVersionToken: String(execution.data.nextVersionToken)
+                    workingStateVersionToken: String(resultEnvelope.data.nextVersionToken)
                 };
             }
             if (isCancelled()) {
@@ -5181,9 +5213,11 @@ const ASSISTANT_CHAT_RECOVERY_RETRY_LIMIT = 2;
 const ASSISTANT_CHAT_CONTINUATION_MARKER = 'Continuation instructions:';
 function buildAssistantChatToolRecoveryPrompt(mode, policyError) {
     const providerLabel = mode === 'mcp' ? 'MCP mode' : mode === 'cli' ? 'CLI mode' : 'Direct mode';
-    const violationText = policyError?.trim()
-        ? `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}: ${policyError.trim()}.`
-        : `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}.`;
+    const violationText = mode === 'direct'
+        ? 'The previous attempt was interrupted because you issued an operation outside the direct-action contract for this session.'
+        : policyError?.trim()
+            ? `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}: ${policyError.trim()}.`
+            : `The previous attempt was interrupted because you attempted an illegal operation in ${providerLabel}.`;
     if (mode === 'mcp') {
         return [
             'Continue the same user request using the existing session context.',
@@ -5205,9 +5239,10 @@ function buildAssistantChatToolRecoveryPrompt(mode, policyError) {
             'Continue the same user request using the existing session context.',
             violationText,
             'Do not try that illegal operation again.',
-            'Direct mode does not allow ACP tool calls, MCP tools, kb CLI commands, Shell, Terminal, list_mcp_resources, fetch_mcp_resource, Read File, grep, codebase search, or filesystem exploration.',
+            'Stay inside the direct-action contract from the original prompt.',
             'If you already gathered enough context in this session, answer now.',
-            'If you still need KB or app context, return exactly one `needs_action` direct-action JSON envelope instead of calling a tool.',
+            'If you still need KB or app context, return exactly one `needs_action` direct-action JSON envelope using only the allowed direct actions from the original prompt.',
+            'Do not describe transport internals or ad-hoc environment exploration.',
             'Do not send a progress update.'
         ].join(' ');
     }

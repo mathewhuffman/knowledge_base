@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { test, expect } from '@playwright/test';
+import { openWorkspaceDatabase } from '@kb-vault/db';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
 import { BatchAnalysisOrchestrator } from '../src/main/services/batch-analysis-orchestrator';
 import { AppWorkingStateService } from '../src/main/services/app-working-state-service';
@@ -290,6 +291,244 @@ test.describe('workspace repository content model', () => {
     expect(secondGet.defaultLocale).toBe('fr-fr');
     expect(secondGet.enabledLocales).toEqual(['fr-fr']);
     expect(secondGet.kbAccessMode).toBe('cli');
+  });
+
+  test('persists KB scope catalog entries and resolves display names with overrides', async () => {
+    const created = await repository.createWorkspace({
+      name: 'KB Scope Catalog Workspace',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us'],
+      path: path.join(workspaceRoot, 'kb-scope-catalog')
+    });
+
+    await repository.upsertKbScopeCatalogEntries(created.id, [
+      {
+        workspaceId: created.id,
+        scopeType: 'category',
+        scopeId: '200',
+        displayName: 'Operations',
+        source: 'zendesk'
+      },
+      {
+        workspaceId: created.id,
+        scopeType: 'section',
+        scopeId: '201',
+        parentScopeId: '200',
+        displayName: 'Billing Dashboard',
+        source: 'zendesk'
+      }
+    ]);
+
+    const catalog = await repository.listKbScopeCatalogEntries(created.id);
+    expect(catalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        workspaceId: created.id,
+        scopeType: 'category',
+        scopeId: '200',
+        displayName: 'Operations',
+        source: 'zendesk'
+      }),
+      expect.objectContaining({
+        workspaceId: created.id,
+        scopeType: 'section',
+        scopeId: '201',
+        parentScopeId: '200',
+        displayName: 'Billing Dashboard',
+        source: 'zendesk'
+      })
+    ]));
+
+    const fallbackResolved = await repository.resolveKbScopeDisplayNames(created.id, [
+      { scopeType: 'category', scopeId: '200' },
+      { scopeType: 'section', scopeId: '201' },
+      { scopeType: 'section', scopeId: 'missing-scope' },
+      { scopeType: 'category' }
+    ]);
+
+    expect(fallbackResolved).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        scopeType: 'category',
+        scopeId: '200',
+        displayName: 'Operations',
+        labelSource: 'catalog',
+        isHidden: false
+      }),
+      expect.objectContaining({
+        scopeType: 'section',
+        scopeId: '201',
+        displayName: 'Billing Dashboard',
+        labelSource: 'catalog',
+        parentScopeId: '200',
+        isHidden: false
+      }),
+      expect.objectContaining({
+        scopeType: 'section',
+        scopeId: 'missing-scope',
+        displayName: 'missing-scope (fallback)',
+        labelSource: 'fallback',
+        isHidden: false
+      }),
+      expect.objectContaining({
+        scopeType: 'category',
+        scopeId: undefined,
+        displayName: 'Uncategorized',
+        labelSource: 'fallback',
+        isHidden: false
+      })
+    ]));
+
+    const db = openWorkspaceDatabase(path.join(created.path, '.meta', 'kb-vault.sqlite'));
+    try {
+      const now = new Date().toISOString();
+      db.run(
+        `INSERT INTO kb_scope_overrides (
+           id, workspace_id, scope_type, scope_id, display_name, parent_scope_id, is_hidden, created_at, updated_at
+         ) VALUES (
+           @id, @workspaceId, @scopeType, @scopeId, @displayName, @parentScopeId, @isHidden, @createdAt, @updatedAt
+         )`,
+        {
+          id: randomUUID(),
+          workspaceId: created.id,
+          scopeType: 'section',
+          scopeId: '201',
+          displayName: 'Billing Control Center',
+          parentScopeId: '200',
+          isHidden: 1,
+          createdAt: now,
+          updatedAt: now
+        }
+      );
+    } finally {
+      db.close();
+    }
+
+    const overrides = await repository.listKbScopeOverrides(created.id);
+    expect(overrides).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        workspaceId: created.id,
+        scopeType: 'section',
+        scopeId: '201',
+        displayName: 'Billing Control Center',
+        parentScopeId: '200',
+        isHidden: true
+      })
+    ]));
+
+    const overrideResolved = await repository.resolveKbScopeDisplayNames(created.id, [
+      { scopeType: 'section', scopeId: '201' }
+    ]);
+    expect(overrideResolved).toEqual([
+      expect.objectContaining({
+        scopeType: 'section',
+        scopeId: '201',
+        displayName: 'Billing Control Center',
+        labelSource: 'override',
+        parentScopeId: '200',
+        isHidden: true
+      })
+    ]);
+  });
+
+  test('derives effective article taxonomy from section reparenting overrides before catalog parents', async () => {
+    const created = await repository.createWorkspace({
+      name: 'KB Scope Override Taxonomy Workspace',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us'],
+      path: path.join(workspaceRoot, 'kb-scope-override-taxonomy')
+    });
+
+    await repository.upsertKbScopeCatalogEntries(created.id, [
+      {
+        workspaceId: created.id,
+        scopeType: 'category',
+        scopeId: '200',
+        displayName: 'Operations',
+        source: 'zendesk'
+      },
+      {
+        workspaceId: created.id,
+        scopeType: 'category',
+        scopeId: '300',
+        displayName: 'Revenue',
+        source: 'zendesk'
+      },
+      {
+        workspaceId: created.id,
+        scopeType: 'section',
+        scopeId: '201',
+        parentScopeId: '200',
+        displayName: 'Billing Dashboard',
+        source: 'zendesk'
+      }
+    ]);
+
+    const db = openWorkspaceDatabase(path.join(created.path, '.meta', 'kb-vault.sqlite'));
+    try {
+      const now = new Date().toISOString();
+      db.run(
+        `INSERT INTO kb_scope_overrides (
+           id, workspace_id, scope_type, scope_id, display_name, parent_scope_id, is_hidden, created_at, updated_at
+         ) VALUES (
+           @id, @workspaceId, @scopeType, @scopeId, @displayName, @parentScopeId, @isHidden, @createdAt, @updatedAt
+         )`,
+        {
+          id: randomUUID(),
+          workspaceId: created.id,
+          scopeType: 'section',
+          scopeId: '201',
+          displayName: 'Billing Control Center',
+          parentScopeId: '300',
+          isHidden: 0,
+          createdAt: now,
+          updatedAt: now
+        }
+      );
+    } finally {
+      db.close();
+    }
+
+    await expect(repository.getKbSectionParentCategory(created.id, '201')).resolves.toBe('300');
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'hc:scope-override-1001',
+      title: 'Billing Dashboard',
+      sourceSectionId: '201'
+    });
+    const resolvedFamily = await repository.resolveEffectiveArticleTaxonomyPlacement(created.id, family.id);
+
+    expect(resolvedFamily).toEqual(expect.objectContaining({
+      sectionId: '201',
+      categoryId: '300',
+      sourceSectionId: '201',
+      sourceCategoryId: undefined,
+      sectionSource: 'zendesk_article',
+      categorySource: 'zendesk_section_parent'
+    }));
+
+    const summary = await repository.getArticleRelationFeatureMapSummary({
+      workspaceId: created.id
+    });
+
+    expect(summary.categories).toEqual([
+      expect.objectContaining({
+        categoryId: '300',
+        categoryName: 'Revenue',
+        sections: [
+          expect.objectContaining({
+            sectionId: '201',
+            sectionName: 'Billing Control Center',
+            articleCount: 1,
+            sectionLabel: expect.objectContaining({
+              parentScopeId: '300',
+              labelSource: 'override'
+            })
+          })
+        ]
+      })
+    ]);
   });
 
   test('persists workspace settings updates across repository instances', async () => {
@@ -894,6 +1133,91 @@ test.describe('workspace repository content model', () => {
     expect(plan.items[0]?.reason).toContain('distinct duplicate food item workflow');
     expect(plan.items[0]?.evidence[0]?.summary).toContain('prefilled create mode side sheet');
     expect(plan.openQuestions[0]).toContain('Should this be a standalone article');
+  });
+
+  test('does not persist dismissed structured questions as open plan questions', async () => {
+    const created = await repository.createWorkspace({
+      name: `QuestionState-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Question State Batch',
+      'question-state.csv',
+      'imports/question-state.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const iteration = await repository.createBatchAnalysisIteration({
+      workspaceId: created.id,
+      batchId: batch.id,
+      stage: 'plan_revision',
+      role: 'planner',
+      status: 'running',
+      summary: 'Persisting approved plan question state.',
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session'
+    });
+
+    const dismissedPrompt = 'Should the Training Plan Detail article stay comprehensive or split per interaction?';
+    await repository.recordBatchAnalysisPlan({
+      id: randomUUID(),
+      workspaceId: created.id,
+      batchId: batch.id,
+      iterationId: iteration.id,
+      iteration: iteration.iteration,
+      stage: 'plan_revision',
+      role: 'planner',
+      verdict: 'approved',
+      planVersion: 2,
+      summary: 'Approved plan with reviewer-dismissed question.',
+      coverage: [{ pbiId: 'pbi-1', outcome: 'covered', planItemIds: ['plan-1'] }],
+      items: [
+        {
+          planItemId: 'plan-1',
+          pbiIds: ['pbi-1'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'Training Plan Detail',
+          reason: 'Net-new screen coverage is required.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+          confidence: 0.91,
+          executionStatus: 'pending'
+        }
+      ],
+      questions: [
+        {
+          id: 'q-001',
+          prompt: dismissedPrompt,
+          reason: 'Reviewer decided the worker can safely keep this as one article.',
+          requiresUserInput: false,
+          linkedPbiIds: ['pbi-1'],
+          linkedPlanItemIds: ['plan-1'],
+          linkedDiscoveryIds: [],
+          status: 'dismissed',
+          createdAtUtc: new Date().toISOString()
+        }
+      ],
+      openQuestions: [dismissedPrompt],
+      createdAtUtc: new Date().toISOString(),
+      agentModelId: 'gpt-5.4',
+      sessionId: 'planner-session-2'
+    });
+
+    const snapshot = await repository.getBatchAnalysisSnapshot(created.id, batch.id);
+    expect(snapshot.latestApprovedPlan?.questions?.[0]?.status).toBe('dismissed');
+    expect(snapshot.latestApprovedPlan?.openQuestions).toEqual([]);
   });
 
   test('matches collapsed plan titles to spaced proposal titles during worker execution', async () => {

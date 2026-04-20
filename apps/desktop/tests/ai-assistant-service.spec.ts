@@ -531,9 +531,13 @@ test.describe('ai assistant service prompt builder', () => {
     expect(prompt).toContain('`needs_action`');
     expect(prompt).toContain('request `search_kb`');
     expect(prompt).toContain('request `get_article`');
+    expect(prompt).toContain('`get_explorer_tree`');
+    expect(prompt).toContain('`list_sections` requires both `locale` and integer `categoryId`');
     expect(prompt).not.toContain('kb search-kb');
     expect(prompt).not.toContain('`app_patch_form`');
     expect(prompt).not.toContain('`kb app patch-form`');
+    expect(prompt).not.toContain('MCP tools');
+    expect(prompt).not.toContain('kb CLI commands');
   });
 
   test('Proposal Review guidance prefers proposal_patch over live form mutation', () => {

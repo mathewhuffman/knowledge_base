@@ -8,6 +8,7 @@ import { AiAssistantProvider } from './components/assistant/AssistantContext';
 import { DetachedAssistantWindowHost, GlobalAssistantHost } from './components/assistant/GlobalAssistantHost';
 
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
+const ARTICLE_EXPLORER_TARGET_KEY = 'kbv:article-explorer-target';
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'kbv:sidebar-collapsed';
 
 interface BootData {
@@ -147,6 +148,15 @@ function AppShell() {
     setActiveRoute(AppRoute.PROPOSAL_REVIEW);
   }, []);
 
+  const openArticleExplorer = useCallback((target: {
+    familyId: string;
+    localeVariantId?: string;
+    tab?: 'preview' | 'relations';
+  }) => {
+    window.sessionStorage.setItem(ARTICLE_EXPLORER_TARGET_KEY, JSON.stringify(target));
+    setActiveRoute(AppRoute.ARTICLE_EXPLORER);
+  }, []);
+
   useEffect(() => {
     if (!window.kbv?.emitAppNavigationEvents) {
       return;
@@ -154,9 +164,21 @@ function AppShell() {
     return window.kbv.emitAppNavigationEvents((event: AppNavigationEvent) => {
       if (event.action.type === 'open_proposal_review') {
         openProposalReview(event.action.proposalId);
+        return;
+      }
+      if (event.action.type === 'open_route') {
+        setActiveRoute(event.action.route);
+        return;
+      }
+      if (event.action.type === 'open_article_explorer') {
+        openArticleExplorer({
+          familyId: event.action.familyId,
+          localeVariantId: event.action.localeVariantId,
+          tab: event.action.tab
+        });
       }
     });
-  }, [openProposalReview]);
+  }, [openArticleExplorer, openProposalReview]);
 
   const Active = routeToComponent[activeRoute];
 

@@ -1,14 +1,14 @@
 import type { AgentDirectSessionContext, AgentSessionMode, AgentSessionType, BatchAnalysisAgentRole, MCPAppPatchFormInput, MCPFindRelatedArticlesInput, MCPGetArticleFamilyInput, MCPGetArticleHistoryInput, MCPGetArticleInput, MCPGetBatchContextInput, MCPGetLocaleVariantInput, MCPGetPBIInput, MCPGetPBISubsetInput, MCPGetTemplateInput, MCPListArticleTemplatesInput, MCPListCategoriesInput, MCPListSectionsInput, MCPRecordAgentNotesInput, MCPSearchKbInput } from './batch6';
 import type { ProposalPlacementSuggestion } from './batch7';
 import { ProposalReviewStatus } from './batch7';
-export declare const DIRECT_READ_ACTION_TYPES: readonly ["search_kb", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
+export declare const DIRECT_READ_ACTION_TYPES: readonly ["search_kb", "get_explorer_tree", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
 export declare const DIRECT_MUTATION_ACTION_TYPES: readonly ["record_agent_notes", "create_proposals", "patch_form"];
-export declare const DIRECT_ACTION_TYPES: readonly ["search_kb", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template", "record_agent_notes", "create_proposals", "patch_form"];
-export declare const DIRECT_BATCH_READ_ONLY_ACTION_TYPES: readonly ["search_kb", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
-export declare const DIRECT_BATCH_WORKER_ACTION_TYPES: readonly ["search_kb", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template", "create_proposals"];
-export declare const DIRECT_ARTICLE_EDIT_ACTION_TYPES: readonly ["search_kb", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
-export declare const DIRECT_ASSISTANT_READ_ACTION_TYPES: readonly ["search_kb", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
-export declare const DIRECT_ASSISTANT_TEMPLATE_ACTION_TYPES: readonly ["search_kb", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template", "patch_form"];
+export declare const DIRECT_ACTION_TYPES: readonly ["search_kb", "get_explorer_tree", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template", "record_agent_notes", "create_proposals", "patch_form"];
+export declare const DIRECT_BATCH_READ_ONLY_ACTION_TYPES: readonly ["search_kb", "get_explorer_tree", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
+export declare const DIRECT_BATCH_WORKER_ACTION_TYPES: readonly ["search_kb", "get_explorer_tree", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template", "create_proposals"];
+export declare const DIRECT_ARTICLE_EDIT_ACTION_TYPES: readonly ["search_kb", "get_explorer_tree", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
+export declare const DIRECT_ASSISTANT_READ_ACTION_TYPES: readonly ["search_kb", "get_explorer_tree", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template"];
+export declare const DIRECT_ASSISTANT_TEMPLATE_ACTION_TYPES: readonly ["search_kb", "get_explorer_tree", "get_batch_context", "get_pbi", "get_pbi_subset", "get_article", "get_article_family", "get_locale_variant", "get_article_history", "find_related_articles", "list_categories", "list_sections", "list_article_templates", "get_template", "patch_form"];
 export type DirectReadActionType = (typeof DIRECT_READ_ACTION_TYPES)[number];
 export type DirectMutationActionType = (typeof DIRECT_MUTATION_ACTION_TYPES)[number];
 export type DirectActionType = (typeof DIRECT_ACTION_TYPES)[number];
@@ -69,6 +69,7 @@ export interface DirectExecutorContext {
 }
 export interface DirectActionArgsMap {
     search_kb: Omit<MCPSearchKbInput, 'workspaceId'>;
+    get_explorer_tree: Record<string, never>;
     get_batch_context: Omit<MCPGetBatchContextInput, 'workspaceId'>;
     get_pbi: Omit<MCPGetPBIInput, 'workspaceId'>;
     get_pbi_subset: Omit<MCPGetPBISubsetInput, 'workspaceId'>;
@@ -125,3 +126,28 @@ export interface DirectTerminalEnvelope {
     message: string;
     details?: unknown;
 }
+interface DirectActionJsonSchema {
+    type?: string | readonly string[];
+    enum?: readonly unknown[];
+    properties?: Record<string, DirectActionJsonSchema>;
+    required?: readonly string[];
+    additionalProperties?: boolean;
+    items?: DirectActionJsonSchema;
+    minLength?: number;
+    maxLength?: number;
+    minimum?: number;
+    maximum?: number;
+    minItems?: number;
+    minProperties?: number;
+    anyOf?: readonly DirectActionJsonSchema[];
+    oneOf?: readonly DirectActionJsonSchema[];
+}
+export interface DirectActionDefinition {
+    description: string;
+    argsHint: string;
+    usageHint?: string;
+    inputSchema: DirectActionJsonSchema;
+}
+export declare const DIRECT_ACTION_DEFINITIONS: Record<DirectActionType, DirectActionDefinition>;
+export declare function validateDirectActionArgs(actionType: DirectActionType, args: unknown): string | null;
+export {};

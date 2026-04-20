@@ -628,6 +628,17 @@ export interface BatchPlannerRelationMatch {
   strengthScore: number;
   relationType: string;
   evidence: string[];
+  localeVariantIds?: string[];
+  relationEligible?: boolean;
+  typedEvidence?: BatchPlannerRelationEvidence[];
+}
+
+export interface BatchPlannerRelationEvidence {
+  evidenceType: string;
+  sourceRef?: string;
+  snippet?: string;
+  weight: number;
+  metadata?: unknown;
 }
 
 export interface BatchPlannerPrefetch {

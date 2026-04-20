@@ -107,6 +107,26 @@ export var ArticleRelationEvidenceType;
     ArticleRelationEvidenceType["MANUAL_NOTE"] = "manual_note";
     ArticleRelationEvidenceType["HEURISTIC"] = "heuristic";
 })(ArticleRelationEvidenceType || (ArticleRelationEvidenceType = {}));
+export var ArticleRelationIndexStateStatus;
+(function (ArticleRelationIndexStateStatus) {
+    ArticleRelationIndexStateStatus["INDEXED"] = "indexed";
+    ArticleRelationIndexStateStatus["STALE"] = "stale";
+    ArticleRelationIndexStateStatus["ERROR"] = "error";
+})(ArticleRelationIndexStateStatus || (ArticleRelationIndexStateStatus = {}));
+export var ArticleRelationFeedbackType;
+(function (ArticleRelationFeedbackType) {
+    ArticleRelationFeedbackType["ADD"] = "add";
+    ArticleRelationFeedbackType["REMOVE"] = "remove";
+    ArticleRelationFeedbackType["MISSED"] = "missed";
+    ArticleRelationFeedbackType["BAD_SUGGESTION"] = "bad_suggestion";
+    ArticleRelationFeedbackType["GOOD_SUGGESTION"] = "good_suggestion";
+})(ArticleRelationFeedbackType || (ArticleRelationFeedbackType = {}));
+export var ArticleRelationFeedbackSource;
+(function (ArticleRelationFeedbackSource) {
+    ArticleRelationFeedbackSource["MANUAL_RELATION"] = "manual_relation";
+    ArticleRelationFeedbackSource["UI"] = "ui";
+    ArticleRelationFeedbackSource["SYSTEM"] = "system";
+})(ArticleRelationFeedbackSource || (ArticleRelationFeedbackSource = {}));
 export const KB_ACCESS_MODES = ['direct', 'mcp', 'cli'];
 export function isKbAccessMode(value) {
     return typeof value === 'string' && KB_ACCESS_MODES.includes(value);

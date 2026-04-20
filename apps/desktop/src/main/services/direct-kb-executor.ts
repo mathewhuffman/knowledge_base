@@ -17,7 +17,8 @@ import {
   DIRECT_ASSISTANT_TEMPLATE_ACTION_TYPES,
   DIRECT_BATCH_READ_ONLY_ACTION_TYPES,
   DIRECT_BATCH_WORKER_ACTION_TYPES,
-  ProposalAction
+  ProposalAction,
+  validateDirectActionArgs
 } from '@kb-vault/shared-types';
 import { KbActionService } from './kb-action-service';
 
@@ -73,6 +74,10 @@ export class DirectKbExecutor {
   async execute(request: DirectActionExecutionRequest): Promise<DirectActionExecutionResult> {
     try {
       this.assertActionAllowed(request.action, request.context);
+      const validationError = validateDirectActionArgs(request.action.type, request.action.args);
+      if (validationError) {
+        throw new Error(validationError);
+      }
       const data = await this.dispatch(request);
       return {
         actionId: request.action.id,
@@ -141,6 +146,9 @@ export class DirectKbExecutor {
             'familyIds'
           )
         });
+
+      case 'get_explorer_tree':
+        return this.deps.kbActionService.getExplorerTree(workspaceId);
 
       case 'get_batch_context': {
         const batchId = this.requireBatchId(request.action.args.batchId, request.context.batchId);

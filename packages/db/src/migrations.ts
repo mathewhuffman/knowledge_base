@@ -1032,6 +1032,131 @@ export const migrations: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_batch_analysis_questions_batch
         ON batch_analysis_questions(workspace_id, batch_id, created_at DESC);
     `
+  },
+  {
+    version: 23,
+    name: '0023_article_relations_v2_foundation',
+    description: 'Add article relation v2 index state, feedback, and richer run metadata.',
+    sql: `
+      ALTER TABLE article_relation_runs
+        ADD COLUMN engine_version TEXT NOT NULL DEFAULT 'legacy-v1';
+
+      ALTER TABLE article_relation_runs
+        ADD COLUMN indexed_document_count INTEGER NOT NULL DEFAULT 0;
+
+      ALTER TABLE article_relation_runs
+        ADD COLUMN stale_document_count INTEGER NOT NULL DEFAULT 0;
+
+      ALTER TABLE article_relation_runs
+        ADD COLUMN degraded_mode INTEGER NOT NULL DEFAULT 0;
+
+      ALTER TABLE article_relation_runs
+        ADD COLUMN thresholds_json TEXT NOT NULL DEFAULT '{}';
+
+      CREATE TABLE IF NOT EXISTS article_relation_index_state (
+        workspace_id TEXT NOT NULL,
+        locale_variant_id TEXT NOT NULL,
+        family_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        engine_version TEXT NOT NULL,
+        status TEXT NOT NULL,
+        last_indexed_at TEXT,
+        last_error TEXT,
+        PRIMARY KEY (workspace_id, locale_variant_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS article_relation_feedback (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        left_family_id TEXT NOT NULL,
+        right_family_id TEXT NOT NULL,
+        feedback_type TEXT NOT NULL,
+        source TEXT NOT NULL,
+        note TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_article_relation_index_state_workspace_status
+        ON article_relation_index_state(workspace_id, status, family_id);
+
+      CREATE INDEX IF NOT EXISTS idx_article_relation_index_state_workspace_family
+        ON article_relation_index_state(workspace_id, family_id, locale_variant_id);
+
+      CREATE INDEX IF NOT EXISTS idx_article_relation_feedback_workspace_pair
+        ON article_relation_feedback(workspace_id, left_family_id, right_family_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_article_relation_feedback_workspace_created
+        ON article_relation_feedback(workspace_id, created_at DESC);
+    `
+  },
+  {
+    version: 24,
+    name: '0024_kb_scope_catalog',
+    description: 'Persist KB category and section catalog names plus workspace-level overrides.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS kb_scope_catalog (
+        workspace_id TEXT NOT NULL,
+        scope_type TEXT NOT NULL CHECK (scope_type IN ('category', 'section')),
+        scope_id TEXT NOT NULL,
+        parent_scope_id TEXT,
+        display_name TEXT NOT NULL,
+        source TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, scope_type, scope_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS kb_scope_overrides (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        scope_type TEXT NOT NULL CHECK (scope_type IN ('category', 'section')),
+        scope_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        parent_scope_id TEXT,
+        is_hidden INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_kb_scope_catalog_workspace_parent
+        ON kb_scope_catalog(workspace_id, scope_type, parent_scope_id);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_scope_overrides_workspace_scope
+        ON kb_scope_overrides(workspace_id, scope_type, scope_id);
+    `
+  },
+  {
+    version: 25,
+    name: '0025_article_family_taxonomy_sources',
+    description: 'Preserve raw Zendesk taxonomy alongside effective article taxonomy and provenance.',
+    sql: `
+      ALTER TABLE article_families
+        ADD COLUMN source_section_id TEXT;
+
+      ALTER TABLE article_families
+        ADD COLUMN source_category_id TEXT;
+
+      ALTER TABLE article_families
+        ADD COLUMN section_source TEXT NOT NULL DEFAULT 'none';
+
+      ALTER TABLE article_families
+        ADD COLUMN category_source TEXT NOT NULL DEFAULT 'none';
+
+      ALTER TABLE article_families
+        ADD COLUMN taxonomy_confidence REAL;
+
+      ALTER TABLE article_families
+        ADD COLUMN taxonomy_updated_at TEXT;
+
+      ALTER TABLE article_families
+        ADD COLUMN taxonomy_note TEXT;
+
+      UPDATE article_families
+         SET source_section_id = COALESCE(source_section_id, section_id),
+             source_category_id = COALESCE(source_category_id, category_id)
+       WHERE source_section_id IS NULL
+          OR source_category_id IS NULL;
+    `
   }
 ];
 

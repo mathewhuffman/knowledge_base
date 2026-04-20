@@ -7,6 +7,7 @@ import { WorkspaceProvider, useWorkspace } from './context/WorkspaceContext';
 import { AiAssistantProvider } from './components/assistant/AssistantContext';
 import { DetachedAssistantWindowHost, GlobalAssistantHost } from './components/assistant/GlobalAssistantHost';
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
+const ARTICLE_EXPLORER_TARGET_KEY = 'kbv:article-explorer-target';
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'kbv:sidebar-collapsed';
 function loadSidebarCollapsedFromLocalStorage() {
     try {
@@ -118,6 +119,10 @@ function AppShell() {
         window.sessionStorage.setItem(PROPOSAL_REVIEW_TARGET_KEY, proposalId);
         setActiveRoute(AppRoute.PROPOSAL_REVIEW);
     }, []);
+    const openArticleExplorer = useCallback((target) => {
+        window.sessionStorage.setItem(ARTICLE_EXPLORER_TARGET_KEY, JSON.stringify(target));
+        setActiveRoute(AppRoute.ARTICLE_EXPLORER);
+    }, []);
     useEffect(() => {
         if (!window.kbv?.emitAppNavigationEvents) {
             return;
@@ -125,9 +130,21 @@ function AppShell() {
         return window.kbv.emitAppNavigationEvents((event) => {
             if (event.action.type === 'open_proposal_review') {
                 openProposalReview(event.action.proposalId);
+                return;
+            }
+            if (event.action.type === 'open_route') {
+                setActiveRoute(event.action.route);
+                return;
+            }
+            if (event.action.type === 'open_article_explorer') {
+                openArticleExplorer({
+                    familyId: event.action.familyId,
+                    localeVariantId: event.action.localeVariantId,
+                    tab: event.action.tab
+                });
             }
         });
-    }, [openProposalReview]);
+    }, [openArticleExplorer, openProposalReview]);
     const Active = routeToComponent[activeRoute];
     return (_jsxs("div", { className: "app-shell", children: [_jsx(Sidebar, { activeRoute: activeRoute, onNavigate: setActiveRoute, workspaceName: activeWorkspace?.name, isConnected: boot?.ok === true, collapsed: sidebarCollapsed, onToggleCollapse: toggleSidebar }), bootError ? _jsx("p", { style: { padding: '16px', color: 'crimson' }, children: bootError }) : null, _jsxs(AiAssistantProvider, { windowRole: "main", activeRoute: activeRoute, workspaceId: activeWorkspace?.id, children: [_jsx("main", { className: "main-content", children: _jsx(Active, {}) }), _jsx(GlobalAssistantHost, {})] })] }));
 }

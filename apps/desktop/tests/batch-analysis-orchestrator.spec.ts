@@ -752,6 +752,36 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(result.review.questions?.[0]?.status).toBe('dismissed');
   });
 
+  test('approved plans carry reviewer-dismissed question state and hide it from worker prompts', async () => {
+    const orchestrator = createOrchestrator();
+    const plannerQuestion = createQuestion({
+      id: 'planner-question-dismiss',
+      requiresUserInput: false,
+      prompt: 'Should the Training Plan Detail article stay comprehensive or split per interaction?'
+    });
+
+    const reconciledPlan = orchestrator.reconcilePlanQuestionState(
+      createPlan({
+        verdict: 'approved',
+        questions: [plannerQuestion],
+        openQuestions: [plannerQuestion.prompt]
+      }),
+      [
+        {
+          ...plannerQuestion,
+          status: 'dismissed'
+        }
+      ]
+    );
+
+    expect(reconciledPlan.questions?.[0]?.status).toBe('dismissed');
+    expect(reconciledPlan.openQuestions).toEqual([]);
+
+    const workerPrompt = await orchestrator.buildWorkerPrompt(reconciledPlan);
+    expect(workerPrompt).not.toContain('Should the Training Plan Detail article stay comprehensive or split per interaction?');
+    expect(workerPrompt).toContain('"openQuestions": []');
+  });
+
   test('reviewer can resolve a planner candidate question without leaving a blocker', () => {
     const orchestrator = createOrchestrator();
     const plannerQuestion = createQuestion({ id: 'planner-question-resolve' });

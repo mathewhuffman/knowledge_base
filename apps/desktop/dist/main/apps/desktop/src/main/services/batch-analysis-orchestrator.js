@@ -865,6 +865,14 @@ class BatchAnalysisOrchestrator {
             sessionId: params.sessionId
         };
     }
+    reconcilePlanQuestionState(plan, reviewQuestions) {
+        const questions = mergeStructuredQuestions(plan.questions ?? [], reviewQuestions ?? []);
+        return {
+            ...plan,
+            questions,
+            openQuestions: serializeOpenQuestionPrompts(questions, plan.openQuestions)
+        };
+    }
     validatePlanForExecution(params) {
         const finalQuestions = mergeStructuredQuestions(params.candidateQuestions ?? params.plan.questions ?? [], params.review.questions ?? []);
         const blockingUserInputQuestions = collectBlockingUserInputQuestions(finalQuestions);
@@ -1398,6 +1406,7 @@ class BatchAnalysisOrchestrator {
         }
     }
     async buildWorkerPlanPromptPayload(plan) {
+        const promptVisibleQuestions = filterPromptVisibleQuestions(plan.questions ?? []);
         return {
             planId: plan.id,
             verdict: plan.verdict,
@@ -1408,8 +1417,8 @@ class BatchAnalysisOrchestrator {
                 ...compactPlanItemForPrompt(item),
                 executionTarget: await this.buildWorkerExecutionTargetHint(plan.workspaceId, item)
             }))),
-            questions: (plan.questions ?? []).map((question) => compactPlanQuestionForPrompt(question)),
-            openQuestions: serializeOpenQuestionPrompts(plan.questions ?? [], plan.openQuestions)
+            questions: promptVisibleQuestions.map((question) => compactPlanQuestionForPrompt(question)),
+            openQuestions: serializeOpenQuestionPrompts(promptVisibleQuestions, plan.openQuestions)
         };
     }
     async buildWorkerExecutionTargetHint(workspaceId, item) {
@@ -1751,6 +1760,7 @@ function compactPbiForPrompt(row) {
     };
 }
 function compactPlanForPrompt(plan) {
+    const promptVisibleQuestions = filterPromptVisibleQuestions(plan.questions ?? []);
     return {
         planId: plan.id,
         verdict: plan.verdict,
@@ -1758,8 +1768,8 @@ function compactPlanForPrompt(plan) {
         summary: plan.summary,
         coverage: plan.coverage.map((item) => compactPlanCoverageForPrompt(item)),
         items: plan.items.map((item) => compactPlanItemForPrompt(item)),
-        questions: (plan.questions ?? []).map((question) => compactPlanQuestionForPrompt(question)),
-        openQuestions: serializeOpenQuestionPrompts(plan.questions ?? [], plan.openQuestions)
+        questions: promptVisibleQuestions.map((question) => compactPlanQuestionForPrompt(question)),
+        openQuestions: serializeOpenQuestionPrompts(promptVisibleQuestions, plan.openQuestions)
     };
 }
 function compactPlanCoverageForPrompt(item) {
@@ -2315,13 +2325,25 @@ function hasOwn(candidate, key) {
     return Object.prototype.hasOwnProperty.call(candidate, key);
 }
 function serializeOpenQuestionPrompts(questions, legacyOpenQuestions) {
+    const structuredQuestionByKey = new Map(questions
+        .map((question) => [normalizeQuestionPromptKey(question.prompt), question]));
     const prompts = questions
+        .filter((question) => shouldSurfaceQuestionPromptAsOpen(question))
         .map((question) => question.prompt?.trim())
         .filter((prompt) => Boolean(prompt));
     const legacy = Array.isArray(legacyOpenQuestions)
-        ? legacyOpenQuestions.filter((entry) => typeof entry === 'string').map((entry) => humanizeReadableText(entry))
+        ? legacyOpenQuestions
+            .filter((entry) => typeof entry === 'string')
+            .map((entry) => humanizeReadableText(entry))
+            .filter((prompt) => {
+            const matchingStructuredQuestion = structuredQuestionByKey.get(normalizeQuestionPromptKey(prompt));
+            return !matchingStructuredQuestion || shouldSurfaceQuestionPromptAsOpen(matchingStructuredQuestion);
+        })
         : [];
     return Array.from(new Set([...prompts, ...legacy]));
+}
+function filterPromptVisibleQuestions(questions) {
+    return questions.filter((question) => shouldIncludeQuestionInPrompt(question));
 }
 function mergeStructuredQuestions(...questionGroups) {
     const merged = new Map();
@@ -2420,6 +2442,14 @@ function isPendingRequiredUserInputQuestion(question) {
     return question.requiresUserInput
         && question.status === 'pending'
         && !question.answer?.trim();
+}
+function shouldSurfaceQuestionPromptAsOpen(question) {
+    return question.status === 'pending'
+        && !question.answer?.trim();
+}
+function shouldIncludeQuestionInPrompt(question) {
+    return question.status !== 'dismissed'
+        && question.status !== 'resolved';
 }
 function normalizePlanCoverage(item) {
     const planItemIds = Array.isArray(item.planItemIds)

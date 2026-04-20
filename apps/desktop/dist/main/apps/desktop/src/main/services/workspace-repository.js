@@ -12,6 +12,13 @@ const electron_1 = require("electron");
 const shared_types_1 = require("@kb-vault/shared-types");
 const diff_engine_1 = require("@kb-vault/diff-engine");
 const db_1 = require("@kb-vault/db");
+const export_service_1 = require("./article-relations-v2/export-service");
+const feature_map_service_1 = require("./article-relations-v2/feature-map-service");
+const index_builder_1 = require("./article-relations-v2/index-builder");
+const index_db_1 = require("./article-relations-v2/index-db");
+const query_service_1 = require("./article-relations-v2/query-service");
+const relation_orchestrator_1 = require("./article-relations-v2/relation-orchestrator");
+const types_1 = require("./article-relations-v2/types");
 const logger_1 = require("./logger");
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
 const DEFAULT_KB_ACCESS_MODE = 'direct';
@@ -32,6 +39,10 @@ const WORKSPACE_SCOPED_DB_TABLES = [
     'article_relation_runs',
     'article_relations',
     'article_relation_overrides',
+    'article_relation_index_state',
+    'article_relation_feedback',
+    'kb_scope_catalog',
+    'kb_scope_overrides',
     'batch_analysis_iterations',
     'batch_analysis_stage_runs',
     'batch_analysis_plans',
@@ -56,6 +67,30 @@ const PBIBATCH_STATUS_SEQUENCE = [
     shared_types_1.PBIBatchStatus.ARCHIVED
 ];
 const PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX = 'proposal-';
+const ARTICLE_TAXONOMY_SOURCE_VALUES = [
+    'zendesk_article',
+    'zendesk_section_parent',
+    'inferred_existing_scope',
+    'inferred_local_scope',
+    'manual_override',
+    'none'
+];
+const ARTICLE_FAMILY_SELECT_COLUMNS = `
+  id,
+  workspace_id as workspaceId,
+  external_key as externalKey,
+  title,
+  section_id as sectionId,
+  category_id as categoryId,
+  source_section_id as sourceSectionId,
+  source_category_id as sourceCategoryId,
+  section_source as sectionSource,
+  category_source as categorySource,
+  taxonomy_confidence as taxonomyConfidence,
+  taxonomy_updated_at as taxonomyUpdatedAt,
+  taxonomy_note as taxonomyNote,
+  retired_at as retiredAtUtc
+`;
 const REVIEWABLE_PROPOSAL_STATUSES = new Set([
     shared_types_1.ProposalReviewStatus.PENDING_REVIEW,
     shared_types_1.ProposalReviewStatus.ACCEPTED,
@@ -124,11 +159,25 @@ const ACP_ALLOWED_MODEL_IDS = new Set([
 class WorkspaceRepository {
     workspaceRoot;
     catalogDbPath;
+    articleRelationsV2ExportService;
+    articleRelationsV2FeatureMapService;
+    articleRelationsV2QueryService;
+    articleRelationsV2RelationOrchestrator;
     lastCatalogFailureMs = 0;
     lastCatalogFailureMessage;
     constructor(workspaceRoot) {
         this.workspaceRoot = workspaceRoot;
         this.catalogDbPath = node_path_1.default.join(this.workspaceRoot, CATALOG_DB_PATH);
+        this.articleRelationsV2ExportService = new export_service_1.ArticleRelationsV2ExportService({
+            fileExists: async (filePath) => this.fileExists(filePath),
+            readTextFile: async (filePath) => promises_1.default.readFile(filePath, 'utf8')
+        });
+        this.articleRelationsV2FeatureMapService = new feature_map_service_1.ArticleRelationsV2FeatureMapService({
+            withWorkspaceDb: async (workspaceId, handler) => this.withWorkspaceDb(workspaceId, handler),
+            resolveKbScopeDisplayNames: async (workspaceId, scopes) => this.resolveKbScopeDisplayNames(workspaceId, scopes)
+        });
+        this.articleRelationsV2QueryService = new query_service_1.ArticleRelationsV2QueryService();
+        this.articleRelationsV2RelationOrchestrator = new relation_orchestrator_1.ArticleRelationsV2RelationOrchestrator(this.articleRelationsV2QueryService);
     }
     normalizeAgentModelId(modelId) {
         const next = modelId?.trim();
@@ -172,6 +221,17 @@ class WorkspaceRepository {
         }
         finally {
             catalog.close();
+        }
+    }
+    async withWorkspaceDb(workspaceId, handler) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return await handler(workspaceDb);
+        }
+        finally {
+            workspaceDb.close();
         }
     }
     async getWorkspaceSettings(id) {
@@ -575,10 +635,10 @@ class WorkspaceRepository {
         const workspace = await this.getWorkspace(workspaceId);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
-            return workspaceDb.all(`SELECT id, workspace_id as workspaceId, external_key as externalKey, title, section_id as sectionId, category_id as categoryId, retired_at as retiredAtUtc
+            return workspaceDb.all(`SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
          FROM article_families
          WHERE workspace_id = @workspaceId
-         ORDER BY title`, { workspaceId });
+         ORDER BY title`, { workspaceId }).map(mapArticleFamilyRow);
         }
         finally {
             workspaceDb.close();
@@ -588,13 +648,13 @@ class WorkspaceRepository {
         const workspace = await this.getWorkspace(workspaceId);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
-            const family = workspaceDb.get(`SELECT id, workspace_id as workspaceId, external_key as externalKey, title, section_id as sectionId, category_id as categoryId, retired_at as retiredAtUtc
+            const family = workspaceDb.get(`SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
          FROM article_families
          WHERE id = @familyId AND workspace_id = @workspaceId`, { familyId, workspaceId });
             if (!family) {
                 throw new Error('Article family not found');
             }
-            return family;
+            return mapArticleFamilyRow(family);
         }
         finally {
             workspaceDb.close();
@@ -619,25 +679,93 @@ class WorkspaceRepository {
             if (!externalKey) {
                 throw new Error('Article family externalKey is required');
             }
-            workspaceDb.run(`INSERT INTO article_families (id, workspace_id, external_key, title, section_id, category_id, retired_at)
-         VALUES (@id, @workspaceId, @externalKey, @title, @sectionId, @categoryId, @retiredAtUtc)`, {
+            const sectionId = normalizeFeatureMapScopeId(payload.sectionId);
+            const categoryId = normalizeFeatureMapScopeId(payload.categoryId);
+            const sourceSectionId = normalizeFeatureMapScopeId(payload.sourceSectionId);
+            const sourceCategoryId = normalizeFeatureMapScopeId(payload.sourceCategoryId);
+            const sectionSource = payload.sectionSource !== undefined
+                ? normalizeArticleTaxonomySource(payload.sectionSource)
+                : (sectionId ? 'manual_override' : 'none');
+            const categorySource = payload.categorySource !== undefined
+                ? normalizeArticleTaxonomySource(payload.categorySource)
+                : (categoryId ? 'manual_override' : 'none');
+            const taxonomyConfidence = normalizeArticleTaxonomyConfidence(payload.taxonomyConfidence);
+            const taxonomyNote = normalizeFeatureMapScopeId(payload.taxonomyNote);
+            const taxonomyUpdatedAt = payload.taxonomyUpdatedAt !== undefined
+                ? normalizeFeatureMapScopeId(payload.taxonomyUpdatedAt)
+                : (sectionId
+                    || categoryId
+                    || sourceSectionId
+                    || sourceCategoryId
+                    || sectionSource !== 'none'
+                    || categorySource !== 'none'
+                    || taxonomyConfidence !== undefined
+                    || taxonomyNote)
+                    ? now
+                    : undefined;
+            workspaceDb.run(`INSERT INTO article_families (
+           id,
+           workspace_id,
+           external_key,
+           title,
+           section_id,
+           category_id,
+           source_section_id,
+           source_category_id,
+           section_source,
+           category_source,
+           taxonomy_confidence,
+           taxonomy_updated_at,
+           taxonomy_note,
+           retired_at
+         )
+         VALUES (
+           @id,
+           @workspaceId,
+           @externalKey,
+           @title,
+           @sectionId,
+           @categoryId,
+           @sourceSectionId,
+           @sourceCategoryId,
+           @sectionSource,
+           @categorySource,
+           @taxonomyConfidence,
+           @taxonomyUpdatedAt,
+           @taxonomyNote,
+           @retiredAtUtc
+         )`, {
                 id,
                 workspaceId: payload.workspaceId,
                 externalKey,
                 title,
-                sectionId: payload.sectionId ?? null,
-                categoryId: payload.categoryId ?? null,
+                sectionId: sectionId ?? null,
+                categoryId: categoryId ?? null,
+                sourceSectionId: sourceSectionId ?? null,
+                sourceCategoryId: sourceCategoryId ?? null,
+                sectionSource,
+                categorySource,
+                taxonomyConfidence: taxonomyConfidence ?? null,
+                taxonomyUpdatedAt: taxonomyUpdatedAt ?? null,
+                taxonomyNote: taxonomyNote ?? null,
                 retiredAtUtc: payload.retiredAtUtc ?? null
             });
-            return {
+            return mapArticleFamilyRow({
                 id,
                 workspaceId: payload.workspaceId,
                 externalKey,
                 title,
-                sectionId: payload.sectionId,
-                categoryId: payload.categoryId,
-                retiredAtUtc: payload.retiredAtUtc
-            };
+                sectionId: sectionId ?? null,
+                categoryId: categoryId ?? null,
+                sourceSectionId: sourceSectionId ?? null,
+                sourceCategoryId: sourceCategoryId ?? null,
+                sectionSource,
+                categorySource,
+                taxonomyConfidence: taxonomyConfidence ?? null,
+                taxonomyUpdatedAt: taxonomyUpdatedAt ?? null,
+                taxonomyNote: taxonomyNote ?? null,
+                retiredAtUtc: payload.retiredAtUtc ?? null
+            });
         }
         finally {
             workspaceDb.close();
@@ -648,15 +776,23 @@ class WorkspaceRepository {
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
-            const existing = workspaceDb.get(`SELECT id, workspace_id as workspaceId, external_key as externalKey, title, section_id as sectionId, category_id as categoryId, retired_at as retiredAtUtc
+            const existingRow = workspaceDb.get(`SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
          FROM article_families
          WHERE id = @familyId AND workspace_id = @workspaceId`, { familyId: payload.familyId, workspaceId: payload.workspaceId });
-            if (!existing) {
+            if (!existingRow) {
                 throw new Error('Article family not found');
             }
+            const existing = mapArticleFamilyRow(existingRow);
             if (payload.title === undefined &&
                 payload.sectionId === undefined &&
                 payload.categoryId === undefined &&
+                payload.sourceSectionId === undefined &&
+                payload.sourceCategoryId === undefined &&
+                payload.sectionSource === undefined &&
+                payload.categorySource === undefined &&
+                payload.taxonomyConfidence === undefined &&
+                payload.taxonomyUpdatedAt === undefined &&
+                payload.taxonomyNote === undefined &&
                 payload.retiredAtUtc === undefined) {
                 throw new Error('Article family update requires at least one field');
             }
@@ -665,16 +801,56 @@ class WorkspaceRepository {
                 throw new Error('Article family title cannot be empty');
             }
             const sectionId = payload.sectionId !== undefined
-                ? (payload.sectionId ?? undefined)
-                : (existing.sectionId ?? undefined);
+                ? normalizeFeatureMapScopeId(payload.sectionId)
+                : existing.sectionId;
             const categoryId = payload.categoryId !== undefined
-                ? (payload.categoryId ?? undefined)
-                : (existing.categoryId ?? undefined);
+                ? normalizeFeatureMapScopeId(payload.categoryId)
+                : existing.categoryId;
+            const sourceSectionId = payload.sourceSectionId !== undefined
+                ? normalizeFeatureMapScopeId(payload.sourceSectionId)
+                : existing.sourceSectionId;
+            const sourceCategoryId = payload.sourceCategoryId !== undefined
+                ? normalizeFeatureMapScopeId(payload.sourceCategoryId)
+                : existing.sourceCategoryId;
+            const sectionSource = payload.sectionSource !== undefined
+                ? normalizeArticleTaxonomySource(payload.sectionSource)
+                : (payload.sectionId !== undefined
+                    ? (sectionId ? 'manual_override' : 'none')
+                    : (existing.sectionSource ?? 'none'));
+            const categorySource = payload.categorySource !== undefined
+                ? normalizeArticleTaxonomySource(payload.categorySource)
+                : (payload.categoryId !== undefined
+                    ? (categoryId ? 'manual_override' : 'none')
+                    : (existing.categorySource ?? 'none'));
+            const taxonomyConfidence = payload.taxonomyConfidence !== undefined
+                ? normalizeArticleTaxonomyConfidence(payload.taxonomyConfidence)
+                : existing.taxonomyConfidence;
+            const taxonomyNote = payload.taxonomyNote !== undefined
+                ? normalizeFeatureMapScopeId(payload.taxonomyNote)
+                : existing.taxonomyNote;
             const retiredAt = payload.retiredAtUtc === null ? null : (payload.retiredAtUtc ?? existing.retiredAtUtc ?? null);
+            const taxonomyFieldsChanged = sectionId !== existing.sectionId
+                || categoryId !== existing.categoryId
+                || sourceSectionId !== existing.sourceSectionId
+                || sourceCategoryId !== existing.sourceCategoryId
+                || sectionSource !== (existing.sectionSource ?? 'none')
+                || categorySource !== (existing.categorySource ?? 'none')
+                || taxonomyConfidence !== existing.taxonomyConfidence
+                || taxonomyNote !== existing.taxonomyNote;
+            const taxonomyUpdatedAt = payload.taxonomyUpdatedAt !== undefined
+                ? normalizeFeatureMapScopeId(payload.taxonomyUpdatedAt)
+                : (taxonomyFieldsChanged ? new Date().toISOString() : existing.taxonomyUpdatedAt);
             workspaceDb.run(`UPDATE article_families
          SET title = @title,
              section_id = @sectionId,
              category_id = @categoryId,
+             source_section_id = @sourceSectionId,
+             source_category_id = @sourceCategoryId,
+             section_source = @sectionSource,
+             category_source = @categorySource,
+             taxonomy_confidence = @taxonomyConfidence,
+             taxonomy_updated_at = @taxonomyUpdatedAt,
+             taxonomy_note = @taxonomyNote,
              retired_at = @retiredAtUtc
          WHERE id = @familyId AND workspace_id = @workspaceId`, {
                 familyId: payload.familyId,
@@ -682,17 +858,132 @@ class WorkspaceRepository {
                 title,
                 sectionId,
                 categoryId,
+                sourceSectionId: sourceSectionId ?? null,
+                sourceCategoryId: sourceCategoryId ?? null,
+                sectionSource,
+                categorySource,
+                taxonomyConfidence: taxonomyConfidence ?? null,
+                taxonomyUpdatedAt: taxonomyUpdatedAt ?? null,
+                taxonomyNote: taxonomyNote ?? null,
                 retiredAtUtc: retiredAt
             });
+            const familyMetadataChanged = title !== existing.title
+                || sectionId !== (existing.sectionId ?? undefined)
+                || categoryId !== (existing.categoryId ?? undefined)
+                || sourceSectionId !== (existing.sourceSectionId ?? undefined)
+                || sourceCategoryId !== (existing.sourceCategoryId ?? undefined)
+                || sectionSource !== (existing.sectionSource ?? 'none')
+                || categorySource !== (existing.categorySource ?? 'none')
+                || taxonomyConfidence !== existing.taxonomyConfidence
+                || taxonomyNote !== existing.taxonomyNote
+                || (retiredAt ?? undefined) !== (existing.retiredAtUtc ?? undefined);
+            if (familyMetadataChanged) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, payload.workspaceId, [payload.familyId]);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.updateArticleFamily stale-mark failed', {
+                        workspaceId: payload.workspaceId,
+                        familyId: payload.familyId,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
             return {
                 ...existing,
                 title,
                 sectionId,
                 categoryId,
+                sourceSectionId,
+                sourceCategoryId,
+                sectionSource,
+                categorySource,
+                taxonomyConfidence,
+                taxonomyUpdatedAt,
+                taxonomyNote,
                 retiredAtUtc: retiredAt ?? undefined
             };
         }
         finally {
+            workspaceDb.close();
+        }
+    }
+    async getKbSectionParentCategory(workspaceId, sectionId) {
+        const normalizedSectionId = normalizeFeatureMapScopeId(sectionId);
+        if (!normalizedSectionId) {
+            return undefined;
+        }
+        return this.withWorkspaceDb(workspaceId, (workspaceDb) => (this.getKbSectionParentCategoryInDb(workspaceDb, workspaceId, normalizedSectionId)));
+    }
+    async resolveEffectiveArticleTaxonomyPlacement(workspaceId, familyId, options = {}) {
+        const reconciled = await this.reconcileEffectiveArticleTaxonomyPlacements(workspaceId, {
+            familyIds: [familyId],
+            allowInference: options.allowInference,
+            indexDb: options.indexDb
+        });
+        const family = reconciled[0];
+        if (!family) {
+            throw new Error('Article family not found');
+        }
+        return family;
+    }
+    async reconcileEffectiveArticleTaxonomyPlacements(workspaceId, options = {}) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        let ownedIndexDb = false;
+        let indexDb = options.indexDb;
+        try {
+            if (!indexDb && options.allowInference === true) {
+                const indexDbPath = this.getArticleRelationsV2IndexDbPath(workspace.path);
+                if (await this.fileExists(indexDbPath)) {
+                    indexDb = this.getArticleRelationsV2IndexDb(workspace.path).open();
+                    ownedIndexDb = true;
+                }
+            }
+            const families = this.listArticleFamiliesForTaxonomyInDb(workspaceDb, workspaceId, options.familyIds);
+            if (families.length === 0) {
+                return [];
+            }
+            const changedFamilyIds = [];
+            const results = [];
+            workspaceDb.exec('BEGIN IMMEDIATE');
+            try {
+                for (const family of families) {
+                    const resolution = this.resolveEffectiveArticleTaxonomyPlacementInDb(workspaceDb, workspaceId, family, {
+                        allowInference: options.allowInference === true,
+                        indexDb
+                    });
+                    const applied = this.applyArticleTaxonomyResolutionInDb(workspaceDb, workspaceId, family, resolution);
+                    results.push(applied.family);
+                    if (applied.changed) {
+                        changedFamilyIds.push(family.id);
+                    }
+                }
+                workspaceDb.exec('COMMIT');
+            }
+            catch (error) {
+                workspaceDb.exec('ROLLBACK');
+                throw error;
+            }
+            if (changedFamilyIds.length > 0) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, workspaceId, changedFamilyIds);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.reconcileEffectiveArticleTaxonomyPlacements stale-mark failed', {
+                        workspaceId,
+                        familyIds: changedFamilyIds,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
+            return results;
+        }
+        finally {
+            if (ownedIndexDb) {
+                indexDb?.close();
+            }
             workspaceDb.close();
         }
     }
@@ -1351,6 +1642,22 @@ class WorkspaceRepository {
                 status,
                 retiredAtUtc: retiredAt
             });
+            const variantMetadataChanged = locale !== existing.locale
+                || status !== existing.status
+                || (retiredAt ?? undefined) !== (existing.retiredAtUtc ?? undefined);
+            if (variantMetadataChanged) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, payload.workspaceId, [existing.familyId]);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.updateLocaleVariant stale-mark failed', {
+                        workspaceId: payload.workspaceId,
+                        familyId: existing.familyId,
+                        localeVariantId: payload.variantId,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
             return {
                 id: existing.id,
                 familyId: existing.familyId,
@@ -1422,6 +1729,11 @@ class WorkspaceRepository {
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
+            const affectedFamilies = workspaceDb.all(`SELECT DISTINCT af.id as familyId
+         FROM locale_variants lv
+         JOIN article_families af ON af.id = lv.family_id
+         WHERE af.workspace_id = @workspaceId
+           AND lv.locale = @locale`, { workspaceId, locale }).map((row) => row.familyId);
             const now = new Date().toISOString();
             const retainedStatus = shared_types_1.RevisionState.LIVE;
             const retiredStatus = shared_types_1.RevisionState.RETIRED;
@@ -1446,6 +1758,18 @@ class WorkspaceRepository {
                JOIN article_families af ON af.id = lv.family_id
                WHERE af.workspace_id = @workspaceId AND lv.locale = @locale
              )`, { workspaceId, locale, retiredAtUtc });
+                if (affectedFamilies.length > 0) {
+                    try {
+                        this.markArticleRelationFamiliesStale(workspaceDb, workspaceId, affectedFamilies);
+                    }
+                    catch (error) {
+                        logger_1.logger.warn('workspace-repository.reconcileSyncedLocaleVariants stale-mark failed', {
+                            workspaceId,
+                            locale,
+                            message: error instanceof Error ? error.message : String(error)
+                        });
+                    }
+                }
                 return;
             }
             const keys = Array.from(new Set(remoteFamilyExternalKeys.filter(Boolean)));
@@ -1493,7 +1817,19 @@ class WorkspaceRepository {
              WHERE af.workspace_id = @workspaceId
                AND lv.locale = @locale
                AND af.external_key NOT IN (${placeholders})
-           )`, queryParams);
+         )`, queryParams);
+            if (affectedFamilies.length > 0) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, workspaceId, affectedFamilies);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.reconcileSyncedLocaleVariants stale-mark failed', {
+                        workspaceId,
+                        locale,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
         }
         finally {
             workspaceDb.close();
@@ -1522,7 +1858,9 @@ class WorkspaceRepository {
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
-            const variant = workspaceDb.get(`SELECT id FROM locale_variants WHERE id = @variantId`, { variantId: payload.localeVariantId });
+            const variant = workspaceDb.get(`SELECT id, family_id as familyId
+         FROM locale_variants
+         WHERE id = @variantId`, { variantId: payload.localeVariantId });
             if (!variant) {
                 throw new Error('Locale variant not found');
             }
@@ -1559,6 +1897,20 @@ class WorkspaceRepository {
                 createdAt: payload.createdAtUtc ?? now,
                 updatedAt: payload.updatedAtUtc ?? now
             });
+            if (payload.revisionType === shared_types_1.RevisionState.LIVE) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, payload.workspaceId, [variant.familyId]);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.createRevision stale-mark failed', {
+                        workspaceId: payload.workspaceId,
+                        familyId: variant.familyId,
+                        localeVariantId: payload.localeVariantId,
+                        revisionId: id,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
             return {
                 id,
                 localeVariantId: payload.localeVariantId,
@@ -1591,6 +1943,9 @@ class WorkspaceRepository {
             if (!existing) {
                 throw new Error('Revision not found');
             }
+            const variant = workspaceDb.get(`SELECT family_id as familyId
+         FROM locale_variants
+         WHERE id = @localeVariantId`, { localeVariantId: existing.localeVariantId });
             const revisionType = payload.revisionType ?? existing.revisionType;
             const branchId = payload.branchId ?? existing.branchId;
             const filePath = payload.filePath ?? existing.filePath;
@@ -1629,6 +1984,20 @@ class WorkspaceRepository {
                 status,
                 updatedAt: now
             });
+            if (variant && (revisionType === shared_types_1.RevisionState.LIVE || existing.revisionType === shared_types_1.RevisionState.LIVE)) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, payload.workspaceId, [variant.familyId]);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.updateRevision stale-mark failed', {
+                        workspaceId: payload.workspaceId,
+                        familyId: variant.familyId,
+                        localeVariantId: existing.localeVariantId,
+                        revisionId: payload.revisionId,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
             return {
                 ...existing,
                 revisionType,
@@ -1650,12 +2019,36 @@ class WorkspaceRepository {
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
+            const existing = workspaceDb.get(`SELECT r.locale_variant_id as localeVariantId,
+                r.revision_type as revisionType,
+                lv.family_id as familyId
+           FROM revisions r
+           JOIN locale_variants lv ON lv.id = r.locale_variant_id
+          WHERE r.id = @revisionId
+            AND r.workspace_id = @workspaceId`, {
+                revisionId,
+                workspaceId
+            });
             const removed = workspaceDb.run(`DELETE FROM revisions WHERE id = @revisionId AND workspace_id = @workspaceId`, {
                 revisionId,
                 workspaceId
             });
             if (removed.changes === 0) {
                 throw new Error('Revision not found');
+            }
+            if (existing?.revisionType === shared_types_1.RevisionState.LIVE) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, workspaceId, [existing.familyId]);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.deleteRevision stale-mark failed', {
+                        workspaceId,
+                        familyId: existing.familyId,
+                        localeVariantId: existing.localeVariantId,
+                        revisionId,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
             }
         }
         finally {
@@ -1884,7 +2277,9 @@ class WorkspaceRepository {
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
-            const latestRun = workspaceDb.get(`SELECT id, workspace_id, status, source, triggered_by, agent_session_id, started_at, ended_at, summary_json
+            const indexStats = await this.loadArticleRelationIndexStats(workspace.path, workspaceId);
+            const latestRun = workspaceDb.get(`SELECT id, workspace_id, status, source, triggered_by, agent_session_id, started_at, ended_at, summary_json,
+                engine_version, indexed_document_count, stale_document_count, degraded_mode, thresholds_json
          FROM article_relation_runs
          WHERE workspace_id = @workspaceId
          ORDER BY started_at DESC
@@ -1899,12 +2294,18 @@ class WorkspaceRepository {
                 workspaceId,
                 status: shared_types_1.ArticleRelationStatus.ACTIVE
             });
+            const indexCounts = this.loadArticleRelationIndexStateCounts(workspaceDb, workspaceId, this.loadArticleRelationEnabledLocales(workspaceDb, workspaceId));
             const summary = {
                 totalActive: counts?.totalActive ?? 0,
                 inferred: counts?.inferred ?? 0,
                 manual: counts?.manual ?? 0,
                 lastRefreshedAtUtc: latestRun?.ended_at ?? latestRun?.started_at,
-                latestRunState: normalizeRelationRunStatus(latestRun?.status)
+                latestRunState: normalizeRelationRunStatus(latestRun?.status),
+                engineVersion: latestRun?.engine_version ?? types_1.ARTICLE_RELATIONS_V2_LEGACY_ENGINE_VERSION,
+                indexedDocumentCount: indexCounts.indexedDocumentCount ?? latestRun?.indexed_document_count ?? 0,
+                staleDocumentCount: indexCounts.staleDocumentCount ?? latestRun?.stale_document_count ?? 0,
+                degradedMode: Boolean(latestRun?.degraded_mode),
+                indexStats
             };
             return {
                 workspaceId,
@@ -1918,6 +2319,11 @@ class WorkspaceRepository {
                         startedAtUtc: latestRun.started_at,
                         endedAtUtc: latestRun.ended_at ?? undefined,
                         agentSessionId: latestRun.agent_session_id ?? undefined,
+                        engineVersion: latestRun.engine_version ?? types_1.ARTICLE_RELATIONS_V2_LEGACY_ENGINE_VERSION,
+                        indexedDocumentCount: latestRun.indexed_document_count ?? 0,
+                        staleDocumentCount: latestRun.stale_document_count ?? 0,
+                        degradedMode: Boolean(latestRun.degraded_mode),
+                        thresholdsUsed: safeParseJson(latestRun.thresholds_json) ?? undefined,
                         summary: safeParseJson(latestRun.summary_json) ?? undefined
                     }
                     : null,
@@ -2073,11 +2479,33 @@ class WorkspaceRepository {
                         weight: 1
                     });
                 }
+                this.insertArticleRelationFeedback(workspaceDb, {
+                    workspaceId: payload.workspaceId,
+                    leftFamilyId: pair.leftFamilyId,
+                    rightFamilyId: pair.rightFamilyId,
+                    feedbackType: shared_types_1.ArticleRelationFeedbackType.ADD,
+                    source: shared_types_1.ArticleRelationFeedbackSource.MANUAL_RELATION,
+                    note: payload.note
+                }, now);
                 workspaceDb.exec('COMMIT');
             }
             catch (error) {
                 workspaceDb.exec('ROLLBACK');
                 throw error;
+            }
+            try {
+                this.markArticleRelationNeighborhoodStale(workspaceDb, payload.workspaceId, [
+                    pair.leftFamilyId,
+                    pair.rightFamilyId
+                ]);
+            }
+            catch (error) {
+                logger_1.logger.warn('workspace-repository.upsertManualArticleRelation stale-mark failed', {
+                    workspaceId: payload.workspaceId,
+                    leftFamilyId: pair.leftFamilyId,
+                    rightFamilyId: pair.rightFamilyId,
+                    message: error instanceof Error ? error.message : String(error)
+                });
             }
             const row = workspaceDb.get(`SELECT
            r.id,
@@ -2168,11 +2596,32 @@ class WorkspaceRepository {
                     createdAt: now,
                     updatedAt: now
                 });
+                this.insertArticleRelationFeedback(workspaceDb, {
+                    workspaceId: payload.workspaceId,
+                    leftFamilyId: pair.leftFamilyId,
+                    rightFamilyId: pair.rightFamilyId,
+                    feedbackType: shared_types_1.ArticleRelationFeedbackType.REMOVE,
+                    source: shared_types_1.ArticleRelationFeedbackSource.MANUAL_RELATION
+                }, now);
                 workspaceDb.exec('COMMIT');
             }
             catch (error) {
                 workspaceDb.exec('ROLLBACK');
                 throw error;
+            }
+            try {
+                this.markArticleRelationNeighborhoodStale(workspaceDb, payload.workspaceId, [
+                    pair.leftFamilyId,
+                    pair.rightFamilyId
+                ]);
+            }
+            catch (error) {
+                logger_1.logger.warn('workspace-repository.deleteArticleRelation stale-mark failed', {
+                    workspaceId: payload.workspaceId,
+                    leftFamilyId: pair.leftFamilyId,
+                    rightFamilyId: pair.rightFamilyId,
+                    message: error instanceof Error ? error.message : String(error)
+                });
             }
             return {
                 workspaceId: payload.workspaceId,
@@ -2191,124 +2640,78 @@ class WorkspaceRepository {
         const startedAtUtc = new Date().toISOString();
         const source = options?.source ?? 'manual_refresh';
         const triggeredBy = options?.triggeredBy ?? 'user';
+        const limitPerArticle = clampRelationLimit(options?.limitPerArticle ?? 12);
+        const thresholdsUsed = {
+            limitPerArticle
+        };
+        let indexedDocumentCount = 0;
+        let staleDocumentCount = 0;
+        let degradedMode = false;
+        let indexDb;
         try {
             workspaceDb.run(`INSERT INTO article_relation_runs (
-           id, workspace_id, status, source, triggered_by, started_at
+           id, workspace_id, status, source, triggered_by, started_at,
+           engine_version, indexed_document_count, stale_document_count, degraded_mode, thresholds_json
          ) VALUES (
-           @id, @workspaceId, @status, @source, @triggeredBy, @startedAt
+           @id, @workspaceId, @status, @source, @triggeredBy, @startedAt,
+           @engineVersion, @indexedDocumentCount, @staleDocumentCount, @degradedMode, @thresholdsJson
          )`, {
                 id: runId,
                 workspaceId,
                 status: 'running',
                 source,
                 triggeredBy,
-                startedAt: startedAtUtc
+                startedAt: startedAtUtc,
+                engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                indexedDocumentCount: 0,
+                staleDocumentCount: 0,
+                degradedMode: 0,
+                thresholdsJson: JSON.stringify(thresholdsUsed)
             });
-            const corpus = await this.buildArticleRelationCorpus(workspace.path, workspaceDb);
-            const inferred = buildInferredRelationCandidates(corpus, clampRelationLimit(options?.limitPerArticle ?? 12));
-            const summary = {
-                totalArticles: corpus.length,
-                candidatePairs: inferred.candidatePairs,
-                inferredRelations: inferred.relations.length,
-                manualRelations: 0,
-                suppressedRelations: 0
-            };
-            workspaceDb.exec('BEGIN IMMEDIATE');
-            try {
-                const previousInferredIds = workspaceDb.all(`SELECT id FROM article_relations WHERE workspace_id = @workspaceId AND origin = @origin`, {
-                    workspaceId,
-                    origin: shared_types_1.ArticleRelationOrigin.INFERRED
-                });
-                if (previousInferredIds.length > 0) {
-                    const params = {};
-                    const placeholders = previousInferredIds.map((row, index) => {
-                        const key = `id${index}`;
-                        params[key] = row.id;
-                        return `@${key}`;
-                    }).join(', ');
-                    workspaceDb.run(`DELETE FROM article_relation_evidence WHERE relation_id IN (${placeholders})`, params);
-                    workspaceDb.run(`DELETE FROM article_relations WHERE id IN (${placeholders})`, params);
-                }
-                const insertRelation = workspaceDb.prepare(`INSERT INTO article_relations (
-             id, workspace_id, left_family_id, right_family_id, relation_type, direction, strength_score, status, origin, run_id, created_at, updated_at
-           ) VALUES (
-             @id, @workspaceId, @leftFamilyId, @rightFamilyId, @relationType, @direction, @strengthScore, @status, @origin, @runId, @createdAt, @updatedAt
-           )`);
-                const insertEvidence = workspaceDb.prepare(`INSERT INTO article_relation_evidence (
-             id, relation_id, evidence_type, source_ref, snippet, weight, metadata_json
-           ) VALUES (
-             @id, @relationId, @evidenceType, @sourceRef, @snippet, @weight, @metadataJson
-           )`);
-                for (const relation of inferred.relations) {
-                    insertRelation.run({
-                        id: relation.id,
-                        workspaceId,
-                        leftFamilyId: relation.leftFamilyId,
-                        rightFamilyId: relation.rightFamilyId,
-                        relationType: relation.relationType,
-                        direction: relation.direction,
-                        strengthScore: relation.strengthScore,
-                        status: shared_types_1.ArticleRelationStatus.ACTIVE,
-                        origin: shared_types_1.ArticleRelationOrigin.INFERRED,
-                        runId,
-                        createdAt: startedAtUtc,
-                        updatedAt: startedAtUtc
-                    });
-                    for (const evidence of relation.evidence) {
-                        insertEvidence.run({
-                            id: (0, node_crypto_1.randomUUID)(),
-                            relationId: relation.id,
-                            evidenceType: evidence.evidenceType,
-                            sourceRef: evidence.sourceRef ?? null,
-                            snippet: evidence.snippet ?? null,
-                            weight: evidence.weight,
-                            metadataJson: evidence.metadata ? JSON.stringify(evidence.metadata) : null
-                        });
-                    }
-                }
-                const manualCounts = workspaceDb.get(`SELECT COUNT(*) as total
-           FROM article_relations
-           WHERE workspace_id = @workspaceId
-             AND origin = @origin
-             AND status = @status`, {
-                    workspaceId,
-                    origin: shared_types_1.ArticleRelationOrigin.MANUAL,
-                    status: shared_types_1.ArticleRelationStatus.ACTIVE
-                });
-                summary.manualRelations = manualCounts?.total ?? 0;
-                const suppressions = workspaceDb.all(`SELECT left_family_id as leftFamilyId, right_family_id as rightFamilyId
-           FROM article_relation_overrides
-           WHERE workspace_id = @workspaceId
-             AND override_type = 'force_remove'`, { workspaceId });
-                summary.suppressedRelations = suppressions.length;
-                for (const suppression of suppressions) {
-                    workspaceDb.run(`UPDATE article_relations
-             SET status = @status, updated_at = @updatedAt
-             WHERE workspace_id = @workspaceId
-               AND left_family_id = @leftFamilyId
-               AND right_family_id = @rightFamilyId`, {
-                        workspaceId,
-                        leftFamilyId: suppression.leftFamilyId,
-                        rightFamilyId: suppression.rightFamilyId,
-                        status: shared_types_1.ArticleRelationStatus.SUPPRESSED,
-                        updatedAt: startedAtUtc
-                    });
-                }
-                workspaceDb.run(`UPDATE article_relation_runs
-           SET status = 'complete',
-               ended_at = @endedAt,
-               summary_json = @summaryJson
-           WHERE id = @id`, {
-                    id: runId,
-                    endedAt: new Date().toISOString(),
-                    summaryJson: JSON.stringify(summary)
-                });
-                workspaceDb.exec('COMMIT');
+            const preparedIndex = await this.prepareArticleRelationCoverageIndexForRefresh({
+                workspaceId,
+                workspacePath: workspace.path,
+                enabledLocales: workspace.enabledLocales,
+                workspaceDb
+            });
+            indexedDocumentCount = preparedIndex.indexedDocumentCount;
+            staleDocumentCount = preparedIndex.staleDocumentCount;
+            degradedMode = preparedIndex.degradedMode;
+            if (preparedIndex.seedFamilyIds.length > 0) {
+                indexDb = this.getArticleRelationsV2IndexDb(workspace.path).open();
             }
-            catch (error) {
-                workspaceDb.exec('ROLLBACK');
-                throw error;
-            }
+            const summary = this.articleRelationsV2RelationOrchestrator.refreshRelations({
+                workspaceId,
+                runId,
+                startedAtUtc,
+                workspaceDb,
+                indexDb,
+                seedFamilyIds: preparedIndex.seedFamilyIds,
+                limitPerArticle,
+                indexedDocumentCount,
+                staleDocumentCount,
+                degradedMode
+            });
+            const endedAtUtc = new Date().toISOString();
+            workspaceDb.run(`UPDATE article_relation_runs
+         SET status = 'complete',
+             ended_at = @endedAt,
+             summary_json = @summaryJson,
+             engine_version = @engineVersion,
+             indexed_document_count = @indexedDocumentCount,
+             stale_document_count = @staleDocumentCount,
+             degraded_mode = @degradedMode,
+             thresholds_json = @thresholdsJson
+         WHERE id = @id`, {
+                id: runId,
+                endedAt: endedAtUtc,
+                summaryJson: JSON.stringify(summary),
+                engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                indexedDocumentCount: summary.indexedDocumentCount ?? indexedDocumentCount,
+                staleDocumentCount: summary.staleDocumentCount ?? staleDocumentCount,
+                degradedMode: summary.degradedMode ? 1 : 0,
+                thresholdsJson: JSON.stringify(summary.thresholdsUsed ?? thresholdsUsed)
+            });
             return {
                 id: runId,
                 workspaceId,
@@ -2316,7 +2719,12 @@ class WorkspaceRepository {
                 source,
                 triggeredBy,
                 startedAtUtc,
-                endedAtUtc: new Date().toISOString(),
+                endedAtUtc,
+                engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                indexedDocumentCount: summary.indexedDocumentCount ?? indexedDocumentCount,
+                staleDocumentCount: summary.staleDocumentCount ?? staleDocumentCount,
+                degradedMode: summary.degradedMode ?? degradedMode,
+                thresholdsUsed: summary.thresholdsUsed ?? thresholdsUsed,
                 summary
             };
         }
@@ -2324,7 +2732,12 @@ class WorkspaceRepository {
             workspaceDb.run(`UPDATE article_relation_runs
          SET status = 'failed',
              ended_at = @endedAt,
-             summary_json = @summaryJson
+             summary_json = @summaryJson,
+             engine_version = @engineVersion,
+             indexed_document_count = @indexedDocumentCount,
+             stale_document_count = @staleDocumentCount,
+             degraded_mode = @degradedMode,
+             thresholds_json = @thresholdsJson
          WHERE id = @id`, {
                 id: runId,
                 endedAt: new Date().toISOString(),
@@ -2334,13 +2747,1069 @@ class WorkspaceRepository {
                     inferredRelations: 0,
                     manualRelations: 0,
                     suppressedRelations: 0,
+                    engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                    indexedDocumentCount,
+                    staleDocumentCount,
+                    degradedMode,
+                    thresholdsUsed,
                     error: error instanceof Error ? error.message : String(error)
-                })
+                }),
+                engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                indexedDocumentCount,
+                staleDocumentCount,
+                degradedMode: degradedMode ? 1 : 0,
+                thresholdsJson: JSON.stringify(thresholdsUsed)
             });
             throw error;
         }
         finally {
+            indexDb?.close();
             workspaceDb.close();
+        }
+    }
+    async exportArticleRelationCorpus(workspaceId, payload = {}) {
+        const workspace = await this.getWorkspace(workspaceId);
+        const settings = await this.getWorkspaceSettings(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return await this.exportArticleRelationCorpusWithDb({
+                workspaceId,
+                workspacePath: workspace.path,
+                enabledLocales: settings.enabledLocales,
+                workspaceDb,
+                payload
+            });
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async rebuildArticleRelationCoverageIndex(workspaceId, options) {
+        const workspace = await this.getWorkspace(workspaceId);
+        const settings = await this.getWorkspaceSettings(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return await this.rebuildArticleRelationCoverageIndexWithDb({
+                workspaceId,
+                workspacePath: workspace.path,
+                enabledLocales: settings.enabledLocales,
+                workspaceDb,
+                forceFullRebuild: options?.forceFullRebuild
+            });
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async queryArticleRelationCoverage(request) {
+        const hasSignals = Boolean(request.query?.trim())
+            || (request.seedFamilyIds?.some((value) => value.trim()) ?? false)
+            || (request.batchQueries?.some((value) => value.trim()) ?? false);
+        if (!hasSignals) {
+            return {
+                workspaceId: request.workspaceId,
+                engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                results: []
+            };
+        }
+        const workspace = await this.getWorkspace(request.workspaceId);
+        const settings = await this.getWorkspaceSettings(request.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const freshness = await this.evaluateArticleRelationCoverageIndexFreshness({
+                workspaceId: request.workspaceId,
+                workspacePath: workspace.path,
+                enabledLocales: settings.enabledLocales,
+                workspaceDb
+            });
+            if (freshness.sourceStates.length === 0) {
+                return {
+                    workspaceId: request.workspaceId,
+                    engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                    results: []
+                };
+            }
+            if (freshness.requiresRebuild) {
+                try {
+                    await this.rebuildArticleRelationCoverageIndexWithDb({
+                        workspaceId: request.workspaceId,
+                        workspacePath: workspace.path,
+                        enabledLocales: settings.enabledLocales,
+                        workspaceDb,
+                        forceFullRebuild: freshness.reason === 'engine_version_mismatch'
+                            || freshness.reason === 'missing_index_file'
+                            || freshness.reason === 'index_open_failed'
+                    });
+                }
+                catch (error) {
+                    if (!freshness.hasUsableIndex) {
+                        throw error;
+                    }
+                    logger_1.logger.warn('workspace-repository.queryArticleRelationCoverage using stale index fallback', {
+                        workspaceId: request.workspaceId,
+                        reason: freshness.reason,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
+            const indexDb = this.getArticleRelationsV2IndexDb(workspace.path).open();
+            try {
+                return this.articleRelationsV2QueryService.queryCoverage({
+                    workspaceDb,
+                    indexDb,
+                    request
+                });
+            }
+            finally {
+                indexDb.close();
+            }
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async queryArticleRelationGraph(request) {
+        const workspace = await this.getWorkspace(request.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const minScore = typeof request.minScore === 'number' ? Math.max(0, request.minScore) : 0;
+            const includeSuppressed = request.includeSuppressed === true;
+            const limitNodes = clampGraphLimit(request.limitNodes);
+            const where = [
+                'r.workspace_id = @workspaceId',
+                'r.strength_score >= @minScore',
+                'lower(left_f.external_key) NOT LIKE @proposalScopedPattern',
+                'lower(right_f.external_key) NOT LIKE @proposalScopedPattern'
+            ];
+            const params = {
+                workspaceId: request.workspaceId,
+                minScore,
+                proposalScopedPattern: `${PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX}%`,
+                activeStatus: shared_types_1.ArticleRelationStatus.ACTIVE,
+                suppressedStatus: shared_types_1.ArticleRelationStatus.SUPPRESSED
+            };
+            if (includeSuppressed) {
+                where.push('(r.status = @activeStatus OR r.status = @suppressedStatus)');
+            }
+            else {
+                where.push('r.status = @activeStatus');
+            }
+            if (request.familyId) {
+                where.push('(r.left_family_id = @familyId OR r.right_family_id = @familyId)');
+                params.familyId = request.familyId;
+            }
+            if (request.sectionId) {
+                where.push('left_f.section_id = @sectionId');
+                where.push('right_f.section_id = @sectionId');
+                params.sectionId = request.sectionId;
+            }
+            if (request.categoryId) {
+                where.push('left_f.category_id = @categoryId');
+                where.push('right_f.category_id = @categoryId');
+                params.categoryId = request.categoryId;
+            }
+            const rows = workspaceDb.all(`SELECT
+           r.id,
+           r.workspace_id as workspaceId,
+           r.left_family_id as leftFamilyId,
+           r.right_family_id as rightFamilyId,
+           r.relation_type as relationType,
+           r.direction as direction,
+           r.strength_score as strengthScore,
+           r.status as status,
+           r.origin as origin,
+           r.run_id as runId,
+           r.created_at as createdAtUtc,
+           r.updated_at as updatedAtUtc,
+           left_f.title as leftTitle,
+           left_f.external_key as leftExternalKey,
+           right_f.title as rightTitle,
+           right_f.external_key as rightExternalKey
+         FROM article_relations r
+         JOIN article_families left_f ON left_f.id = r.left_family_id
+         JOIN article_families right_f ON right_f.id = r.right_family_id
+         WHERE ${where.join('\n           AND ')}
+         ORDER BY r.strength_score DESC, r.updated_at DESC
+         LIMIT ${Math.max(limitNodes * 8, 48)}`, params);
+            const relationRecords = rows.map((row) => this.mapArticleRelationRow(row, workspaceDb, true));
+            const limitedRelations = limitArticleRelationGraphEdges(relationRecords, limitNodes, request.familyId);
+            const familyIds = new Set();
+            for (const relation of limitedRelations) {
+                familyIds.add(relation.sourceFamily.id);
+                familyIds.add(relation.targetFamily.id);
+            }
+            if (request.familyId) {
+                familyIds.add(request.familyId);
+            }
+            const nodeRows = familyIds.size > 0
+                ? workspaceDb.all(`SELECT id as familyId,
+                    title,
+                    external_key as externalKey,
+                    section_id as sectionId,
+                    category_id as categoryId
+               FROM article_families
+              WHERE id IN (${buildRelationCoverageInClause('family', Array.from(familyIds), params)})`, params)
+                : [];
+            return {
+                workspaceId: request.workspaceId,
+                nodes: nodeRows.map((row) => ({
+                    familyId: row.familyId,
+                    title: row.title,
+                    externalKey: row.externalKey ?? undefined,
+                    sectionId: row.sectionId ?? undefined,
+                    categoryId: row.categoryId ?? undefined
+                })),
+                edges: limitedRelations.map((relation) => ({
+                    relationId: relation.id,
+                    leftFamilyId: relation.sourceFamily.id,
+                    rightFamilyId: relation.targetFamily.id,
+                    relationType: relation.relationType,
+                    origin: relation.origin,
+                    status: relation.status,
+                    strengthScore: relation.strengthScore,
+                    evidence: relation.evidence
+                }))
+            };
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async getArticleRelationFeatureMapSummary(request) {
+        return this.articleRelationsV2FeatureMapService.getFeatureMapSummary(request);
+    }
+    async getArticleRelationFeatureScope(request) {
+        return this.articleRelationsV2FeatureMapService.getFeatureScope(request);
+    }
+    async getArticleRelationNeighborhood(request) {
+        return this.articleRelationsV2FeatureMapService.getNeighborhood(request);
+    }
+    async recordArticleRelationFeedback(payload) {
+        const workspace = await this.getWorkspace(payload.workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            const now = new Date().toISOString();
+            const pair = normalizeFamilyPair(payload.leftFamilyId, payload.rightFamilyId);
+            const record = this.insertArticleRelationFeedback(workspaceDb, {
+                workspaceId: payload.workspaceId,
+                leftFamilyId: pair.leftFamilyId,
+                rightFamilyId: pair.rightFamilyId,
+                feedbackType: payload.feedbackType,
+                source: payload.source ?? shared_types_1.ArticleRelationFeedbackSource.UI,
+                note: payload.note
+            }, now);
+            if (shouldReevaluateFromRelationFeedback(payload.feedbackType)) {
+                try {
+                    this.markArticleRelationNeighborhoodStale(workspaceDb, payload.workspaceId, [
+                        pair.leftFamilyId,
+                        pair.rightFamilyId
+                    ]);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.recordArticleRelationFeedback stale-mark failed', {
+                        workspaceId: payload.workspaceId,
+                        leftFamilyId: pair.leftFamilyId,
+                        rightFamilyId: pair.rightFamilyId,
+                        feedbackType: payload.feedbackType,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
+            return record;
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async exportArticleRelationCorpusWithDb(input) {
+        try {
+            return await this.articleRelationsV2ExportService.exportDocuments({
+                workspaceId: input.workspaceId,
+                familyIds: input.payload.familyIds,
+                localeVariantIds: input.payload.localeVariantIds,
+                locales: input.payload.locales,
+                workspacePath: input.workspacePath,
+                enabledLocales: input.enabledLocales,
+                workspaceDb: input.workspaceDb
+            });
+        }
+        catch (error) {
+            if (error instanceof export_service_1.ArticleRelationsV2ExportDocumentError) {
+                this.recordArticleRelationExportError(input.workspaceDb, input.workspaceId, error);
+            }
+            throw error;
+        }
+    }
+    async rebuildArticleRelationCoverageIndexWithDb(input) {
+        const initialExport = await this.exportArticleRelationCorpusWithDb({
+            workspaceId: input.workspaceId,
+            workspacePath: input.workspacePath,
+            enabledLocales: input.enabledLocales,
+            workspaceDb: input.workspaceDb,
+            payload: {}
+        });
+        const builder = new index_builder_1.ArticleRelationsV2IndexBuilder(this.getArticleRelationsV2IndexDb(input.workspacePath));
+        builder.rebuild({
+            workspaceId: input.workspaceId,
+            workspaceDb: input.workspaceDb,
+            documents: initialExport.documents,
+            forceFullRebuild: input.forceFullRebuild
+        });
+        const inferenceIndexDb = this.getArticleRelationsV2IndexDb(input.workspacePath).open();
+        try {
+            await this.reconcileEffectiveArticleTaxonomyPlacements(input.workspaceId, {
+                familyIds: Array.from(new Set(initialExport.documents.map((document) => document.familyId))),
+                allowInference: true,
+                indexDb: inferenceIndexDb
+            });
+        }
+        finally {
+            inferenceIndexDb.close();
+        }
+        const finalExport = await this.exportArticleRelationCorpusWithDb({
+            workspaceId: input.workspaceId,
+            workspacePath: input.workspacePath,
+            enabledLocales: input.enabledLocales,
+            workspaceDb: input.workspaceDb,
+            payload: {}
+        });
+        return builder.rebuild({
+            workspaceId: input.workspaceId,
+            workspaceDb: input.workspaceDb,
+            documents: finalExport.documents,
+            forceFullRebuild: input.forceFullRebuild
+        });
+    }
+    async evaluateArticleRelationCoverageIndexFreshness(input) {
+        const rawSourceStates = this.loadArticleRelationCoverageSourceStates(input.workspaceId, input.enabledLocales, input.workspaceDb);
+        if (rawSourceStates.length === 0) {
+            return {
+                sourceStates: rawSourceStates,
+                requiresRebuild: false,
+                hasUsableIndex: false,
+                reason: 'no_live_documents'
+            };
+        }
+        const indexDbPath = this.getArticleRelationsV2IndexDbPath(input.workspacePath);
+        if (!(await this.fileExists(indexDbPath))) {
+            return {
+                sourceStates: rawSourceStates,
+                requiresRebuild: true,
+                hasUsableIndex: false,
+                reason: 'missing_index_file'
+            };
+        }
+        let derivedStates = [];
+        let derivedDocumentCount = 0;
+        let derivedEngineVersion = types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION;
+        try {
+            const indexDbRef = this.getArticleRelationsV2IndexDb(input.workspacePath);
+            const indexDb = indexDbRef.open();
+            try {
+                const stats = indexDbRef.getStats(indexDb, input.workspaceId);
+                derivedStates = indexDbRef.listDocumentStates(indexDb);
+                derivedDocumentCount = stats.documentCount;
+                derivedEngineVersion = stats.engineVersion;
+            }
+            finally {
+                indexDb.close();
+            }
+        }
+        catch (error) {
+            logger_1.logger.warn('workspace-repository.evaluateArticleRelationCoverageIndexFreshness index open failed', {
+                workspaceId: input.workspaceId,
+                message: error instanceof Error ? error.message : String(error)
+            });
+            return {
+                sourceStates: rawSourceStates,
+                requiresRebuild: true,
+                hasUsableIndex: false,
+                reason: 'index_open_failed'
+            };
+        }
+        if (derivedEngineVersion !== types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION) {
+            return {
+                sourceStates: rawSourceStates,
+                requiresRebuild: true,
+                hasUsableIndex: false,
+                reason: 'engine_version_mismatch'
+            };
+        }
+        const mainIndexStates = input.workspaceDb.all(`SELECT locale_variant_id as localeVariantId,
+              family_id as familyId,
+              revision_id as revisionId,
+              content_hash as contentHash,
+              engine_version as engineVersion,
+              status as status
+       FROM article_relation_index_state
+       WHERE workspace_id = @workspaceId`, { workspaceId: input.workspaceId });
+        const sourceByLocaleVariant = new Map(rawSourceStates.map((row) => [row.localeVariantId, row]));
+        const derivedByLocaleVariant = new Map(derivedStates.map((row) => [row.localeVariantId, row]));
+        const mainByLocaleVariant = new Map(mainIndexStates.map((row) => [row.localeVariantId, row]));
+        for (const sourceState of rawSourceStates) {
+            const derivedState = derivedByLocaleVariant.get(sourceState.localeVariantId);
+            if (!derivedState) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex: false,
+                    reason: 'missing_derived_document'
+                };
+            }
+            if (derivedState.familyId !== sourceState.familyId || derivedState.revisionId !== sourceState.revisionId) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex: false,
+                    reason: 'derived_document_mismatch'
+                };
+            }
+        }
+        for (const derivedState of derivedStates) {
+            if (!sourceByLocaleVariant.has(derivedState.localeVariantId)) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex: false,
+                    reason: 'orphaned_derived_document'
+                };
+            }
+        }
+        // Once source and derived documents align exactly, the index is complete enough to answer
+        // coverage queries even if workspace metadata repair later fails.
+        const hasUsableIndex = true;
+        for (const mainState of mainIndexStates) {
+            if (!sourceByLocaleVariant.has(mainState.localeVariantId)) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'orphaned_main_index_state'
+                };
+            }
+        }
+        if (derivedDocumentCount !== rawSourceStates.length || derivedDocumentCount !== derivedStates.length) {
+            return {
+                sourceStates: rawSourceStates,
+                requiresRebuild: true,
+                hasUsableIndex,
+                reason: 'index_metadata_count_mismatch'
+            };
+        }
+        for (const sourceState of rawSourceStates) {
+            const derivedState = derivedByLocaleVariant.get(sourceState.localeVariantId);
+            if (!derivedState) {
+                continue;
+            }
+            const mainState = mainByLocaleVariant.get(sourceState.localeVariantId);
+            if (!mainState) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'missing_main_index_state'
+                };
+            }
+            if (mainState.status !== shared_types_1.ArticleRelationIndexStateStatus.INDEXED) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'main_index_state_not_indexed'
+                };
+            }
+            if (mainState.familyId !== sourceState.familyId
+                || mainState.revisionId !== sourceState.revisionId
+                || mainState.engineVersion !== types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION
+                || mainState.contentHash !== derivedState.contentHash) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'main_index_state_mismatch'
+                };
+            }
+        }
+        let exportResponse;
+        try {
+            exportResponse = await this.exportArticleRelationCorpusWithDb({
+                workspaceId: input.workspaceId,
+                workspacePath: input.workspacePath,
+                enabledLocales: input.enabledLocales,
+                workspaceDb: input.workspaceDb,
+                payload: {}
+            });
+        }
+        catch (error) {
+            if (error instanceof export_service_1.ArticleRelationsV2ExportDocumentError) {
+                return {
+                    sourceStates: rawSourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'export_validation_failed'
+                };
+            }
+            throw error;
+        }
+        const sourceStates = exportResponse.documents.map((document) => ({
+            familyId: document.familyId,
+            localeVariantId: document.localeVariantId,
+            revisionId: document.revisionId,
+            contentHash: document.contentHash
+        }));
+        const exportedByLocaleVariant = new Map(sourceStates.map((row) => [row.localeVariantId, row]));
+        if (sourceStates.length !== derivedStates.length || sourceStates.length !== rawSourceStates.length) {
+            return {
+                sourceStates,
+                requiresRebuild: true,
+                hasUsableIndex,
+                reason: 'exported_document_count_mismatch'
+            };
+        }
+        for (const sourceState of sourceStates) {
+            const derivedState = derivedByLocaleVariant.get(sourceState.localeVariantId);
+            const mainState = mainByLocaleVariant.get(sourceState.localeVariantId);
+            if (!derivedState || !mainState) {
+                return {
+                    sourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'exported_document_missing'
+                };
+            }
+            if (derivedState.familyId !== sourceState.familyId
+                || derivedState.revisionId !== sourceState.revisionId
+                || derivedState.contentHash !== sourceState.contentHash) {
+                return {
+                    sourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'exported_document_mismatch'
+                };
+            }
+            if (mainState.contentHash !== sourceState.contentHash) {
+                return {
+                    sourceStates,
+                    requiresRebuild: true,
+                    hasUsableIndex,
+                    reason: 'main_index_export_mismatch'
+                };
+            }
+        }
+        return {
+            sourceStates,
+            requiresRebuild: false,
+            hasUsableIndex,
+            reason: 'fresh'
+        };
+    }
+    getArticleRelationsV2IndexDb(workspacePath) {
+        return new index_db_1.ArticleRelationsV2IndexDb(this.getArticleRelationsV2IndexDbPath(workspacePath));
+    }
+    getArticleRelationsV2IndexDbPath(workspacePath) {
+        return node_path_1.default.join(workspacePath, types_1.ARTICLE_RELATIONS_V2_INDEX_DB_RELATIVE_PATH);
+    }
+    loadArticleRelationEnabledLocales(workspaceDb, workspaceId) {
+        const row = workspaceDb.get(`SELECT enabled_locales as enabledLocales
+       FROM workspace_settings
+       WHERE workspace_id = @workspaceId`, { workspaceId });
+        return safeParseLocales(row?.enabledLocales ?? '["en-us"]');
+    }
+    loadArticleRelationCoverageSourceStates(workspaceId, enabledLocales, workspaceDb, familyIds) {
+        const selectedLocaleKeys = normalizeRelationCoverageLocaleKeys(enabledLocales);
+        if (selectedLocaleKeys.length === 0) {
+            return [];
+        }
+        const scopedFamilyIds = familyIds
+            ? Array.from(new Set(familyIds.map((value) => value.trim()).filter(Boolean)))
+            : [];
+        if (familyIds && scopedFamilyIds.length === 0) {
+            return [];
+        }
+        const params = {
+            workspaceId,
+            proposalScopedPattern: `${PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX}%`,
+            liveRevisionType: shared_types_1.RevisionState.LIVE
+        };
+        const familyFilter = scopedFamilyIds.length > 0
+            ? `\n         AND af.id IN (${buildRelationCoverageInClause('family', scopedFamilyIds, params)})`
+            : '';
+        return workspaceDb.all(`SELECT
+         af.id as familyId,
+         lv.id as localeVariantId,
+         r.id as revisionId,
+         COALESCE(r.content_hash, '') as contentHash
+       FROM article_families af
+       JOIN locale_variants lv ON lv.family_id = af.id
+       JOIN revisions r
+         ON r.id = (
+           SELECT live.id
+           FROM revisions live
+           WHERE live.locale_variant_id = lv.id
+             AND live.revision_type = @liveRevisionType
+           ORDER BY live.revision_number DESC, live.updated_at DESC, live.id DESC
+           LIMIT 1
+         )
+       WHERE af.workspace_id = @workspaceId
+         AND af.retired_at IS NULL
+         AND lower(af.external_key) NOT LIKE @proposalScopedPattern
+         AND (lv.retired_at IS NULL OR lv.retired_at = '')
+         AND lower(lv.locale) IN (${buildRelationCoverageInClause('locale', selectedLocaleKeys, params)})${familyFilter}
+       ORDER BY af.id ASC, lv.id ASC`, params);
+    }
+    recordArticleRelationExportError(workspaceDb, workspaceId, error) {
+        workspaceDb.run(`INSERT INTO article_relation_index_state (
+         workspace_id, locale_variant_id, family_id, revision_id, content_hash, engine_version, status, last_indexed_at, last_error
+       ) VALUES (
+         @workspaceId, @localeVariantId, @familyId, @revisionId, @contentHash, @engineVersion, @status, NULL, @lastError
+       )
+       ON CONFLICT(workspace_id, locale_variant_id) DO UPDATE SET
+         family_id = excluded.family_id,
+         revision_id = excluded.revision_id,
+         content_hash = excluded.content_hash,
+         engine_version = excluded.engine_version,
+         status = excluded.status,
+         last_indexed_at = NULL,
+         last_error = excluded.last_error`, {
+            workspaceId,
+            localeVariantId: error.row.localeVariantId,
+            familyId: error.row.familyId,
+            revisionId: error.row.revisionId,
+            contentHash: error.row.contentHash ?? '',
+            engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+            status: shared_types_1.ArticleRelationIndexStateStatus.ERROR,
+            lastError: error.message
+        });
+    }
+    async prepareArticleRelationCoverageIndexForRefresh(input) {
+        const freshness = await this.evaluateArticleRelationCoverageIndexFreshness(input);
+        const seedFamilyIds = Array.from(new Set(freshness.sourceStates.map((row) => row.familyId)));
+        if (seedFamilyIds.length === 0) {
+            return {
+                seedFamilyIds: [],
+                indexedDocumentCount: 0,
+                staleDocumentCount: 0,
+                degradedMode: false
+            };
+        }
+        let degradedMode = false;
+        if (freshness.requiresRebuild) {
+            try {
+                await this.rebuildArticleRelationCoverageIndexWithDb({
+                    workspaceId: input.workspaceId,
+                    workspacePath: input.workspacePath,
+                    enabledLocales: input.enabledLocales,
+                    workspaceDb: input.workspaceDb,
+                    forceFullRebuild: freshness.reason === 'engine_version_mismatch'
+                        || freshness.reason === 'missing_index_file'
+                        || freshness.reason === 'index_open_failed'
+                });
+            }
+            catch (error) {
+                if (!freshness.hasUsableIndex) {
+                    throw error;
+                }
+                degradedMode = true;
+                logger_1.logger.warn('workspace-repository.refreshArticleRelations using stale index fallback', {
+                    workspaceId: input.workspaceId,
+                    reason: freshness.reason,
+                    message: error instanceof Error ? error.message : String(error)
+                });
+            }
+        }
+        const indexCounts = this.loadArticleRelationIndexStateCounts(input.workspaceDb, input.workspaceId, input.enabledLocales);
+        return {
+            seedFamilyIds,
+            indexedDocumentCount: indexCounts.indexedDocumentCount || freshness.sourceStates.length,
+            staleDocumentCount: indexCounts.staleDocumentCount,
+            degradedMode
+        };
+    }
+    loadArticleRelationIndexStateCounts(workspaceDb, workspaceId, enabledLocales) {
+        const sourceStates = this.loadArticleRelationCoverageSourceStates(workspaceId, enabledLocales, workspaceDb);
+        if (sourceStates.length === 0) {
+            return {
+                indexedDocumentCount: 0,
+                staleDocumentCount: 0
+            };
+        }
+        const params = { workspaceId };
+        const localeVariantPlaceholders = buildRelationCoverageInClause('countLocaleVariant', sourceStates.map((row) => row.localeVariantId), params);
+        const row = workspaceDb.get(`SELECT
+         SUM(CASE WHEN status = 'indexed' THEN 1 ELSE 0 END) as indexedDocumentCount,
+         SUM(CASE WHEN status = 'stale' THEN 1 ELSE 0 END) as staleDocumentCount
+         FROM article_relation_index_state
+        WHERE workspace_id = @workspaceId
+          AND locale_variant_id IN (${localeVariantPlaceholders})`, params);
+        return {
+            indexedDocumentCount: row?.indexedDocumentCount ?? 0,
+            staleDocumentCount: row?.staleDocumentCount ?? 0
+        };
+    }
+    upsertKbScopeCatalogEntriesInDb(workspaceDb, workspaceId, entries, updatedAtUtc) {
+        const recordsByKey = new Map();
+        for (const entry of entries) {
+            const scopeType = normalizeKbScopeType(entry.scopeType);
+            const scopeId = normalizeRequiredKbScopeId(entry.scopeId, 'scopeId');
+            const displayName = normalizeRequiredKbScopeDisplayName(entry.displayName);
+            const source = normalizeRequiredKbScopeSource(entry.source);
+            const parentScopeId = normalizeFeatureMapScopeId(entry.parentScopeId ?? undefined);
+            const record = {
+                workspaceId,
+                scopeType,
+                scopeId,
+                parentScopeId,
+                displayName,
+                source,
+                updatedAtUtc
+            };
+            recordsByKey.set(buildFeatureMapBucketKey(scopeType, scopeId), record);
+        }
+        for (const record of recordsByKey.values()) {
+            workspaceDb.run(`INSERT INTO kb_scope_catalog (
+           workspace_id, scope_type, scope_id, parent_scope_id, display_name, source, updated_at
+         ) VALUES (
+           @workspaceId, @scopeType, @scopeId, @parentScopeId, @displayName, @source, @updatedAtUtc
+         )
+         ON CONFLICT(workspace_id, scope_type, scope_id) DO UPDATE SET
+           parent_scope_id = excluded.parent_scope_id,
+           display_name = excluded.display_name,
+           source = excluded.source,
+           updated_at = excluded.updated_at`, {
+                workspaceId: record.workspaceId,
+                scopeType: record.scopeType,
+                scopeId: record.scopeId,
+                parentScopeId: record.parentScopeId ?? null,
+                displayName: record.displayName,
+                source: record.source,
+                updatedAtUtc: record.updatedAtUtc
+            });
+        }
+        return Array.from(recordsByKey.values())
+            .sort((left, right) => (left.scopeType.localeCompare(right.scopeType)
+            || left.displayName.localeCompare(right.displayName)
+            || left.scopeId.localeCompare(right.scopeId)));
+    }
+    listKbScopeCatalogEntriesInDb(workspaceDb, workspaceId, query = {}) {
+        const where = ['workspace_id = @workspaceId'];
+        const params = { workspaceId };
+        if (query.scopeType) {
+            where.push('scope_type = @scopeType');
+            params.scopeType = normalizeKbScopeType(query.scopeType);
+        }
+        const scopeIds = Array.from(new Set((query.scopeIds ?? []).map((value) => normalizeFeatureMapScopeId(value)).filter(Boolean)));
+        if (scopeIds.length > 0) {
+            where.push(`scope_id IN (${buildRelationCoverageInClause('scopeId', scopeIds, params)})`);
+        }
+        return workspaceDb.all(`SELECT workspace_id as workspaceId,
+              scope_type as scopeType,
+              scope_id as scopeId,
+              parent_scope_id as parentScopeId,
+              display_name as displayName,
+              source,
+              updated_at as updatedAtUtc
+         FROM kb_scope_catalog
+        WHERE ${where.join('\n          AND ')}
+        ORDER BY scope_type ASC, display_name COLLATE NOCASE ASC, scope_id ASC`, params).map((row) => ({
+            ...row,
+            parentScopeId: normalizeFeatureMapScopeId(row.parentScopeId)
+        }));
+    }
+    listKbScopeOverridesInDb(workspaceDb, workspaceId, query = {}) {
+        const where = ['workspace_id = @workspaceId'];
+        const params = { workspaceId };
+        if (query.scopeType) {
+            where.push('scope_type = @scopeType');
+            params.scopeType = normalizeKbScopeType(query.scopeType);
+        }
+        const scopeIds = Array.from(new Set((query.scopeIds ?? []).map((value) => normalizeFeatureMapScopeId(value)).filter(Boolean)));
+        if (scopeIds.length > 0) {
+            where.push(`scope_id IN (${buildRelationCoverageInClause('overrideScopeId', scopeIds, params)})`);
+        }
+        return workspaceDb.all(`SELECT id,
+              workspace_id as workspaceId,
+              scope_type as scopeType,
+              scope_id as scopeId,
+              display_name as displayName,
+              parent_scope_id as parentScopeId,
+              is_hidden as isHidden,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+         FROM kb_scope_overrides
+        WHERE ${where.join('\n          AND ')}
+        ORDER BY scope_type ASC, updated_at DESC, scope_id ASC`, params).map((row) => ({
+            ...row,
+            displayName: normalizeFeatureMapScopeId(row.displayName),
+            parentScopeId: normalizeFeatureMapScopeId(row.parentScopeId),
+            isHidden: Boolean(row.isHidden)
+        }));
+    }
+    resolveKbScopeDisplayNamesInDb(workspaceDb, workspaceId, scopes) {
+        const normalizedScopes = [];
+        const seen = new Set();
+        for (const scope of scopes) {
+            const scopeType = normalizeKbScopeType(scope.scopeType);
+            const scopeId = normalizeFeatureMapScopeId(scope.scopeId);
+            const key = buildFeatureMapBucketKey(scopeType, scopeId);
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            normalizedScopes.push({
+                scopeType,
+                scopeId
+            });
+        }
+        if (normalizedScopes.length === 0) {
+            return [];
+        }
+        const scopeIds = normalizedScopes
+            .map((scope) => scope.scopeId)
+            .filter((value) => Boolean(value));
+        const catalogByKey = new Map(this.listKbScopeCatalogEntriesInDb(workspaceDb, workspaceId, { scopeIds })
+            .map((record) => [buildFeatureMapBucketKey(record.scopeType, record.scopeId), record]));
+        const overridesByKey = new Map(this.listKbScopeOverridesInDb(workspaceDb, workspaceId, { scopeIds })
+            .map((record) => [buildFeatureMapBucketKey(record.scopeType, record.scopeId), record]));
+        return normalizedScopes.map((scope) => {
+            const key = buildFeatureMapBucketKey(scope.scopeType, scope.scopeId);
+            const override = overridesByKey.get(key);
+            const catalog = catalogByKey.get(key);
+            const overrideName = normalizeFeatureMapScopeId(override?.displayName);
+            const catalogName = normalizeFeatureMapScopeId(catalog?.displayName);
+            const labelSource = overrideName
+                ? 'override'
+                : (catalogName ? 'catalog' : 'fallback');
+            return {
+                scopeType: scope.scopeType,
+                scopeId: scope.scopeId,
+                displayName: overrideName
+                    ?? catalogName
+                    ?? buildFallbackKbScopeDisplayName(scope.scopeType, scope.scopeId),
+                labelSource,
+                parentScopeId: normalizeFeatureMapScopeId(override?.parentScopeId) ?? normalizeFeatureMapScopeId(catalog?.parentScopeId),
+                isHidden: Boolean(override?.isHidden)
+            };
+        });
+    }
+    loadFeatureMapContext(workspaceDb, workspaceId, options) {
+        const families = this.loadFeatureMapFamilies(workspaceDb, workspaceId);
+        const relations = this.loadFeatureMapRelations(workspaceDb, workspaceId, options);
+        const staleCountsByFamily = this.loadFeatureMapStaleCounts(workspaceDb, workspaceId);
+        return {
+            families,
+            relations,
+            staleCountsByFamily
+        };
+    }
+    loadFeatureMapFamilies(workspaceDb, workspaceId) {
+        return workspaceDb.all(`SELECT id as familyId,
+              title,
+              section_id as sectionId,
+              category_id as categoryId
+         FROM article_families
+        WHERE workspace_id = @workspaceId
+          AND retired_at IS NULL
+          AND lower(external_key) NOT LIKE @proposalScopedPattern
+        ORDER BY title COLLATE NOCASE ASC`, {
+            workspaceId,
+            proposalScopedPattern: `${PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX}%`
+        });
+    }
+    loadFeatureMapRelations(workspaceDb, workspaceId, options) {
+        const where = [
+            'r.workspace_id = @workspaceId',
+            'r.strength_score >= @minScore',
+            'left_f.retired_at IS NULL',
+            'right_f.retired_at IS NULL',
+            'lower(left_f.external_key) NOT LIKE @proposalScopedPattern',
+            'lower(right_f.external_key) NOT LIKE @proposalScopedPattern'
+        ];
+        const params = {
+            workspaceId,
+            minScore: options.minScore,
+            proposalScopedPattern: `${PROPOSAL_SCOPED_EXTERNAL_KEY_PREFIX}%`,
+            activeStatus: shared_types_1.ArticleRelationStatus.ACTIVE,
+            suppressedStatus: shared_types_1.ArticleRelationStatus.SUPPRESSED
+        };
+        if (options.includeSuppressed) {
+            where.push('(r.status = @activeStatus OR r.status = @suppressedStatus)');
+        }
+        else {
+            where.push('r.status = @activeStatus');
+        }
+        return workspaceDb.all(`SELECT
+         r.id,
+         r.workspace_id as workspaceId,
+         r.left_family_id as leftFamilyId,
+         r.right_family_id as rightFamilyId,
+         r.relation_type as relationType,
+         r.direction as direction,
+         r.strength_score as strengthScore,
+         r.status as status,
+         r.origin as origin,
+         r.run_id as runId,
+         r.created_at as createdAtUtc,
+         r.updated_at as updatedAtUtc,
+         left_f.title as leftTitle,
+         left_f.external_key as leftExternalKey,
+         left_f.section_id as leftSectionId,
+         left_f.category_id as leftCategoryId,
+         right_f.title as rightTitle,
+         right_f.external_key as rightExternalKey,
+         right_f.section_id as rightSectionId,
+         right_f.category_id as rightCategoryId
+       FROM article_relations r
+       JOIN article_families left_f ON left_f.id = r.left_family_id
+       JOIN article_families right_f ON right_f.id = r.right_family_id
+       WHERE ${where.join('\n         AND ')}
+       ORDER BY r.strength_score DESC, r.updated_at DESC, r.id ASC`, params);
+    }
+    loadFeatureMapStaleCounts(workspaceDb, workspaceId) {
+        const sourceStates = this.loadArticleRelationCoverageSourceStates(workspaceId, this.loadArticleRelationEnabledLocales(workspaceDb, workspaceId), workspaceDb);
+        if (sourceStates.length === 0) {
+            return new Map();
+        }
+        const params = { workspaceId };
+        const localeVariantPlaceholders = buildRelationCoverageInClause('featureMapLocaleVariant', sourceStates.map((row) => row.localeVariantId), params);
+        const rows = workspaceDb.all(`SELECT family_id as familyId,
+              COUNT(*) as total
+         FROM article_relation_index_state
+        WHERE workspace_id = @workspaceId
+          AND status = @status
+          AND locale_variant_id IN (${localeVariantPlaceholders})
+        GROUP BY family_id`, {
+            ...params,
+            status: shared_types_1.ArticleRelationIndexStateStatus.STALE
+        });
+        return new Map(rows.map((row) => [row.familyId, row.total]));
+    }
+    async loadArticleRelationIndexStats(workspacePath, workspaceId) {
+        const indexDbPath = this.getArticleRelationsV2IndexDbPath(workspacePath);
+        if (!(await this.fileExists(indexDbPath))) {
+            return undefined;
+        }
+        try {
+            const indexDbRef = this.getArticleRelationsV2IndexDb(workspacePath);
+            const indexDb = indexDbRef.open();
+            try {
+                const stats = indexDbRef.getStats(indexDb, workspaceId);
+                return {
+                    engineVersion: stats.engineVersion,
+                    documentCount: stats.documentCount,
+                    chunkCount: stats.chunkCount,
+                    aliasCount: stats.aliasCount,
+                    linkCount: stats.linkCount,
+                    lastBuiltAtUtc: stats.lastBuiltAtUtc
+                };
+            }
+            finally {
+                indexDb.close();
+            }
+        }
+        catch (error) {
+            logger_1.logger.warn('workspace-repository.loadArticleRelationIndexStats failed', {
+                workspaceId,
+                message: error instanceof Error ? error.message : String(error)
+            });
+            return undefined;
+        }
+    }
+    insertArticleRelationFeedback(workspaceDb, input, createdAtUtc) {
+        const record = {
+            id: (0, node_crypto_1.randomUUID)(),
+            workspaceId: input.workspaceId,
+            leftFamilyId: input.leftFamilyId,
+            rightFamilyId: input.rightFamilyId,
+            feedbackType: input.feedbackType,
+            source: input.source,
+            note: input.note?.trim() ? input.note.trim() : undefined,
+            createdAtUtc
+        };
+        workspaceDb.run(`INSERT INTO article_relation_feedback (
+         id, workspace_id, left_family_id, right_family_id, feedback_type, source, note, created_at
+       ) VALUES (
+         @id, @workspaceId, @leftFamilyId, @rightFamilyId, @feedbackType, @source, @note, @createdAt
+       )`, {
+            id: record.id,
+            workspaceId: record.workspaceId,
+            leftFamilyId: record.leftFamilyId,
+            rightFamilyId: record.rightFamilyId,
+            feedbackType: record.feedbackType,
+            source: record.source,
+            note: record.note ?? null,
+            createdAt: record.createdAtUtc
+        });
+        return record;
+    }
+    markArticleRelationNeighborhoodStale(workspaceDb, workspaceId, familyIds) {
+        const neighborhoodFamilyIds = this.loadArticleRelationNeighborhoodFamilyIds(workspaceDb, workspaceId, familyIds);
+        this.markArticleRelationFamiliesStale(workspaceDb, workspaceId, neighborhoodFamilyIds);
+    }
+    loadArticleRelationNeighborhoodFamilyIds(workspaceDb, workspaceId, familyIds) {
+        const dedupedFamilyIds = Array.from(new Set(familyIds.map((value) => value.trim()).filter(Boolean)));
+        if (dedupedFamilyIds.length === 0) {
+            return [];
+        }
+        const params = { workspaceId };
+        const placeholders = buildRelationCoverageInClause('family', dedupedFamilyIds, params);
+        const relatedFamilies = workspaceDb.all(`SELECT DISTINCT CASE
+           WHEN left_family_id IN (${placeholders}) THEN right_family_id
+           ELSE left_family_id
+         END as familyId
+       FROM article_relations
+       WHERE workspace_id = @workspaceId
+         AND (left_family_id IN (${placeholders}) OR right_family_id IN (${placeholders}))`, params);
+        return Array.from(new Set([
+            ...dedupedFamilyIds,
+            ...relatedFamilies.map((row) => row.familyId).filter(Boolean)
+        ]));
+    }
+    markArticleRelationFamiliesStale(workspaceDb, workspaceId, familyIds) {
+        const dedupedFamilyIds = Array.from(new Set(familyIds.map((value) => value.trim()).filter(Boolean)));
+        if (dedupedFamilyIds.length === 0) {
+            return;
+        }
+        const sourceStates = this.loadArticleRelationCoverageSourceStates(workspaceId, this.loadArticleRelationEnabledLocales(workspaceDb, workspaceId), workspaceDb, dedupedFamilyIds);
+        const params = { workspaceId };
+        const familyPlaceholders = buildRelationCoverageInClause('family', dedupedFamilyIds, params);
+        if (sourceStates.length === 0) {
+            workspaceDb.run(`DELETE FROM article_relation_index_state
+         WHERE workspace_id = @workspaceId
+           AND family_id IN (${familyPlaceholders})`, params);
+            return;
+        }
+        const scopedParams = { ...params };
+        const keepLocaleVariantPlaceholders = buildRelationCoverageInClause('keepLocaleVariant', sourceStates.map((row) => row.localeVariantId), scopedParams);
+        workspaceDb.run(`DELETE FROM article_relation_index_state
+       WHERE workspace_id = @workspaceId
+         AND family_id IN (${familyPlaceholders})
+         AND locale_variant_id NOT IN (${keepLocaleVariantPlaceholders})`, scopedParams);
+        for (const row of sourceStates) {
+            workspaceDb.run(`INSERT INTO article_relation_index_state (
+           workspace_id, locale_variant_id, family_id, revision_id, content_hash, engine_version, status, last_indexed_at, last_error
+         ) VALUES (
+           @workspaceId, @localeVariantId, @familyId, @revisionId, @contentHash, @engineVersion, @status, NULL, NULL
+         )
+         ON CONFLICT(workspace_id, locale_variant_id) DO UPDATE SET
+           family_id = excluded.family_id,
+           revision_id = excluded.revision_id,
+           content_hash = excluded.content_hash,
+           engine_version = excluded.engine_version,
+           status = excluded.status,
+           last_error = NULL`, {
+                workspaceId,
+                localeVariantId: row.localeVariantId,
+                familyId: row.familyId,
+                revisionId: row.revisionId,
+                contentHash: row.contentHash,
+                engineVersion: types_1.ARTICLE_RELATIONS_V2_ENGINE_VERSION,
+                status: shared_types_1.ArticleRelationIndexStateStatus.STALE
+            });
         }
     }
     async createPBIBatch(workspaceId, batchName, sourceFileName, sourcePath, sourceFormat, sourceRowCount, counts, scopeMode = shared_types_1.PBIBatchScopeMode.ALL, scopePayload, status = shared_types_1.PBIBatchStatus.IMPORTED) {
@@ -5950,6 +7419,444 @@ class WorkspaceRepository {
             workspaceDb.close();
         }
     }
+    async upsertKbScopeCatalogEntries(workspaceId, entries) {
+        if (entries.length === 0) {
+            return [];
+        }
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        const updatedAtUtc = new Date().toISOString();
+        try {
+            workspaceDb.exec('BEGIN IMMEDIATE');
+            const records = this.upsertKbScopeCatalogEntriesInDb(workspaceDb, workspaceId, entries, updatedAtUtc);
+            workspaceDb.exec('COMMIT');
+            return records;
+        }
+        catch (error) {
+            try {
+                workspaceDb.exec('ROLLBACK');
+            }
+            catch {
+                // no-op
+            }
+            throw error;
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async listKbScopeCatalogEntries(workspaceId, query = {}) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return this.listKbScopeCatalogEntriesInDb(workspaceDb, workspaceId, query);
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async listKbScopeOverrides(workspaceId, query = {}) {
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return this.listKbScopeOverridesInDb(workspaceDb, workspaceId, query);
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    async resolveKbScopeDisplayNames(workspaceId, scopes) {
+        if (scopes.length === 0) {
+            return [];
+        }
+        const workspace = await this.getWorkspace(workspaceId);
+        await this.ensureWorkspaceDb(workspace.path);
+        const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+        try {
+            return this.resolveKbScopeDisplayNamesInDb(workspaceDb, workspaceId, scopes);
+        }
+        finally {
+            workspaceDb.close();
+        }
+    }
+    listArticleFamiliesForTaxonomyInDb(workspaceDb, workspaceId, familyIds) {
+        const where = ['workspace_id = @workspaceId'];
+        const params = { workspaceId };
+        const dedupedFamilyIds = Array.from(new Set((familyIds ?? []).map((value) => value.trim()).filter(Boolean)));
+        if (dedupedFamilyIds.length > 0) {
+            where.push(`id IN (${buildRelationCoverageInClause('taxonomyFamily', dedupedFamilyIds, params)})`);
+        }
+        return workspaceDb.all(`SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
+         FROM article_families
+        WHERE ${where.join('\n          AND ')}
+        ORDER BY title COLLATE NOCASE ASC, id ASC`, params).map(mapArticleFamilyRow);
+    }
+    getKbSectionParentCategoryInDb(workspaceDb, workspaceId, sectionId) {
+        const row = workspaceDb.get(`SELECT (
+          SELECT parent_scope_id
+            FROM kb_scope_overrides
+           WHERE workspace_id = @workspaceId
+             AND scope_type = 'section'
+             AND scope_id = @sectionId
+           ORDER BY updated_at DESC, id DESC
+           LIMIT 1
+        ) as overrideParentScopeId,
+        (
+          SELECT parent_scope_id
+            FROM kb_scope_catalog
+           WHERE workspace_id = @workspaceId
+             AND scope_type = 'section'
+             AND scope_id = @sectionId
+           LIMIT 1
+        ) as catalogParentScopeId`, {
+            workspaceId,
+            sectionId
+        });
+        return normalizeFeatureMapScopeId(row?.overrideParentScopeId)
+            ?? normalizeFeatureMapScopeId(row?.catalogParentScopeId);
+    }
+    isKbScopeCatalogEntryPresentInDb(workspaceDb, workspaceId, scopeType, scopeId) {
+        const normalizedScopeId = normalizeFeatureMapScopeId(scopeId);
+        if (!normalizedScopeId) {
+            return false;
+        }
+        const row = workspaceDb.get(`SELECT 1 as present
+         FROM kb_scope_catalog
+        WHERE workspace_id = @workspaceId
+          AND scope_type = @scopeType
+          AND scope_id = @scopeId
+        LIMIT 1`, {
+            workspaceId,
+            scopeType,
+            scopeId: normalizedScopeId
+        });
+        return Boolean(row?.present);
+    }
+    resolveEffectiveArticleTaxonomyPlacementInDb(workspaceDb, workspaceId, family, options) {
+        const rawSectionId = normalizeFeatureMapScopeId(family.sourceSectionId);
+        const rawCategoryId = normalizeFeatureMapScopeId(family.sourceCategoryId);
+        const currentSectionId = normalizeFeatureMapScopeId(family.sectionId);
+        const currentCategoryId = normalizeFeatureMapScopeId(family.categoryId);
+        const currentSectionSource = normalizeArticleTaxonomySource(family.sectionSource);
+        const currentCategorySource = normalizeArticleTaxonomySource(family.categorySource);
+        const manualSection = currentSectionSource === 'manual_override';
+        const manualCategory = currentCategorySource === 'manual_override';
+        let sectionId = currentSectionId;
+        let categoryId = currentCategoryId;
+        let sectionSource = currentSectionSource;
+        let categorySource = currentCategorySource;
+        let taxonomyConfidence = normalizeArticleTaxonomyConfidence(family.taxonomyConfidence);
+        let taxonomyNote = normalizeFeatureMapScopeId(family.taxonomyNote);
+        if (rawSectionId && rawCategoryId) {
+            const sectionParentCategoryId = this.getKbSectionParentCategoryInDb(workspaceDb, workspaceId, rawSectionId);
+            if (!manualSection) {
+                sectionId = rawSectionId;
+                sectionSource = 'zendesk_article';
+            }
+            if (!manualCategory) {
+                if (sectionParentCategoryId && sectionParentCategoryId !== rawCategoryId) {
+                    categoryId = sectionParentCategoryId;
+                    categorySource = 'zendesk_section_parent';
+                    taxonomyConfidence = 0.98;
+                    taxonomyNote = `Zendesk category ${rawCategoryId} conflicts with section ${rawSectionId} parent ${sectionParentCategoryId}; effective category follows the section parent.`;
+                }
+                else {
+                    categoryId = rawCategoryId;
+                    categorySource = 'zendesk_article';
+                    taxonomyConfidence = 1;
+                    taxonomyNote = undefined;
+                }
+            }
+            return {
+                sectionId,
+                categoryId,
+                sourceSectionId: rawSectionId,
+                sourceCategoryId: rawCategoryId,
+                sectionSource,
+                categorySource,
+                taxonomyConfidence,
+                taxonomyNote
+            };
+        }
+        if (rawSectionId) {
+            const sectionParentCategoryId = this.getKbSectionParentCategoryInDb(workspaceDb, workspaceId, rawSectionId);
+            if (!manualSection) {
+                sectionId = rawSectionId;
+                sectionSource = 'zendesk_article';
+            }
+            if (!manualCategory && sectionParentCategoryId) {
+                categoryId = sectionParentCategoryId;
+                categorySource = 'zendesk_section_parent';
+                taxonomyConfidence = 0.98;
+                taxonomyNote = undefined;
+            }
+            return {
+                sectionId,
+                categoryId,
+                sourceSectionId: rawSectionId,
+                sourceCategoryId: rawCategoryId,
+                sectionSource,
+                categorySource,
+                taxonomyConfidence,
+                taxonomyNote
+            };
+        }
+        if (rawCategoryId) {
+            if (!manualSection) {
+                sectionId = undefined;
+                sectionSource = 'none';
+            }
+            if (!manualCategory) {
+                categoryId = rawCategoryId;
+                categorySource = 'zendesk_article';
+                taxonomyConfidence = 0.92;
+                taxonomyNote = undefined;
+            }
+            return {
+                sectionId,
+                categoryId,
+                sourceSectionId: rawSectionId,
+                sourceCategoryId: rawCategoryId,
+                sectionSource,
+                categorySource,
+                taxonomyConfidence,
+                taxonomyNote
+            };
+        }
+        if (options.allowInference) {
+            const inferred = options.indexDb
+                ? this.inferExistingArticleTaxonomyPlacementInDb(workspaceDb, workspaceId, family.id, options.indexDb)
+                : null;
+            if (inferred) {
+                if (!manualSection) {
+                    sectionId = inferred.sectionId;
+                    sectionSource = inferred.sectionId ? 'inferred_existing_scope' : 'none';
+                }
+                if (!manualCategory) {
+                    categoryId = inferred.categoryId;
+                    categorySource = inferred.categoryId ? 'inferred_existing_scope' : 'none';
+                }
+                taxonomyConfidence = inferred.confidence;
+                taxonomyNote = inferred.note;
+            }
+        }
+        return {
+            sectionId,
+            categoryId,
+            sourceSectionId: rawSectionId,
+            sourceCategoryId: rawCategoryId,
+            sectionSource,
+            categorySource,
+            taxonomyConfidence,
+            taxonomyNote
+        };
+    }
+    inferExistingArticleTaxonomyPlacementInDb(workspaceDb, workspaceId, familyId, indexDb) {
+        const response = this.articleRelationsV2QueryService.queryCoverage({
+            workspaceDb,
+            indexDb,
+            request: {
+                workspaceId,
+                seedFamilyIds: [familyId],
+                maxResults: 12,
+                minScore: 0.18,
+                includeEvidence: true
+            }
+        });
+        if (response.results.length < 2) {
+            return null;
+        }
+        const candidateFamilies = new Map(this.listArticleFamiliesForTaxonomyInDb(workspaceDb, workspaceId, response.results.map((result) => result.familyId)).map((family) => [family.id, family]));
+        const sectionVotes = new Map();
+        const categoryVotes = new Map();
+        for (const result of response.results) {
+            const candidateFamily = candidateFamilies.get(result.familyId);
+            if (!candidateFamily || candidateFamily.id === familyId) {
+                continue;
+            }
+            const evidenceTypes = new Set(result.evidence.map((entry) => entry.evidenceType));
+            const hasExplicitLink = evidenceTypes.has('explicit_link');
+            const lexicalEvidenceCount = [
+                'title_fts',
+                'heading_fts',
+                'body_chunk_fts',
+                'external_key_exact',
+                'alias_exact'
+            ].filter((type) => evidenceTypes.has(type)).length;
+            if (!hasExplicitLink && lexicalEvidenceCount < 2 && result.finalScore < 0.72) {
+                continue;
+            }
+            let candidateSectionId = normalizeFeatureMapScopeId(candidateFamily.sectionId);
+            let candidateCategoryId = normalizeFeatureMapScopeId(candidateFamily.categoryId);
+            if (candidateSectionId) {
+                const sectionParentCategoryId = this.getKbSectionParentCategoryInDb(workspaceDb, workspaceId, candidateSectionId);
+                if (!sectionParentCategoryId) {
+                    candidateSectionId = undefined;
+                }
+                else {
+                    candidateCategoryId = sectionParentCategoryId;
+                }
+            }
+            if (candidateCategoryId && !this.isKbScopeCatalogEntryPresentInDb(workspaceDb, workspaceId, 'category', candidateCategoryId)) {
+                candidateCategoryId = undefined;
+            }
+            if (!candidateSectionId && !candidateCategoryId) {
+                continue;
+            }
+            let score = result.finalScore;
+            if (hasExplicitLink) {
+                score += 0.35;
+            }
+            if (lexicalEvidenceCount >= 2) {
+                score += 0.12;
+            }
+            else if (lexicalEvidenceCount === 1) {
+                score += 0.05;
+            }
+            score = Number(score.toFixed(3));
+            if (candidateSectionId && candidateCategoryId) {
+                const sectionVote = sectionVotes.get(candidateSectionId) ?? {
+                    sectionId: candidateSectionId,
+                    categoryId: candidateCategoryId,
+                    score: 0,
+                    supporters: new Set(),
+                    explicitLinkSupporters: new Set()
+                };
+                sectionVote.score = Number((sectionVote.score + score).toFixed(3));
+                sectionVote.supporters.add(candidateFamily.id);
+                if (hasExplicitLink) {
+                    sectionVote.explicitLinkSupporters.add(candidateFamily.id);
+                }
+                sectionVotes.set(candidateSectionId, sectionVote);
+                const categoryVote = categoryVotes.get(candidateCategoryId) ?? {
+                    categoryId: candidateCategoryId,
+                    score: 0,
+                    supporters: new Set(),
+                    explicitLinkSupporters: new Set()
+                };
+                categoryVote.score = Number((categoryVote.score + (score * 0.92)).toFixed(3));
+                categoryVote.supporters.add(candidateFamily.id);
+                if (hasExplicitLink) {
+                    categoryVote.explicitLinkSupporters.add(candidateFamily.id);
+                }
+                categoryVotes.set(candidateCategoryId, categoryVote);
+                continue;
+            }
+            if (candidateCategoryId) {
+                const categoryVote = categoryVotes.get(candidateCategoryId) ?? {
+                    categoryId: candidateCategoryId,
+                    score: 0,
+                    supporters: new Set(),
+                    explicitLinkSupporters: new Set()
+                };
+                categoryVote.score = Number((categoryVote.score + (score * 0.82)).toFixed(3));
+                categoryVote.supporters.add(candidateFamily.id);
+                if (hasExplicitLink) {
+                    categoryVote.explicitLinkSupporters.add(candidateFamily.id);
+                }
+                categoryVotes.set(candidateCategoryId, categoryVote);
+            }
+        }
+        const rankedSections = Array.from(sectionVotes.values()).sort((left, right) => (right.score - left.score
+            || right.supporters.size - left.supporters.size
+            || right.explicitLinkSupporters.size - left.explicitLinkSupporters.size
+            || left.sectionId.localeCompare(right.sectionId)));
+        const rankedCategories = Array.from(categoryVotes.values()).sort((left, right) => (right.score - left.score
+            || right.supporters.size - left.supporters.size
+            || right.explicitLinkSupporters.size - left.explicitLinkSupporters.size
+            || left.categoryId.localeCompare(right.categoryId)));
+        const topSection = rankedSections[0];
+        const secondSection = rankedSections[1];
+        if (topSection
+            && topSection.supporters.size >= 2
+            && topSection.score >= 1.55
+            && (topSection.score - (secondSection?.score ?? 0)) >= 0.2) {
+            return {
+                sectionId: topSection.sectionId,
+                categoryId: topSection.categoryId,
+                confidence: normalizeArticleTaxonomyConfidence(0.5
+                    + Math.min(0.25, topSection.score / 5)
+                    + Math.min(0.12, topSection.supporters.size * 0.04)
+                    + Math.min(0.06, topSection.explicitLinkSupporters.size * 0.03)) ?? 0.82,
+                note: `Inferred from ${topSection.supporters.size} related articles into existing Zendesk section ${topSection.sectionId} and category ${topSection.categoryId}.`
+            };
+        }
+        const topCategory = rankedCategories[0];
+        const secondCategory = rankedCategories[1];
+        if (topCategory
+            && topCategory.supporters.size >= 2
+            && topCategory.score >= 1.45
+            && (topCategory.score - (secondCategory?.score ?? 0)) >= 0.18) {
+            return {
+                categoryId: topCategory.categoryId,
+                confidence: normalizeArticleTaxonomyConfidence(0.46
+                    + Math.min(0.22, topCategory.score / 5.5)
+                    + Math.min(0.1, topCategory.supporters.size * 0.035)
+                    + Math.min(0.04, topCategory.explicitLinkSupporters.size * 0.02)) ?? 0.76,
+                note: `Inferred from ${topCategory.supporters.size} related articles into existing Zendesk category ${topCategory.categoryId}.`
+            };
+        }
+        return null;
+    }
+    applyArticleTaxonomyResolutionInDb(workspaceDb, workspaceId, family, resolution) {
+        const next = {
+            ...family,
+            sectionId: normalizeFeatureMapScopeId(resolution.sectionId),
+            categoryId: normalizeFeatureMapScopeId(resolution.categoryId),
+            sourceSectionId: normalizeFeatureMapScopeId(resolution.sourceSectionId),
+            sourceCategoryId: normalizeFeatureMapScopeId(resolution.sourceCategoryId),
+            sectionSource: normalizeArticleTaxonomySource(resolution.sectionSource),
+            categorySource: normalizeArticleTaxonomySource(resolution.categorySource),
+            taxonomyConfidence: normalizeArticleTaxonomyConfidence(resolution.taxonomyConfidence),
+            taxonomyUpdatedAt: normalizeFeatureMapScopeId(resolution.taxonomyUpdatedAt) ?? new Date().toISOString(),
+            taxonomyNote: normalizeFeatureMapScopeId(resolution.taxonomyNote)
+        };
+        const changed = next.sectionId !== family.sectionId
+            || next.categoryId !== family.categoryId
+            || next.sourceSectionId !== family.sourceSectionId
+            || next.sourceCategoryId !== family.sourceCategoryId
+            || next.sectionSource !== family.sectionSource
+            || next.categorySource !== family.categorySource
+            || next.taxonomyConfidence !== family.taxonomyConfidence
+            || next.taxonomyNote !== family.taxonomyNote;
+        if (!changed) {
+            return {
+                family,
+                changed: false
+            };
+        }
+        workspaceDb.run(`UPDATE article_families
+          SET section_id = @sectionId,
+              category_id = @categoryId,
+              source_section_id = @sourceSectionId,
+              source_category_id = @sourceCategoryId,
+              section_source = @sectionSource,
+              category_source = @categorySource,
+              taxonomy_confidence = @taxonomyConfidence,
+              taxonomy_updated_at = @taxonomyUpdatedAt,
+              taxonomy_note = @taxonomyNote
+        WHERE id = @familyId
+          AND workspace_id = @workspaceId`, {
+            familyId: family.id,
+            workspaceId,
+            sectionId: next.sectionId ?? null,
+            categoryId: next.categoryId ?? null,
+            sourceSectionId: next.sourceSectionId ?? null,
+            sourceCategoryId: next.sourceCategoryId ?? null,
+            sectionSource: next.sectionSource ?? 'none',
+            categorySource: next.categorySource ?? 'none',
+            taxonomyConfidence: next.taxonomyConfidence ?? null,
+            taxonomyUpdatedAt: next.taxonomyUpdatedAt ?? null,
+            taxonomyNote: next.taxonomyNote ?? null
+        });
+        return {
+            family: next,
+            changed: true
+        };
+    }
     async logSyncRunStart(workspaceId, runId, mode) {
         const workspace = await this.getWorkspace(workspaceId);
         await this.ensureWorkspaceDb(workspace.path);
@@ -6068,9 +7975,9 @@ class WorkspaceRepository {
         await this.ensureWorkspaceDb(workspace.path);
         const workspaceDb = this.openWorkspaceDbWithRecovery(node_path_1.default.join(workspace.path, '.meta', DEFAULT_DB_FILE));
         try {
-            const row = workspaceDb.get(`SELECT id, workspace_id as workspaceId, external_key as externalKey, title, section_id as sectionId, category_id as categoryId, retired_at as retiredAtUtc
+            const row = workspaceDb.get(`SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
          FROM article_families WHERE workspace_id = @workspaceId AND external_key = @externalKey`, { workspaceId, externalKey });
-            return row ?? null;
+            return row ? mapArticleFamilyRow(row) : null;
         }
         finally {
             workspaceDb.close();
@@ -6658,6 +8565,8 @@ class WorkspaceRepository {
         return Array.from(seedFamilyIds);
     }
     async buildArticleRelationCorpus(workspacePath, workspaceDb) {
+        // Legacy Phase 2 corpus builder retained only as an unused fallback reference while
+        // the v2 relation engine is rolled out. Phase 3 removes it from the refresh hot path.
         const families = workspaceDb.all(`SELECT id, title, external_key as externalKey, section_id as sectionId, category_id as categoryId
        FROM article_families
        WHERE retired_at IS NULL
@@ -7195,10 +9104,31 @@ class WorkspaceRepository {
         }
     }
     serializeBatchAnalysisPlanOpenQuestions(plan) {
+        const structuredQuestionByKey = new Map((plan.questions ?? [])
+            .map((question) => [
+            this.normalizeBatchAnalysisQuestionPromptKey(question.prompt),
+            question
+        ]));
         const promptsFromQuestions = (plan.questions ?? [])
+            .filter((question) => this.shouldPersistBatchAnalysisQuestionAsOpen(question))
             .map((question) => question.prompt?.trim())
             .filter((prompt) => Boolean(prompt));
-        return Array.from(new Set([...(plan.openQuestions ?? []), ...promptsFromQuestions]));
+        const promptsFromLegacyOpenQuestions = (plan.openQuestions ?? [])
+            .map((prompt) => prompt.trim())
+            .filter(Boolean)
+            .filter((prompt) => {
+            const matchingStructuredQuestion = structuredQuestionByKey.get(this.normalizeBatchAnalysisQuestionPromptKey(prompt));
+            return !matchingStructuredQuestion || this.shouldPersistBatchAnalysisQuestionAsOpen(matchingStructuredQuestion);
+        });
+        return Array.from(new Set([...promptsFromLegacyOpenQuestions, ...promptsFromQuestions]));
+    }
+    shouldPersistBatchAnalysisQuestionAsOpen(question) {
+        return question.status === 'pending'
+            && !question.answer?.trim()
+            && Boolean(question.prompt?.trim());
+    }
+    normalizeBatchAnalysisQuestionPromptKey(prompt) {
+        return (prompt ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
     }
     listBatchAnalysisIterationsFromDb(db, workspaceId, batchId) {
         const rows = db.all(`SELECT id,
@@ -8515,6 +10445,19 @@ class WorkspaceRepository {
          FROM locale_variants
          WHERE id = @variantId
          LIMIT 1`, { variantId: proposal.localeVariantId });
+            if (family?.familyId) {
+                try {
+                    this.markArticleRelationFamiliesStale(workspaceDb, proposal.workspaceId, [family.familyId]);
+                }
+                catch (error) {
+                    logger_1.logger.warn('workspace-repository.markProposalTargetRetired stale-mark failed', {
+                        workspaceId: proposal.workspaceId,
+                        familyId: family.familyId,
+                        localeVariantId: proposal.localeVariantId,
+                        message: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
             return {
                 reviewStatus: shared_types_1.ProposalReviewStatus.ACCEPTED,
                 legacyStatus: shared_types_1.ProposalDecision.ACCEPT,
@@ -8556,6 +10499,16 @@ class WorkspaceRepository {
             state: shared_types_1.RevisionState.OBSOLETE,
             updatedAt: retiredAtUtc
         });
+        try {
+            this.markArticleRelationFamiliesStale(workspaceDb, proposal.workspaceId, [proposal.familyId]);
+        }
+        catch (error) {
+            logger_1.logger.warn('workspace-repository.markProposalTargetRetired stale-mark failed', {
+                workspaceId: proposal.workspaceId,
+                familyId: proposal.familyId,
+                message: error instanceof Error ? error.message : String(error)
+            });
+        }
         return {
             reviewStatus: shared_types_1.ProposalReviewStatus.ACCEPTED,
             legacyStatus: shared_types_1.ProposalDecision.ACCEPT,
@@ -9108,9 +11061,10 @@ class WorkspaceRepository {
             };
         }
         const variant = await this.getLocaleVariant(input.workspaceId, input.localeVariantId);
-        const family = workspaceDb.get(`SELECT id, workspace_id as workspaceId, external_key as externalKey, title, section_id as sectionId, category_id as categoryId, retired_at as retiredAtUtc
+        const familyRow = workspaceDb.get(`SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
        FROM article_families
        WHERE id = @familyId`, { familyId: variant.familyId });
+        const family = familyRow ? mapArticleFamilyRow(familyRow) : null;
         const revision = await this.getLatestRevision(input.workspaceId, input.localeVariantId, shared_types_1.RevisionState.LIVE)
             ?? await this.getLatestRevision(input.workspaceId, input.localeVariantId);
         if (!family || !revision) {
@@ -10256,6 +12210,8 @@ function buildCorpusItemFromFamily(family, bodyHtml) {
     };
 }
 function buildInferredRelationCandidates(corpus, limitPerArticle) {
+    // Legacy heuristic relation inference retained temporarily for deletion work.
+    // Phase 3 cutover no longer routes production relation refresh through this path.
     const byId = new Map(corpus.map((item) => [item.familyId, item]));
     const tokenIndex = new Map();
     for (const item of corpus) {
@@ -10403,10 +12359,601 @@ function tokenizeRelationText(input) {
         .split(/\s+/)
         .filter((token) => token.length >= 3 && !stopWords.has(token));
 }
+const FEATURE_CLUSTER_MAX_PHRASE_LENGTH = 3;
+const FEATURE_CLUSTER_GENERIC_STOPWORDS = new Set([
+    'a',
+    'add',
+    'an',
+    'and',
+    'article',
+    'basic',
+    'center',
+    'change',
+    'configuration',
+    'configure',
+    'configuring',
+    'create',
+    'creating',
+    'delete',
+    'deleting',
+    'disable',
+    'edit',
+    'editing',
+    'enable',
+    'faq',
+    'faqs',
+    'for',
+    'from',
+    'get',
+    'getting',
+    'guide',
+    'guides',
+    'help',
+    'how',
+    'intro',
+    'introduction',
+    'kb',
+    'learn',
+    'manage',
+    'managing',
+    'new',
+    'of',
+    'on',
+    'overview',
+    'remove',
+    'reset',
+    'set',
+    'setup',
+    'start',
+    'started',
+    'support',
+    'the',
+    'this',
+    'to',
+    'troubleshoot',
+    'troubleshooting',
+    'update',
+    'updating',
+    'use',
+    'using',
+    'view',
+    'what',
+    'when',
+    'where',
+    'why',
+    'with',
+    'your'
+]);
 function normalizeFamilyPair(sourceFamilyId, targetFamilyId) {
     return sourceFamilyId.localeCompare(targetFamilyId) <= 0
         ? { leftFamilyId: sourceFamilyId, rightFamilyId: targetFamilyId }
         : { leftFamilyId: targetFamilyId, rightFamilyId: sourceFamilyId };
+}
+function normalizeFeatureMapScopeId(value) {
+    const normalized = value?.trim();
+    return normalized ? normalized : undefined;
+}
+function normalizeKbScopeType(value) {
+    if (value === 'category' || value === 'section') {
+        return value;
+    }
+    throw new Error(`Unsupported KB scope type: ${value}`);
+}
+function normalizeRequiredKbScopeId(value, fieldName) {
+    const normalized = normalizeFeatureMapScopeId(value);
+    if (!normalized) {
+        throw new Error(`KB scope entry requires ${fieldName}`);
+    }
+    return normalized;
+}
+function normalizeRequiredKbScopeDisplayName(value) {
+    const normalized = value?.trim();
+    if (!normalized) {
+        throw new Error('KB scope entry requires displayName');
+    }
+    return normalized;
+}
+function normalizeRequiredKbScopeSource(value) {
+    const normalized = value?.trim();
+    if (!normalized) {
+        throw new Error('KB scope entry requires source');
+    }
+    return normalized;
+}
+function normalizeArticleTaxonomySource(value) {
+    if (typeof value === 'string' && ARTICLE_TAXONOMY_SOURCE_VALUES.includes(value)) {
+        return value;
+    }
+    return 'none';
+}
+function normalizeArticleTaxonomyConfidence(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return undefined;
+    }
+    return Number(Math.max(0, Math.min(1, value)).toFixed(3));
+}
+function mapArticleFamilyRow(row) {
+    return {
+        id: row.id,
+        workspaceId: row.workspaceId,
+        externalKey: row.externalKey,
+        title: row.title,
+        sectionId: normalizeFeatureMapScopeId(row.sectionId),
+        categoryId: normalizeFeatureMapScopeId(row.categoryId),
+        sourceSectionId: normalizeFeatureMapScopeId(row.sourceSectionId),
+        sourceCategoryId: normalizeFeatureMapScopeId(row.sourceCategoryId),
+        sectionSource: normalizeArticleTaxonomySource(row.sectionSource),
+        categorySource: normalizeArticleTaxonomySource(row.categorySource),
+        taxonomyConfidence: normalizeArticleTaxonomyConfidence(row.taxonomyConfidence),
+        taxonomyUpdatedAt: normalizeFeatureMapScopeId(row.taxonomyUpdatedAt),
+        taxonomyNote: normalizeFeatureMapScopeId(row.taxonomyNote),
+        retiredAtUtc: normalizeFeatureMapScopeId(row.retiredAtUtc)
+    };
+}
+function buildFeatureMapBucketKey(scopeType, scopeId) {
+    return `${scopeType}::${normalizeFeatureMapScopeId(scopeId) ?? '__none__'}`;
+}
+function extractFeatureMapBucketScopeId(bucketKey) {
+    const [, rawScopeId = ''] = bucketKey.split('::');
+    return rawScopeId === '__none__' ? undefined : rawScopeId;
+}
+function buildFallbackKbScopeDisplayName(scopeType, scopeId) {
+    const normalizedScopeId = normalizeFeatureMapScopeId(scopeId);
+    if (normalizedScopeId) {
+        return `${normalizedScopeId} (fallback)`;
+    }
+    return scopeType === 'category' ? 'Uncategorized' : 'Unsectioned';
+}
+function deriveFeatureMapScopeName(scopeType, scopeId) {
+    return buildFallbackKbScopeDisplayName(scopeType, scopeId);
+}
+function resolveFeatureMapScopeLabel(scopeLabelsByKey, scopeType, scopeId) {
+    return scopeLabelsByKey.get(buildFeatureMapBucketKey(scopeType, scopeId)) ?? {
+        scopeType,
+        scopeId: normalizeFeatureMapScopeId(scopeId),
+        displayName: deriveFeatureMapScopeName(scopeType, scopeId),
+        labelSource: 'fallback',
+        isHidden: false
+    };
+}
+function doesFeatureMapFamilyMatchScope(family, scopeType, scopeId) {
+    const familyScopeId = scopeType === 'section'
+        ? normalizeFeatureMapScopeId(family.sectionId)
+        : normalizeFeatureMapScopeId(family.categoryId);
+    return familyScopeId === normalizeFeatureMapScopeId(scopeId);
+}
+function partitionFeatureMapRelationsByScope(relations, scopeFamilyIds) {
+    const internalRelations = [];
+    const bridgeRelations = [];
+    for (const relation of relations) {
+        const leftInside = scopeFamilyIds.has(relation.leftFamilyId);
+        const rightInside = scopeFamilyIds.has(relation.rightFamilyId);
+        if (leftInside && rightInside) {
+            internalRelations.push(relation);
+            continue;
+        }
+        if (leftInside || rightInside) {
+            bridgeRelations.push(relation);
+        }
+    }
+    return {
+        internalRelations,
+        bridgeRelations
+    };
+}
+function buildFeatureMapScopeSummary(input) {
+    const scopeFamilyIds = new Set(input.scopeFamilies.map((family) => family.familyId));
+    const { internalRelations, bridgeRelations } = partitionFeatureMapRelationsByScope(input.relations, scopeFamilyIds);
+    const visibleBridgeRelations = input.includeBridges ? bridgeRelations : [];
+    const clusters = buildFeatureMapClusters({
+        scopeFamilies: input.scopeFamilies,
+        familiesById: input.familiesById,
+        internalRelations: internalRelations.filter((relation) => relation.status === shared_types_1.ArticleRelationStatus.ACTIVE),
+        bridgeRelations: visibleBridgeRelations
+    });
+    const visibleRelations = [...internalRelations, ...visibleBridgeRelations];
+    return {
+        articleCount: input.scopeFamilies.length,
+        clusterCount: clusters.length,
+        internalEdgeCount: internalRelations.length,
+        bridgeEdgeCount: visibleBridgeRelations.length,
+        staleDocumentCount: input.scopeFamilies.reduce((total, family) => total + (input.staleCountsByFamily.get(family.familyId) ?? 0), 0),
+        manualEdgeCount: visibleRelations.filter((relation) => relation.origin === shared_types_1.ArticleRelationOrigin.MANUAL).length,
+        inferredEdgeCount: visibleRelations.filter((relation) => relation.origin === shared_types_1.ArticleRelationOrigin.INFERRED).length
+    };
+}
+function buildFeatureMapClusters(input) {
+    if (input.scopeFamilies.length === 0) {
+        return [];
+    }
+    const adjacency = new Map();
+    for (const family of input.scopeFamilies) {
+        adjacency.set(family.familyId, new Set());
+    }
+    for (const relation of input.internalRelations) {
+        adjacency.get(relation.leftFamilyId)?.add(relation.rightFamilyId);
+        adjacency.get(relation.rightFamilyId)?.add(relation.leftFamilyId);
+    }
+    const orderedFamilies = input.scopeFamilies
+        .slice()
+        .sort((left, right) => left.title.localeCompare(right.title));
+    const visited = new Set();
+    const clusters = [];
+    for (const family of orderedFamilies) {
+        if (visited.has(family.familyId)) {
+            continue;
+        }
+        const stack = [family.familyId];
+        const articleIds = [];
+        visited.add(family.familyId);
+        while (stack.length > 0) {
+            const familyId = stack.pop();
+            if (!familyId) {
+                continue;
+            }
+            articleIds.push(familyId);
+            const neighbors = adjacency.get(familyId) ?? new Set();
+            for (const neighbor of neighbors) {
+                if (visited.has(neighbor)) {
+                    continue;
+                }
+                visited.add(neighbor);
+                stack.push(neighbor);
+            }
+        }
+        articleIds.sort((left, right) => {
+            const leftTitle = input.familiesById.get(left)?.title ?? left;
+            const rightTitle = input.familiesById.get(right)?.title ?? right;
+            return leftTitle.localeCompare(rightTitle);
+        });
+        const articleIdSet = new Set(articleIds);
+        const componentRelations = input.internalRelations.filter((relation) => (articleIdSet.has(relation.leftFamilyId)
+            && articleIdSet.has(relation.rightFamilyId)));
+        const degreeByFamilyId = new Map();
+        for (const articleId of articleIds) {
+            degreeByFamilyId.set(articleId, 0);
+        }
+        for (const relation of componentRelations) {
+            degreeByFamilyId.set(relation.leftFamilyId, (degreeByFamilyId.get(relation.leftFamilyId) ?? 0) + 1);
+            degreeByFamilyId.set(relation.rightFamilyId, (degreeByFamilyId.get(relation.rightFamilyId) ?? 0) + 1);
+        }
+        const representativeArticleIds = articleIds
+            .slice()
+            .sort((left, right) => ((degreeByFamilyId.get(right) ?? 0) - (degreeByFamilyId.get(left) ?? 0)
+            || (input.familiesById.get(left)?.title ?? left).localeCompare(input.familiesById.get(right)?.title ?? right)))
+            .slice(0, 3);
+        const labelDetails = deriveFeatureClusterLabel({
+            articleIds,
+            representativeArticleIds,
+            familiesById: input.familiesById
+        });
+        const bridgeEdgeCount = input.bridgeRelations.filter((relation) => (articleIdSet.has(relation.leftFamilyId) || articleIdSet.has(relation.rightFamilyId))).length;
+        clusters.push({
+            clusterId: `cluster-${(0, node_crypto_1.createHash)('sha1').update(articleIds.join(':')).digest('hex').slice(0, 12)}`,
+            label: labelDetails.label,
+            labelSource: labelDetails.labelSource,
+            articleIds,
+            articleCount: articleIds.length,
+            internalEdgeCount: componentRelations.length,
+            bridgeEdgeCount,
+            representativeArticleIds
+        });
+    }
+    return clusters.sort((left, right) => (right.articleCount - left.articleCount
+        || right.internalEdgeCount - left.internalEdgeCount
+        || left.label.localeCompare(right.label)));
+}
+function buildFeatureMapScopeArticles(input) {
+    const statsByFamilyId = new Map();
+    for (const family of input.scopeFamilies) {
+        statsByFamilyId.set(family.familyId, {
+            totalEdgeCount: 0,
+            internalEdgeCount: 0,
+            bridgeEdgeCount: 0
+        });
+    }
+    for (const relation of input.internalRelations) {
+        const left = statsByFamilyId.get(relation.leftFamilyId);
+        const right = statsByFamilyId.get(relation.rightFamilyId);
+        if (left) {
+            left.totalEdgeCount += 1;
+            left.internalEdgeCount += 1;
+        }
+        if (right) {
+            right.totalEdgeCount += 1;
+            right.internalEdgeCount += 1;
+        }
+    }
+    for (const relation of input.bridgeRelations) {
+        const left = statsByFamilyId.get(relation.leftFamilyId);
+        const right = statsByFamilyId.get(relation.rightFamilyId);
+        if (left && !right) {
+            left.totalEdgeCount += 1;
+            left.bridgeEdgeCount += 1;
+        }
+        else if (right && !left) {
+            right.totalEdgeCount += 1;
+            right.bridgeEdgeCount += 1;
+        }
+    }
+    return input.scopeFamilies
+        .map((family) => {
+        const stats = statsByFamilyId.get(family.familyId);
+        return {
+            familyId: family.familyId,
+            title: family.title,
+            sectionId: family.sectionId ?? undefined,
+            categoryId: family.categoryId ?? undefined,
+            totalEdgeCount: stats?.totalEdgeCount ?? 0,
+            internalEdgeCount: stats?.internalEdgeCount ?? 0,
+            bridgeEdgeCount: stats?.bridgeEdgeCount ?? 0
+        };
+    })
+        .sort((left, right) => (right.internalEdgeCount - left.internalEdgeCount
+        || right.bridgeEdgeCount - left.bridgeEdgeCount
+        || right.totalEdgeCount - left.totalEdgeCount
+        || left.title.localeCompare(right.title)));
+}
+function buildFeatureMapBridges(input) {
+    const bridges = new Map();
+    for (const relation of input.bridgeRelations) {
+        const leftClusterId = input.clusterByFamilyId.get(relation.leftFamilyId);
+        const rightClusterId = input.clusterByFamilyId.get(relation.rightFamilyId);
+        if (!leftClusterId && !rightClusterId) {
+            continue;
+        }
+        const outsideFamilyId = leftClusterId ? relation.rightFamilyId : relation.leftFamilyId;
+        const sourceClusterId = leftClusterId ?? rightClusterId;
+        const outsideFamily = input.familiesById.get(outsideFamilyId);
+        const targetScope = resolveFeatureMapBridgeTargetScope(input.scopeType, outsideFamily, input.scopeLabelsByKey);
+        const sourceClusterLabel = input.clusterLabelsById.get(sourceClusterId) ?? 'This cluster';
+        const bridgeKey = [
+            sourceClusterId,
+            targetScope.targetScopeType,
+            targetScope.targetScopeId ?? '__none__',
+            targetScope.targetScopeName
+        ].join('::');
+        const aggregate = bridges.get(bridgeKey) ?? {
+            sourceClusterId,
+            sourceClusterLabel,
+            targetScopeType: targetScope.targetScopeType,
+            targetScopeId: targetScope.targetScopeId,
+            targetScopeName: targetScope.targetScopeName,
+            targetScopeLabel: targetScope.targetScopeLabel,
+            summary: buildFeatureMapBridgeSummary(sourceClusterLabel, targetScope.targetScopeName),
+            edgeCount: 0,
+            maxStrengthScore: 0,
+            examples: new Map()
+        };
+        aggregate.edgeCount += 1;
+        aggregate.maxStrengthScore = Math.max(aggregate.maxStrengthScore, relation.strengthScore);
+        aggregate.examples.set(relation.id, {
+            leftFamilyId: relation.leftFamilyId,
+            leftTitle: input.familiesById.get(relation.leftFamilyId)?.title,
+            rightFamilyId: relation.rightFamilyId,
+            rightTitle: input.familiesById.get(relation.rightFamilyId)?.title,
+            relationType: relation.relationType,
+            strengthScore: relation.strengthScore
+        });
+        bridges.set(bridgeKey, aggregate);
+    }
+    return Array.from(bridges.values())
+        .map((bridge) => ({
+        sourceClusterId: bridge.sourceClusterId,
+        sourceClusterLabel: bridge.sourceClusterLabel,
+        targetScopeType: bridge.targetScopeType,
+        targetScopeId: bridge.targetScopeId,
+        targetScopeName: bridge.targetScopeName,
+        targetScopeLabel: bridge.targetScopeLabel,
+        summary: bridge.summary,
+        edgeCount: bridge.edgeCount,
+        maxStrengthScore: bridge.maxStrengthScore,
+        examples: Array.from(bridge.examples.values())
+            .sort((left, right) => (right.strengthScore - left.strengthScore
+            || (left.leftTitle ?? left.leftFamilyId).localeCompare(right.leftTitle ?? right.leftFamilyId)
+            || (left.rightTitle ?? left.rightFamilyId).localeCompare(right.rightTitle ?? right.rightFamilyId)))
+            .slice(0, 3)
+    }))
+        .sort((left, right) => (right.edgeCount - left.edgeCount
+        || right.maxStrengthScore - left.maxStrengthScore
+        || left.targetScopeName.localeCompare(right.targetScopeName)));
+}
+function deriveFeatureClusterLabel(input) {
+    const representativeLabel = input.familiesById.get(input.representativeArticleIds[0] ?? input.articleIds[0])?.title
+        ?? input.familiesById.get(input.articleIds[0])?.title
+        ?? 'Cluster';
+    if (input.articleIds.length < 2) {
+        return {
+            label: representativeLabel,
+            labelSource: 'representative_article'
+        };
+    }
+    const derivedLabel = deriveFeatureClusterKeywordLabel(input.articleIds
+        .map((articleId) => input.familiesById.get(articleId)?.title?.trim())
+        .filter((title) => Boolean(title)));
+    if (derivedLabel) {
+        return {
+            label: derivedLabel,
+            labelSource: 'derived_keywords'
+        };
+    }
+    return {
+        label: representativeLabel,
+        labelSource: 'representative_article'
+    };
+}
+function deriveFeatureClusterKeywordLabel(titles) {
+    const candidates = collectFeatureClusterPhraseCandidates(titles).filter((candidate) => candidate.docFreq >= 2);
+    if (candidates.length === 0) {
+        return null;
+    }
+    const maxDocFreq = Math.max(...candidates.map((candidate) => candidate.docFreq));
+    const preferredMultiWordCandidates = candidates.filter((candidate) => (candidate.tokenCount > 1
+        && candidate.docFreq >= Math.max(2, maxDocFreq - 1)));
+    const candidatePool = preferredMultiWordCandidates.length > 0
+        ? preferredMultiWordCandidates
+        : candidates;
+    candidatePool.sort(compareFeatureClusterPhraseCandidates);
+    return selectFeatureClusterPhraseDisplay(candidatePool[0]);
+}
+function collectFeatureClusterPhraseCandidates(titles) {
+    const candidates = new Map();
+    titles.forEach((title) => {
+        const tokens = extractFeatureClusterTitleTokens(title);
+        if (tokens.length === 0) {
+            return;
+        }
+        const seenInTitle = new Set();
+        for (let tokenCount = 1; tokenCount <= Math.min(FEATURE_CLUSTER_MAX_PHRASE_LENGTH, tokens.length); tokenCount += 1) {
+            for (let start = 0; start + tokenCount <= tokens.length; start += 1) {
+                const phraseTokens = tokens.slice(start, start + tokenCount);
+                const key = phraseTokens.map((token) => token.normalized).join(' ');
+                const surface = phraseTokens.map((token) => token.surface).join(' ');
+                const candidate = candidates.get(key) ?? {
+                    key,
+                    tokenCount,
+                    docFreq: 0,
+                    totalOccurrences: 0,
+                    surfaces: new Map()
+                };
+                candidate.totalOccurrences += 1;
+                candidate.surfaces.set(surface, (candidate.surfaces.get(surface) ?? 0) + 1);
+                if (!seenInTitle.has(key)) {
+                    candidate.docFreq += 1;
+                    seenInTitle.add(key);
+                }
+                candidates.set(key, candidate);
+            }
+        }
+    });
+    return Array.from(candidates.values());
+}
+function compareFeatureClusterPhraseCandidates(left, right) {
+    return right.docFreq - left.docFreq
+        || right.tokenCount - left.tokenCount
+        || right.totalOccurrences - left.totalOccurrences
+        || right.key.length - left.key.length
+        || left.key.localeCompare(right.key);
+}
+function extractFeatureClusterTitleTokens(title) {
+    const rawTokens = title.match(/[A-Za-z0-9]+/g) ?? [];
+    return rawTokens
+        .map((surface) => ({
+        normalized: normalizeFeatureClusterToken(surface),
+        surface
+    }))
+        .filter((token) => isFeatureClusterKeywordToken(token.normalized));
+}
+function normalizeFeatureClusterToken(rawToken) {
+    let normalized = rawToken.trim().toLowerCase();
+    if (!normalized || /^\d+$/.test(normalized)) {
+        return '';
+    }
+    if (normalized.length >= 5 && normalized.endsWith('ies')) {
+        normalized = `${normalized.slice(0, -3)}y`;
+    }
+    else if (normalized.length >= 4
+        && normalized.endsWith('s')
+        && !normalized.endsWith('ss')
+        && !normalized.endsWith('us')) {
+        normalized = normalized.slice(0, -1);
+    }
+    return normalized;
+}
+function isFeatureClusterKeywordToken(token) {
+    return token.length >= 2
+        && /[a-z]/.test(token)
+        && !FEATURE_CLUSTER_GENERIC_STOPWORDS.has(token);
+}
+function selectFeatureClusterPhraseDisplay(candidate) {
+    if (!candidate) {
+        return null;
+    }
+    const preferredSurface = Array.from(candidate.surfaces.entries())
+        .sort((left, right) => (right[1] - left[1]
+        || left[0].length - right[0].length
+        || left[0].localeCompare(right[0])))[0]?.[0]
+        ?.trim();
+    if (preferredSurface) {
+        return preferredSurface;
+    }
+    return candidate.key
+        .split(' ')
+        .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
+        .join(' ');
+}
+function buildFeatureMapBridgeSummary(sourceClusterLabel, targetScopeName) {
+    return `${sourceClusterLabel} connects to ${targetScopeName}`;
+}
+function resolveFeatureMapBridgeTargetScope(scopeType, outsideFamily, scopeLabelsByKey) {
+    if (scopeType === 'section') {
+        const sectionId = normalizeFeatureMapScopeId(outsideFamily?.sectionId);
+        if (sectionId) {
+            const targetScopeLabel = resolveFeatureMapScopeLabel(scopeLabelsByKey, 'section', sectionId);
+            return {
+                targetScopeType: 'section',
+                targetScopeId: sectionId,
+                targetScopeName: targetScopeLabel.displayName,
+                targetScopeLabel
+            };
+        }
+        const categoryId = normalizeFeatureMapScopeId(outsideFamily?.categoryId);
+        const targetScopeLabel = resolveFeatureMapScopeLabel(scopeLabelsByKey, 'category', categoryId);
+        return {
+            targetScopeType: 'category',
+            targetScopeId: categoryId,
+            targetScopeName: targetScopeLabel.displayName,
+            targetScopeLabel
+        };
+    }
+    const categoryId = normalizeFeatureMapScopeId(outsideFamily?.categoryId);
+    if (categoryId) {
+        const targetScopeLabel = resolveFeatureMapScopeLabel(scopeLabelsByKey, 'category', categoryId);
+        return {
+            targetScopeType: 'category',
+            targetScopeId: categoryId,
+            targetScopeName: targetScopeLabel.displayName,
+            targetScopeLabel
+        };
+    }
+    const sectionId = normalizeFeatureMapScopeId(outsideFamily?.sectionId);
+    const targetScopeLabel = resolveFeatureMapScopeLabel(scopeLabelsByKey, 'section', sectionId);
+    return {
+        targetScopeType: 'section',
+        targetScopeId: sectionId,
+        targetScopeName: targetScopeLabel.displayName,
+        targetScopeLabel
+    };
+}
+function collectFeatureMapNeighborhoodFamilyIds(centerFamilyId, relations, hopCount) {
+    const adjacency = new Map();
+    for (const relation of relations) {
+        const leftNeighbors = adjacency.get(relation.leftFamilyId) ?? new Set();
+        leftNeighbors.add(relation.rightFamilyId);
+        adjacency.set(relation.leftFamilyId, leftNeighbors);
+        const rightNeighbors = adjacency.get(relation.rightFamilyId) ?? new Set();
+        rightNeighbors.add(relation.leftFamilyId);
+        adjacency.set(relation.rightFamilyId, rightNeighbors);
+    }
+    const visited = new Set([centerFamilyId]);
+    const queue = [{ familyId: centerFamilyId, depth: 0 }];
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || current.depth >= hopCount) {
+            continue;
+        }
+        for (const neighbor of adjacency.get(current.familyId) ?? new Set()) {
+            if (visited.has(neighbor)) {
+                continue;
+            }
+            visited.add(neighbor);
+            queue.push({
+                familyId: neighbor,
+                depth: current.depth + 1
+            });
+        }
+    }
+    return visited;
 }
 function normalizeRelationRunStatus(value) {
     if (value === 'running' || value === 'complete' || value === 'failed' || value === 'canceled') {
@@ -10425,6 +12972,49 @@ function clampRelationLimit(value) {
         return 24;
     }
     return Math.max(1, Math.min(100, Math.floor(value)));
+}
+function clampGraphLimit(value) {
+    if (!Number.isFinite(value)) {
+        return 36;
+    }
+    return Math.max(8, Math.min(120, Math.floor(value ?? 36)));
+}
+function limitArticleRelationGraphEdges(relations, limitNodes, seedFamilyId) {
+    const selected = [];
+    const nodeIds = new Set(seedFamilyId ? [seedFamilyId] : []);
+    for (const relation of relations) {
+        const nextNodeIds = new Set(nodeIds);
+        nextNodeIds.add(relation.sourceFamily.id);
+        nextNodeIds.add(relation.targetFamily.id);
+        if (selected.length > 0 && nextNodeIds.size > limitNodes) {
+            continue;
+        }
+        selected.push(relation);
+        nextNodeIds.forEach((nodeId) => nodeIds.add(nodeId));
+        if (nodeIds.size >= limitNodes) {
+            break;
+        }
+    }
+    return selected;
+}
+function shouldReevaluateFromRelationFeedback(feedbackType) {
+    return feedbackType === shared_types_1.ArticleRelationFeedbackType.ADD
+        || feedbackType === shared_types_1.ArticleRelationFeedbackType.REMOVE
+        || feedbackType === shared_types_1.ArticleRelationFeedbackType.MISSED
+        || feedbackType === shared_types_1.ArticleRelationFeedbackType.BAD_SUGGESTION;
+}
+function normalizeRelationCoverageLocaleKeys(locales) {
+    const normalized = (locales ?? [])
+        .map((locale) => locale.trim().toLowerCase())
+        .filter(Boolean);
+    return Array.from(new Set(normalized));
+}
+function buildRelationCoverageInClause(prefix, values, params) {
+    return values.map((value, index) => {
+        const key = `${prefix}${index}`;
+        params[key] = value;
+        return `@${key}`;
+    }).join(', ');
 }
 function mapWorkspaceRow(row) {
     return {

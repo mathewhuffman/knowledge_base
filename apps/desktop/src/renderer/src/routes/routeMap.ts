@@ -1,5 +1,6 @@
 import { AppRoute } from '@kb-vault/shared-types';
 import { ArticleExplorer } from '../pages/ArticleExplorer';
+import { ArticleRelationsGraph as FeatureMapPage } from '../pages/ArticleRelationsGraph';
 import { KBVaultHome } from '../pages/KBVaultHome';
 import { PBI } from '../pages/PBIBatches';
 import { PBILibrary } from '../pages/PBILibrary';
@@ -15,6 +16,7 @@ export const routeToComponent: Record<AppRoute, FunctionComponent> = {
   [AppRoute.WORKSPACE_SWITCHER]: WorkspaceSwitcher,
   [AppRoute.KB_VAULT_HOME]: KBVaultHome,
   [AppRoute.ARTICLE_EXPLORER]: ArticleExplorer,
+  [AppRoute.RELATIONS_GRAPH]: FeatureMapPage,
   [AppRoute.PBI_BATCHES]: PBI,
   [AppRoute.PBI_LIBRARY]: PBILibrary,
   [AppRoute.PROPOSAL_REVIEW]: ProposalReview,

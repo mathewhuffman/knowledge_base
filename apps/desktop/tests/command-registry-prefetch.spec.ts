@@ -130,4 +130,135 @@ test.describe('command registry planner prefetch clustering', () => {
       'Details Tab'
     ]));
   });
+
+  test('uses v2 coverage for planner article matches, resolves a preferred live locale, and maps relation counterparts relative to the seeded family', async () => {
+    const uploadedPbis = {
+      rows: [
+        {
+          id: 'pbi-1',
+          title: 'Billing Alerts',
+          title1: 'Billing Alerts',
+          title2: 'Manage Notifications',
+          title3: ''
+        }
+      ]
+    };
+
+    const coverageQueries: string[] = [];
+    const relationFamilyIds: string[] = [];
+    const mockRepository = {
+      getBatchAnalysisInspection: async () => null,
+      getWorkspaceSettings: async () => ({
+        workspaceId: 'workspace-1',
+        zendeskSubdomain: 'support',
+        defaultLocale: 'en-us',
+        enabledLocales: ['en-us', 'fr-fr'],
+        kbAccessMode: 'cli'
+      }),
+      getArticleFamily: async () => ({
+        title: 'Notification Settings'
+      }),
+      getLocaleVariantsForFamily: async () => ([
+        {
+          id: 'variant-en',
+          familyId: 'family-match-1',
+          locale: 'en-us',
+          status: 'live',
+          retiredAtUtc: undefined
+        },
+        {
+          id: 'variant-fr',
+          familyId: 'family-match-1',
+          locale: 'fr-fr',
+          status: 'live',
+          retiredAtUtc: undefined
+        }
+      ]),
+      queryArticleRelationCoverage: async (request: { query: string; workspaceId: string }) => {
+        coverageQueries.push(request.query);
+        return {
+          workspaceId: request.workspaceId,
+          engineVersion: 'article-relations-v2',
+          results: [
+            {
+              familyId: 'family-match-1',
+              localeVariantIds: ['variant-fr', 'variant-en'],
+              title: 'Manage Notifications',
+              externalKey: 'hc:2002',
+              finalScore: 1.44,
+              relationEligible: true,
+              evidence: [
+                {
+                  evidenceType: 'title_fts',
+                  snippet: 'Manage Notifications',
+                  weight: 0.92
+                }
+              ]
+            }
+          ]
+        };
+      },
+      listArticleRelations: async (_workspaceId: string, payload: { familyId?: string }) => {
+        relationFamilyIds.push(payload.familyId ?? '');
+        return {
+          workspaceId: 'workspace-1',
+          seedFamilyIds: payload.familyId ? [payload.familyId] : [],
+          total: 1,
+          relations: [
+            {
+              id: 'relation-1',
+              workspaceId: 'workspace-1',
+              relationType: 'see_also',
+              direction: 'bidirectional',
+              strengthScore: 0.77,
+              status: 'active',
+              origin: 'inferred',
+              createdAtUtc: '2026-04-19T00:00:00.000Z',
+              updatedAtUtc: '2026-04-19T00:00:00.000Z',
+              sourceFamily: {
+                id: 'family-related',
+                title: 'Billing Alerts Overview'
+              },
+              targetFamily: {
+                id: 'family-match-1',
+                title: 'Manage Notifications'
+              },
+              evidence: [
+                {
+                  evidenceType: 'explicit_link',
+                  snippet: 'Links from billing alerts',
+                  weight: 1
+                }
+              ]
+            }
+          ]
+        };
+      }
+    } as never;
+
+    const prefetch = await __commandRegistryTestables.buildPlannerPrefetch(
+      mockRepository,
+      'workspace-1',
+      'batch-1',
+      uploadedPbis
+    );
+
+    expect(coverageQueries.length).toBeGreaterThan(0);
+    expect(relationFamilyIds).toContain('family-match-1');
+    expect(prefetch.articleMatches.some((match) =>
+      match.topResults.some((result) => result.familyId === 'family-match-1')
+    )).toBe(true);
+    const matchedArticle = prefetch.articleMatches.flatMap((match) => match.topResults)
+      .find((result) => result.familyId === 'family-match-1');
+    expect(matchedArticle?.localeVariantId).toBe('variant-en');
+    expect(matchedArticle?.title).toBe('Notification Settings');
+    expect(matchedArticle?.matchContext).toBe('content');
+    expect(matchedArticle?.snippet).toBe('Canonical KB title: Notification Settings');
+    expect(prefetch.relationMatches[0]).toEqual(expect.objectContaining({
+      familyId: 'family-related',
+      title: 'Billing Alerts Overview',
+      relationType: 'see_also'
+    }));
+    expect(prefetch.relationMatches[0]?.typedEvidence?.[0]?.evidenceType).toBe('explicit_link');
+  });
 });

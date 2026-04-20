@@ -366,14 +366,33 @@ export class KbCliLoopbackService {
         const articleId = typeof body.articleId === 'string' ? body.articleId : undefined;
         const familyId = typeof body.familyId === 'string' ? body.familyId : undefined;
         const batchId = typeof body.batchId === 'string' ? body.batchId : undefined;
+        const query = typeof body.query === 'string' ? body.query.trim() : '';
         const limit = clampLimit(body.limit) ?? 10;
         const minScore = typeof body.minScore === 'number' ? body.minScore : undefined;
         const includeEvidence = body.includeEvidence !== false;
 
+        if (query && !articleId && !familyId && !batchId) {
+          const result = await this.workspaceRepository.queryArticleRelationCoverage({
+            workspaceId,
+            query,
+            maxResults: limit,
+            minScore,
+            includeEvidence
+          });
+
+          sendJson(response, 200, {
+            ok: true,
+            ...result,
+            total: result.results.length,
+            results: result.results
+          });
+          return;
+        }
+
         if (!articleId && !familyId && !batchId) {
           sendJson(response, 400, {
             ok: false,
-            error: 'Either articleId, familyId, or batchId is required.'
+            error: 'Either query, articleId, familyId, or batchId is required.'
           });
           return;
         }

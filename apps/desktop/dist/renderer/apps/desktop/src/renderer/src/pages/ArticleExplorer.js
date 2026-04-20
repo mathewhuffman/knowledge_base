@@ -16,6 +16,7 @@ import { CodeEditor } from '../components/editor/CodeEditor';
 import { EditorPane } from '../components/editor/EditorPane';
 import { ArticleModeToggle, ArticleSurface } from '../components/article/ArticleSurface';
 const EXPANDED_FOLDER_STORAGE_KEY_PREFIX = 'kbv.articleExplorer.expandedFolders';
+const ARTICLE_EXPLORER_TARGET_KEY = 'kbv:article-explorer-target';
 const DETAIL_TAB_CONFIG = [
     { id: 'preview', label: 'Preview', icon: IconEye },
     { id: 'source', label: 'Source', icon: IconCode },
@@ -100,6 +101,33 @@ function relationTypeLabel(type) {
 function relationVariant(relation) {
     return relation.origin === 'manual' ? 'primary' : 'neutral';
 }
+function relationEvidenceLabel(type) {
+    switch (type) {
+        case 'explicit_link': return 'Explicit Link';
+        case 'external_key_exact': return 'External Key';
+        case 'alias_exact': return 'Alias Match';
+        case 'title_fts': return 'Title Match';
+        case 'heading_fts': return 'Heading Match';
+        case 'body_chunk_fts': return 'Body Match';
+        case 'same_section': return 'Same Section';
+        case 'same_category': return 'Same Category';
+        case 'manual_note': return 'Manual Note';
+        default:
+            return type.replace(/_/g, ' ');
+    }
+}
+function formatRelationEvidenceMetadata(metadata) {
+    if (!metadata)
+        return null;
+    if (typeof metadata === 'string')
+        return metadata;
+    try {
+        return JSON.stringify(metadata);
+    }
+    catch {
+        return null;
+    }
+}
 function RelationsPanel({ workspaceId, familyId, relations, onChanged, onOpenRelation }) {
     const searchQuery = useIpc('workspace.search');
     const createRelation = useIpcMutation('article.relations.upsert');
@@ -147,7 +175,16 @@ function RelationsPanel({ workspaceId, familyId, relations, onChanged, onOpenRel
     };
     return (_jsxs("div", { style: { display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }, children: [_jsxs("div", { className: "card", children: [_jsx("div", { className: "card-header", children: _jsx("span", { className: "card-header-title", children: "Add Manual Relation" }) }), _jsxs("div", { className: "card-body", style: { display: 'grid', gap: 'var(--space-3)' }, children: [_jsx("input", { className: "input input-sm", placeholder: "Search article title...", value: searchText, onChange: (event) => setSearchText(event.target.value) }), _jsxs("select", { className: "input input-sm", value: selectedFamilyId, onChange: (event) => setSelectedFamilyId(event.target.value), children: [_jsx("option", { value: "", children: "Select article" }), uniqueTargets.map((result) => (_jsx("option", { value: result.familyId, children: result.title }, result.familyId)))] }), _jsx("select", { className: "input input-sm", value: relationType, onChange: (event) => setRelationType(event.target.value), children: Object.values(ArticleRelationType).map((type) => (_jsx("option", { value: type, children: relationTypeLabel(type) }, type))) }), _jsx("button", { className: "btn btn-primary btn-sm", onClick: () => void addRelation(), disabled: !selectedFamilyId || createRelation.loading, children: "Add Relation" }), (createRelation.error || deleteRelation.error) && (_jsx("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-danger)' }, children: createRelation.error ?? deleteRelation.error }))] })] }), relations.length === 0 ? (_jsx(EmptyState, { title: "No relations yet", description: "Run a relation refresh or add a manual relation for this article family." })) : (_jsx("div", { className: "publish-list", children: relations.map((relation) => {
                     const counterpart = relation.sourceFamily.id === familyId ? relation.targetFamily : relation.sourceFamily;
-                    return (_jsxs("div", { className: "publish-card", children: [_jsxs("div", { className: "publish-card-header", children: [_jsx("button", { className: "btn btn-ghost btn-sm", style: { padding: 0, fontWeight: 'var(--weight-semibold)' }, onClick: () => void onOpenRelation(counterpart.id), title: `Open ${counterpart.title}`, children: counterpart.title }), _jsxs("div", { style: { display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }, children: [_jsx(Badge, { variant: relationVariant(relation), children: relation.origin }), _jsx(Badge, { variant: "neutral", children: relationTypeLabel(relation.relationType) }), _jsx("button", { className: "btn btn-ghost btn-xs", onClick: () => void removeRelation(relation), children: "Remove" })] })] }), _jsxs("div", { className: "publish-card-meta", children: ["Score ", Math.round(relation.strengthScore * 100), "%"] }), relation.evidence.length > 0 && (_jsx("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginTop: 'var(--space-2)', lineHeight: 1.5 }, children: relation.evidence.slice(0, 2).map((evidence) => evidence.snippet).filter(Boolean).join(' • ') }))] }, relation.id));
+                    return (_jsxs("div", { className: "publish-card", children: [_jsxs("div", { className: "publish-card-header", children: [_jsx("button", { className: "btn btn-ghost btn-sm", style: { padding: 0, fontWeight: 'var(--weight-semibold)' }, onClick: () => void onOpenRelation(counterpart.id), title: `Open ${counterpart.title}`, children: counterpart.title }), _jsxs("div", { style: { display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }, children: [_jsx(Badge, { variant: relationVariant(relation), children: relation.origin }), _jsx(Badge, { variant: "neutral", children: relationTypeLabel(relation.relationType) }), _jsx("button", { className: "btn btn-ghost btn-xs", onClick: () => void removeRelation(relation), children: "Remove" })] })] }), _jsxs("div", { className: "publish-card-meta", children: ["Score ", Math.round(relation.strengthScore * 100), "%"] }), relation.evidence.length > 0 && (_jsx("div", { style: { display: 'grid', gap: 'var(--space-2)', marginTop: 'var(--space-3)' }, children: relation.evidence.slice(0, 5).map((evidence) => {
+                                    const metadataText = formatRelationEvidenceMetadata(evidence.metadata);
+                                    return (_jsxs("div", { style: {
+                                            border: '1px solid rgba(15, 23, 42, 0.08)',
+                                            borderRadius: 10,
+                                            padding: 'var(--space-2)',
+                                            display: 'grid',
+                                            gap: 4
+                                        }, children: [_jsxs("div", { style: { display: 'flex', justifyContent: 'space-between', gap: 'var(--space-2)' }, children: [_jsx(Badge, { variant: "neutral", children: relationEvidenceLabel(evidence.evidenceType) }), _jsxs("span", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }, children: ["weight ", evidence.weight.toFixed(2)] })] }), evidence.snippet ? (_jsx("div", { style: { fontSize: 'var(--text-sm)', lineHeight: 1.5 }, children: evidence.snippet })) : null, evidence.sourceRef ? (_jsxs("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }, children: ["source: ", evidence.sourceRef] })) : null, metadataText ? (_jsxs("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }, children: ["meta: ", metadataText] })) : null] }, evidence.id));
+                                }) }))] }, relation.id));
                 }) }))] }));
 }
 /* ---------- Article AI Chat Tab ---------- */
@@ -842,6 +879,30 @@ export const ArticleExplorer = () => {
         }
         await openArticleDetail(node, 'relations');
     }, [tree, openArticleDetail]);
+    useEffect(() => {
+        if (!activeWorkspace || tree.length === 0) {
+            return;
+        }
+        const rawTarget = window.sessionStorage.getItem(ARTICLE_EXPLORER_TARGET_KEY);
+        if (!rawTarget) {
+            return;
+        }
+        window.sessionStorage.removeItem(ARTICLE_EXPLORER_TARGET_KEY);
+        try {
+            const parsed = JSON.parse(rawTarget);
+            if (!parsed.familyId) {
+                return;
+            }
+            const node = tree.find((item) => item.familyId === parsed.familyId);
+            if (!node) {
+                return;
+            }
+            void openArticleDetail(node, parsed.tab ?? 'preview', parsed.localeVariantId);
+        }
+        catch {
+            window.sessionStorage.removeItem(ARTICLE_EXPLORER_TARGET_KEY);
+        }
+    }, [activeWorkspace?.id, openArticleDetail, tree]);
     useEffect(() => {
         if (!detailPanel.detail)
             return;

@@ -1462,6 +1462,88 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createAssistantChatDirectInvalidActionAcpBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'fake-agent-assistant-chat-direct-invalid-action');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-assistant-direct-invalid-action';
+let promptCount = 0;
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize' || message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    promptCount += 1;
+    if (promptCount === 1) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          text: JSON.stringify({
+            completionState: 'needs_action',
+            isFinal: false,
+            action: {
+              id: 'assistant-direct-invalid-action-1',
+              type: 'list_sections',
+              args: {
+                categoryId: 42
+              }
+            }
+          })
+        }
+      }) + '\\n');
+      return;
+    }
+
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        text: JSON.stringify({
+          command: 'none',
+          artifactType: 'informational_response',
+          completionState: 'completed',
+          isFinal: true,
+          response: 'I need the locale before I can list sections for that category.'
+        })
+      }
+    }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
 async function createAssistantChatDirectPatchFormAcpBinary(root: string, logPath: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-agent-assistant-chat-direct-patch-form');
   const source = `#!/usr/bin/env node
@@ -3238,11 +3320,83 @@ test.describe('agent runtime provider modes', () => {
       const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
       expect(firstPromptText).toContain('route-aware assistant in Direct mode');
       expect(firstPromptText).toContain('Allowed direct action types');
+      expect(firstPromptText).toContain('`get_explorer_tree`');
+      expect(firstPromptText).toContain('Args: `locale` and integer `categoryId`');
       expect(firstPromptText).toContain('needs_action');
       expect(firstPromptText).not.toContain('kb search-kb');
+      expect(firstPromptText).not.toContain('MCP tools');
+      expect(firstPromptText).not.toContain('kb CLI commands');
       expect(firstPromptText).not.toContain('`app_patch_form`');
       expect(secondPromptText).toContain('"type": "action_result"');
       expect(promptRequests[0]?.params?.sessionId).toBe(promptRequests[1]?.params?.sessionId);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('direct assistant chat rejects malformed direct action args before hitting the executor', async () => {
+    const logPath = path.join(tempRoot, 'assistant-direct-invalid-action-log.jsonl');
+    const binaryPath = await createAssistantChatDirectInvalidActionAcpBinary(tempRoot, logPath);
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = tempRoot;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const directActions: Array<{ type: string }> = [];
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for assistant chat, article edit, and batch analysis'
+      }),
+      executeDirectAction: async (request) => {
+        directActions.push({
+          type: request.action.type
+        });
+        return {
+          actionId: request.action.id,
+          ok: true,
+          data: {
+            sections: []
+          }
+        };
+      }
+    });
+
+    try {
+      const result = await runtime.runAssistantChat(
+        {
+          workspaceId: 'workspace-1',
+          localeVariantId: 'locale-variant-1',
+          kbAccessMode: 'direct',
+          prompt: 'Route: kb_vault_home\nFind sections for the article.',
+          timeoutMs: 10_000
+        },
+        () => undefined,
+        () => false
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result.completionState).toBe('completed');
+      expect(result.isFinal).toBe(true);
+      expect(directActions).toEqual([]);
+      expect(result.toolCalls).toEqual([
+        expect.objectContaining({
+          toolName: 'direct.list_sections',
+          allowed: false,
+          reason: 'Invalid args for direct action list_sections: locale is required'
+        })
+      ]);
+
+      const requests = await readLoggedRequests(logPath);
+      const promptRequests = requests.filter((entry) => entry.method === 'session/prompt');
+      expect(promptRequests).toHaveLength(2);
+      const secondPromptText = ((promptRequests[1]?.params?.prompt as Array<{ text?: string }> | undefined) ?? [])[0]?.text ?? '';
+      expect(secondPromptText).toContain('"code":"INVALID_DIRECT_ACTION_INPUT"');
+      expect(secondPromptText).toContain('locale is required');
     } finally {
       await runtime.stop();
     }

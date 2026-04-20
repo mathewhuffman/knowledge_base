@@ -6,6 +6,7 @@ var AppRoute;
     AppRoute["WORKSPACE_SWITCHER"] = "workspace_switcher";
     AppRoute["KB_VAULT_HOME"] = "kb_vault_home";
     AppRoute["ARTICLE_EXPLORER"] = "article_explorer";
+    AppRoute["RELATIONS_GRAPH"] = "relations_graph";
     AppRoute["PBI_BATCHES"] = "pbi_batches";
     AppRoute["PBI_LIBRARY"] = "pbi_library";
     AppRoute["PROPOSAL_REVIEW"] = "proposal_review";

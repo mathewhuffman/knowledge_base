@@ -195,6 +195,7 @@ const ROUTE_LABELS: Record<AppRoute, string> = {
   [AppRoute.WORKSPACE_SWITCHER]: 'Workspace Switcher',
   [AppRoute.KB_VAULT_HOME]: 'KB Vault Home',
   [AppRoute.ARTICLE_EXPLORER]: 'Article Explorer',
+  [AppRoute.RELATIONS_GRAPH]: 'Feature Map',
   [AppRoute.PBI_BATCHES]: 'PBI Batches',
   [AppRoute.PBI_LIBRARY]: 'PBI Library',
   [AppRoute.PROPOSAL_REVIEW]: 'Proposal Review',

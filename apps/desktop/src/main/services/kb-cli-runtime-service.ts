@@ -430,8 +430,9 @@ async function resolveArticle(workspaceId, options, command, jsonMode) {
         const batchId = getString(options, 'batchId');
         const articleId = getString(options, 'articleId', 'localeVariantId');
         const familyId = getString(options, 'familyId');
-        if (!batchId && !articleId && !familyId) {
-          fail(command, '--batch-id, --family-id, or --article-id is required', 'VALIDATION_ERROR', jsonMode);
+        const query = getString(options, 'query', 'q');
+        if (!batchId && !articleId && !familyId && !query) {
+          fail(command, '--query, --batch-id, --family-id, or --article-id is required', 'VALIDATION_ERROR', jsonMode);
         }
         const limit = getString(options, 'limit');
         const minScore = getString(options, 'minScore');
@@ -440,6 +441,7 @@ async function resolveArticle(workspaceId, options, command, jsonMode) {
           '/workspaces/' + encodeURIComponent(workspaceId) + '/articles/related',
           undefined,
           {
+            ...(query ? { query } : {}),
             ...(batchId ? { batchId } : {}),
             ...(articleId ? { articleId } : {}),
             ...(familyId ? { familyId } : {}),

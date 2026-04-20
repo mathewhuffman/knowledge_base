@@ -3,6 +3,9 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import {
   AppRoute,
+  DIRECT_ACTION_DEFINITIONS,
+  DIRECT_ASSISTANT_READ_ACTION_TYPES,
+  DIRECT_ASSISTANT_TEMPLATE_ACTION_TYPES,
   PBIImportFormat,
   PBIBatchScopeMode,
   ProposalAction,
@@ -68,7 +71,7 @@ function buildAssistantChatCompletionFollowupPrompt(kbAccessMode: KbAccessMode):
     ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
     : kbAccessMode === 'cli'
       ? 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
-      : 'If you still need KB access or a confirmed app mutation, return exactly one `needs_action` direct-action JSON envelope instead of using MCP tools, CLI commands, terminal commands, or filesystem exploration in this follow-up.';
+      : 'If one final KB lookup or confirmed app mutation is still required, return exactly one `needs_action` direct-action JSON envelope in this follow-up. Do not describe transport internals or ad-hoc environment exploration.';
 
   return [
     'Complete the same user request using the research already gathered in this session.',
@@ -76,6 +79,30 @@ function buildAssistantChatCompletionFollowupPrompt(kbAccessMode: KbAccessMode):
     'Do not send a progress update.',
     lookupInstruction
   ].join(' ');
+}
+
+function contextAllowsDirectPatchForm(context: AiViewContext): boolean {
+  return context.route === AppRoute.TEMPLATES_AND_PROMPTS
+    && context.subject?.type === 'template_pack'
+    && context.capabilities.canPatchTemplate;
+}
+
+function buildDirectAssistantActionGuide(context: AiViewContext): string[] {
+  const actionTypes = contextAllowsDirectPatchForm(context)
+    ? DIRECT_ASSISTANT_TEMPLATE_ACTION_TYPES
+    : DIRECT_ASSISTANT_READ_ACTION_TYPES;
+
+  return [
+    'Direct actions available in this route:',
+    ...actionTypes.map((actionType) => {
+      const definition = DIRECT_ACTION_DEFINITIONS[actionType];
+      if (!definition) {
+        return `- \`${actionType}\``;
+      }
+      const usage = definition.usageHint ? ` Guidance: ${definition.usageHint}` : '';
+      return `- \`${actionType}\`: ${definition.description} Args: ${definition.argsHint}${usage}`;
+    })
+  ];
 }
 
 interface AiSessionRow {
@@ -889,6 +916,7 @@ export class AiAssistantService {
     kbAccessMode: KbAccessMode
   ): string {
     const allowedArtifacts = this.allowedArtifactTypes(context);
+    const directActionGuide = kbAccessMode === 'direct' ? buildDirectAssistantActionGuide(context) : [];
     const isArticleChangeRequest =
       context.subject?.type === 'article'
       && context.capabilities.canCreateProposal
@@ -922,11 +950,14 @@ export class AiAssistantService {
             '- If the answer is already clear from the provided context, answer immediately without requesting a direct action.',
             '- If workspace knowledge is needed, request the minimum direct KB action needed to answer accurately.',
             '- For app-feature, workflow, or terminology questions, default to this sequence: request `search_kb`, then request `get_article` for the best 1-3 matches, then answer the user clearly.',
+            '- If `search_kb` returns no useful matches, request `get_explorer_tree` so you can browse article titles, localeVariantIds, and revisionIds before choosing an article.',
             '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and return the final findings in the same turn. Do not stop on a progress update.',
             '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply.',
-            '- When research or data lookup is needed, return a `needs_action` envelope instead of using MCP tools, kb CLI commands, terminal commands, list_mcp_resources, fetch_mcp_resource, Read File, grep, codebase search, or filesystem exploration.',
+            '- When research or data lookup is needed, return a `needs_action` envelope instead of attempting any ad-hoc environment or transport exploration.',
             '- Prefer `search_kb` first and `get_article` second for ordinary user questions about the app.',
+            '- `search_kb` requires a real `query` or explicit ids. Do not send it with empty args.',
             '- Use `get_article_family` only when one clearly relevant article needs family or locale context.',
+            '- `list_categories` requires `locale`. `list_sections` requires both `locale` and integer `categoryId`; only request `list_sections` after you already know the categoryId.',
             '- Use `get_batch_context`, `find_related_articles`, and `patch_form` only when the route or user request clearly requires them.',
             '- Do not request actions just to decide what to do next.'
           ]
@@ -1062,7 +1093,8 @@ export class AiAssistantService {
       ...(kbAccessMode === 'direct'
         ? [
             '- In Direct mode, if you need KB access or a confirmed app mutation, return a separate JSON object with `completionState="needs_action"`, `isFinal=false`, and one `action` object instead of calling tools.',
-            '- After the app returns an `action_result`, continue and return either another `needs_action` envelope or the final assistant JSON object.'
+            '- After the app returns an `action_result`, continue and return either another `needs_action` envelope or the final assistant JSON object.',
+            ...directActionGuide
           ]
         : []),
       '- Any mutating result must include an explicit command and valid JSON. Without a valid command, the result will be treated as informational_response.',
@@ -1301,10 +1333,7 @@ export class AiAssistantService {
     const localeVariantId = extractString(backing.localeVariantId)
       ?? (context.subject?.type === 'article' ? context.subject.id : undefined);
     const familyId = extractString(backing.familyId);
-    const canPatchTemplate =
-      context.route === AppRoute.TEMPLATES_AND_PROMPTS
-      && context.subject?.type === 'template_pack'
-      && context.capabilities.canPatchTemplate;
+    const canPatchTemplate = contextAllowsDirectPatchForm(context);
 
     return {
       route: context.route,

@@ -105,6 +105,15 @@ class KbActionService {
         });
     }
     async findRelatedArticles(input) {
+        if (input.query?.trim() && !input.articleId && !input.familyId && !input.batchId) {
+            return this.deps.workspaceRepository.queryArticleRelationCoverage({
+                workspaceId: input.workspaceId,
+                query: input.query.trim(),
+                maxResults: input.max,
+                minScore: input.minScore,
+                includeEvidence: input.includeEvidence
+            });
+        }
         if (input.articleId || input.familyId || input.batchId) {
             return this.deps.workspaceRepository.listArticleRelations(input.workspaceId, {
                 workspaceId: input.workspaceId,
@@ -116,35 +125,10 @@ class KbActionService {
                 includeEvidence: input.includeEvidence
             });
         }
-        if (input.query?.trim()) {
-            const search = await this.deps.workspaceRepository.searchArticles(input.workspaceId, {
-                workspaceId: input.workspaceId,
-                query: input.query,
-                scope: 'all',
-                includeArchived: true
-            });
-            const top = search.results[0];
-            if (!top) {
-                return {
-                    workspaceId: input.workspaceId,
-                    seedFamilyIds: [],
-                    total: 0,
-                    relations: []
-                };
-            }
-            return this.deps.workspaceRepository.listArticleRelations(input.workspaceId, {
-                workspaceId: input.workspaceId,
-                familyId: top.familyId,
-                limit: input.max,
-                minScore: input.minScore,
-                includeEvidence: input.includeEvidence
-            });
-        }
         return {
             workspaceId: input.workspaceId,
-            seedFamilyIds: [],
-            total: 0,
-            relations: []
+            engineVersion: 'article-relations-v2',
+            results: []
         };
     }
     async listCategories(input) {

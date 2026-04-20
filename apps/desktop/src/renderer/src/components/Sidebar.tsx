@@ -7,6 +7,7 @@ import {
   IconArchive,
   IconCheckCircle,
   IconGitBranch,
+  IconLayers,
   IconSend,
   IconLayout,
   IconSettings,
@@ -34,6 +35,7 @@ interface NavItem {
 const mainNav: NavItem[] = [
   { id: AppRoute.KB_VAULT_HOME,   label: 'Home',            icon: <IconHome /> },
   { id: AppRoute.ARTICLE_EXPLORER, label: 'Articles',       icon: <IconFolder /> },
+  { id: AppRoute.RELATIONS_GRAPH, label: 'Feature Map', icon: <IconLayers /> },
   { id: AppRoute.PBI_BATCHES,     label: 'PBI Batches',     icon: <IconUpload /> },
   { id: AppRoute.PBI_LIBRARY,     label: 'PBI Library',     icon: <IconArchive /> },
   { id: AppRoute.PROPOSAL_REVIEW, label: 'Proposal Review', icon: <IconCheckCircle /> },
