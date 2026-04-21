@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.KB_ACCESS_MODES = exports.ArticleRelationFeedbackSource = exports.ArticleRelationFeedbackType = exports.ArticleRelationIndexStateStatus = exports.ArticleRelationEvidenceType = exports.ArticleRelationStatus = exports.ArticleRelationOrigin = exports.ArticleRelationDirection = exports.ArticleRelationType = exports.PublishStatus = exports.PBIValidationStatus = exports.PBIImportFormat = exports.PBIBatchScopeMode = exports.PBIBatchStatus = exports.ProposalDecision = exports.ProposalAction = exports.RevisionStatus = exports.RevisionState = exports.WorkspaceState = void 0;
+exports.ZENDESK_PLACEHOLDER_ASSET_POLICIES = exports.ZENDESK_RETIREMENT_STRATEGIES = exports.KB_ACCESS_MODES = exports.ArticleRelationFeedbackSource = exports.ArticleRelationFeedbackType = exports.ArticleRelationIndexStateStatus = exports.ArticleRelationEvidenceType = exports.ArticleRelationStatus = exports.ArticleRelationOrigin = exports.ArticleRelationDirection = exports.ArticleRelationType = exports.PublishStatus = exports.PBIValidationStatus = exports.PBIImportFormat = exports.PBIBatchScopeMode = exports.PBIBatchStatus = exports.ProposalDecision = exports.ProposalAction = exports.RevisionStatus = exports.RevisionState = exports.WorkspaceState = void 0;
 exports.isKbAccessMode = isKbAccessMode;
 var WorkspaceState;
 (function (WorkspaceState) {
@@ -132,6 +132,8 @@ var ArticleRelationFeedbackSource;
     ArticleRelationFeedbackSource["SYSTEM"] = "system";
 })(ArticleRelationFeedbackSource || (exports.ArticleRelationFeedbackSource = ArticleRelationFeedbackSource = {}));
 exports.KB_ACCESS_MODES = ['direct', 'mcp', 'cli'];
+exports.ZENDESK_RETIREMENT_STRATEGIES = ['archive'];
+exports.ZENDESK_PLACEHOLDER_ASSET_POLICIES = ['block', 'upload'];
 function isKbAccessMode(value) {
     return typeof value === 'string' && exports.KB_ACCESS_MODES.includes(value);
 }

@@ -593,8 +593,9 @@ class BatchAnalysisOrchestrator {
             'If a deterministic prefetch query already returned zero meaningful matches, treat that zero-result evidence as final unless you have a materially different query.',
             'If a question can be resolved by revising the plan with the existing evidence, revise the plan and do not emit a user-input question.',
             'Emit `requiresUserInput: true` only when the user must decide scope, intent, sequencing, or another product decision the planner cannot infer safely.',
-            'Every create plan item must include `suggestedPlacement` with a stable `categoryId`. Include `categoryName` plus optional `sectionId` and `sectionName` when the article belongs in a section.',
-            'For create placement, use existing article evidence first and call `list_categories` or `list_sections` only when you need authoritative Zendesk placement IDs or need to verify a section choice.',
+            'Every create plan item must include `suggestedPlacement` with both category and section placement. When the target taxonomy already exists in Zendesk, include authoritative `categoryId` and `sectionId`. When you intend to create a new category or section, include deterministic `categoryName` and `sectionName` instead of leaving placement blank.',
+            'Use the live Zendesk taxonomy included in deterministic planner prefetch as the authoritative source of existing categories and sections.',
+            'For create placement, use existing article placement evidence first. If no existing Zendesk section is a clear fit, explicitly propose the new section (and category if needed) by name so publish can create it later.',
             hasUserDirectives
                 ? 'User directives inside the batch context summary are mandatory. Guaranteed edit families must be represented by concrete edit items for each listed live locale variant, guaranteed creates must preserve their requested `targetLocale` and any requested placement, and create-versus-edit ambiguity on a guaranteed create must be surfaced as user input instead of guessed.'
                 : '',
@@ -663,7 +664,7 @@ class BatchAnalysisOrchestrator {
             'Reserve `needs_human_review` for issues that cannot be reduced to concrete user-answerable questions.',
             'If you return `needs_user_input`, include at least one final structured question with `requiresUserInput: true` and `status: "pending"`.',
             'Do not execute proposals or mutate KB content in this stage.',
-            'Do not approve create plan items that still omit a stable category placement. Section placement is optional, but when a section is proposed it should be represented with authoritative Zendesk IDs.',
+            'Do not approve create plan items that omit deterministic category or section placement. Existing Zendesk taxonomy should use authoritative IDs; new taxonomy should still include explicit `categoryName` and `sectionName`.',
             hasUserDirectives
                 ? 'Treat batch-context user directives as hard requirements. Do not approve a plan that drops guaranteed edit locales, guaranteed creates, or requested guaranteed-create placement, and pause for user input instead of guessing when a guaranteed create conflicts with an existing live article.'
                 : '',
@@ -877,6 +878,36 @@ class BatchAnalysisOrchestrator {
             legacyOpenQuestions: parsed.openQuestions,
             sourceRole: 'planner'
         });
+        const normalizedItems = items.map((item) => {
+            const normalizedPlacement = normalizeBatchPlanPlacement(item.suggestedPlacement);
+            return {
+                ...item,
+                targetTitle: humanizeReadableText(item.targetTitle),
+                targetLocale: typeof item.targetLocale === 'string' && item.targetLocale.trim()
+                    ? item.targetLocale.trim().toLowerCase()
+                    : undefined,
+                suggestedPlacement: item.action === 'create'
+                    ? resolveDeterministicCreatePlanPlacement({
+                        item: {
+                            ...item,
+                            targetTitle: humanizeReadableText(item.targetTitle),
+                            targetLocale: typeof item.targetLocale === 'string' && item.targetLocale.trim()
+                                ? item.targetLocale.trim().toLowerCase()
+                                : undefined,
+                            suggestedPlacement: normalizedPlacement
+                        },
+                        plannerPrefetch: params.plannerPrefetch
+                    })
+                    : normalizedPlacement,
+                reason: humanizeReadableText(item.reason),
+                evidence: Array.isArray(item.evidence)
+                    ? item.evidence.map((evidence) => ({
+                        ...evidence,
+                        summary: humanizeReadableText(evidence.summary)
+                    }))
+                    : []
+            };
+        });
         return {
             id: (0, node_crypto_1.randomUUID)(),
             workspaceId: params.workspaceId,
@@ -889,21 +920,7 @@ class BatchAnalysisOrchestrator {
             planVersion: params.planVersion,
             summary: typeof parsed.summary === 'string' ? humanizeReadableText(parsed.summary) : `Plan version ${params.planVersion}`,
             coverage: coverage.map((item) => normalizePlanCoverage(item)),
-            items: items.map((item) => ({
-                ...item,
-                targetTitle: humanizeReadableText(item.targetTitle),
-                targetLocale: typeof item.targetLocale === 'string' && item.targetLocale.trim()
-                    ? item.targetLocale.trim().toLowerCase()
-                    : undefined,
-                suggestedPlacement: normalizeBatchPlanPlacement(item.suggestedPlacement),
-                reason: humanizeReadableText(item.reason),
-                evidence: Array.isArray(item.evidence)
-                    ? item.evidence.map((evidence) => ({
-                        ...evidence,
-                        summary: humanizeReadableText(evidence.summary)
-                    }))
-                    : []
-            })),
+            items: normalizedItems,
             questions,
             openQuestions: serializeOpenQuestionPrompts(questions, parsed.openQuestions),
             createdAtUtc: new Date().toISOString(),
@@ -1192,7 +1209,7 @@ class BatchAnalysisOrchestrator {
             'Use `create_proposals` as soon as you have enough content for one or more approved items, and batch proposal writes whenever practical.',
             'For approved edit/retire items, `create_proposals` may persist with `localeVariantId`, `familyId`, or `targetTitle` using the authoritative target already supplied in the plan.',
             'For approved create items, persist with `targetTitle` directly. Do not spend lookup turns trying to discover a localeVariantId for net-new work first.',
-            'Preserve any approved `suggestedPlacement` when you call `create_proposals`. If a create item somehow reaches execution without authoritative placement IDs, resolve that placement before persisting the proposal.',
+            'Preserve any approved `suggestedPlacement` when you call `create_proposals`. Create items must keep deterministic category and section placement, whether that is existing Zendesk IDs or explicit new category/section names to be created later.',
             hasUserDirectives
                 ? 'If a create plan item includes `targetLocale`, preserve that locale in the persisted proposal. User directives embedded in the batch context remain mandatory during execution, including any requested guaranteed-create placement.'
                 : '',
@@ -1348,8 +1365,8 @@ class BatchAnalysisOrchestrator {
             if (item.action !== 'create') {
                 continue;
             }
-            if (!normalizePlacementScopeId(item.suggestedPlacement?.categoryId)) {
-                reasons.push(`Create plan item ${item.planItemId} (${item.targetTitle}) is missing suggested category placement with an authoritative categoryId.`);
+            if (!hasDeterministicCreatePlacement(item.suggestedPlacement)) {
+                reasons.push(`Create plan item ${item.planItemId} (${item.targetTitle}) is missing deterministic category and section placement.`);
             }
         }
         return { ok: reasons.length === 0, reasons };
@@ -2174,7 +2191,8 @@ function compactPlannerPrefetchForPrompt(prefetch) {
                 localeVariantId: result.localeVariantId,
                 score: result.score,
                 matchContext: result.matchContext ?? null,
-                snippet: truncatePromptText(result.snippet, 160)
+                snippet: truncatePromptText(result.snippet, 160),
+                placement: compactPlacementForPrompt(result.placement)
             }))
         })),
         relationMatches: relationMatches.slice(0, 12).map((match) => ({
@@ -2183,7 +2201,20 @@ function compactPlannerPrefetchForPrompt(prefetch) {
             strengthScore: match.strengthScore,
             relationType: match.relationType,
             evidence: match.evidence.slice(0, 3).map((item) => truncatePromptText(item, 140))
-        }))
+        })),
+        zendeskTaxonomy: prefetch.zendeskTaxonomy
+            ? {
+                locale: prefetch.zendeskTaxonomy.locale,
+                categories: prefetch.zendeskTaxonomy.categories.map((category) => ({
+                    categoryId: category.categoryId,
+                    categoryName: category.categoryName,
+                    sections: category.sections.map((section) => ({
+                        sectionId: section.sectionId,
+                        sectionName: section.sectionName
+                    }))
+                }))
+            }
+            : null
     };
 }
 function compactWorkerReportForPrompt(report) {
@@ -2607,18 +2638,284 @@ function normalizeBatchPlanPlacement(value) {
     };
     return Object.values(placement).some(Boolean) ? placement : undefined;
 }
+function normalizePlacementNameForLookup(value) {
+    return value?.trim().toLowerCase().replace(/\s+/g, ' ') ?? '';
+}
+function buildPlannerTaxonomyIndex(prefetch) {
+    const categoriesById = new Map();
+    const categoryIdsByName = new Map();
+    const sectionsById = new Map();
+    const sectionsByCategoryId = new Map();
+    const sectionsByName = new Map();
+    for (const category of prefetch?.zendeskTaxonomy?.categories ?? []) {
+        const categoryId = normalizePlacementScopeId(category.categoryId);
+        const categoryName = normalizePromptString(category.categoryName);
+        if (!categoryId || !categoryName) {
+            continue;
+        }
+        categoriesById.set(categoryId, { categoryName });
+        const categoryNameKey = normalizePlacementNameForLookup(categoryName);
+        if (categoryNameKey) {
+            const existingCategoryIds = categoryIdsByName.get(categoryNameKey) ?? [];
+            existingCategoryIds.push(categoryId);
+            categoryIdsByName.set(categoryNameKey, existingCategoryIds);
+        }
+        for (const section of category.sections ?? []) {
+            const sectionId = normalizePlacementScopeId(section.sectionId);
+            const sectionName = normalizePromptString(section.sectionName);
+            if (!sectionId || !sectionName) {
+                continue;
+            }
+            const entry = {
+                sectionId,
+                sectionName,
+                categoryId,
+                categoryName
+            };
+            sectionsById.set(sectionId, entry);
+            const categorySections = sectionsByCategoryId.get(categoryId) ?? [];
+            categorySections.push(entry);
+            sectionsByCategoryId.set(categoryId, categorySections);
+            const sectionNameKey = normalizePlacementNameForLookup(sectionName);
+            if (sectionNameKey) {
+                const namedSections = sectionsByName.get(sectionNameKey) ?? [];
+                namedSections.push(entry);
+                sectionsByName.set(sectionNameKey, namedSections);
+            }
+        }
+    }
+    return {
+        categoriesById,
+        categoryIdsByName,
+        sectionsById,
+        sectionsByCategoryId,
+        sectionsByName
+    };
+}
+function resolvePlacementAgainstPlannerTaxonomy(placement, taxonomy) {
+    if (!placement) {
+        return undefined;
+    }
+    let categoryId = normalizePlacementScopeId(placement.categoryId) || undefined;
+    let categoryName = normalizePromptString(placement.categoryName);
+    let sectionId = normalizePlacementScopeId(placement.sectionId) || undefined;
+    let sectionName = normalizePromptString(placement.sectionName);
+    const articleTitle = normalizePromptString(placement.articleTitle);
+    const parentArticleId = normalizePromptString(placement.parentArticleId);
+    const notes = normalizePromptString(placement.notes);
+    if (sectionId) {
+        const sectionEntry = taxonomy.sectionsById.get(sectionId);
+        if (sectionEntry) {
+            sectionName = sectionName ?? sectionEntry.sectionName;
+            categoryId = categoryId ?? sectionEntry.categoryId;
+            categoryName = categoryName ?? sectionEntry.categoryName;
+        }
+    }
+    if (!categoryId && categoryName) {
+        const matchingCategoryIds = taxonomy.categoryIdsByName.get(normalizePlacementNameForLookup(categoryName)) ?? [];
+        if (matchingCategoryIds.length === 1) {
+            categoryId = matchingCategoryIds[0];
+        }
+    }
+    if (categoryId) {
+        categoryName = categoryName ?? taxonomy.categoriesById.get(categoryId)?.categoryName;
+    }
+    if (!sectionId && sectionName) {
+        const normalizedSectionName = normalizePlacementNameForLookup(sectionName);
+        let matchingSections = [];
+        if (categoryId) {
+            matchingSections = (taxonomy.sectionsByCategoryId.get(categoryId) ?? [])
+                .filter((entry) => normalizePlacementNameForLookup(entry.sectionName) === normalizedSectionName);
+        }
+        if (matchingSections.length === 0 && categoryName) {
+            const matchingCategoryIds = categoryId
+                ? [categoryId]
+                : (taxonomy.categoryIdsByName.get(normalizePlacementNameForLookup(categoryName)) ?? []);
+            matchingSections = matchingCategoryIds
+                .flatMap((candidateCategoryId) => taxonomy.sectionsByCategoryId.get(candidateCategoryId) ?? [])
+                .filter((entry) => normalizePlacementNameForLookup(entry.sectionName) === normalizedSectionName);
+        }
+        if (matchingSections.length === 0) {
+            matchingSections = taxonomy.sectionsByName.get(normalizedSectionName) ?? [];
+        }
+        if (matchingSections.length === 1) {
+            const [sectionEntry] = matchingSections;
+            sectionId = sectionEntry.sectionId;
+            sectionName = sectionName ?? sectionEntry.sectionName;
+            categoryId = categoryId ?? sectionEntry.categoryId;
+            categoryName = categoryName ?? sectionEntry.categoryName;
+        }
+    }
+    if (!sectionId && !sectionName && categoryId) {
+        const categorySections = taxonomy.sectionsByCategoryId.get(categoryId) ?? [];
+        if (categorySections.length === 1) {
+            const [sectionEntry] = categorySections;
+            sectionId = sectionEntry.sectionId;
+            sectionName = sectionEntry.sectionName;
+            categoryName = categoryName ?? sectionEntry.categoryName;
+        }
+    }
+    const resolved = {
+        ...(categoryId ? { categoryId } : {}),
+        ...(categoryName ? { categoryName } : {}),
+        ...(sectionId ? { sectionId } : {}),
+        ...(sectionName ? { sectionName } : {}),
+        ...(articleTitle ? { articleTitle } : {}),
+        ...(parentArticleId ? { parentArticleId } : {}),
+        ...(notes ? { notes } : {})
+    };
+    return Object.values(resolved).some(Boolean) ? resolved : undefined;
+}
+function mergePlacementSuggestions(base, inferred) {
+    if (!base && !inferred) {
+        return undefined;
+    }
+    const merged = {
+        categoryId: base?.categoryId ?? inferred?.categoryId,
+        categoryName: base?.categoryName ?? inferred?.categoryName,
+        sectionId: base?.sectionId ?? inferred?.sectionId,
+        sectionName: base?.sectionName ?? inferred?.sectionName,
+        articleTitle: base?.articleTitle ?? inferred?.articleTitle,
+        parentArticleId: base?.parentArticleId ?? inferred?.parentArticleId,
+        notes: base?.notes ?? inferred?.notes
+    };
+    return Object.values(merged).some(Boolean) ? merged : undefined;
+}
+function hasDeterministicCreatePlacement(placement) {
+    const categoryId = normalizePlacementScopeId(placement?.categoryId);
+    const categoryName = normalizePromptString(placement?.categoryName);
+    const sectionId = normalizePlacementScopeId(placement?.sectionId);
+    const sectionName = normalizePromptString(placement?.sectionName);
+    return Boolean((categoryId || categoryName) && (sectionId || sectionName));
+}
+function placementMatchesHint(placement, hint) {
+    if (!hint) {
+        return true;
+    }
+    const hintCategoryId = normalizePlacementScopeId(hint.categoryId);
+    const hintCategoryName = normalizePlacementNameForLookup(hint.categoryName);
+    const hintSectionId = normalizePlacementScopeId(hint.sectionId);
+    const hintSectionName = normalizePlacementNameForLookup(hint.sectionName);
+    const placementCategoryId = normalizePlacementScopeId(placement?.categoryId);
+    const placementCategoryName = normalizePlacementNameForLookup(placement?.categoryName);
+    const placementSectionId = normalizePlacementScopeId(placement?.sectionId);
+    const placementSectionName = normalizePlacementNameForLookup(placement?.sectionName);
+    if (hintCategoryId && placementCategoryId && placementCategoryId !== hintCategoryId) {
+        return false;
+    }
+    if (!hintCategoryId && hintCategoryName && placementCategoryName && placementCategoryName !== hintCategoryName) {
+        return false;
+    }
+    if (hintSectionId && placementSectionId && placementSectionId !== hintSectionId) {
+        return false;
+    }
+    if (!hintSectionId && hintSectionName && placementSectionName && placementSectionName !== hintSectionName) {
+        return false;
+    }
+    return true;
+}
+function buildPlacementCandidateKey(placement) {
+    const categoryKey = normalizePlacementScopeId(placement.categoryId)
+        || normalizePlacementNameForLookup(placement.categoryName)
+        || '__none__';
+    const sectionKey = normalizePlacementScopeId(placement.sectionId)
+        || normalizePlacementNameForLookup(placement.sectionName)
+        || '__none__';
+    return `${categoryKey}::${sectionKey}`;
+}
+function collectStrongPlacementMatchesForPlanItem(item, plannerPrefetch, taxonomy, hint) {
+    if (!plannerPrefetch) {
+        return [];
+    }
+    const planPbiIds = new Set(item.pbiIds.map((pbiId) => pbiId.trim()).filter(Boolean));
+    const relatedClusterIds = new Set((plannerPrefetch.topicClusters ?? [])
+        .filter((cluster) => cluster.pbiIds.some((pbiId) => planPbiIds.has(pbiId.trim())))
+        .map((cluster) => cluster.clusterId));
+    if (relatedClusterIds.size === 0) {
+        return [];
+    }
+    const matches = [];
+    for (const match of plannerPrefetch.articleMatches ?? []) {
+        if (!relatedClusterIds.has(match.clusterId)) {
+            continue;
+        }
+        for (const candidate of match.topResults ?? []) {
+            if (!isStrongExistingArticleMatch(candidate)) {
+                continue;
+            }
+            const resolvedPlacement = resolvePlacementAgainstPlannerTaxonomy(candidate.placement, taxonomy);
+            if (!resolvedPlacement || !hasDeterministicCreatePlacement(resolvedPlacement)) {
+                continue;
+            }
+            if (!placementMatchesHint(resolvedPlacement, hint)) {
+                continue;
+            }
+            matches.push({
+                placement: resolvedPlacement,
+                score: typeof candidate.score === 'number' ? candidate.score : 0
+            });
+        }
+    }
+    return matches;
+}
+function inferPlacementFromStrongArticleMatches(item, plannerPrefetch, taxonomy, hint) {
+    const matches = collectStrongPlacementMatchesForPlanItem(item, plannerPrefetch, taxonomy, hint);
+    if (matches.length === 0) {
+        return undefined;
+    }
+    const candidatesByKey = new Map();
+    for (const match of matches) {
+        const key = buildPlacementCandidateKey(match.placement);
+        const existing = candidatesByKey.get(key);
+        if (existing) {
+            existing.totalScore += match.score;
+            existing.count += 1;
+            continue;
+        }
+        candidatesByKey.set(key, {
+            placement: match.placement,
+            totalScore: match.score,
+            count: 1
+        });
+    }
+    const ranked = Array.from(candidatesByKey.entries())
+        .sort((left, right) => right[1].totalScore - left[1].totalScore
+        || right[1].count - left[1].count
+        || left[0].localeCompare(right[0]));
+    return ranked[0]?.[1].placement;
+}
+function resolveDeterministicCreatePlanPlacement(params) {
+    const taxonomy = buildPlannerTaxonomyIndex(params.plannerPrefetch);
+    const normalizedPlacement = normalizeBatchPlanPlacement(params.item.suggestedPlacement);
+    let resolvedPlacement = resolvePlacementAgainstPlannerTaxonomy(normalizedPlacement, taxonomy);
+    if (!hasDeterministicCreatePlacement(resolvedPlacement)) {
+        const inferredPlacement = inferPlacementFromStrongArticleMatches(params.item, params.plannerPrefetch, taxonomy, resolvedPlacement);
+        resolvedPlacement = resolvePlacementAgainstPlannerTaxonomy(mergePlacementSuggestions(resolvedPlacement, inferredPlacement), taxonomy);
+    }
+    return resolvedPlacement;
+}
 function doesPlacementMeetRequirement(actual, required) {
     const requiredCategoryId = normalizePlacementScopeId(required?.categoryId);
+    const requiredCategoryName = normalizePlacementNameForLookup(required?.categoryName);
     const requiredSectionId = normalizePlacementScopeId(required?.sectionId);
-    if (!requiredCategoryId && !requiredSectionId) {
+    const requiredSectionName = normalizePlacementNameForLookup(required?.sectionName);
+    if (!requiredCategoryId && !requiredCategoryName && !requiredSectionId && !requiredSectionName) {
         return true;
     }
     const actualCategoryId = normalizePlacementScopeId(actual?.categoryId);
+    const actualCategoryName = normalizePlacementNameForLookup(actual?.categoryName);
     const actualSectionId = normalizePlacementScopeId(actual?.sectionId);
+    const actualSectionName = normalizePlacementNameForLookup(actual?.sectionName);
     if (requiredCategoryId && actualCategoryId !== requiredCategoryId) {
         return false;
     }
+    if (!requiredCategoryId && requiredCategoryName && actualCategoryName && actualCategoryName !== requiredCategoryName) {
+        return false;
+    }
     if (requiredSectionId && actualSectionId !== requiredSectionId) {
+        return false;
+    }
+    if (!requiredSectionId && requiredSectionName && actualSectionName && actualSectionName !== requiredSectionName) {
         return false;
     }
     return true;

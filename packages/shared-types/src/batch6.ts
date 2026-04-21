@@ -616,6 +616,7 @@ export interface BatchPlannerArticleMatchResult {
   score: number;
   matchContext?: string;
   snippet: string;
+  placement?: ProposalPlacementSuggestion;
 }
 
 export interface BatchPlannerArticleMatch {
@@ -644,11 +645,28 @@ export interface BatchPlannerRelationEvidence {
   metadata?: unknown;
 }
 
+export interface BatchPlannerTaxonomySection {
+  sectionId: string;
+  sectionName: string;
+}
+
+export interface BatchPlannerTaxonomyCategory {
+  categoryId: string;
+  categoryName: string;
+  sections: BatchPlannerTaxonomySection[];
+}
+
+export interface BatchPlannerZendeskTaxonomy {
+  locale: string;
+  categories: BatchPlannerTaxonomyCategory[];
+}
+
 export interface BatchPlannerPrefetch {
   priorAnalysis: BatchPlannerPrefetchPriorAnalysis | null;
   topicClusters: BatchPlannerPrefetchCluster[];
   articleMatches: BatchPlannerArticleMatch[];
   relationMatches: BatchPlannerRelationMatch[];
+  zendeskTaxonomy: BatchPlannerZendeskTaxonomy | null;
 }
 
 export interface BatchAnalysisIterationRecord {

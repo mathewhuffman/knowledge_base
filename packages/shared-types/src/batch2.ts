@@ -216,6 +216,14 @@ export const KB_ACCESS_MODES = ['direct', 'mcp', 'cli'] as const;
 
 export type KbAccessMode = (typeof KB_ACCESS_MODES)[number];
 
+export const ZENDESK_RETIREMENT_STRATEGIES = ['archive'] as const;
+
+export type ZendeskRetirementStrategy = (typeof ZENDESK_RETIREMENT_STRATEGIES)[number];
+
+export const ZENDESK_PLACEHOLDER_ASSET_POLICIES = ['block', 'upload'] as const;
+
+export type ZendeskPlaceholderAssetPolicy = (typeof ZENDESK_PLACEHOLDER_ASSET_POLICIES)[number];
+
 export function isKbAccessMode(value: unknown): value is KbAccessMode {
   return typeof value === 'string' && (KB_ACCESS_MODES as readonly string[]).includes(value);
 }
@@ -242,6 +250,17 @@ export interface WorkspaceSettingsRecord {
   kbAccessMode: KbAccessMode;
   agentModelId?: string;
   acpModelId?: string;
+  zendeskPermissionGroupId?: string;
+  zendeskLiveUserSegmentId?: string;
+  zendeskNotifySubscribers: boolean;
+  zendeskAllowSectionCreation: boolean;
+  zendeskAllowCategoryCreation: boolean;
+  zendeskRetirementStrategy: ZendeskRetirementStrategy;
+  zendeskPlaceholderAssetPolicy: ZendeskPlaceholderAssetPolicy;
+  zendeskRequireLiveConfirmation: boolean;
+  zendeskBlockLiveOnWarnings: boolean;
+  zendeskFallbackCategoryName: string;
+  zendeskFallbackSectionName: string;
 }
 
 export interface WorkspaceSettingsUpdateRequest {
@@ -253,6 +272,17 @@ export interface WorkspaceSettingsUpdateRequest {
   kbAccessMode?: KbAccessMode;
   agentModelId?: string;
   acpModelId?: string;
+  zendeskPermissionGroupId?: string | null;
+  zendeskLiveUserSegmentId?: string | null;
+  zendeskNotifySubscribers?: boolean;
+  zendeskAllowSectionCreation?: boolean;
+  zendeskAllowCategoryCreation?: boolean;
+  zendeskRetirementStrategy?: ZendeskRetirementStrategy;
+  zendeskPlaceholderAssetPolicy?: ZendeskPlaceholderAssetPolicy;
+  zendeskRequireLiveConfirmation?: boolean;
+  zendeskBlockLiveOnWarnings?: boolean;
+  zendeskFallbackCategoryName?: string;
+  zendeskFallbackSectionName?: string;
 }
 
 export interface WorkspaceListItem extends WorkspaceRecord {
@@ -284,7 +314,9 @@ export interface ArticleFamilyRecord {
   externalKey: string;
   title: string;
   sectionId?: string;
+  sectionName?: string;
   categoryId?: string;
+  categoryName?: string;
   sourceSectionId?: string;
   sourceCategoryId?: string;
   sectionSource?: ArticleTaxonomySource;
@@ -330,7 +362,9 @@ export interface ArticleFamilyCreateRequest {
   externalKey: string;
   title: string;
   sectionId?: string;
+  sectionName?: string;
   categoryId?: string;
+  categoryName?: string;
   sourceSectionId?: string;
   sourceCategoryId?: string;
   sectionSource?: ArticleTaxonomySource;
@@ -344,9 +378,12 @@ export interface ArticleFamilyCreateRequest {
 export interface ArticleFamilyUpdateRequest {
   workspaceId: EntityId;
   familyId: EntityId;
+  externalKey?: string;
   title?: string;
   sectionId?: string | null;
+  sectionName?: string | null;
   categoryId?: string | null;
+  categoryName?: string | null;
   sourceSectionId?: string | null;
   sourceCategoryId?: string | null;
   sectionSource?: ArticleTaxonomySource;

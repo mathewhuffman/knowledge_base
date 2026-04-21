@@ -1166,6 +1166,105 @@ export const migrations: Migration[] = [
       ALTER TABLE pbi_batches
         ADD COLUMN analysis_config_json TEXT;
     `
+  },
+  {
+    version: 27,
+    name: '0027_publish_job_items',
+    description: 'Persist per-branch Zendesk publish validation and execution results.',
+    sql: `
+      CREATE TABLE IF NOT EXISTS publish_job_items (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        branch_id TEXT NOT NULL,
+        branch_name TEXT NOT NULL,
+        family_id TEXT NOT NULL,
+        family_title TEXT NOT NULL,
+        locale_variant_id TEXT NOT NULL,
+        locale TEXT NOT NULL,
+        status TEXT NOT NULL,
+        zendesk_article_id TEXT,
+        zendesk_source_article_id TEXT,
+        published_revision_id TEXT,
+        result_code TEXT,
+        result_message TEXT,
+        remote_updated_at TEXT,
+        issues_json TEXT NOT NULL DEFAULT '[]',
+        started_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_publish_job_items_job
+        ON publish_job_items(workspace_id, job_id, created_at ASC);
+
+      CREATE INDEX IF NOT EXISTS idx_publish_job_items_branch
+        ON publish_job_items(workspace_id, branch_id, created_at DESC);
+    `
+  },
+  {
+    version: 28,
+    name: '0028_publish_settings_defaults',
+    description: 'Persist Zendesk publish defaults and guardrails on workspace settings.',
+    sql: `
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_permission_group_id TEXT;
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_live_user_segment_id TEXT;
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_notify_subscribers INTEGER NOT NULL DEFAULT 0;
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_allow_section_creation INTEGER NOT NULL DEFAULT 1;
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_allow_category_creation INTEGER NOT NULL DEFAULT 1;
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_retirement_strategy TEXT NOT NULL DEFAULT 'archive';
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_placeholder_asset_policy TEXT NOT NULL DEFAULT 'upload';
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_require_live_confirmation INTEGER NOT NULL DEFAULT 1;
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_block_live_on_warnings INTEGER NOT NULL DEFAULT 1;
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_fallback_category_name TEXT NOT NULL DEFAULT 'KB Vault Imports';
+
+      ALTER TABLE workspace_settings
+        ADD COLUMN zendesk_fallback_section_name TEXT NOT NULL DEFAULT 'Unsorted';
+    `
+  },
+  {
+    version: 29,
+    name: '0029_article_family_scope_names_and_uncategorized_defaults',
+    description: 'Persist manual article-family placement names and update publish fallback defaults to Uncategorized.',
+    sql: `
+      ALTER TABLE article_families
+        ADD COLUMN section_name TEXT;
+
+      ALTER TABLE article_families
+        ADD COLUMN category_name TEXT;
+
+      UPDATE workspace_settings
+         SET zendesk_fallback_category_name = 'Uncategorized'
+       WHERE zendesk_fallback_category_name IS NULL
+          OR trim(zendesk_fallback_category_name) = ''
+          OR zendesk_fallback_category_name = 'KB Vault Imports';
+
+      UPDATE workspace_settings
+         SET zendesk_fallback_section_name = 'Uncategorized'
+       WHERE zendesk_fallback_section_name IS NULL
+          OR trim(zendesk_fallback_section_name) = ''
+          OR zendesk_fallback_section_name = 'Unsorted';
+    `
   }
 ];
 

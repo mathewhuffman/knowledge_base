@@ -75,6 +75,8 @@ import {
   type ArticleRelationUpsertRequest,
   isKbAccessMode,
   type KbAccessMode,
+  type ZendeskPlaceholderAssetPolicy,
+  type ZendeskRetirementStrategy,
   type AgentToolCallAudit,
   type BatchAnalysisExecutionCounts,
   type BatchAnalysisEventStreamResponse,
@@ -130,6 +132,8 @@ import {
   type ArticleFamilyRecord,
   type ArticlePlacementSummary,
   type LocaleVariantRecord,
+  type PublishJobRecord,
+  PublishStatus,
   type RevisionRecord,
   type ArticleFamilyCreateRequest,
   type ArticleFamilyUpdateRequest,
@@ -139,6 +143,15 @@ import {
   type RevisionUpdateRequest,
   type ExplorerNode,
   type ZendeskCredentialRecord,
+  PublishJobItemState,
+  type ZendeskPublishJobItemRecord,
+  type ZendeskPublishJobSnapshot,
+  type ZendeskPublishJobSummary,
+  type ZendeskPublishValidationIssue,
+  type ZendeskRetireActionStatus,
+  type ZendeskRetireQueueItem,
+  type ZendeskRetireQueueListResponse,
+  type ZendeskRetireQueueSummary,
   type ZendeskSyncCheckpoint,
   type ProposalPlacementSuggestion,
   type ProposalReviewDecisionRequest,
@@ -228,6 +241,15 @@ import { logger } from './logger';
 
 const DEFAULT_DB_FILE = 'kb-vault.sqlite';
 const DEFAULT_KB_ACCESS_MODE: KbAccessMode = 'direct';
+const DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS = false;
+const DEFAULT_ZENDESK_ALLOW_SECTION_CREATION = true;
+const DEFAULT_ZENDESK_ALLOW_CATEGORY_CREATION = true;
+const DEFAULT_ZENDESK_RETIREMENT_STRATEGY: ZendeskRetirementStrategy = 'archive';
+const DEFAULT_ZENDESK_PLACEHOLDER_ASSET_POLICY: ZendeskPlaceholderAssetPolicy = 'upload';
+const DEFAULT_ZENDESK_REQUIRE_LIVE_CONFIRMATION = true;
+const DEFAULT_ZENDESK_BLOCK_LIVE_ON_WARNINGS = true;
+const DEFAULT_ZENDESK_FALLBACK_CATEGORY_NAME = 'Uncategorized';
+const DEFAULT_ZENDESK_FALLBACK_SECTION_NAME = 'Uncategorized';
 const CATALOG_DB_PATH = path.join('.meta', 'catalog.sqlite');
 const WORKSPACE_SCOPED_DB_TABLES = [
   'article_families',
@@ -237,6 +259,7 @@ const WORKSPACE_SCOPED_DB_TABLES = [
   'ai_runs',
   'proposals',
   'publish_jobs',
+  'publish_job_items',
   'assets',
   'template_packs',
   'zendesk_credentials',
@@ -287,7 +310,9 @@ const ARTICLE_FAMILY_SELECT_COLUMNS = `
   external_key as externalKey,
   title,
   section_id as sectionId,
+  section_name as sectionName,
   category_id as categoryId,
+  category_name as categoryName,
   source_section_id as sourceSectionId,
   source_category_id as sourceCategoryId,
   section_source as sectionSource,
@@ -340,7 +365,9 @@ interface ArticleFamilyDbRow {
   externalKey: string;
   title: string;
   sectionId?: string | null;
+  sectionName?: string | null;
   categoryId?: string | null;
+  categoryName?: string | null;
   sourceSectionId?: string | null;
   sourceCategoryId?: string | null;
   sectionSource?: string | null;
@@ -546,6 +573,41 @@ interface DraftRevisionCommitRow {
   commitKind: string;
   commitMessage: string | null;
   createdAtUtc: string;
+}
+
+interface PublishJobDbRow {
+  id: string;
+  workspaceId: string;
+  status: string;
+  requestedBy: string | null;
+  enqueuedAtUtc: string;
+  startedAtUtc: string | null;
+  completedAtUtc: string | null;
+  branchIdsJson: string;
+}
+
+interface PublishJobItemDbRow {
+  id: string;
+  jobId: string;
+  workspaceId: string;
+  branchId: string;
+  branchName: string;
+  familyId: string;
+  familyTitle: string;
+  localeVariantId: string;
+  locale: string;
+  status: string;
+  zendeskArticleId: string | null;
+  zendeskSourceArticleId: string | null;
+  publishedRevisionId: string | null;
+  resultCode: string | null;
+  resultMessage: string | null;
+  remoteUpdatedAtUtc: string | null;
+  issuesJson: string | null;
+  startedAtUtc: string | null;
+  completedAtUtc: string | null;
+  createdAtUtc: string;
+  updatedAtUtc: string;
 }
 
 interface ArticleAiSessionDbRow {
@@ -825,9 +887,23 @@ export class WorkspaceRepository {
           kb_access_mode: string | null;
           agent_model_id: string | null;
           acp_model_id: string | null;
+          zendesk_permission_group_id: string | null;
+          zendesk_live_user_segment_id: string | null;
+          zendesk_notify_subscribers: number | null;
+          zendesk_allow_section_creation: number | null;
+          zendesk_allow_category_creation: number | null;
+          zendesk_retirement_strategy: string | null;
+          zendesk_placeholder_asset_policy: string | null;
+          zendesk_require_live_confirmation: number | null;
+          zendesk_block_live_on_warnings: number | null;
+          zendesk_fallback_category_name: string | null;
+          zendesk_fallback_section_name: string | null;
         }>(
           `SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
-            , kb_access_mode, agent_model_id, acp_model_id
+            , kb_access_mode, agent_model_id, acp_model_id, zendesk_permission_group_id, zendesk_live_user_segment_id
+            , zendesk_notify_subscribers, zendesk_allow_section_creation, zendesk_allow_category_creation
+            , zendesk_retirement_strategy, zendesk_placeholder_asset_policy, zendesk_require_live_confirmation
+            , zendesk_block_live_on_warnings, zendesk_fallback_category_name, zendesk_fallback_section_name
            FROM workspace_settings WHERE workspace_id = @workspaceId`,
           { workspaceId: id }
         );
@@ -841,16 +917,35 @@ export class WorkspaceRepository {
             enabledLocales: safeParseLocales(settings.enabled_locales),
             kbAccessMode: normalizeKbAccessMode(settings.kb_access_mode),
             agentModelId: this.normalizeAgentModelId(settings.agent_model_id),
-            acpModelId: this.normalizeAcpModelId(settings.acp_model_id)
+            acpModelId: this.normalizeAcpModelId(settings.acp_model_id),
+            zendeskPermissionGroupId: normalizeZendeskPublishId(settings.zendesk_permission_group_id),
+            zendeskLiveUserSegmentId: normalizeZendeskPublishId(settings.zendesk_live_user_segment_id),
+            zendeskNotifySubscribers: normalizeBooleanColumn(settings.zendesk_notify_subscribers, DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS),
+            zendeskAllowSectionCreation: normalizeBooleanColumn(settings.zendesk_allow_section_creation, DEFAULT_ZENDESK_ALLOW_SECTION_CREATION),
+            zendeskAllowCategoryCreation: normalizeBooleanColumn(settings.zendesk_allow_category_creation, DEFAULT_ZENDESK_ALLOW_CATEGORY_CREATION),
+            zendeskRetirementStrategy: normalizeZendeskRetirementStrategy(settings.zendesk_retirement_strategy),
+            zendeskPlaceholderAssetPolicy: normalizeZendeskPlaceholderAssetPolicy(settings.zendesk_placeholder_asset_policy),
+            zendeskRequireLiveConfirmation: normalizeBooleanColumn(settings.zendesk_require_live_confirmation, DEFAULT_ZENDESK_REQUIRE_LIVE_CONFIRMATION),
+            zendeskBlockLiveOnWarnings: normalizeBooleanColumn(settings.zendesk_block_live_on_warnings, DEFAULT_ZENDESK_BLOCK_LIVE_ON_WARNINGS),
+            zendeskFallbackCategoryName: settings.zendesk_fallback_category_name?.trim() || DEFAULT_ZENDESK_FALLBACK_CATEGORY_NAME,
+            zendeskFallbackSectionName: settings.zendesk_fallback_section_name?.trim() || DEFAULT_ZENDESK_FALLBACK_SECTION_NAME
           };
         }
 
         const enabledLocales = safeParseLocales(row.enabled_locales);
         workspaceDb.run(
           `INSERT INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, acp_model_id, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, acp_model_id,
+            zendesk_permission_group_id, zendesk_live_user_segment_id, zendesk_notify_subscribers,
+            zendesk_allow_section_creation, zendesk_allow_category_creation, zendesk_retirement_strategy,
+            zendesk_placeholder_asset_policy, zendesk_require_live_confirmation, zendesk_block_live_on_warnings,
+            zendesk_fallback_category_name, zendesk_fallback_section_name, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @acpModelId, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @acpModelId,
+            @zendeskPermissionGroupId, @zendeskLiveUserSegmentId, @zendeskNotifySubscribers,
+            @zendeskAllowSectionCreation, @zendeskAllowCategoryCreation, @zendeskRetirementStrategy,
+            @zendeskPlaceholderAssetPolicy, @zendeskRequireLiveConfirmation, @zendeskBlockLiveOnWarnings,
+            @zendeskFallbackCategoryName, @zendeskFallbackSectionName, @updatedAt
           )`,
           {
             workspaceId: id,
@@ -861,6 +956,17 @@ export class WorkspaceRepository {
             kbAccessMode: DEFAULT_KB_ACCESS_MODE,
             agentModelId: null,
             acpModelId: null,
+            zendeskPermissionGroupId: null,
+            zendeskLiveUserSegmentId: null,
+            zendeskNotifySubscribers: DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS ? 1 : 0,
+            zendeskAllowSectionCreation: DEFAULT_ZENDESK_ALLOW_SECTION_CREATION ? 1 : 0,
+            zendeskAllowCategoryCreation: DEFAULT_ZENDESK_ALLOW_CATEGORY_CREATION ? 1 : 0,
+            zendeskRetirementStrategy: DEFAULT_ZENDESK_RETIREMENT_STRATEGY,
+            zendeskPlaceholderAssetPolicy: DEFAULT_ZENDESK_PLACEHOLDER_ASSET_POLICY,
+            zendeskRequireLiveConfirmation: DEFAULT_ZENDESK_REQUIRE_LIVE_CONFIRMATION ? 1 : 0,
+            zendeskBlockLiveOnWarnings: DEFAULT_ZENDESK_BLOCK_LIVE_ON_WARNINGS ? 1 : 0,
+            zendeskFallbackCategoryName: DEFAULT_ZENDESK_FALLBACK_CATEGORY_NAME,
+            zendeskFallbackSectionName: DEFAULT_ZENDESK_FALLBACK_SECTION_NAME,
             updatedAt: new Date().toISOString()
           }
         );
@@ -873,7 +979,18 @@ export class WorkspaceRepository {
           enabledLocales,
           kbAccessMode: DEFAULT_KB_ACCESS_MODE,
           agentModelId: undefined,
-          acpModelId: undefined
+          acpModelId: undefined,
+          zendeskPermissionGroupId: undefined,
+          zendeskLiveUserSegmentId: undefined,
+          zendeskNotifySubscribers: DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS,
+          zendeskAllowSectionCreation: DEFAULT_ZENDESK_ALLOW_SECTION_CREATION,
+          zendeskAllowCategoryCreation: DEFAULT_ZENDESK_ALLOW_CATEGORY_CREATION,
+          zendeskRetirementStrategy: DEFAULT_ZENDESK_RETIREMENT_STRATEGY,
+          zendeskPlaceholderAssetPolicy: DEFAULT_ZENDESK_PLACEHOLDER_ASSET_POLICY,
+          zendeskRequireLiveConfirmation: DEFAULT_ZENDESK_REQUIRE_LIVE_CONFIRMATION,
+          zendeskBlockLiveOnWarnings: DEFAULT_ZENDESK_BLOCK_LIVE_ON_WARNINGS,
+          zendeskFallbackCategoryName: DEFAULT_ZENDESK_FALLBACK_CATEGORY_NAME,
+          zendeskFallbackSectionName: DEFAULT_ZENDESK_FALLBACK_SECTION_NAME
         };
       } finally {
         workspaceDb.close();
@@ -908,9 +1025,23 @@ export class WorkspaceRepository {
           kb_access_mode: string | null;
           agent_model_id: string | null;
           acp_model_id: string | null;
+          zendesk_permission_group_id: string | null;
+          zendesk_live_user_segment_id: string | null;
+          zendesk_notify_subscribers: number | null;
+          zendesk_allow_section_creation: number | null;
+          zendesk_allow_category_creation: number | null;
+          zendesk_retirement_strategy: string | null;
+          zendesk_placeholder_asset_policy: string | null;
+          zendesk_require_live_confirmation: number | null;
+          zendesk_block_live_on_warnings: number | null;
+          zendesk_fallback_category_name: string | null;
+          zendesk_fallback_section_name: string | null;
         }>(
           `SELECT workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales
-            , kb_access_mode, agent_model_id, acp_model_id
+            , kb_access_mode, agent_model_id, acp_model_id, zendesk_permission_group_id, zendesk_live_user_segment_id
+            , zendesk_notify_subscribers, zendesk_allow_section_creation, zendesk_allow_category_creation
+            , zendesk_retirement_strategy, zendesk_placeholder_asset_policy, zendesk_require_live_confirmation
+            , zendesk_block_live_on_warnings, zendesk_fallback_category_name, zendesk_fallback_section_name
            FROM workspace_settings WHERE workspace_id = @workspaceId`,
           { workspaceId: payload.workspaceId }
         );
@@ -927,7 +1058,18 @@ export class WorkspaceRepository {
           payload.enabledLocales === undefined &&
           payload.kbAccessMode === undefined &&
           payload.agentModelId === undefined &&
-          payload.acpModelId === undefined
+          payload.acpModelId === undefined &&
+          payload.zendeskPermissionGroupId === undefined &&
+          payload.zendeskLiveUserSegmentId === undefined &&
+          payload.zendeskNotifySubscribers === undefined &&
+          payload.zendeskAllowSectionCreation === undefined &&
+          payload.zendeskAllowCategoryCreation === undefined &&
+          payload.zendeskRetirementStrategy === undefined &&
+          payload.zendeskPlaceholderAssetPolicy === undefined &&
+          payload.zendeskRequireLiveConfirmation === undefined &&
+          payload.zendeskBlockLiveOnWarnings === undefined &&
+          payload.zendeskFallbackCategoryName === undefined &&
+          payload.zendeskFallbackSectionName === undefined
         ) {
           throw new Error('No settings provided');
         }
@@ -953,6 +1095,22 @@ export class WorkspaceRepository {
         if (typeof payload.acpModelId === 'string' && !payload.acpModelId.trim()) {
           throw new Error('acpModelId cannot be empty');
         }
+        if (payload.zendeskRetirementStrategy !== undefined && payload.zendeskRetirementStrategy !== 'archive') {
+          throw new Error('zendeskRetirementStrategy must be archive');
+        }
+        if (
+          payload.zendeskPlaceholderAssetPolicy !== undefined
+          && payload.zendeskPlaceholderAssetPolicy !== 'block'
+          && payload.zendeskPlaceholderAssetPolicy !== 'upload'
+        ) {
+          throw new Error('zendeskPlaceholderAssetPolicy must be block or upload');
+        }
+        if (payload.zendeskFallbackCategoryName !== undefined && !payload.zendeskFallbackCategoryName.trim()) {
+          throw new Error('zendeskFallbackCategoryName cannot be empty');
+        }
+        if (payload.zendeskFallbackSectionName !== undefined && !payload.zendeskFallbackSectionName.trim()) {
+          throw new Error('zendeskFallbackSectionName cannot be empty');
+        }
 
         const enabledLocales = payload.enabledLocales?.length
           ? normalizeLocales(payload.enabledLocales)
@@ -967,6 +1125,39 @@ export class WorkspaceRepository {
         const nextAcpModelId = payload.acpModelId !== undefined
           ? this.normalizeAcpModelId(payload.acpModelId)
           : this.normalizeAcpModelId(existing?.acp_model_id);
+        const nextZendeskPermissionGroupId = payload.zendeskPermissionGroupId !== undefined
+          ? normalizeZendeskPublishId(payload.zendeskPermissionGroupId)
+          : normalizeZendeskPublishId(existing?.zendesk_permission_group_id);
+        const nextZendeskLiveUserSegmentId = payload.zendeskLiveUserSegmentId !== undefined
+          ? normalizeZendeskPublishId(payload.zendeskLiveUserSegmentId)
+          : normalizeZendeskPublishId(existing?.zendesk_live_user_segment_id);
+        const nextZendeskNotifySubscribers = payload.zendeskNotifySubscribers !== undefined
+          ? payload.zendeskNotifySubscribers
+          : normalizeBooleanColumn(existing?.zendesk_notify_subscribers, DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS);
+        const nextZendeskAllowSectionCreation = payload.zendeskAllowSectionCreation !== undefined
+          ? payload.zendeskAllowSectionCreation
+          : normalizeBooleanColumn(existing?.zendesk_allow_section_creation, DEFAULT_ZENDESK_ALLOW_SECTION_CREATION);
+        const nextZendeskAllowCategoryCreation = payload.zendeskAllowCategoryCreation !== undefined
+          ? payload.zendeskAllowCategoryCreation
+          : normalizeBooleanColumn(existing?.zendesk_allow_category_creation, DEFAULT_ZENDESK_ALLOW_CATEGORY_CREATION);
+        const nextZendeskRetirementStrategy = normalizeZendeskRetirementStrategy(
+          payload.zendeskRetirementStrategy ?? existing?.zendesk_retirement_strategy
+        );
+        const nextZendeskPlaceholderAssetPolicy = normalizeZendeskPlaceholderAssetPolicy(
+          payload.zendeskPlaceholderAssetPolicy ?? existing?.zendesk_placeholder_asset_policy
+        );
+        const nextZendeskRequireLiveConfirmation = payload.zendeskRequireLiveConfirmation !== undefined
+          ? payload.zendeskRequireLiveConfirmation
+          : normalizeBooleanColumn(existing?.zendesk_require_live_confirmation, DEFAULT_ZENDESK_REQUIRE_LIVE_CONFIRMATION);
+        const nextZendeskBlockLiveOnWarnings = payload.zendeskBlockLiveOnWarnings !== undefined
+          ? payload.zendeskBlockLiveOnWarnings
+          : normalizeBooleanColumn(existing?.zendesk_block_live_on_warnings, DEFAULT_ZENDESK_BLOCK_LIVE_ON_WARNINGS);
+        const nextZendeskFallbackCategoryName = payload.zendeskFallbackCategoryName?.trim()
+          || existing?.zendesk_fallback_category_name?.trim()
+          || DEFAULT_ZENDESK_FALLBACK_CATEGORY_NAME;
+        const nextZendeskFallbackSectionName = payload.zendeskFallbackSectionName?.trim()
+          || existing?.zendesk_fallback_section_name?.trim()
+          || DEFAULT_ZENDESK_FALLBACK_SECTION_NAME;
 
         if (!nextSubdomain) {
           throw new Error('zendeskSubdomain cannot be empty');
@@ -986,9 +1177,17 @@ export class WorkspaceRepository {
 
         workspaceDb.run(
           `INSERT OR REPLACE INTO workspace_settings (
-            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, acp_model_id, updated_at
+            workspace_id, zendesk_subdomain, zendesk_brand_id, default_locale, enabled_locales, kb_access_mode, agent_model_id, acp_model_id,
+            zendesk_permission_group_id, zendesk_live_user_segment_id, zendesk_notify_subscribers,
+            zendesk_allow_section_creation, zendesk_allow_category_creation, zendesk_retirement_strategy,
+            zendesk_placeholder_asset_policy, zendesk_require_live_confirmation, zendesk_block_live_on_warnings,
+            zendesk_fallback_category_name, zendesk_fallback_section_name, updated_at
           ) VALUES (
-            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @acpModelId, @updatedAt
+            @workspaceId, @zendeskSubdomain, @zendeskBrandId, @defaultLocale, @enabledLocales, @kbAccessMode, @agentModelId, @acpModelId,
+            @zendeskPermissionGroupId, @zendeskLiveUserSegmentId, @zendeskNotifySubscribers,
+            @zendeskAllowSectionCreation, @zendeskAllowCategoryCreation, @zendeskRetirementStrategy,
+            @zendeskPlaceholderAssetPolicy, @zendeskRequireLiveConfirmation, @zendeskBlockLiveOnWarnings,
+            @zendeskFallbackCategoryName, @zendeskFallbackSectionName, @updatedAt
           )`,
           {
             workspaceId: payload.workspaceId,
@@ -999,6 +1198,17 @@ export class WorkspaceRepository {
             kbAccessMode: nextKbAccessMode,
             agentModelId: nextAgentModelId ?? null,
             acpModelId: nextAcpModelId ?? null,
+            zendeskPermissionGroupId: nextZendeskPermissionGroupId ?? null,
+            zendeskLiveUserSegmentId: nextZendeskLiveUserSegmentId ?? null,
+            zendeskNotifySubscribers: nextZendeskNotifySubscribers ? 1 : 0,
+            zendeskAllowSectionCreation: nextZendeskAllowSectionCreation ? 1 : 0,
+            zendeskAllowCategoryCreation: nextZendeskAllowCategoryCreation ? 1 : 0,
+            zendeskRetirementStrategy: nextZendeskRetirementStrategy,
+            zendeskPlaceholderAssetPolicy: nextZendeskPlaceholderAssetPolicy,
+            zendeskRequireLiveConfirmation: nextZendeskRequireLiveConfirmation ? 1 : 0,
+            zendeskBlockLiveOnWarnings: nextZendeskBlockLiveOnWarnings ? 1 : 0,
+            zendeskFallbackCategoryName: nextZendeskFallbackCategoryName,
+            zendeskFallbackSectionName: nextZendeskFallbackSectionName,
             updatedAt: now
           }
         );
@@ -1029,7 +1239,18 @@ export class WorkspaceRepository {
           enabledLocales: normalizedEnabledLocales,
           kbAccessMode: nextKbAccessMode,
           agentModelId: nextAgentModelId,
-          acpModelId: nextAcpModelId
+          acpModelId: nextAcpModelId,
+          zendeskPermissionGroupId: nextZendeskPermissionGroupId,
+          zendeskLiveUserSegmentId: nextZendeskLiveUserSegmentId,
+          zendeskNotifySubscribers: nextZendeskNotifySubscribers,
+          zendeskAllowSectionCreation: nextZendeskAllowSectionCreation,
+          zendeskAllowCategoryCreation: nextZendeskAllowCategoryCreation,
+          zendeskRetirementStrategy: nextZendeskRetirementStrategy,
+          zendeskPlaceholderAssetPolicy: nextZendeskPlaceholderAssetPolicy,
+          zendeskRequireLiveConfirmation: nextZendeskRequireLiveConfirmation,
+          zendeskBlockLiveOnWarnings: nextZendeskBlockLiveOnWarnings,
+          zendeskFallbackCategoryName: nextZendeskFallbackCategoryName,
+          zendeskFallbackSectionName: nextZendeskFallbackSectionName
         };
       } finally {
         workspaceDb.close();
@@ -1332,22 +1553,26 @@ export class WorkspaceRepository {
         throw new Error('Article family externalKey is required');
       }
       const sectionId = normalizeFeatureMapScopeId(payload.sectionId);
+      const sectionName = payload.sectionName?.trim() || undefined;
       const categoryId = normalizeFeatureMapScopeId(payload.categoryId);
+      const categoryName = payload.categoryName?.trim() || undefined;
       const sourceSectionId = normalizeFeatureMapScopeId(payload.sourceSectionId);
       const sourceCategoryId = normalizeFeatureMapScopeId(payload.sourceCategoryId);
       const sectionSource = payload.sectionSource !== undefined
         ? normalizeArticleTaxonomySource(payload.sectionSource)
-        : (sectionId ? 'manual_override' : 'none');
+        : (sectionId || sectionName ? 'manual_override' : 'none');
       const categorySource = payload.categorySource !== undefined
         ? normalizeArticleTaxonomySource(payload.categorySource)
-        : (categoryId ? 'manual_override' : 'none');
+        : (categoryId || categoryName ? 'manual_override' : 'none');
       const taxonomyConfidence = normalizeArticleTaxonomyConfidence(payload.taxonomyConfidence);
       const taxonomyNote = normalizeFeatureMapScopeId(payload.taxonomyNote);
       const taxonomyUpdatedAt = payload.taxonomyUpdatedAt !== undefined
         ? normalizeFeatureMapScopeId(payload.taxonomyUpdatedAt)
         : (
             sectionId
+            || sectionName
             || categoryId
+            || categoryName
             || sourceSectionId
             || sourceCategoryId
             || sectionSource !== 'none'
@@ -1365,7 +1590,9 @@ export class WorkspaceRepository {
            external_key,
            title,
            section_id,
+           section_name,
            category_id,
+           category_name,
            source_section_id,
            source_category_id,
            section_source,
@@ -1381,7 +1608,9 @@ export class WorkspaceRepository {
            @externalKey,
            @title,
            @sectionId,
+           @sectionName,
            @categoryId,
+           @categoryName,
            @sourceSectionId,
            @sourceCategoryId,
            @sectionSource,
@@ -1397,7 +1626,9 @@ export class WorkspaceRepository {
           externalKey,
           title,
           sectionId: sectionId ?? null,
+          sectionName: sectionName ?? null,
           categoryId: categoryId ?? null,
+          categoryName: categoryName ?? null,
           sourceSectionId: sourceSectionId ?? null,
           sourceCategoryId: sourceCategoryId ?? null,
           sectionSource,
@@ -1415,7 +1646,9 @@ export class WorkspaceRepository {
         externalKey,
         title,
         sectionId: sectionId ?? null,
+        sectionName: sectionName ?? null,
         categoryId: categoryId ?? null,
+        categoryName: categoryName ?? null,
         sourceSectionId: sourceSectionId ?? null,
         sourceCategoryId: sourceCategoryId ?? null,
         sectionSource,
@@ -1447,9 +1680,12 @@ export class WorkspaceRepository {
       const existing = mapArticleFamilyRow(existingRow);
 
       if (
+        payload.externalKey === undefined &&
         payload.title === undefined &&
         payload.sectionId === undefined &&
+        payload.sectionName === undefined &&
         payload.categoryId === undefined &&
+        payload.categoryName === undefined &&
         payload.sourceSectionId === undefined &&
         payload.sourceCategoryId === undefined &&
         payload.sectionSource === undefined &&
@@ -1462,6 +1698,31 @@ export class WorkspaceRepository {
         throw new Error('Article family update requires at least one field');
       }
 
+      const externalKey = payload.externalKey !== undefined
+        ? payload.externalKey.trim()
+        : existing.externalKey;
+      if (!externalKey) {
+        throw new Error('Article family externalKey cannot be empty');
+      }
+      if (payload.externalKey !== undefined && externalKey !== existing.externalKey) {
+        const duplicate = workspaceDb.get<{ id: string }>(
+          `SELECT id
+             FROM article_families
+            WHERE workspace_id = @workspaceId
+              AND external_key = @externalKey
+              AND id != @familyId
+            LIMIT 1`,
+          {
+            workspaceId: payload.workspaceId,
+            externalKey,
+            familyId: payload.familyId
+          }
+        );
+        if (duplicate) {
+          throw new Error('Article family externalKey is already in use');
+        }
+      }
+
       const title = payload.title ?? existing.title;
       if (payload.title !== undefined && !title.trim()) {
         throw new Error('Article family title cannot be empty');
@@ -1469,9 +1730,15 @@ export class WorkspaceRepository {
       const sectionId = payload.sectionId !== undefined
         ? normalizeFeatureMapScopeId(payload.sectionId)
         : existing.sectionId;
+      const sectionName = payload.sectionName !== undefined
+        ? (payload.sectionName?.trim() || undefined)
+        : existing.sectionName;
       const categoryId = payload.categoryId !== undefined
         ? normalizeFeatureMapScopeId(payload.categoryId)
         : existing.categoryId;
+      const categoryName = payload.categoryName !== undefined
+        ? (payload.categoryName?.trim() || undefined)
+        : existing.categoryName;
       const sourceSectionId = payload.sourceSectionId !== undefined
         ? normalizeFeatureMapScopeId(payload.sourceSectionId)
         : existing.sourceSectionId;
@@ -1480,13 +1747,13 @@ export class WorkspaceRepository {
         : existing.sourceCategoryId;
       const sectionSource = payload.sectionSource !== undefined
         ? normalizeArticleTaxonomySource(payload.sectionSource)
-        : (payload.sectionId !== undefined
-            ? (sectionId ? 'manual_override' : 'none')
+        : (payload.sectionId !== undefined || payload.sectionName !== undefined
+            ? (sectionId || sectionName ? 'manual_override' : 'none')
             : (existing.sectionSource ?? 'none'));
       const categorySource = payload.categorySource !== undefined
         ? normalizeArticleTaxonomySource(payload.categorySource)
-        : (payload.categoryId !== undefined
-            ? (categoryId ? 'manual_override' : 'none')
+        : (payload.categoryId !== undefined || payload.categoryName !== undefined
+            ? (categoryId || categoryName ? 'manual_override' : 'none')
             : (existing.categorySource ?? 'none'));
       const taxonomyConfidence = payload.taxonomyConfidence !== undefined
         ? normalizeArticleTaxonomyConfidence(payload.taxonomyConfidence)
@@ -1496,7 +1763,9 @@ export class WorkspaceRepository {
         : existing.taxonomyNote;
       const retiredAt = payload.retiredAtUtc === null ? null : (payload.retiredAtUtc ?? existing.retiredAtUtc ?? null);
       const taxonomyFieldsChanged = sectionId !== existing.sectionId
+        || sectionName !== existing.sectionName
         || categoryId !== existing.categoryId
+        || categoryName !== existing.categoryName
         || sourceSectionId !== existing.sourceSectionId
         || sourceCategoryId !== existing.sourceCategoryId
         || sectionSource !== (existing.sectionSource ?? 'none')
@@ -1508,9 +1777,12 @@ export class WorkspaceRepository {
         : (taxonomyFieldsChanged ? new Date().toISOString() : existing.taxonomyUpdatedAt);
       workspaceDb.run(
         `UPDATE article_families
-         SET title = @title,
+         SET external_key = @externalKey,
+             title = @title,
              section_id = @sectionId,
+             section_name = @sectionName,
              category_id = @categoryId,
+             category_name = @categoryName,
              source_section_id = @sourceSectionId,
              source_category_id = @sourceCategoryId,
              section_source = @sectionSource,
@@ -1523,9 +1795,12 @@ export class WorkspaceRepository {
         {
           familyId: payload.familyId,
           workspaceId: payload.workspaceId,
+          externalKey,
           title,
-          sectionId,
-          categoryId,
+          sectionId: sectionId ?? null,
+          sectionName: sectionName ?? null,
+          categoryId: categoryId ?? null,
+          categoryName: categoryName ?? null,
           sourceSectionId: sourceSectionId ?? null,
           sourceCategoryId: sourceCategoryId ?? null,
           sectionSource,
@@ -1537,9 +1812,12 @@ export class WorkspaceRepository {
         }
       );
 
-      const familyMetadataChanged = title !== existing.title
+      const familyMetadataChanged = externalKey !== existing.externalKey
+        || title !== existing.title
         || sectionId !== (existing.sectionId ?? undefined)
+        || sectionName !== (existing.sectionName ?? undefined)
         || categoryId !== (existing.categoryId ?? undefined)
+        || categoryName !== (existing.categoryName ?? undefined)
         || sourceSectionId !== (existing.sourceSectionId ?? undefined)
         || sourceCategoryId !== (existing.sourceCategoryId ?? undefined)
         || sectionSource !== (existing.sectionSource ?? 'none')
@@ -1561,9 +1839,12 @@ export class WorkspaceRepository {
 
       return {
         ...existing,
+        externalKey,
         title,
         sectionId,
+        sectionName,
         categoryId,
+        categoryName,
         sourceSectionId,
         sourceCategoryId,
         sectionSource,
@@ -3103,9 +3384,9 @@ export class WorkspaceRepository {
               ? RevisionState.RETIRED
               : RevisionState.LIVE),
           sectionId: family.sectionId ?? undefined,
-          sectionName: family.sectionId ?? undefined,
+          sectionName: family.sectionName ?? undefined,
           categoryId: family.categoryId ?? undefined,
-          categoryName: family.categoryId ?? undefined,
+          categoryName: family.categoryName ?? undefined,
           locales
         };
       });
@@ -8437,6 +8718,182 @@ export class WorkspaceRepository {
     }
   }
 
+  async listZendeskRetireQueue(
+    workspaceId: string,
+    proposalIds?: string[]
+  ): Promise<ZendeskRetireQueueListResponse> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const selectedProposalIds = new Set(
+        (proposalIds ?? [])
+          .map((proposalId) => proposalId.trim())
+          .filter(Boolean)
+      );
+      const rows = workspaceDb.all<ProposalDbRow>(`
+        SELECT p.id,
+               p.workspace_id as workspaceId,
+               p.batch_id as batchId,
+               p.action,
+               p.locale_variant_id as localeVariantId,
+               p.branch_id as branchId,
+               p.status,
+               p.rationale,
+               p.generated_at as generatedAtUtc,
+               p.updated_at as updatedAtUtc,
+               p.review_status as reviewStatus,
+               p.queue_order as queueOrder,
+               p.family_id as familyId,
+               p.source_revision_id as sourceRevisionId,
+               p.target_title as targetTitle,
+               p.target_locale as targetLocale,
+               p.confidence_score as confidenceScore,
+               p.rationale_summary as rationaleSummary,
+               p.ai_notes as aiNotes,
+               p.suggested_placement_json as suggestedPlacementJson,
+               p.source_html_path as sourceHtmlPath,
+               p.proposed_html_path as proposedHtmlPath,
+               p.metadata_json as metadataJson,
+               p.decision_payload_json as decisionPayloadJson,
+               p.decided_at as decidedAtUtc,
+               p.agent_session_id as sessionId
+        FROM proposals p
+        WHERE p.workspace_id = @workspaceId
+          AND p.action = @action
+          AND p.review_status = @reviewStatus
+        ORDER BY COALESCE(p.decided_at, p.updated_at, p.generated_at) DESC, p.generated_at DESC
+      `, {
+        workspaceId,
+        action: ProposalAction.RETIRE,
+        reviewStatus: ProposalReviewStatus.ACCEPTED
+      });
+
+      const items: ZendeskRetireQueueItem[] = [];
+      for (const row of rows) {
+        if (selectedProposalIds.size > 0 && !selectedProposalIds.has(row.id)) {
+          continue;
+        }
+
+        const proposal = this.hydrateProposalDisplayFields(this.mapProposalRow(row), workspaceDb);
+        const metadata = normalizeProposalMetadata(proposal.metadata);
+        const remoteRetire = normalizeProposalZendeskRetireState(metadata.zendeskRemoteRetire);
+        if (remoteRetire?.status === 'archived' || remoteRetire?.status === 'already_archived') {
+          continue;
+        }
+
+        const family = proposal.familyId
+          ? workspaceDb.get<{ externalKey: string | null; title: string; retiredAtUtc: string | null }>(
+              `SELECT external_key as externalKey, title, retired_at as retiredAtUtc
+               FROM article_families
+               WHERE id = @familyId
+               LIMIT 1`,
+              { familyId: proposal.familyId }
+            )
+          : null;
+        const decisionPayload = safeParseJson<Record<string, unknown>>(row.decisionPayloadJson) ?? {};
+        const zendeskArticleId = parseZendeskArticleIdFromExternalKey(family?.externalKey ?? undefined);
+        const canArchive = Boolean(proposal.familyId && zendeskArticleId);
+
+        items.push({
+          workspaceId,
+          proposalId: proposal.id,
+          batchId: proposal.batchId,
+          familyId: proposal.familyId,
+          localeVariantId: proposal.localeVariantId,
+          familyTitle: proposal.targetTitle ?? family?.title ?? 'Retired article',
+          locale: proposal.targetLocale ?? undefined,
+          externalKey: family?.externalKey ?? undefined,
+          zendeskArticleId: zendeskArticleId ? String(zendeskArticleId) : undefined,
+          canArchive,
+          blockedReason: canArchive
+            ? undefined
+            : proposal.familyId
+              ? 'No Zendesk article is linked to this retired article family yet.'
+              : 'Retire proposal is missing an article family target.',
+          localRetiredAtUtc: extractString(decisionPayload.retiredAtUtc) ?? proposal.decidedAtUtc ?? family?.retiredAtUtc ?? undefined,
+          remoteRetireStatus: remoteRetire?.status,
+          remoteAttemptedAtUtc: remoteRetire?.attemptedAtUtc,
+          remoteRetiredAtUtc: remoteRetire?.completedAtUtc,
+          remoteRetireMessage: remoteRetire?.message
+        });
+      }
+
+      return {
+        workspaceId,
+        summary: summarizeZendeskRetireQueueItems(items),
+        items,
+        listedAtUtc: new Date().toISOString()
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async updateProposalZendeskRetireState(
+    workspaceId: string,
+    proposalId: string,
+    patch: {
+      status: ZendeskRetireActionStatus;
+      attemptedAtUtc?: string | null;
+      completedAtUtc?: string | null;
+      zendeskArticleId?: string | null;
+      locale?: string | null;
+      message?: string | null;
+    }
+  ): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const existing = workspaceDb.get<{ metadataJson: string | null }>(
+        `SELECT metadata_json as metadataJson
+         FROM proposals
+         WHERE workspace_id = @workspaceId AND id = @proposalId
+         LIMIT 1`,
+        { workspaceId, proposalId }
+      );
+      if (!existing) {
+        throw new Error('Proposal not found');
+      }
+
+      const metadata = normalizeProposalMetadata(safeParseJson(existing.metadataJson));
+      const current = normalizeProposalZendeskRetireState(metadata.zendeskRemoteRetire);
+      const nextState = {
+        status: patch.status,
+        attemptedAtUtc: patch.attemptedAtUtc === undefined
+          ? current?.attemptedAtUtc
+          : patch.attemptedAtUtc ?? undefined,
+        completedAtUtc: patch.completedAtUtc === undefined
+          ? current?.completedAtUtc
+          : patch.completedAtUtc ?? undefined,
+        zendeskArticleId: patch.zendeskArticleId === undefined
+          ? current?.zendeskArticleId
+          : patch.zendeskArticleId ?? undefined,
+        locale: patch.locale === undefined
+          ? current?.locale
+          : patch.locale ?? undefined,
+        message: patch.message === undefined
+          ? current?.message
+          : patch.message ?? undefined
+      };
+
+      metadata.zendeskRemoteRetire = nextState;
+      workspaceDb.run(
+        `UPDATE proposals
+         SET metadata_json = @metadataJson,
+             updated_at = @updatedAt
+         WHERE workspace_id = @workspaceId AND id = @proposalId`,
+        {
+          workspaceId,
+          proposalId,
+          metadataJson: JSON.stringify(metadata),
+          updatedAt: new Date().toISOString()
+        }
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async promoteBatchProposalsToPendingReview(params: {
     workspaceId: string;
     batchId: string;
@@ -8887,6 +9344,21 @@ export class WorkspaceRepository {
       const nextPlacement = input.placementOverride
         ? JSON.stringify(input.placementOverride)
         : existing.suggestedPlacementJson;
+      const existingMetadata = normalizeProposalMetadata(safeParseJson(existing.metadataJson));
+      const existingRetireState = normalizeProposalZendeskRetireState(existingMetadata.zendeskRemoteRetire);
+      const nextMetadata = proposal.action === ProposalAction.RETIRE && input.decision === ProposalReviewDecision.ACCEPT
+        ? {
+            ...existingMetadata,
+            zendeskRemoteRetire: {
+              status: 'pending',
+              attemptedAtUtc: existingRetireState?.attemptedAtUtc,
+              completedAtUtc: undefined,
+              zendeskArticleId: existingRetireState?.zendeskArticleId,
+              locale: existingRetireState?.locale ?? proposal.targetLocale ?? undefined,
+              message: undefined
+            }
+          }
+        : existingMetadata;
 
       workspaceDb.run(
         `UPDATE proposals
@@ -8894,6 +9366,7 @@ export class WorkspaceRepository {
              status = @status,
              branch_id = COALESCE(@branchId, branch_id),
              suggested_placement_json = @suggestedPlacementJson,
+             metadata_json = @metadataJson,
              decision_payload_json = @decisionPayloadJson,
              decided_at = @decidedAt,
              updated_at = @updatedAt
@@ -8903,6 +9376,7 @@ export class WorkspaceRepository {
           status: legacyStatus,
           branchId: mutation.branchId ?? input.branchId ?? null,
           suggestedPlacementJson: nextPlacement ?? null,
+          metadataJson: Object.keys(nextMetadata).length > 0 ? JSON.stringify(nextMetadata) : null,
           decisionPayloadJson: JSON.stringify({
             decision: input.decision,
             branchId: mutation.branchId ?? input.branchId,
@@ -10582,6 +11056,699 @@ export class WorkspaceRepository {
     return this.getLatestSyncRunWithFilter(workspaceId, 'SUCCEEDED');
   }
 
+  async createPublishJob(
+    workspaceId: string,
+    payload: {
+      jobId: string;
+      branchIds: string[];
+      requestedBy?: string;
+    }
+  ): Promise<PublishJobRecord> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    const now = new Date().toISOString();
+    try {
+      workspaceDb.run(
+        `INSERT OR REPLACE INTO publish_jobs (
+          id, workspace_id, status, requested_by, enqueued_at, started_at, completed_at, branch_ids
+        ) VALUES (
+          @id, @workspaceId, @status, @requestedBy, @enqueuedAt, NULL, NULL, @branchIds
+        )`,
+        {
+          id: payload.jobId,
+          workspaceId,
+          status: PublishStatus.QUEUED,
+          requestedBy: payload.requestedBy?.trim() || null,
+          enqueuedAt: now,
+          branchIds: JSON.stringify(Array.from(new Set(payload.branchIds.map((branchId) => branchId.trim()).filter(Boolean))))
+        }
+      );
+      return {
+        id: payload.jobId,
+        workspaceId,
+        status: PublishStatus.QUEUED,
+        requestedBy: payload.requestedBy?.trim() || undefined,
+        enqueuedAtUtc: now,
+        branchIds: Array.from(new Set(payload.branchIds.map((branchId) => branchId.trim()).filter(Boolean)))
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async updatePublishJobStatus(
+    workspaceId: string,
+    jobId: string,
+    status: PublishStatus,
+    options: {
+      startedAtUtc?: string | null;
+      completedAtUtc?: string | null;
+    } = {}
+  ): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const existing = workspaceDb.get<{ startedAtUtc: string | null; completedAtUtc: string | null }>(
+        `SELECT started_at as startedAtUtc, completed_at as completedAtUtc
+           FROM publish_jobs
+          WHERE id = @jobId AND workspace_id = @workspaceId
+          LIMIT 1`,
+        { workspaceId, jobId }
+      );
+      workspaceDb.run(
+        `UPDATE publish_jobs
+            SET status = @status,
+                started_at = @startedAtUtc,
+                completed_at = @completedAtUtc
+          WHERE id = @jobId AND workspace_id = @workspaceId`,
+        {
+          workspaceId,
+          jobId,
+          status,
+          startedAtUtc: options.startedAtUtc !== undefined ? options.startedAtUtc : (existing?.startedAtUtc ?? null),
+          completedAtUtc: options.completedAtUtc !== undefined ? options.completedAtUtc : (existing?.completedAtUtc ?? null)
+        }
+      );
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async replacePublishJobItems(
+    workspaceId: string,
+    jobId: string,
+    items: Array<{
+      branchId: string;
+      branchName: string;
+      familyId: string;
+      familyTitle: string;
+      localeVariantId: string;
+      locale: string;
+      status: PublishJobItemState;
+      zendeskArticleId?: string;
+      zendeskSourceArticleId?: string;
+      publishedRevisionId?: string;
+      resultCode?: string;
+      resultMessage?: string;
+      remoteUpdatedAtUtc?: string;
+      issues?: ZendeskPublishValidationIssue[];
+      startedAtUtc?: string;
+      completedAtUtc?: string;
+    }>
+  ): Promise<ZendeskPublishJobItemRecord[]> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    const now = new Date().toISOString();
+    try {
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      workspaceDb.run(
+        `DELETE FROM publish_job_items
+          WHERE workspace_id = @workspaceId AND job_id = @jobId`,
+        { workspaceId, jobId }
+      );
+
+      const insert = workspaceDb.prepare(
+        `INSERT INTO publish_job_items (
+          id, job_id, workspace_id, branch_id, branch_name, family_id, family_title, locale_variant_id, locale,
+          status, zendesk_article_id, zendesk_source_article_id, published_revision_id, result_code, result_message,
+          remote_updated_at, issues_json, started_at, completed_at, created_at, updated_at
+        ) VALUES (
+          @id, @jobId, @workspaceId, @branchId, @branchName, @familyId, @familyTitle, @localeVariantId, @locale,
+          @status, @zendeskArticleId, @zendeskSourceArticleId, @publishedRevisionId, @resultCode, @resultMessage,
+          @remoteUpdatedAtUtc, @issuesJson, @startedAtUtc, @completedAtUtc, @createdAtUtc, @updatedAtUtc
+        )`
+      );
+
+      for (const item of items) {
+        insert.run({
+          id: randomUUID(),
+          jobId,
+          workspaceId,
+          branchId: item.branchId,
+          branchName: item.branchName,
+          familyId: item.familyId,
+          familyTitle: item.familyTitle,
+          localeVariantId: item.localeVariantId,
+          locale: item.locale,
+          status: item.status,
+          zendeskArticleId: item.zendeskArticleId ?? null,
+          zendeskSourceArticleId: item.zendeskSourceArticleId ?? null,
+          publishedRevisionId: item.publishedRevisionId ?? null,
+          resultCode: item.resultCode ?? null,
+          resultMessage: item.resultMessage ?? null,
+          remoteUpdatedAtUtc: item.remoteUpdatedAtUtc ?? null,
+          issuesJson: JSON.stringify(item.issues ?? []),
+          startedAtUtc: item.startedAtUtc ?? null,
+          completedAtUtc: item.completedAtUtc ?? null,
+          createdAtUtc: now,
+          updatedAtUtc: now
+        });
+      }
+      workspaceDb.exec('COMMIT');
+      return this.listPublishJobItemsInDb(workspaceDb, workspaceId, jobId);
+    } catch (error) {
+      try {
+        workspaceDb.exec('ROLLBACK');
+      } catch {
+        // no-op
+      }
+      throw error;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async updatePublishJobItem(
+    workspaceId: string,
+    jobId: string,
+    branchId: string,
+    patch: {
+      status?: PublishJobItemState;
+      zendeskArticleId?: string | null;
+      zendeskSourceArticleId?: string | null;
+      publishedRevisionId?: string | null;
+      resultCode?: string | null;
+      resultMessage?: string | null;
+      remoteUpdatedAtUtc?: string | null;
+      issues?: ZendeskPublishValidationIssue[];
+      startedAtUtc?: string | null;
+      completedAtUtc?: string | null;
+    }
+  ): Promise<ZendeskPublishJobItemRecord> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const existing = workspaceDb.get<PublishJobItemDbRow>(
+        `SELECT id,
+                job_id as jobId,
+                workspace_id as workspaceId,
+                branch_id as branchId,
+                branch_name as branchName,
+                family_id as familyId,
+                family_title as familyTitle,
+                locale_variant_id as localeVariantId,
+                locale,
+                status,
+                zendesk_article_id as zendeskArticleId,
+                zendesk_source_article_id as zendeskSourceArticleId,
+                published_revision_id as publishedRevisionId,
+                result_code as resultCode,
+                result_message as resultMessage,
+                remote_updated_at as remoteUpdatedAtUtc,
+                issues_json as issuesJson,
+                started_at as startedAtUtc,
+                completed_at as completedAtUtc,
+                created_at as createdAtUtc,
+                updated_at as updatedAtUtc
+           FROM publish_job_items
+          WHERE workspace_id = @workspaceId
+            AND job_id = @jobId
+            AND branch_id = @branchId
+          LIMIT 1`,
+        { workspaceId, jobId, branchId }
+      );
+      if (!existing) {
+        throw new Error('Publish job item not found');
+      }
+
+      const nextIssues = patch.issues ?? mapPublishJobItemRow(existing).issues;
+      const nextUpdatedAt = new Date().toISOString();
+      workspaceDb.run(
+        `UPDATE publish_job_items
+            SET status = @status,
+                zendesk_article_id = @zendeskArticleId,
+                zendesk_source_article_id = @zendeskSourceArticleId,
+                published_revision_id = @publishedRevisionId,
+                result_code = @resultCode,
+                result_message = @resultMessage,
+                remote_updated_at = @remoteUpdatedAtUtc,
+                issues_json = @issuesJson,
+                started_at = @startedAtUtc,
+                completed_at = @completedAtUtc,
+                updated_at = @updatedAtUtc
+          WHERE id = @id`,
+        {
+          id: existing.id,
+          status: patch.status ?? normalizePublishJobItemState(existing.status),
+          zendeskArticleId: patch.zendeskArticleId !== undefined ? patch.zendeskArticleId : existing.zendeskArticleId,
+          zendeskSourceArticleId: patch.zendeskSourceArticleId !== undefined ? patch.zendeskSourceArticleId : existing.zendeskSourceArticleId,
+          publishedRevisionId: patch.publishedRevisionId !== undefined ? patch.publishedRevisionId : existing.publishedRevisionId,
+          resultCode: patch.resultCode !== undefined ? patch.resultCode : existing.resultCode,
+          resultMessage: patch.resultMessage !== undefined ? patch.resultMessage : existing.resultMessage,
+          remoteUpdatedAtUtc: patch.remoteUpdatedAtUtc !== undefined ? patch.remoteUpdatedAtUtc : existing.remoteUpdatedAtUtc,
+          issuesJson: JSON.stringify(nextIssues),
+          startedAtUtc: patch.startedAtUtc !== undefined ? patch.startedAtUtc : existing.startedAtUtc,
+          completedAtUtc: patch.completedAtUtc !== undefined ? patch.completedAtUtc : existing.completedAtUtc,
+          updatedAtUtc: nextUpdatedAt
+        }
+      );
+
+      const updated = workspaceDb.get<PublishJobItemDbRow>(
+        `SELECT id,
+                job_id as jobId,
+                workspace_id as workspaceId,
+                branch_id as branchId,
+                branch_name as branchName,
+                family_id as familyId,
+                family_title as familyTitle,
+                locale_variant_id as localeVariantId,
+                locale,
+                status,
+                zendesk_article_id as zendeskArticleId,
+                zendesk_source_article_id as zendeskSourceArticleId,
+                published_revision_id as publishedRevisionId,
+                result_code as resultCode,
+                result_message as resultMessage,
+                remote_updated_at as remoteUpdatedAtUtc,
+                issues_json as issuesJson,
+                started_at as startedAtUtc,
+                completed_at as completedAtUtc,
+                created_at as createdAtUtc,
+                updated_at as updatedAtUtc
+           FROM publish_job_items
+          WHERE id = @id`,
+        { id: existing.id }
+      );
+      if (!updated) {
+        throw new Error('Publish job item not found after update');
+      }
+      return mapPublishJobItemRow(updated);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getPublishJobSnapshot(workspaceId: string, jobId?: string): Promise<ZendeskPublishJobSnapshot> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const job = jobId?.trim()
+        ? workspaceDb.get<PublishJobDbRow>(
+            `SELECT id,
+                    workspace_id as workspaceId,
+                    status,
+                    requested_by as requestedBy,
+                    enqueued_at as enqueuedAtUtc,
+                    started_at as startedAtUtc,
+                    completed_at as completedAtUtc,
+                    branch_ids as branchIdsJson
+               FROM publish_jobs
+              WHERE workspace_id = @workspaceId
+                AND id = @jobId
+              LIMIT 1`,
+            { workspaceId, jobId: jobId.trim() }
+          )
+        : workspaceDb.get<PublishJobDbRow>(
+            `SELECT id,
+                    workspace_id as workspaceId,
+                    status,
+                    requested_by as requestedBy,
+                    enqueued_at as enqueuedAtUtc,
+                    started_at as startedAtUtc,
+                    completed_at as completedAtUtc,
+                    branch_ids as branchIdsJson
+               FROM publish_jobs
+              WHERE workspace_id = @workspaceId
+              ORDER BY COALESCE(started_at, enqueued_at) DESC, enqueued_at DESC
+              LIMIT 1`,
+            { workspaceId }
+          );
+      if (!job) {
+        return {
+          workspaceId,
+          job: null,
+          items: [],
+          summary: summarizePublishJobItems([])
+        };
+      }
+
+      const items = this.listPublishJobItemsInDb(workspaceDb, workspaceId, job.id);
+      return {
+        workspaceId,
+        job: mapPublishJobRow(job),
+        items,
+        summary: summarizePublishJobItems(items)
+      };
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async promotePublishedDraftBranch(payload: {
+    workspaceId: string;
+    branchId: string;
+    jobId: string;
+    zendeskArticleId: string;
+    zendeskSourceArticleId?: string;
+    externalKey?: string;
+    remoteSectionId?: string | null;
+    remoteCategoryId?: string | null;
+    remoteUpdatedAtUtc?: string;
+    resultMessage?: string;
+    publishedHtml?: string;
+    publishedAtUtc?: string;
+  }): Promise<{ revisionId: string; revisionNumber: number; familyId: string }> {
+    const workspace = await this.getWorkspace(payload.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const branch = this.getDraftBranchRow(workspaceDb, payload.workspaceId, payload.branchId);
+      if (normalizeDraftBranchStatus(branch.state) === DraftBranchStatus.OBSOLETE) {
+        throw new Error('Cannot publish an obsolete draft branch');
+      }
+      if (normalizeDraftBranchStatus(branch.state) === DraftBranchStatus.DISCARDED) {
+        throw new Error('Cannot publish a discarded draft branch');
+      }
+
+      const variant = workspaceDb.get<{ id: string; familyId: string; locale: string }>(
+        `SELECT id, family_id as familyId, locale
+           FROM locale_variants
+          WHERE id = @localeVariantId
+          LIMIT 1`,
+        { localeVariantId: branch.localeVariantId }
+      );
+      if (!variant) {
+        throw new Error('Locale variant not found');
+      }
+
+      const family = workspaceDb.get<ArticleFamilyDbRow>(
+        `SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
+           FROM article_families
+          WHERE id = @familyId
+            AND workspace_id = @workspaceId
+          LIMIT 1`,
+        { familyId: variant.familyId, workspaceId: payload.workspaceId }
+      );
+      if (!family) {
+        throw new Error('Article family not found');
+      }
+
+      const headRevision = await this.getDraftBranchHeadRevision(workspaceDb, branch);
+      if (!headRevision) {
+        throw new Error('Draft branch has no revision history');
+      }
+      const currentLive = await this.getLatestRevisionForVariant(workspaceDb, branch.localeVariantId, RevisionState.LIVE);
+      const nextRevisionNumber = ((await this.getLatestRevisionForVariant(workspaceDb, branch.localeVariantId))?.revisionNumber ?? 0) + 1;
+      const now = payload.publishedAtUtc ?? new Date().toISOString();
+      const html = payload.publishedHtml ?? await this.readRevisionSource(resolveRevisionPath(workspace.path, headRevision.filePath));
+      const revisionId = randomUUID();
+      const filePath = await this.writePublishedLiveRevision(workspace.path, branch.localeVariantId, revisionId, html);
+
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      workspaceDb.run(
+        `INSERT INTO revisions (
+          id, locale_variant_id, revision_type, branch_id, workspace_id, file_path, content_hash, source_revision_id, revision_number, status, created_at, updated_at
+        ) VALUES (
+          @id, @localeVariantId, @revisionType, NULL, @workspaceId, @filePath, @contentHash, @sourceRevisionId, @revisionNumber, @status, @createdAt, @updatedAt
+        )`,
+        {
+          id: revisionId,
+          localeVariantId: branch.localeVariantId,
+          revisionType: RevisionState.LIVE,
+          workspaceId: payload.workspaceId,
+          filePath,
+          contentHash: createContentHash(html),
+          sourceRevisionId: headRevision.id,
+          revisionNumber: nextRevisionNumber,
+          status: RevisionStatus.PROMOTED,
+          createdAt: now,
+          updatedAt: now
+        }
+      );
+      this.recordArticleLineage(workspaceDb, branch.localeVariantId, headRevision.id, revisionId, 'system', now);
+
+      const normalizedExternalKey = payload.externalKey?.trim();
+      if (normalizedExternalKey && normalizedExternalKey !== family.externalKey) {
+        const duplicate = workspaceDb.get<{ id: string }>(
+          `SELECT id
+             FROM article_families
+            WHERE workspace_id = @workspaceId
+              AND external_key = @externalKey
+              AND id != @familyId
+            LIMIT 1`,
+          {
+            workspaceId: payload.workspaceId,
+            externalKey: normalizedExternalKey,
+            familyId: variant.familyId
+          }
+        );
+        if (duplicate) {
+          throw new Error('Published external key already belongs to another article family');
+        }
+      }
+
+      workspaceDb.run(
+        `UPDATE article_families
+            SET external_key = COALESCE(@externalKey, external_key),
+                source_section_id = COALESCE(@sourceSectionId, source_section_id),
+                source_category_id = COALESCE(@sourceCategoryId, source_category_id),
+                retired_at = NULL
+          WHERE id = @familyId
+            AND workspace_id = @workspaceId`,
+        {
+          familyId: variant.familyId,
+          workspaceId: payload.workspaceId,
+          externalKey: normalizedExternalKey ?? null,
+          sourceSectionId: normalizeFeatureMapScopeId(payload.remoteSectionId) ?? null,
+          sourceCategoryId: normalizeFeatureMapScopeId(payload.remoteCategoryId) ?? null
+        }
+      );
+
+      workspaceDb.run(
+        `UPDATE locale_variants
+            SET status = @status,
+                retired_at = NULL
+          WHERE id = @localeVariantId`,
+        {
+          localeVariantId: branch.localeVariantId,
+          status: RevisionState.LIVE
+        }
+      );
+
+      workspaceDb.run(
+        `UPDATE draft_branches
+            SET state = @state,
+                updated_at = @updatedAt
+          WHERE id = @branchId
+            AND workspace_id = @workspaceId`,
+        {
+          branchId: branch.id,
+          workspaceId: payload.workspaceId,
+          state: DraftBranchStatus.PUBLISHED,
+          updatedAt: now
+        }
+      );
+
+      workspaceDb.run(
+        `UPDATE draft_branches
+            SET state = @state,
+                updated_at = @updatedAt
+          WHERE workspace_id = @workspaceId
+            AND locale_variant_id = @localeVariantId
+            AND id != @branchId
+            AND state NOT IN (@publishedState, @discardedState, @obsoleteState)`,
+        {
+          workspaceId: payload.workspaceId,
+          localeVariantId: branch.localeVariantId,
+          branchId: branch.id,
+          state: DraftBranchStatus.OBSOLETE,
+          updatedAt: now,
+          publishedState: DraftBranchStatus.PUBLISHED,
+          discardedState: DraftBranchStatus.DISCARDED,
+          obsoleteState: DraftBranchStatus.OBSOLETE
+        }
+      );
+
+      workspaceDb.run(
+        `INSERT INTO publish_records (
+          id, job_id, revision_id, zendesk_article_id, result, published_at
+        ) VALUES (
+          @id, @jobId, @revisionId, @zendeskArticleId, @result, @publishedAt
+        )`,
+        {
+          id: randomUUID(),
+          jobId: payload.jobId,
+          revisionId,
+          zendeskArticleId: payload.zendeskArticleId,
+          result: payload.resultMessage ?? 'published',
+          publishedAt: now
+        }
+      );
+      workspaceDb.exec('COMMIT');
+
+      const obsoleteBranches = workspaceDb.all<{ id: string; localeVariantId: string }>(
+        `SELECT id, locale_variant_id as localeVariantId
+           FROM draft_branches
+          WHERE workspace_id = @workspaceId
+            AND locale_variant_id = @localeVariantId
+            AND id != @branchId
+            AND state = @state`,
+        {
+          workspaceId: payload.workspaceId,
+          localeVariantId: branch.localeVariantId,
+          branchId: branch.id,
+          state: DraftBranchStatus.OBSOLETE
+        }
+      );
+      await this.purgeDraftBranches(workspace.path, workspaceDb, obsoleteBranches);
+
+      try {
+        this.markArticleRelationFamiliesStale(workspaceDb, payload.workspaceId, [variant.familyId]);
+      } catch (error) {
+        logger.warn('workspace-repository.promotePublishedDraftBranch stale-mark failed', {
+          workspaceId: payload.workspaceId,
+          familyId: variant.familyId,
+          localeVariantId: branch.localeVariantId,
+          currentLiveRevisionId: currentLive?.id,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+
+      return {
+        revisionId,
+        revisionNumber: nextRevisionNumber,
+        familyId: variant.familyId
+      };
+    } catch (error) {
+      try {
+        workspaceDb.exec('ROLLBACK');
+      } catch {
+        // no-op
+      }
+      throw error;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async recordDraftBranchRemotePublish(payload: {
+    workspaceId: string;
+    branchId: string;
+    jobId: string;
+    zendeskArticleId: string;
+    zendeskSourceArticleId?: string;
+    externalKey?: string;
+    remoteSectionId?: string | null;
+    remoteCategoryId?: string | null;
+    resultMessage?: string;
+    publishedAtUtc?: string;
+  }): Promise<{ familyId: string; revisionId: string }> {
+    const workspace = await this.getWorkspace(payload.workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const branch = this.getDraftBranchRow(workspaceDb, payload.workspaceId, payload.branchId);
+      if (normalizeDraftBranchStatus(branch.state) === DraftBranchStatus.OBSOLETE) {
+        throw new Error('Cannot publish an obsolete draft branch');
+      }
+      if (normalizeDraftBranchStatus(branch.state) === DraftBranchStatus.DISCARDED) {
+        throw new Error('Cannot publish a discarded draft branch');
+      }
+
+      const variant = workspaceDb.get<{ familyId: string }>(
+        `SELECT family_id as familyId
+           FROM locale_variants
+          WHERE id = @localeVariantId
+          LIMIT 1`,
+        { localeVariantId: branch.localeVariantId }
+      );
+      if (!variant) {
+        throw new Error('Locale variant not found');
+      }
+
+      const family = workspaceDb.get<ArticleFamilyDbRow>(
+        `SELECT ${ARTICLE_FAMILY_SELECT_COLUMNS}
+           FROM article_families
+          WHERE id = @familyId
+            AND workspace_id = @workspaceId
+          LIMIT 1`,
+        { familyId: variant.familyId, workspaceId: payload.workspaceId }
+      );
+      if (!family) {
+        throw new Error('Article family not found');
+      }
+
+      const headRevision = await this.getDraftBranchHeadRevision(workspaceDb, branch);
+      if (!headRevision) {
+        throw new Error('Draft branch has no revision history');
+      }
+
+      const normalizedExternalKey = payload.externalKey?.trim();
+      if (normalizedExternalKey && normalizedExternalKey !== family.externalKey) {
+        const duplicate = workspaceDb.get<{ id: string }>(
+          `SELECT id
+             FROM article_families
+            WHERE workspace_id = @workspaceId
+              AND external_key = @externalKey
+              AND id != @familyId
+            LIMIT 1`,
+          {
+            workspaceId: payload.workspaceId,
+            externalKey: normalizedExternalKey,
+            familyId: variant.familyId
+          }
+        );
+        if (duplicate) {
+          throw new Error('Published external key already belongs to another article family');
+        }
+      }
+
+      const now = payload.publishedAtUtc ?? new Date().toISOString();
+      workspaceDb.exec('BEGIN IMMEDIATE');
+      workspaceDb.run(
+        `UPDATE article_families
+            SET external_key = COALESCE(@externalKey, external_key),
+                source_section_id = COALESCE(@sourceSectionId, source_section_id),
+                source_category_id = COALESCE(@sourceCategoryId, source_category_id)
+          WHERE id = @familyId
+            AND workspace_id = @workspaceId`,
+        {
+          familyId: variant.familyId,
+          workspaceId: payload.workspaceId,
+          externalKey: normalizedExternalKey ?? null,
+          sourceSectionId: normalizeFeatureMapScopeId(payload.remoteSectionId) ?? null,
+          sourceCategoryId: normalizeFeatureMapScopeId(payload.remoteCategoryId) ?? null
+        }
+      );
+
+      workspaceDb.run(
+        `INSERT INTO publish_records (
+          id, job_id, revision_id, zendesk_article_id, result, published_at
+        ) VALUES (
+          @id, @jobId, @revisionId, @zendeskArticleId, @result, @publishedAt
+        )`,
+        {
+          id: randomUUID(),
+          jobId: payload.jobId,
+          revisionId: headRevision.id,
+          zendeskArticleId: payload.zendeskArticleId,
+          result: payload.resultMessage ?? 'draft_synced',
+          publishedAt: now
+        }
+      );
+      workspaceDb.exec('COMMIT');
+
+      return {
+        familyId: variant.familyId,
+        revisionId: headRevision.id
+      };
+    } catch (error) {
+      try {
+        workspaceDb.exec('ROLLBACK');
+      } catch {
+        // no-op
+      }
+      throw error;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   private async getLatestSyncRunWithFilter(
     workspaceId: string,
     state?: string
@@ -10658,6 +11825,41 @@ export class WorkspaceRepository {
     } finally {
       workspaceDb.close();
     }
+  }
+
+  private listPublishJobItemsInDb(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    jobId: string
+  ): ZendeskPublishJobItemRecord[] {
+    return workspaceDb.all<PublishJobItemDbRow>(
+      `SELECT id,
+              job_id as jobId,
+              workspace_id as workspaceId,
+              branch_id as branchId,
+              branch_name as branchName,
+              family_id as familyId,
+              family_title as familyTitle,
+              locale_variant_id as localeVariantId,
+              locale,
+              status,
+              zendesk_article_id as zendeskArticleId,
+              zendesk_source_article_id as zendeskSourceArticleId,
+              published_revision_id as publishedRevisionId,
+              result_code as resultCode,
+              result_message as resultMessage,
+              remote_updated_at as remoteUpdatedAtUtc,
+              issues_json as issuesJson,
+              started_at as startedAtUtc,
+              completed_at as completedAtUtc,
+              created_at as createdAtUtc,
+              updated_at as updatedAtUtc
+         FROM publish_job_items
+        WHERE workspace_id = @workspaceId
+          AND job_id = @jobId
+        ORDER BY created_at ASC, branch_name COLLATE NOCASE ASC`,
+      { workspaceId, jobId }
+    ).map(mapPublishJobItemRow);
   }
 
   async getArticleFamilyByExternalKey(workspaceId: string, externalKey: string): Promise<ArticleFamilyRecord | null> {
@@ -14019,15 +15221,19 @@ export class WorkspaceRepository {
         externalKey: `proposal-${proposal.id}`,
         title: familyTitle,
         categoryId: placement?.categoryId,
-        sectionId: placement?.sectionId
+        categoryName: placement?.categoryName,
+        sectionId: placement?.sectionId,
+        sectionName: placement?.sectionName
       });
       familyId = family.id;
-    } else if (placement?.categoryId || placement?.sectionId) {
+    } else if (placement?.categoryId || placement?.categoryName || placement?.sectionId || placement?.sectionName) {
       await this.updateArticleFamily({
         workspaceId: proposal.workspaceId,
         familyId,
         categoryId: placement.categoryId ?? undefined,
-        sectionId: placement.sectionId ?? undefined
+        categoryName: placement.categoryName ?? undefined,
+        sectionId: placement.sectionId ?? undefined,
+        sectionName: placement.sectionName ?? undefined
       });
     }
 
@@ -14098,6 +15304,19 @@ export class WorkspaceRepository {
     await fs.mkdir(branchDir, { recursive: true });
     const fileName = `${String(revisionNumber).padStart(4, '0')}-${revisionId}.html`;
     const absolutePath = path.join(branchDir, fileName);
+    await fs.writeFile(absolutePath, html || '', 'utf8');
+    return path.relative(workspacePath, absolutePath);
+  }
+
+  private async writePublishedLiveRevision(
+    workspacePath: string,
+    localeVariantId: string,
+    revisionId: string,
+    html: string
+  ): Promise<string> {
+    const revisionDir = path.join(workspacePath, 'revisions', localeVariantId);
+    await fs.mkdir(revisionDir, { recursive: true });
+    const absolutePath = path.join(revisionDir, `${revisionId}.html`);
     await fs.writeFile(absolutePath, html || '', 'utf8');
     return path.relative(workspacePath, absolutePath);
   }
@@ -14411,9 +15630,16 @@ export class WorkspaceRepository {
     workspaceId: string,
     familyId: string
   ): ArticlePlacementSummary | undefined {
-    const family = workspaceDb.get<{ sectionId: string | null; categoryId: string | null }>(
+    const family = workspaceDb.get<{
+      sectionId: string | null;
+      sectionName: string | null;
+      categoryId: string | null;
+      categoryName: string | null;
+    }>(
       `SELECT section_id as sectionId,
-              category_id as categoryId
+              section_name as sectionName,
+              category_id as categoryId,
+              category_name as categoryName
        FROM article_families
        WHERE id = @familyId
        LIMIT 1`,
@@ -14423,6 +15649,35 @@ export class WorkspaceRepository {
     return family
       ? this.resolvePlacementSummaryInDb(workspaceDb, workspaceId, family)
       : undefined;
+  }
+
+  private getDraftBranchPlacementSummaryInDb(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    branchId: string,
+    familyId: string
+  ): ArticlePlacementSummary | undefined {
+    const familyPlacement = this.getFamilyPlacementSummaryInDb(workspaceDb, workspaceId, familyId);
+    if (familyPlacement) {
+      return familyPlacement;
+    }
+
+    const proposal = workspaceDb.get<{ suggestedPlacementJson: string | null }>(
+      `SELECT suggested_placement_json as suggestedPlacementJson
+       FROM proposals
+       WHERE workspace_id = @workspaceId
+         AND suggested_placement_json IS NOT NULL
+         AND (
+           branch_id = @branchId
+           OR (branch_id IS NULL AND family_id = @familyId)
+         )
+       ORDER BY CASE WHEN branch_id = @branchId THEN 0 ELSE 1 END,
+                updated_at DESC
+       LIMIT 1`,
+      { workspaceId, branchId, familyId }
+    );
+    const suggestedPlacement = safeParseJson<ProposalPlacementSuggestion>(proposal?.suggestedPlacementJson);
+    return this.hydrateProposalPlacementSuggestionInDb(workspaceDb, workspaceId, suggestedPlacement ?? undefined);
   }
 
   private resolvePlacementSummaryInDb(
@@ -14806,7 +16061,12 @@ export class WorkspaceRepository {
     }
     const headHtml = await this.readRevisionSource(resolveRevisionPath(workspacePath, headRevision.filePath));
     const validationWarnings = await this.validateDraftBranchHtml(workspacePath, workspaceDb, branch, headHtml);
-    const placement = this.getFamilyPlacementSummaryInDb(workspaceDb, branch.workspaceId, variant.familyId);
+    const placement = this.getDraftBranchPlacementSummaryInDb(
+      workspaceDb,
+      branch.workspaceId,
+      branch.id,
+      variant.familyId
+    );
 
     return {
       id: branch.id,
@@ -17026,7 +18286,9 @@ function mapArticleFamilyRow(row: ArticleFamilyDbRow): ArticleFamilyRecord {
     externalKey: row.externalKey,
     title: row.title,
     sectionId: normalizeFeatureMapScopeId(row.sectionId),
+    sectionName: row.sectionName?.trim() || undefined,
     categoryId: normalizeFeatureMapScopeId(row.categoryId),
+    categoryName: row.categoryName?.trim() || undefined,
     sourceSectionId: normalizeFeatureMapScopeId(row.sourceSectionId),
     sourceCategoryId: normalizeFeatureMapScopeId(row.sourceCategoryId),
     sectionSource: normalizeArticleTaxonomySource(row.sectionSource),
@@ -17036,6 +18298,196 @@ function mapArticleFamilyRow(row: ArticleFamilyDbRow): ArticleFamilyRecord {
     taxonomyNote: normalizeFeatureMapScopeId(row.taxonomyNote),
     retiredAtUtc: normalizeFeatureMapScopeId(row.retiredAtUtc)
   };
+}
+
+function normalizePublishStatus(value: string | null | undefined): PublishStatus {
+  switch (value) {
+    case PublishStatus.RUNNING:
+      return PublishStatus.RUNNING;
+    case PublishStatus.COMPLETED:
+      return PublishStatus.COMPLETED;
+    case PublishStatus.FAILED:
+      return PublishStatus.FAILED;
+    case PublishStatus.CANCELED:
+      return PublishStatus.CANCELED;
+    case PublishStatus.QUEUED:
+    default:
+      return PublishStatus.QUEUED;
+  }
+}
+
+function normalizePublishJobItemState(value: string | null | undefined): PublishJobItemState {
+  switch (value) {
+    case PublishJobItemState.RUNNING:
+      return PublishJobItemState.RUNNING;
+    case PublishJobItemState.SUCCEEDED:
+      return PublishJobItemState.SUCCEEDED;
+    case PublishJobItemState.FAILED:
+      return PublishJobItemState.FAILED;
+    case PublishJobItemState.BLOCKED:
+      return PublishJobItemState.BLOCKED;
+    case PublishJobItemState.CONFLICTED:
+      return PublishJobItemState.CONFLICTED;
+    case PublishJobItemState.CANCELED:
+      return PublishJobItemState.CANCELED;
+    case PublishJobItemState.QUEUED:
+    default:
+      return PublishJobItemState.QUEUED;
+  }
+}
+
+function mapPublishJobRow(row: PublishJobDbRow): PublishJobRecord {
+  const branchIds = safeParseJson<string[]>(row.branchIdsJson);
+  return {
+    id: row.id,
+    workspaceId: row.workspaceId,
+    status: normalizePublishStatus(row.status),
+    requestedBy: row.requestedBy ?? undefined,
+    enqueuedAtUtc: row.enqueuedAtUtc,
+    startedAtUtc: row.startedAtUtc ?? undefined,
+    completedAtUtc: row.completedAtUtc ?? undefined,
+    branchIds: Array.isArray(branchIds)
+      ? branchIds.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : []
+  };
+}
+
+function mapPublishJobItemRow(row: PublishJobItemDbRow): ZendeskPublishJobItemRecord {
+  const issues = safeParseJson<ZendeskPublishValidationIssue[]>(row.issuesJson);
+  return {
+    id: row.id,
+    jobId: row.jobId,
+    workspaceId: row.workspaceId,
+    branchId: row.branchId,
+    branchName: row.branchName,
+    familyId: row.familyId,
+    familyTitle: row.familyTitle,
+    localeVariantId: row.localeVariantId,
+    locale: row.locale,
+    status: normalizePublishJobItemState(row.status),
+    zendeskArticleId: row.zendeskArticleId ?? undefined,
+    zendeskSourceArticleId: row.zendeskSourceArticleId ?? undefined,
+    publishedRevisionId: row.publishedRevisionId ?? undefined,
+    resultCode: row.resultCode ?? undefined,
+    resultMessage: row.resultMessage ?? undefined,
+    remoteUpdatedAtUtc: row.remoteUpdatedAtUtc ?? undefined,
+    issues: Array.isArray(issues) ? issues : [],
+    startedAtUtc: row.startedAtUtc ?? undefined,
+    completedAtUtc: row.completedAtUtc ?? undefined,
+    createdAtUtc: row.createdAtUtc,
+    updatedAtUtc: row.updatedAtUtc
+  };
+}
+
+function summarizePublishJobItems(items: ZendeskPublishJobItemRecord[]): ZendeskPublishJobSummary {
+  const summary: ZendeskPublishJobSummary = {
+    total: items.length,
+    queued: 0,
+    running: 0,
+    succeeded: 0,
+    failed: 0,
+    blocked: 0,
+    conflicted: 0,
+    canceled: 0
+  };
+  for (const item of items) {
+    switch (item.status) {
+      case PublishJobItemState.RUNNING:
+        summary.running += 1;
+        break;
+      case PublishJobItemState.SUCCEEDED:
+        summary.succeeded += 1;
+        break;
+      case PublishJobItemState.FAILED:
+        summary.failed += 1;
+        break;
+      case PublishJobItemState.BLOCKED:
+        summary.blocked += 1;
+        break;
+      case PublishJobItemState.CONFLICTED:
+        summary.conflicted += 1;
+        break;
+      case PublishJobItemState.CANCELED:
+        summary.canceled += 1;
+        break;
+      case PublishJobItemState.QUEUED:
+      default:
+        summary.queued += 1;
+        break;
+    }
+  }
+  return summary;
+}
+
+interface ProposalZendeskRetireState {
+  status: ZendeskRetireActionStatus;
+  attemptedAtUtc?: string;
+  completedAtUtc?: string;
+  zendeskArticleId?: string;
+  locale?: string;
+  message?: string;
+}
+
+function normalizeZendeskRetireActionStatus(value: unknown): ZendeskRetireActionStatus | undefined {
+  switch (value) {
+    case 'pending':
+    case 'running':
+    case 'failed':
+    case 'archived':
+    case 'already_archived':
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function normalizeProposalZendeskRetireState(value: unknown): ProposalZendeskRetireState | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const status = normalizeZendeskRetireActionStatus(record.status);
+  if (!status) {
+    return undefined;
+  }
+  return {
+    status,
+    attemptedAtUtc: extractString(record.attemptedAtUtc),
+    completedAtUtc: extractString(record.completedAtUtc),
+    zendeskArticleId: extractString(record.zendeskArticleId),
+    locale: extractString(record.locale),
+    message: extractString(record.message)
+  };
+}
+
+function parseZendeskArticleIdFromExternalKey(externalKey?: string): number | undefined {
+  const normalized = externalKey?.trim();
+  if (!normalized?.startsWith('hc:')) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(normalized.slice(3), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function summarizeZendeskRetireQueueItems(items: ZendeskRetireQueueItem[]): ZendeskRetireQueueSummary {
+  return items.reduce<ZendeskRetireQueueSummary>((summary, item) => {
+    summary.total += 1;
+    if (!item.canArchive) {
+      summary.blocked += 1;
+      return summary;
+    }
+    if (item.remoteRetireStatus === 'failed') {
+      summary.failed += 1;
+      return summary;
+    }
+    summary.ready += 1;
+    return summary;
+  }, {
+    total: 0,
+    ready: 0,
+    blocked: 0,
+    failed: 0
+  });
 }
 
 function buildFeatureMapBucketKey(scopeType: 'section' | 'category', scopeId?: string | null): string {
@@ -17787,6 +19239,31 @@ function isValidKbAccessMode(value: string): value is KbAccessMode {
 
 function normalizeKbAccessMode(value?: string | null): KbAccessMode {
   return isValidKbAccessMode(value ?? '') ? (value as KbAccessMode) : DEFAULT_KB_ACCESS_MODE;
+}
+
+function normalizeZendeskPublishId(value?: string | null): string | undefined {
+  const normalized = value?.trim();
+  return normalized ? normalized : undefined;
+}
+
+function normalizeBooleanColumn(value: number | boolean | null | undefined, fallback: boolean): boolean {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
+  return fallback;
+}
+
+function normalizeZendeskRetirementStrategy(value?: string | null): ZendeskRetirementStrategy {
+  return value === 'archive' ? 'archive' : DEFAULT_ZENDESK_RETIREMENT_STRATEGY;
+}
+
+function normalizeZendeskPlaceholderAssetPolicy(value?: string | null): ZendeskPlaceholderAssetPolicy {
+  return value === 'block' || value === 'upload'
+    ? value
+    : DEFAULT_ZENDESK_PLACEHOLDER_ASSET_POLICY;
 }
 
 function latestTimestamp(...values: Array<string | undefined>): string | undefined {

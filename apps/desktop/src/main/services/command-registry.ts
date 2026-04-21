@@ -40,6 +40,11 @@ import {
   type ZendeskCategoriesListRequest,
   type ZendeskSectionsListRequest,
   type ZendeskSearchArticlesRequest,
+  type ZendeskPublishJobGetRequest,
+  type ZendeskPublishRunRequest,
+  type ZendeskPublishValidateRequest,
+  type ZendeskRetireQueueListRequest,
+  type ZendeskRetireRunRequest,
   type ArticleDetailRequest,
   type CoverageQueryRequest,
   type GraphQueryRequest,
@@ -105,6 +110,7 @@ import {
   type BatchPlannerPrefetchCluster,
   type BatchPlannerRelationEvidence,
   type BatchPlannerRelationMatch,
+  type ProposalPlacementSuggestion,
   type BatchAnalysisStageStatus,
   type BatchPlanReview,
   type ProposalIngestRequest,
@@ -167,6 +173,8 @@ import { JobRegistry } from './job-runner';
 import { JobState } from '@kb-vault/shared-types';
 import { WorkspaceRepository } from './workspace-repository';
 import { ZendeskSyncService, type ZendeskSyncServiceInput } from './zendesk-sync-service';
+import { ZendeskPublishService } from './zendesk-publish-service';
+import { ZendeskRetireService } from './zendesk-retire-service';
 import { PBIBatchImportService } from './pbi-batch-import-service';
 import { logger } from './logger';
 import { KbCliLoopbackService } from './kb-cli-loopback-service';
@@ -1112,6 +1120,7 @@ const mapPlannerRelationMatches = (
 
 const buildPlannerPrefetch = async (
   workspaceRepository: WorkspaceRepository,
+  buildZendeskClient: (workspaceId: string) => Promise<ZendeskClient>,
   workspaceId: string,
   batchId: string,
   uploadedPbis: unknown
@@ -1120,6 +1129,7 @@ const buildPlannerPrefetch = async (
   const workspaceSettingsPromise = workspaceRepository.getWorkspaceSettings(workspaceId).catch(() => null);
   const familyVariantsByFamilyId = new Map<string, Promise<LocaleVariantRecord[]>>();
   const familyTitlesByFamilyId = new Map<string, Promise<string | null>>();
+  const familyRecordsByFamilyId = new Map<string, Promise<ArticleFamilyRecord | null>>();
   const getFamilyVariants = (familyId: string): Promise<LocaleVariantRecord[]> => {
     const normalizedFamilyId = familyId.trim();
     if (!normalizedFamilyId) {
@@ -1158,6 +1168,126 @@ const buildPlannerPrefetch = async (
     familyTitlesByFamilyId.set(normalizedFamilyId, next);
     return next;
   };
+  const getFamilyRecord = (familyId: string): Promise<ArticleFamilyRecord | null> => {
+    const normalizedFamilyId = familyId.trim();
+    if (!normalizedFamilyId) {
+      return Promise.resolve(null);
+    }
+
+    const existing = familyRecordsByFamilyId.get(normalizedFamilyId);
+    if (existing) {
+      return existing;
+    }
+
+    const repositoryWithFamilyLookup = workspaceRepository as WorkspaceRepository & {
+      getArticleFamily?: (workspaceId: string, familyId: string) => Promise<ArticleFamilyRecord>;
+    };
+    const next = typeof repositoryWithFamilyLookup.getArticleFamily === 'function'
+      ? repositoryWithFamilyLookup.getArticleFamily(workspaceId, normalizedFamilyId).catch(() => null)
+      : Promise.resolve(null);
+    familyRecordsByFamilyId.set(normalizedFamilyId, next);
+    return next;
+  };
+  const zendeskTaxonomyPromise = (async (): Promise<BatchPlannerPrefetch['zendeskTaxonomy']> => {
+    const workspaceSettings = await workspaceSettingsPromise;
+    const locale = workspaceSettings?.defaultLocale?.trim();
+    if (!locale) {
+      return null;
+    }
+
+    try {
+      const client = await buildZendeskClient(workspaceId);
+      const categories = await client.listCategories(locale) as unknown as ZendeskCategoryRecord[];
+      const normalizedCategories: NonNullable<BatchPlannerPrefetch['zendeskTaxonomy']>['categories'] = [];
+
+      for (const category of [...categories].sort((left, right) => {
+        const leftPosition = typeof left.position === 'number' ? left.position : Number.MAX_SAFE_INTEGER;
+        const rightPosition = typeof right.position === 'number' ? right.position : Number.MAX_SAFE_INTEGER;
+        return leftPosition - rightPosition || left.name.localeCompare(right.name);
+      })) {
+        if (!Number.isFinite(category.id) || !category.name?.trim()) {
+          continue;
+        }
+
+        const sections = await client.listSections(category.id, locale).catch(() => []) as unknown as ZendeskSectionRecord[];
+        normalizedCategories.push({
+          categoryId: String(category.id),
+          categoryName: category.name.trim(),
+          sections: sections
+            .filter((section) => Number.isFinite(section.id) && section.name?.trim())
+            .sort((left, right) => {
+              const leftPosition = typeof left.position === 'number' ? left.position : Number.MAX_SAFE_INTEGER;
+              const rightPosition = typeof right.position === 'number' ? right.position : Number.MAX_SAFE_INTEGER;
+              return leftPosition - rightPosition || left.name.localeCompare(right.name);
+            })
+            .map((section) => ({
+              sectionId: String(section.id),
+              sectionName: section.name.trim()
+            }))
+        });
+      }
+
+      return {
+        locale,
+        categories: normalizedCategories
+      };
+    } catch {
+      return null;
+    }
+  })();
+  const taxonomyLookupPromise = zendeskTaxonomyPromise.then((taxonomy) => {
+    const categoriesById = new Map<string, { categoryName: string }>();
+    const sectionsById = new Map<string, {
+      sectionId: string;
+      sectionName: string;
+      categoryId: string;
+      categoryName: string;
+    }>();
+
+    for (const category of taxonomy?.categories ?? []) {
+      categoriesById.set(category.categoryId, {
+        categoryName: category.categoryName
+      });
+      for (const section of category.sections) {
+        sectionsById.set(section.sectionId, {
+          sectionId: section.sectionId,
+          sectionName: section.sectionName,
+          categoryId: category.categoryId,
+          categoryName: category.categoryName
+        });
+      }
+    }
+
+    return {
+      categoriesById,
+      sectionsById
+    };
+  });
+  const resolveFamilyPlannerPlacement = async (familyId: string): Promise<ProposalPlacementSuggestion | undefined> => {
+    const [family, taxonomyLookup] = await Promise.all([
+      getFamilyRecord(familyId),
+      taxonomyLookupPromise
+    ]);
+    if (!family) {
+      return undefined;
+    }
+
+    const directSectionId = family.sectionId?.trim() || undefined;
+    const directCategoryId = family.categoryId?.trim() || undefined;
+    const sectionEntry = directSectionId ? taxonomyLookup.sectionsById.get(directSectionId) : undefined;
+    const resolvedCategoryId = directCategoryId ?? sectionEntry?.categoryId;
+    const categoryEntry = resolvedCategoryId ? taxonomyLookup.categoriesById.get(resolvedCategoryId) : undefined;
+    const placement: ProposalPlacementSuggestion = {
+      categoryId: resolvedCategoryId,
+      categoryName: family.categoryName?.trim() || categoryEntry?.categoryName,
+      sectionId: directSectionId,
+      sectionName: family.sectionName?.trim() || sectionEntry?.sectionName
+    };
+
+    return Object.values(placement).some(Boolean)
+      ? placement
+      : undefined;
+  };
   const resolvePlannerCoverageLocaleVariantId = async (result: Record<string, unknown>): Promise<string> => {
     const familyId = typeof result.familyId === 'string' ? result.familyId.trim() : '';
     const allowedVariantIds = new Set(
@@ -1179,7 +1309,7 @@ const buildPlannerPrefetch = async (
       allowedVariantIds
     );
   };
-  const [inspection, articleMatchResponses] = await Promise.all([
+  const [inspection, articleMatchResponses, zendeskTaxonomy] = await Promise.all([
     workspaceRepository.getBatchAnalysisInspection(workspaceId, batchId).catch(() => null),
     Promise.all(
       topicClusters.slice(0, 12).flatMap((cluster) =>
@@ -1208,7 +1338,10 @@ const buildPlannerPrefetch = async (
               localeVariantId: await resolvePlannerCoverageLocaleVariantId(result),
               score: typeof result.finalScore === 'number' ? result.finalScore : 0,
               matchContext: display.matchContext,
-              snippet: display.snippet
+              snippet: display.snippet,
+              placement: familyId
+                ? await resolveFamilyPlannerPlacement(familyId)
+                : undefined
             };
           }));
 
@@ -1226,7 +1359,8 @@ const buildPlannerPrefetch = async (
           };
         })
       )
-    )
+    ),
+    zendeskTaxonomyPromise
   ]);
 
   const articleMatches = articleMatchResponses.map((response) => response.articleMatch);
@@ -1259,7 +1393,8 @@ const buildPlannerPrefetch = async (
       : null,
     topicClusters,
     articleMatches,
-    relationMatches: mapPlannerRelationMatches(relationResponses)
+    relationMatches: mapPlannerRelationMatches(relationResponses),
+    zendeskTaxonomy
   };
 };
 
@@ -2776,6 +2911,8 @@ export function registerCoreCommands(
       }
     );
   };
+  const zendeskPublishService = new ZendeskPublishService(workspaceRepository, buildZendeskClient);
+  const zendeskRetireService = new ZendeskRetireService(workspaceRepository, buildZendeskClient);
   const kbActionService = new KbActionService({
     workspaceRepository,
     appWorkingStateService,
@@ -3395,7 +3532,18 @@ export function registerCoreCommands(
         input.enabledLocales === undefined &&
         input.kbAccessMode === undefined &&
         input.agentModelId === undefined &&
-        input.acpModelId === undefined
+        input.acpModelId === undefined &&
+        input.zendeskPermissionGroupId === undefined &&
+        input.zendeskLiveUserSegmentId === undefined &&
+        input.zendeskNotifySubscribers === undefined &&
+        input.zendeskAllowSectionCreation === undefined &&
+        input.zendeskAllowCategoryCreation === undefined &&
+        input.zendeskRetirementStrategy === undefined &&
+        input.zendeskPlaceholderAssetPolicy === undefined &&
+        input.zendeskRequireLiveConfirmation === undefined &&
+        input.zendeskBlockLiveOnWarnings === undefined &&
+        input.zendeskFallbackCategoryName === undefined &&
+        input.zendeskFallbackSectionName === undefined
       ) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'workspace.settings.update requires at least one setting field');
       }
@@ -3420,6 +3568,12 @@ export function registerCoreCommands(
       if (typeof input.acpModelId === 'string' && !input.acpModelId.trim()) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'acpModelId cannot be empty');
       }
+      if (typeof input.zendeskFallbackCategoryName === 'string' && !input.zendeskFallbackCategoryName.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendeskFallbackCategoryName cannot be empty');
+      }
+      if (typeof input.zendeskFallbackSectionName === 'string' && !input.zendeskFallbackSectionName.trim()) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendeskFallbackSectionName cannot be empty');
+      }
 
       const updated = await workspaceRepository.updateWorkspaceSettings(input);
       await agentRuntime.setWorkspaceAgentModel(updated.workspaceId, updated.acpModelId);
@@ -3433,7 +3587,11 @@ export function registerCoreCommands(
         (error as Error).message === 'No settings provided' ||
         (error as Error).message === 'defaultLocale cannot be empty' ||
         (error as Error).message === 'enabledLocales cannot be empty' ||
-        (error as Error).message === 'zendeskSubdomain cannot be empty'
+        (error as Error).message === 'zendeskSubdomain cannot be empty' ||
+        (error as Error).message === 'zendeskRetirementStrategy must be archive' ||
+        (error as Error).message === 'zendeskPlaceholderAssetPolicy must be block or upload' ||
+        (error as Error).message === 'zendeskFallbackCategoryName cannot be empty' ||
+        (error as Error).message === 'zendeskFallbackSectionName cannot be empty'
       ) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, (error as Error).message);
       }
@@ -3861,7 +4019,9 @@ export function registerCoreCommands(
       if (
         input.title === undefined &&
         input.sectionId === undefined &&
+        input.sectionName === undefined &&
         input.categoryId === undefined &&
+        input.categoryName === undefined &&
         input.retiredAtUtc === undefined
       ) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'articleFamily.update requires at least one field');
@@ -5470,6 +5630,7 @@ export function registerCoreCommands(
     const uploadedPbis = await workspaceRepository.getPBISubset(input.workspaceId, input.batchId).catch(() => ({ rows: [] }));
     const plannerPrefetch = await buildPlannerPrefetch(
       workspaceRepository,
+      buildZendeskClient,
       input.workspaceId,
       input.batchId,
       uploadedPbis
@@ -5477,7 +5638,8 @@ export function registerCoreCommands(
       priorAnalysis: null,
       topicClusters: [],
       articleMatches: [],
-      relationMatches: []
+      relationMatches: [],
+      zendeskTaxonomy: null
     }));
     const existingSnapshot = await workspaceRepository.getBatchAnalysisSnapshot(input.workspaceId, input.batchId);
     let latestPendingQuestionSet = existingSnapshot.activeQuestionSet;
@@ -6122,7 +6284,8 @@ export function registerCoreCommands(
           agentModelId,
           sessionId,
           planVersion: attempt,
-          supersedesPlanId: priorPlanJson ? (JSON.parse(priorPlanJson) as { id?: string }).id : undefined
+          supersedesPlanId: priorPlanJson ? (JSON.parse(priorPlanJson) as { id?: string }).id : undefined,
+          plannerPrefetch
         });
 
       let plannerResolution = await resolveBatchAnalysisResultText(
@@ -7328,7 +7491,8 @@ export function registerCoreCommands(
         agentModelId,
         sessionId: amendmentPlannerResult.sessionId,
         planVersion: activeApprovedPlan.planVersion + 1,
-        supersedesPlanId: activeApprovedPlan.id
+        supersedesPlanId: activeApprovedPlan.id,
+        plannerPrefetch
       });
       const normalizedAmendmentBatchReferences = batchAnalysisOrchestrator.normalizePlanBatchReferences({
         plan: amendmentDraftPlan,
@@ -8703,6 +8867,69 @@ export function registerCoreCommands(
     }
   });
 
+  bus.register('publish.validate', async (payload) => {
+    try {
+      const input = payload as ZendeskPublishValidateRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'publish.validate requires workspaceId');
+      }
+      const result = await zendeskPublishService.validate(input);
+      return {
+        ok: true,
+        data: result
+      };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      if ((error as Error).message === 'Zendesk credentials are not configured for this workspace') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      if ((error as Error).message === 'Encrypted credential storage is unavailable') {
+        return createErrorResult(AppErrorCode.NOT_AUTHORIZED, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('zendesk.retire.queue.list', async (payload) => {
+    try {
+      const input = payload as ZendeskRetireQueueListRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.retire.queue.list requires workspaceId');
+      }
+      const result = await workspaceRepository.listZendeskRetireQueue(input.workspaceId, input.proposalIds);
+      return {
+        ok: true,
+        data: result
+      };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('publish.job.getLatest', async (payload) => {
+    try {
+      const input = payload as ZendeskPublishJobGetRequest | undefined;
+      if (!input?.workspaceId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'publish.job.getLatest requires workspaceId');
+      }
+      const snapshot = await workspaceRepository.getPublishJobSnapshot(input.workspaceId, input.jobId);
+      return {
+        ok: true,
+        data: snapshot
+      };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
   jobs.registerRunner('zendesk.sync.run', async (payload: JobRunContext, emit) => {
     const input = payload.input as unknown as ZendeskSyncServiceInput | ZendeskSyncRunRequest | undefined;
     if (!input?.workspaceId || !input.mode) {
@@ -8739,6 +8966,50 @@ export function registerCoreCommands(
       emit,
       payload.command,
       payload.jobId
+    );
+  });
+
+  jobs.registerRunner('zendesk.publish.run', async (payload: JobRunContext, emit, isCancelled) => {
+    const input = payload.input as unknown as ZendeskPublishRunRequest | undefined;
+    if (!input?.workspaceId) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'zendesk.publish.run requires workspaceId'
+      });
+      return;
+    }
+
+    await zendeskPublishService.runPublish(
+      input,
+      emit,
+      payload.command,
+      payload.jobId,
+      isCancelled
+    );
+  });
+
+  jobs.registerRunner('zendesk.retire.run', async (payload: JobRunContext, emit, isCancelled) => {
+    const input = payload.input as unknown as ZendeskRetireRunRequest | undefined;
+    if (!input?.workspaceId) {
+      emit({
+        id: payload.jobId,
+        command: payload.command,
+        state: JobState.FAILED,
+        progress: 100,
+        message: 'zendesk.retire.run requires workspaceId'
+      });
+      return;
+    }
+
+    await zendeskRetireService.runRetire(
+      input,
+      emit,
+      payload.command,
+      payload.jobId,
+      isCancelled
     );
   });
 

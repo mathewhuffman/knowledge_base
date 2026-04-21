@@ -756,7 +756,19 @@ export const Settings = () => {
   const [enabledLocales, setEnabledLocales] = useState<string[]>([]);
   const [agentModelId, setAgentModelId] = useState('');
   const [acpModelId, setAcpModelId] = useState('');
+  const [zendeskPermissionGroupId, setZendeskPermissionGroupId] = useState('');
+  const [zendeskLiveUserSegmentId, setZendeskLiveUserSegmentId] = useState('');
+  const [zendeskNotifySubscribers, setZendeskNotifySubscribers] = useState(false);
+  const [zendeskAllowSectionCreation, setZendeskAllowSectionCreation] = useState(true);
+  const [zendeskAllowCategoryCreation, setZendeskAllowCategoryCreation] = useState(true);
+  const [zendeskRetirementStrategy, setZendeskRetirementStrategy] = useState<'archive'>('archive');
+  const [zendeskPlaceholderAssetPolicy, setZendeskPlaceholderAssetPolicy] = useState<'block' | 'upload'>('upload');
+  const [zendeskRequireLiveConfirmation, setZendeskRequireLiveConfirmation] = useState(true);
+  const [zendeskBlockLiveOnWarnings, setZendeskBlockLiveOnWarnings] = useState(true);
+  const [zendeskFallbackCategoryName, setZendeskFallbackCategoryName] = useState('KB Vault Imports');
+  const [zendeskFallbackSectionName, setZendeskFallbackSectionName] = useState('Unsorted');
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [publishSaveSuccess, setPublishSaveSuccess] = useState(false);
   const [runtimeSaveSuccess, setRuntimeSaveSuccess] = useState(false);
   const [runtimeValidationError, setRuntimeValidationError] = useState('');
   const [acpRuntimeSaveSuccess, setAcpRuntimeSaveSuccess] = useState(false);
@@ -777,6 +789,17 @@ export const Settings = () => {
       setEnabledLocales(settingsQuery.data.enabledLocales);
       setAgentModelId(settingsQuery.data.agentModelId ?? '');
       setAcpModelId(settingsQuery.data.acpModelId ?? '');
+      setZendeskPermissionGroupId(settingsQuery.data.zendeskPermissionGroupId ?? '');
+      setZendeskLiveUserSegmentId(settingsQuery.data.zendeskLiveUserSegmentId ?? '');
+      setZendeskNotifySubscribers(settingsQuery.data.zendeskNotifySubscribers);
+      setZendeskAllowSectionCreation(settingsQuery.data.zendeskAllowSectionCreation);
+      setZendeskAllowCategoryCreation(settingsQuery.data.zendeskAllowCategoryCreation);
+      setZendeskRetirementStrategy(settingsQuery.data.zendeskRetirementStrategy);
+      setZendeskPlaceholderAssetPolicy(settingsQuery.data.zendeskPlaceholderAssetPolicy);
+      setZendeskRequireLiveConfirmation(settingsQuery.data.zendeskRequireLiveConfirmation);
+      setZendeskBlockLiveOnWarnings(settingsQuery.data.zendeskBlockLiveOnWarnings);
+      setZendeskFallbackCategoryName(settingsQuery.data.zendeskFallbackCategoryName);
+      setZendeskFallbackSectionName(settingsQuery.data.zendeskFallbackSectionName);
     }
   }, [settingsQuery.data]);
 
@@ -809,6 +832,29 @@ export const Settings = () => {
     if (result) {
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 2000);
+    }
+  };
+
+  const handleSavePublishSettings = async () => {
+    if (!activeWorkspace) return;
+    setPublishSaveSuccess(false);
+    const result = await settingsMutation.mutate({
+      workspaceId: activeWorkspace.id,
+      zendeskPermissionGroupId: zendeskPermissionGroupId.trim() || null,
+      zendeskLiveUserSegmentId: zendeskLiveUserSegmentId.trim() || null,
+      zendeskNotifySubscribers,
+      zendeskAllowSectionCreation,
+      zendeskAllowCategoryCreation,
+      zendeskRetirementStrategy,
+      zendeskPlaceholderAssetPolicy,
+      zendeskRequireLiveConfirmation,
+      zendeskBlockLiveOnWarnings,
+      zendeskFallbackCategoryName: zendeskFallbackCategoryName.trim(),
+      zendeskFallbackSectionName: zendeskFallbackSectionName.trim(),
+    });
+    if (result) {
+      setPublishSaveSuccess(true);
+      setTimeout(() => setPublishSaveSuccess(false), 2000);
     }
   };
 
@@ -888,6 +934,7 @@ export const Settings = () => {
   const sections = [
     { id: 'zendesk', label: 'Zendesk Connection' },
     { id: 'locales', label: 'Locales' },
+    { id: 'publish', label: 'Publish' },
     { id: 'ai', label: 'AI Runtime' },
     { id: 'workspace', label: 'Workspace' },
     { id: 'storage', label: 'Storage' },
@@ -1014,6 +1061,153 @@ export const Settings = () => {
                   </span>
                 )}
                 {settingsMutation.error && <span className="settings-inline-error">{settingsMutation.error}</span>}
+              </div>
+            </div>
+          )}
+
+          {activeSection === 'publish' && (
+            <div>
+              <h3 className="settings-heading">Publish Defaults</h3>
+
+              <div className="card card-padded" style={{ marginBottom: 'var(--space-4)' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+                  <div>
+                    <label className="settings-label">Permission Group ID</label>
+                    <input
+                      className="input"
+                      value={zendeskPermissionGroupId}
+                      onChange={(e) => setZendeskPermissionGroupId(e.target.value)}
+                      placeholder="Leave blank to use Zendesk default"
+                    />
+                    <div className="settings-hint" style={{ marginTop: 'var(--space-1)' }}>
+                      Leave blank if you want Zendesk to use its default Help Center management permission group.
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="settings-label">Live User Segment ID</label>
+                    <input
+                      className="input"
+                      value={zendeskLiveUserSegmentId}
+                      onChange={(e) => setZendeskLiveUserSegmentId(e.target.value)}
+                      placeholder="Leave blank for fully public live articles"
+                    />
+                    <div className="settings-hint" style={{ marginTop: 'var(--space-1)' }}>
+                      Blank means live articles publish as public. Set a Zendesk user segment id only if you want a restricted audience later.
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="settings-label">Fallback Category Name</label>
+                    <input
+                      className="input"
+                      value={zendeskFallbackCategoryName}
+                      onChange={(e) => setZendeskFallbackCategoryName(e.target.value)}
+                    />
+                    <div className="settings-hint" style={{ marginTop: 'var(--space-1)' }}>
+                      Used when a new article has no mapped Zendesk category and category auto-create is enabled.
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="settings-label">Fallback Section Name</label>
+                    <input
+                      className="input"
+                      value={zendeskFallbackSectionName}
+                      onChange={(e) => setZendeskFallbackSectionName(e.target.value)}
+                    />
+                    <div className="settings-hint" style={{ marginTop: 'var(--space-1)' }}>
+                      Used when a new article has no mapped Zendesk section and section auto-create is enabled.
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="settings-label">Retirement Behavior</label>
+                    <select
+                      className="select"
+                      value={zendeskRetirementStrategy}
+                      onChange={(e) => setZendeskRetirementStrategy(e.target.value as 'archive')}
+                    >
+                      <option value="archive">Hide by archiving the Zendesk article</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="settings-label">Placeholder Asset Policy</label>
+                    <select
+                      className="select"
+                      value={zendeskPlaceholderAssetPolicy}
+                      onChange={(e) => setZendeskPlaceholderAssetPolicy(e.target.value as 'block' | 'upload')}
+                    >
+                      <option value="upload">Upload placeholder image tags/data to Zendesk</option>
+                      <option value="block">Block publish when placeholders remain</option>
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+                    {[
+                      {
+                        checked: zendeskNotifySubscribers,
+                        onChange: () => setZendeskNotifySubscribers((value) => !value),
+                        label: 'Notify subscribers on live publish',
+                        detail: 'Currently off per your preference.'
+                      },
+                      {
+                        checked: zendeskAllowCategoryCreation,
+                        onChange: () => setZendeskAllowCategoryCreation((value) => !value),
+                        label: 'Allow category auto-create',
+                        detail: 'Lets KB Vault create missing Zendesk categories during publish.'
+                      },
+                      {
+                        checked: zendeskAllowSectionCreation,
+                        onChange: () => setZendeskAllowSectionCreation((value) => !value),
+                        label: 'Allow section auto-create',
+                        detail: 'Lets KB Vault create missing Zendesk sections during publish.'
+                      },
+                      {
+                        checked: zendeskRequireLiveConfirmation,
+                        onChange: () => setZendeskRequireLiveConfirmation((value) => !value),
+                        label: 'Require confirmation before live publish',
+                        detail: 'Shows a confirmation gate before pushing selected branches live.'
+                      },
+                      {
+                        checked: zendeskBlockLiveOnWarnings,
+                        onChange: () => setZendeskBlockLiveOnWarnings((value) => !value),
+                        label: 'Block live publish when warnings exist',
+                        detail: 'Draft publish can still proceed, but live publish must be warning-free.'
+                      }
+                    ].map((option) => (
+                      <label
+                        key={option.label}
+                        className="card card-padded"
+                        style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--space-3)', cursor: 'pointer' }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={option.checked}
+                          onChange={option.onChange}
+                          style={{ marginTop: 2 }}
+                        />
+                        <div>
+                          <div style={{ fontWeight: 'var(--weight-medium)', fontSize: 'var(--text-sm)' }}>{option.label}</div>
+                          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginTop: 4 }}>{option.detail}</div>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                    <button className="btn btn-primary" onClick={handleSavePublishSettings} disabled={settingsMutation.loading}>
+                      {settingsMutation.loading ? 'Saving...' : 'Save Publish Defaults'}
+                    </button>
+                    {publishSaveSuccess && (
+                      <span className="settings-inline-success">
+                        <IconCheckCircle size={14} /> Saved
+                      </span>
+                    )}
+                    {settingsMutation.error && <span className="settings-inline-error">{settingsMutation.error}</span>}
+                  </div>
+                </div>
               </div>
             </div>
           )}
