@@ -370,6 +370,9 @@ function normalizeTemplatePackTypeInput(value: unknown): TemplatePackType | null
   switch (canonical) {
     case 'FAQ':
       return TemplatePackType.FAQ;
+    case 'PROPOSAL_CREATION':
+    case 'PROPOSAL':
+      return TemplatePackType.PROPOSAL_CREATION;
     case 'TROUBLESHOOTING':
       return TemplatePackType.TROUBLESHOOTING;
     case 'POLICY_NOTICE':

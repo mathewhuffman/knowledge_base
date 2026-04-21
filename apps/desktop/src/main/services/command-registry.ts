@@ -27,6 +27,10 @@ import {
   type PBILibraryListRequest,
   type PBILibraryScopeState,
   type PBIBatchImportRequest,
+  type PBIBatchAnalysisConfigRequest,
+  type PBIBatchAnalysisConfigResponse,
+  type PBIBatchAnalysisConfigSetRequest,
+  type PBIBatchPreflightResponse,
   type PBIBatchRowsRequest,
   type PBIBatchStatusUpdateRequest,
   type PBIBatchDeleteRequest,
@@ -133,6 +137,7 @@ import {
   type TemplatePackDeleteRequest,
   type TemplatePackGetRequest,
   type TemplatePackListRequest,
+  TemplatePackType,
   type TemplatePackUpsertRequest,
   type AiAssistantArtifactDecisionRequest,
   type AiAssistantContextGetResponse,
@@ -4463,8 +4468,59 @@ export function registerCoreCommands(
       if (!workspaceId || !batchId) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.getPreflight requires workspaceId and batchId');
       }
-      const preflight = await pbiBatchImportService.getBatchPreflight(workspaceId, batchId);
+      const preflight: PBIBatchPreflightResponse = await pbiBatchImportService.getBatchPreflight(workspaceId, batchId);
       return { ok: true, data: preflight };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.analysisConfig.get', async (payload) => {
+    try {
+      const input = payload as PBIBatchAnalysisConfigRequest | undefined;
+      if (!input?.workspaceId || !input.batchId) {
+        return createErrorResult(AppErrorCode.INVALID_REQUEST, 'pbiBatch.analysisConfig.get requires workspaceId and batchId');
+      }
+      const analysisState = await workspaceRepository.getPBIBatchAnalysisState(input.workspaceId, input.batchId);
+      const response: PBIBatchAnalysisConfigResponse = {
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        analysisConfig: analysisState.analysisConfig,
+        guaranteedCreateConflicts: analysisState.guaranteedCreateConflicts
+      };
+      return { ok: true, data: response };
+    } catch (error) {
+      if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
+        return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
+      }
+      return createErrorResult(AppErrorCode.INTERNAL_ERROR, String((error as Error).message || error));
+    }
+  });
+
+  bus.register('pbiBatch.analysisConfig.set', async (payload) => {
+    try {
+      const input = payload as PBIBatchAnalysisConfigSetRequest | undefined;
+      if (!input?.workspaceId || !input.batchId || !input.analysisConfig) {
+        return createErrorResult(
+          AppErrorCode.INVALID_REQUEST,
+          'pbiBatch.analysisConfig.set requires workspaceId, batchId, and analysisConfig'
+        );
+      }
+      const analysisState = await workspaceRepository.setPBIBatchAnalysisConfig(
+        input.workspaceId,
+        input.batchId,
+        input.analysisConfig
+      );
+      const response: PBIBatchAnalysisConfigResponse = {
+        workspaceId: input.workspaceId,
+        batchId: input.batchId,
+        analysisConfig: analysisState.analysisConfig,
+        guaranteedCreateConflicts: analysisState.guaranteedCreateConflicts
+      };
+      return { ok: true, data: response };
     } catch (error) {
       if ((error as Error).message === 'Workspace not found' || (error as Error).message === 'PBI batch not found') {
         return createErrorResult(AppErrorCode.NOT_FOUND, (error as Error).message);
@@ -5367,6 +5423,27 @@ export function registerCoreCommands(
       });
       return;
     }
+    const requestedProposalTemplate = input.templatePackId
+      ? await workspaceRepository.getTemplatePackDetail({
+          workspaceId: input.workspaceId,
+          templatePackId: input.templatePackId
+        })
+      : null;
+    const activeProposalTemplate = await workspaceRepository.getActiveTemplatePackByType(
+      input.workspaceId,
+      TemplatePackType.PROPOSAL_CREATION
+    );
+    const proposalCreationTemplate = activeProposalTemplate
+      ?? (
+        requestedProposalTemplate?.templateType === TemplatePackType.PROPOSAL_CREATION
+          ? requestedProposalTemplate
+          : null
+      );
+    const resolvedProposalTemplatePackId = proposalCreationTemplate?.id;
+    const batchAnalysisRuntimeInput = {
+      ...input,
+      templatePackId: resolvedProposalTemplatePackId
+    };
     const requestedWorkerStageBudgetMinutes = input.workerStageBudgetMinutes;
     const normalizedRequestedWorkerStageBudgetMinutes = requestedWorkerStageBudgetMinutes == null
       ? undefined
@@ -5664,7 +5741,7 @@ export function registerCoreCommands(
         role,
         batchId: input.batchId,
         locale: input.locale,
-        templatePackId: input.templatePackId
+        templatePackId: resolvedProposalTemplatePackId
       });
       planningSessionId = session.id;
       return {
@@ -5690,7 +5767,7 @@ export function registerCoreCommands(
         role: 'worker',
         batchId: input.batchId,
         locale: input.locale,
-        templatePackId: input.templatePackId
+        templatePackId: resolvedProposalTemplatePackId
       });
       workerSessionId = session.id;
       logger.info('[agent.analysis.run] created dedicated worker session', {
@@ -5995,14 +6072,15 @@ export function registerCoreCommands(
         plannerPrefetch,
         priorPlan: priorPlanJson ? JSON.parse(priorPlanJson) : undefined,
         reviewDelta: reviewDeltaJson ? JSON.parse(reviewDeltaJson) : undefined,
-        resolvedUserAnswers
+        resolvedUserAnswers,
+        proposalTemplate: proposalCreationTemplate
       });
 
       let plannerResult: Awaited<ReturnType<typeof agentRuntime.runBatchAnalysis>>;
       try {
         plannerResult = await agentRuntime.runBatchAnalysis(
           {
-            ...input,
+            ...batchAnalysisRuntimeInput,
             sessionId: planningSession.sessionId,
             kbAccessMode,
             agentRole: 'planner',
@@ -6090,7 +6168,7 @@ export function registerCoreCommands(
           });
           plannerResult = await agentRuntime.runBatchAnalysis(
             {
-              ...input,
+              ...batchAnalysisRuntimeInput,
               sessionId: planningSessionId,
               sessionReusePolicy: 'new_local_session',
               kbAccessMode,
@@ -6165,7 +6243,7 @@ export function registerCoreCommands(
               });
           plannerResult = await agentRuntime.runBatchAnalysis(
             {
-              ...input,
+              ...batchAnalysisRuntimeInput,
               sessionId: planningSessionId,
               sessionReusePolicy: 'reset_acp',
               kbAccessMode,
@@ -6405,18 +6483,20 @@ export function registerCoreCommands(
       });
       const reviewCandidateQuestions = batchAnalysisOrchestrator.buildReviewCandidateQuestions({
         plan: draftPlan,
-        plannerPrefetch
+        plannerPrefetch,
+        batchContext
       });
       const reviewPrompt = batchAnalysisOrchestrator.buildPlanReviewerPrompt({
         batchContext,
         uploadedPbis,
         plan: draftPlan,
         plannerPrefetch,
-        candidateQuestions: reviewCandidateQuestions
+        candidateQuestions: reviewCandidateQuestions,
+        proposalTemplate: proposalCreationTemplate
       });
       let reviewResult = await agentRuntime.runBatchAnalysis(
         {
-          ...input,
+          ...batchAnalysisRuntimeInput,
           sessionId: planningReviewSession.sessionId,
           kbAccessMode,
           agentRole: 'plan-reviewer',
@@ -6465,7 +6545,7 @@ export function registerCoreCommands(
 
         reviewResult = await agentRuntime.runBatchAnalysis(
           {
-            ...input,
+            ...batchAnalysisRuntimeInput,
             sessionId: planningSessionId,
             sessionReusePolicy: 'reset_acp',
             kbAccessMode,
@@ -6575,7 +6655,8 @@ export function registerCoreCommands(
         candidateQuestions: reviewCandidateQuestions,
         plannerPrefetch,
         unresolvedTargetIssues: normalizedDraftPlanResult.unresolvedTargetIssues,
-        unresolvedReferenceIssues: normalizedBatchReferences.unresolvedReferenceIssues
+        unresolvedReferenceIssues: normalizedBatchReferences.unresolvedReferenceIssues,
+        batchContext
       });
       review = deterministicReviewGuard.review;
       if (deterministicReviewGuard.missingEditTargets.length > 0) {
@@ -6888,12 +6969,16 @@ export function registerCoreCommands(
       return;
     }
 
-      const runAnalysis = async (plan: BatchAnalysisPlan, extraInstructions?: string) => {
+    const runAnalysis = async (plan: BatchAnalysisPlan, extraInstructions?: string) => {
       const workerStageKbAccessMode = resolveStageKbAccessMode('worker');
       const workerStage = (streamMetadata.stage ?? liveIteration.stage) as Extract<BatchAnalysisStageStatus, 'building' | 'reworking'>;
       const workerSession = ensureWorkerSession(workerStage);
       liveSessionId = workerSession.sessionId;
-      const promptTemplate = await batchAnalysisOrchestrator.buildWorkerPrompt(plan, extraInstructions ?? input.prompt);
+      const promptTemplate = await batchAnalysisOrchestrator.buildWorkerPrompt(plan, {
+        extraInstructions: extraInstructions ?? input.prompt,
+        batchContext,
+        proposalTemplate: proposalCreationTemplate
+      });
       const startedAtUtc = new Date().toISOString();
       const stageRun = await workspaceRepository.recordBatchAnalysisStageRun({
         workspaceId: input.workspaceId,
@@ -6915,7 +7000,7 @@ export function registerCoreCommands(
         const result = await runBatchAnalysisWithStageWatchdog(
           agentRuntime,
           {
-            ...input,
+            ...batchAnalysisRuntimeInput,
             sessionId: workerSession.sessionId,
             kbAccessMode: workerStageKbAccessMode,
             agentRole: 'worker',
@@ -7179,7 +7264,7 @@ export function registerCoreCommands(
 
       const amendmentPlannerResult = await agentRuntime.runBatchAnalysis(
         {
-          ...input,
+          ...batchAnalysisRuntimeInput,
           sessionId: amendmentPlanningSession.sessionId,
           kbAccessMode,
           agentRole: 'planner',
@@ -7187,11 +7272,12 @@ export function registerCoreCommands(
           prompt: batchAnalysisOrchestrator.buildAmendmentPlannerPrompt({
             batchContext,
             uploadedPbis,
-          approvedPlan: activeApprovedPlan,
-          discoveredWork: discoveredForAmendment,
-          plannerPrefetch,
-          resolvedUserAnswers: amendmentResolvedUserAnswers
-        })
+            approvedPlan: activeApprovedPlan,
+            discoveredWork: discoveredForAmendment,
+            plannerPrefetch,
+            resolvedUserAnswers: amendmentResolvedUserAnswers,
+            proposalTemplate: proposalCreationTemplate
+          })
         },
         (stream: AgentStreamingPayload) => {
           emit({
@@ -7319,11 +7405,12 @@ export function registerCoreCommands(
         plan: amendmentDraftPlan,
         plannerPrefetch,
         existingQuestions: activeApprovedPlan.questions ?? [],
-        discoveredWork: discoveredForAmendment
+        discoveredWork: discoveredForAmendment,
+        batchContext
       });
       const amendmentReviewResult = await agentRuntime.runBatchAnalysis(
         {
-          ...input,
+          ...batchAnalysisRuntimeInput,
           sessionId: amendmentReviewSession.sessionId,
           kbAccessMode,
           agentRole: 'plan-reviewer',
@@ -7333,7 +7420,8 @@ export function registerCoreCommands(
             uploadedPbis,
             plan: amendmentDraftPlan,
             plannerPrefetch,
-            candidateQuestions: amendmentReviewCandidateQuestions
+            candidateQuestions: amendmentReviewCandidateQuestions,
+            proposalTemplate: proposalCreationTemplate
           })
         },
         (stream: AgentStreamingPayload) => {
@@ -7435,7 +7523,8 @@ export function registerCoreCommands(
         candidateQuestions: amendmentReviewCandidateQuestions,
         plannerPrefetch,
         unresolvedTargetIssues: normalizedAmendmentDraftPlanResult.unresolvedTargetIssues,
-        unresolvedReferenceIssues: normalizedAmendmentBatchReferences.unresolvedReferenceIssues
+        unresolvedReferenceIssues: normalizedAmendmentBatchReferences.unresolvedReferenceIssues,
+        batchContext
       });
       amendmentReview = deterministicAmendmentReviewGuard.review;
       if (deterministicAmendmentReviewGuard.missingEditTargets.length > 0) {
@@ -7804,7 +7893,7 @@ export function registerCoreCommands(
         role: 'final-reviewer',
         batchId: input.batchId,
         locale: input.locale,
-        templatePackId: input.templatePackId
+        templatePackId: resolvedProposalTemplatePackId
       });
       liveSessionId = finalReviewSession.id;
       const proposalContext = await buildFinalReviewProposalContext(
@@ -7818,7 +7907,8 @@ export function registerCoreCommands(
         approvedPlan: activeApprovedPlan,
         workerReport: latestWorkerReport,
         discoveredWork: latestWorkerReport.discoveredWork,
-        proposalContext
+        proposalContext,
+        proposalTemplate: proposalCreationTemplate
       });
       const finalReviewStartedAtUtc = new Date().toISOString();
       let finalReviewResult: AgentRunResult;
@@ -7835,7 +7925,7 @@ export function registerCoreCommands(
         finalReviewResult = await runBatchAnalysisWithStageWatchdog(
           agentRuntime,
           {
-            ...input,
+            ...batchAnalysisRuntimeInput,
             sessionId: finalReviewSession.id,
             kbAccessMode,
             agentRole: 'final-reviewer',
@@ -8046,7 +8136,8 @@ export function registerCoreCommands(
     const hardGateValidation = batchAnalysisOrchestrator.validateFinalApproval({
       plan: activeApprovedPlan,
       workerReport: latestWorkerReport,
-      finalReview: finalReviewOutcome.finalReview
+      finalReview: finalReviewOutcome.finalReview,
+      batchContext
     });
 
     if (finalReviewOutcome.finalReview.verdict === 'approved' && workerPass.result.status === 'ok' && hardGateValidation.ok) {

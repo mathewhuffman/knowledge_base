@@ -128,7 +128,8 @@ export enum TemplatePackType {
   FAQ = 'faq',
   TROUBLESHOOTING = 'troubleshooting',
   POLICY_NOTICE = 'policy_notice',
-  FEATURE_OVERVIEW = 'feature_overview'
+  FEATURE_OVERVIEW = 'feature_overview',
+  PROPOSAL_CREATION = 'proposal_creation'
 }
 
 export interface TemplatePackSummary extends TemplatePackRecord {

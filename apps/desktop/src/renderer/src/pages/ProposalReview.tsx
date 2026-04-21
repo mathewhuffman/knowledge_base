@@ -48,6 +48,7 @@ import { buildArticlePreviewDocument } from '../utils/previewDocument';
 import { CodeEditor } from '../components/editor/CodeEditor';
 import { EditorPane } from '../components/editor/EditorPane';
 import { ArticleModeToggle, ArticleSurface, type ArticleSurfaceMode } from '../components/article/ArticleSurface';
+import { PlacementSummary } from '../components/article/PlacementSummary';
 
 const { diffHtml } = diffEngine;
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
@@ -592,42 +593,23 @@ function PBIEvidenceCard({
   );
 }
 
-function PlacementCard({ placement }: { placement?: ProposalPlacementSuggestion }) {
-  if (!placement) return null;
-  const hasContent = placement.categoryId || placement.sectionId || placement.articleTitle || placement.notes;
-  if (!hasContent) return null;
-
+function PlacementCard({
+  currentPlacement,
+  suggestedPlacement,
+}: {
+  currentPlacement?: ProposalReviewDetailResponse['proposal']['currentPlacement'];
+  suggestedPlacement?: ProposalPlacementSuggestion;
+}) {
   return (
     <div className="card card-padded">
       <div className="review-section-label">
-        <IconMapPin size={12} /> Suggested Placement
+        <IconMapPin size={12} /> Article Location
       </div>
-      <div className="placement-info">
-        {placement.articleTitle && (
-          <div className="placement-info-row">
-            <span className="placement-info-label">Title</span>
-            <span>{placement.articleTitle}</span>
-          </div>
-        )}
-        {placement.sectionId && (
-          <div className="placement-info-row">
-            <span className="placement-info-label">Section</span>
-            <span>{placement.sectionId}</span>
-          </div>
-        )}
-        {placement.categoryId && (
-          <div className="placement-info-row">
-            <span className="placement-info-label">Category</span>
-            <span>{placement.categoryId}</span>
-          </div>
-        )}
-        {placement.notes && (
-          <div className="placement-info-row">
-            <span className="placement-info-label">Notes</span>
-            <span>{placement.notes}</span>
-          </div>
-        )}
-      </div>
+      <PlacementSummary
+        current={currentPlacement}
+        suggested={suggestedPlacement}
+        emptyMessage="No placement metadata is attached to this proposal yet."
+      />
     </div>
   );
 }
@@ -1534,7 +1516,10 @@ export const ProposalReview = () => {
                     aiNotes={proposalWorkingCopy?.aiNotes ?? proposalWorkingCopy?.rationale ?? proposal.aiNotes}
                   />
                   <PBIEvidenceCard pbis={relatedPbis} onSelectPBI={setSelectedPBI} />
-                  <PlacementCard placement={proposal.suggestedPlacement} />
+                  <PlacementCard
+                    currentPlacement={proposal.currentPlacement}
+                    suggestedPlacement={proposal.suggestedPlacement}
+                  />
                 </>
               )}
             </div>

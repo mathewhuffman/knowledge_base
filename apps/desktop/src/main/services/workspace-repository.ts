@@ -105,6 +105,14 @@ import {
   type BatchWorkerExecutionReport,
   type PersistedAgentAnalysisRun,
   type PBIRecord,
+  type PBIBatchAnalysisConfig,
+  type PBIBatchAnalysisConfigInput,
+  type PBIBatchContextResponse,
+  type PBIBatchGuaranteedCreateArticle,
+  type PBIBatchGuaranteedCreateConflict,
+  type PBIBatchGuaranteedCreateConflictMatch,
+  type PBIBatchGuaranteedEditFamily,
+  type PBIBatchGuaranteedEditLocaleVariant,
   type PBIBatchRecord,
   type PBILibraryDetailResponse,
   type PBILibraryLinkedProposalSummary,
@@ -120,6 +128,7 @@ import {
   type WorkspaceRoutePayload,
   type WorkspaceBatchAnalysisRepairSummary,
   type ArticleFamilyRecord,
+  type ArticlePlacementSummary,
   type LocaleVariantRecord,
   type RevisionRecord,
   type ArticleFamilyCreateRequest,
@@ -1785,11 +1794,51 @@ export class WorkspaceRepository {
     }
   }
 
+  async getActiveTemplatePackByType(
+    workspaceId: string,
+    templateType: TemplatePackType
+  ): Promise<TemplatePackDetail | null> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      await this.ensureDefaultTemplatePacks(workspaceId, workspaceDb);
+      this.enforceSingleActiveTemplatePerType(workspaceDb, workspaceId);
+      const row = workspaceDb.get<TemplatePackRecord & { templateType: string | null; description: string | null; analysisJson: string | null }>(
+        `SELECT id,
+                workspace_id as workspaceId,
+                name,
+                language,
+                prompt_template as promptTemplate,
+                tone_rules as toneRules,
+                examples,
+                active,
+                updated_at as updatedAtUtc,
+                template_type as templateType,
+                description,
+                analysis_json as analysisJson
+         FROM template_packs
+         WHERE workspace_id = @workspaceId
+           AND active = 1
+           AND template_type = @templateType
+         ORDER BY updated_at DESC, name ASC
+         LIMIT 1`,
+        {
+          workspaceId,
+          templateType
+        }
+      );
+      return row ? this.mapTemplatePackSummary(row) : null;
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
   async listTemplatePackSummaries(input: TemplatePackListRequest): Promise<TemplatePackListResponse> {
     const workspace = await this.getWorkspace(input.workspaceId);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
       await this.ensureDefaultTemplatePacks(input.workspaceId, workspaceDb);
+      this.enforceSingleActiveTemplatePerType(workspaceDb, input.workspaceId);
       const rows = workspaceDb.all<Array<TemplatePackRecord & { templateType: string | null; description: string | null; analysisJson: string | null }>[number]>(
         `SELECT id,
                 workspace_id as workspaceId,
@@ -1827,6 +1876,7 @@ export class WorkspaceRepository {
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
       await this.ensureDefaultTemplatePacks(input.workspaceId, workspaceDb);
+      this.enforceSingleActiveTemplatePerType(workspaceDb, input.workspaceId);
       const row = workspaceDb.get<TemplatePackRecord & { templateType: string | null; description: string | null; analysisJson: string | null }>(
         `SELECT id,
                 workspace_id as workspaceId,
@@ -1889,6 +1939,12 @@ export class WorkspaceRepository {
           description: input.description?.trim() || null
         }
       );
+      if (input.active !== false) {
+        this.enforceSingleActiveTemplatePerType(workspaceDb, input.workspaceId, {
+          templateType: input.templateType,
+          preferredTemplateId: id
+        });
+      }
       const detail = await this.getTemplatePackDetail({ workspaceId: input.workspaceId, templatePackId: id });
       if (!detail) {
         throw new Error('Template pack not found after save');
@@ -2589,6 +2645,22 @@ export class WorkspaceRepository {
              )`,
           { workspaceId, locale, retiredAtUtc }
         );
+        const obsoleteBranches = workspaceDb.all<{ id: string; localeVariantId: string }>(
+          `SELECT db.id, db.locale_variant_id as localeVariantId
+           FROM draft_branches db
+           JOIN locale_variants lv ON lv.id = db.locale_variant_id
+           JOIN article_families af ON af.id = lv.family_id
+           WHERE db.workspace_id = @workspaceId
+             AND db.state = @state
+             AND af.workspace_id = @workspaceId
+             AND lv.locale = @locale`,
+          {
+            workspaceId,
+            locale,
+            state: DraftBranchStatus.OBSOLETE
+          }
+        );
+        await this.purgeDraftBranches(workspace.path, workspaceDb, obsoleteBranches);
         if (affectedFamilies.length > 0) {
           try {
             this.markArticleRelationFamiliesStale(workspaceDb, workspaceId, affectedFamilies);
@@ -2658,9 +2730,25 @@ export class WorkspaceRepository {
              WHERE af.workspace_id = @workspaceId
                AND lv.locale = @locale
                AND af.external_key NOT IN (${placeholders})
-         )`,
+             )`,
         queryParams
       );
+      const obsoleteBranches = workspaceDb.all<{ id: string; localeVariantId: string }>(
+        `SELECT db.id, db.locale_variant_id as localeVariantId
+         FROM draft_branches db
+         JOIN locale_variants lv ON lv.id = db.locale_variant_id
+         JOIN article_families af ON af.id = lv.family_id
+         WHERE db.workspace_id = @workspaceId
+           AND db.state = @state
+           AND af.workspace_id = @workspaceId
+           AND lv.locale = @locale
+           AND af.external_key NOT IN (${placeholders})`,
+        {
+          ...queryParams,
+          state: DraftBranchStatus.OBSOLETE
+        }
+      );
+      await this.purgeDraftBranches(workspace.path, workspaceDb, obsoleteBranches);
 
       if (affectedFamilies.length > 0) {
         try {
@@ -8882,24 +8970,92 @@ export class WorkspaceRepository {
     }
   }
 
-  async getBatchContext(workspaceId: string, batchId: string): Promise<{
-    batch: PBIBatchRecord;
-    candidateRows: PBIRecord[];
-    malformedRows: PBIRecord[];
-    duplicateRows: PBIRecord[];
-    ignoredRows: PBIRecord[];
-  } | null> {
+  async getPBIBatchAnalysisState(
+    workspaceId: string,
+    batchId: string
+  ): Promise<{
+    analysisConfig: PBIBatchAnalysisConfig;
+    guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
+  }> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const row = workspaceDb.get<{ analysisConfigJson: string | null }>(
+        `SELECT analysis_config_json as analysisConfigJson
+         FROM pbi_batches
+         WHERE id = @batchId AND workspace_id = @workspaceId
+         LIMIT 1`,
+        { batchId, workspaceId }
+      );
+      if (!row) {
+        throw new Error('PBI batch not found');
+      }
+      const storedConfig = normalizePBIBatchAnalysisConfig(safeParseJson(row.analysisConfigJson));
+      return this.hydratePBIBatchAnalysisState(workspace, workspaceDb, storedConfig);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async setPBIBatchAnalysisConfig(
+    workspaceId: string,
+    batchId: string,
+    input: PBIBatchAnalysisConfigInput
+  ): Promise<{
+    analysisConfig: PBIBatchAnalysisConfig;
+    guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
+  }> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      const batchExists = workspaceDb.get<{ id: string }>(
+        `SELECT id FROM pbi_batches WHERE id = @batchId AND workspace_id = @workspaceId`,
+        { batchId, workspaceId }
+      );
+      if (!batchExists) {
+        throw new Error('PBI batch not found');
+      }
+
+      const normalizedConfig = await this.resolvePBIBatchAnalysisConfigInput(
+        workspace,
+        workspaceDb,
+        input
+      );
+
+      workspaceDb.run(
+        `UPDATE pbi_batches
+         SET analysis_config_json = @analysisConfigJson
+         WHERE id = @batchId AND workspace_id = @workspaceId`,
+        {
+          batchId,
+          workspaceId,
+          analysisConfigJson: JSON.stringify(normalizedConfig)
+        }
+      );
+
+      return this.hydratePBIBatchAnalysisState(workspace, workspaceDb, normalizedConfig);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async getBatchContext(workspaceId: string, batchId: string): Promise<PBIBatchContextResponse | null> {
     const batch = await this.getPBIBatch(workspaceId, batchId);
     if (!batch) {
       return null;
     }
     const records = await this.getPBIRecords(workspaceId, batchId);
+    const analysisState = await this.getPBIBatchAnalysisState(workspaceId, batchId);
     return {
       batch,
       candidateRows: records.filter((row) => row.validationStatus === 'candidate'),
       malformedRows: records.filter((row) => row.validationStatus === 'malformed'),
       duplicateRows: records.filter((row) => row.validationStatus === 'duplicate'),
-      ignoredRows: records.filter((row) => row.validationStatus === 'ignored')
+      ignoredRows: records.filter((row) => row.validationStatus === 'ignored'),
+      analysisConfig: analysisState.analysisConfig,
+      guaranteedCreateConflicts: analysisState.guaranteedCreateConflicts
     };
   }
 
@@ -9005,6 +9161,254 @@ export class WorkspaceRepository {
     } finally {
       workspaceDb.close();
     }
+  }
+
+  private async resolvePBIBatchAnalysisConfigInput(
+    workspace: WorkspaceRecord,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    input: PBIBatchAnalysisConfigInput
+  ): Promise<PBIBatchAnalysisConfig> {
+    const guaranteedEditFamiliesById = new Map<string, PBIBatchGuaranteedEditFamily>();
+    const editSelections = Array.isArray(input.guaranteedEditSelections) ? input.guaranteedEditSelections : [];
+
+    for (const selection of editSelections) {
+      if (!selection || typeof selection !== 'object') {
+        continue;
+      }
+      const requestedFamilyId = selection.familyId?.trim();
+      const requestedLocaleVariantId = selection.localeVariantId?.trim();
+      const family = requestedFamilyId
+        ? workspaceDb.get<{
+            familyId: string;
+            familyTitle: string;
+            sectionId: string | null;
+            categoryId: string | null;
+          }>(
+            `SELECT id as familyId, title as familyTitle, section_id as sectionId, category_id as categoryId
+             FROM article_families
+             WHERE id = @familyId
+             LIMIT 1`,
+            { familyId: requestedFamilyId }
+          )
+        : requestedLocaleVariantId
+          ? workspaceDb.get<{
+              familyId: string;
+              familyTitle: string;
+              sectionId: string | null;
+              categoryId: string | null;
+            }>(
+              `SELECT af.id as familyId, af.title as familyTitle, af.section_id as sectionId, af.category_id as categoryId
+               FROM locale_variants lv
+               JOIN article_families af ON af.id = lv.family_id
+               WHERE lv.id = @localeVariantId
+               LIMIT 1`,
+              { localeVariantId: requestedLocaleVariantId }
+            )
+          : null;
+
+      if (!family?.familyId) {
+        throw new Error('Selected article could not be resolved to an article family.');
+      }
+
+      const liveVariants = workspaceDb.all<PBIBatchGuaranteedEditLocaleVariant>(
+        `SELECT lv.id as localeVariantId,
+                lv.locale
+         FROM locale_variants lv
+         WHERE lv.family_id = @familyId
+           AND lv.status = @liveStatus
+           AND lv.retired_at IS NULL
+         ORDER BY lower(lv.locale) ASC`,
+        {
+          familyId: family.familyId,
+          liveStatus: RevisionState.LIVE
+        }
+      );
+
+      if (liveVariants.length === 0) {
+        throw new Error(`Selected article "${family.familyTitle}" has no live locales to guarantee edits for.`);
+      }
+
+      guaranteedEditFamiliesById.set(family.familyId, {
+        familyId: family.familyId,
+        familyTitle: family.familyTitle,
+        selectedFromLocaleVariantId: requestedLocaleVariantId || undefined,
+        mode: 'all_live_locales',
+        resolvedLocaleVariants: liveVariants.map((variant) => ({
+          localeVariantId: variant.localeVariantId,
+          locale: variant.locale
+        })),
+        sectionId: family.sectionId ?? undefined,
+        categoryId: family.categoryId ?? undefined
+      });
+    }
+
+    const guaranteedCreateArticles = dedupeGuaranteedCreateArticles(
+      (Array.isArray(input.guaranteedCreateArticles) ? input.guaranteedCreateArticles : []).map((article) => {
+        const placement = normalizePlacement(article);
+        return {
+          clientId: article.clientId?.trim() || randomUUID(),
+          title: article.title,
+          targetLocale: article.targetLocale?.trim() || workspace.defaultLocale,
+          source: 'manual' as const,
+          categoryId: placement?.categoryId,
+          categoryName: placement?.categoryName,
+          sectionId: placement?.sectionId,
+          sectionName: placement?.sectionName
+        };
+      })
+    );
+
+    const analysisGuidancePrompt = normalizeOptionalPromptText(input.analysisGuidancePrompt);
+    return {
+      version: PBI_BATCH_ANALYSIS_CONFIG_VERSION,
+      updatedAtUtc: new Date().toISOString(),
+      guaranteedEditFamilies: Array.from(guaranteedEditFamiliesById.values()).sort((left, right) =>
+        left.familyTitle.localeCompare(right.familyTitle)
+      ),
+      guaranteedCreateArticles,
+      ...(analysisGuidancePrompt ? { analysisGuidancePrompt } : {})
+    };
+  }
+
+  private async hydratePBIBatchAnalysisState(
+    workspace: WorkspaceRecord,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    config: PBIBatchAnalysisConfig
+  ): Promise<{
+    analysisConfig: PBIBatchAnalysisConfig;
+    guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
+  }> {
+    const hydratedEditFamilies = await Promise.all(
+      config.guaranteedEditFamilies.map(async (family) => {
+        const familyRow = workspaceDb.get<{
+          title: string;
+          sectionId: string | null;
+          categoryId: string | null;
+        }>(
+          `SELECT title, section_id as sectionId, category_id as categoryId
+           FROM article_families
+           WHERE id = @familyId
+           LIMIT 1`,
+          { familyId: family.familyId }
+        );
+
+        const hydratedVariants = await Promise.all(
+          family.resolvedLocaleVariants.map(async (variant) => {
+            const latestRevision = workspaceDb.get<{
+              revisionId: string;
+              revisionType: RevisionState;
+              updatedAtUtc: string;
+              filePath: string;
+            }>(
+              `SELECT id as revisionId,
+                      revision_type as revisionType,
+                      updated_at as updatedAtUtc,
+                      file_path as filePath
+               FROM revisions
+               WHERE locale_variant_id = @localeVariantId
+               ORDER BY CASE WHEN revision_type = @liveType THEN 0 ELSE 1 END,
+                        revision_number DESC
+               LIMIT 1`,
+              {
+                localeVariantId: variant.localeVariantId,
+                liveType: RevisionState.LIVE
+              }
+            );
+
+            let snippet = variant.snippet;
+            if (!snippet && latestRevision?.filePath) {
+              const absolutePath = resolveRevisionPath(workspace.path, latestRevision.filePath);
+              if (await this.fileExists(absolutePath)) {
+                const source = await this.readRevisionSource(absolutePath);
+                snippet = buildSearchSnippet(source);
+              }
+            }
+
+            return {
+              ...variant,
+              revisionId: latestRevision?.revisionId ?? variant.revisionId,
+              revisionState: latestRevision?.revisionType ?? variant.revisionState,
+              updatedAtUtc: latestRevision?.updatedAtUtc ?? variant.updatedAtUtc,
+              snippet
+            };
+          })
+        );
+
+        return {
+          ...family,
+          familyTitle: familyRow?.title?.trim() || family.familyTitle,
+          sectionId: familyRow?.sectionId ?? family.sectionId,
+          categoryId: familyRow?.categoryId ?? family.categoryId,
+          resolvedLocaleVariants: hydratedVariants
+        };
+      })
+    );
+
+    const guaranteedCreateConflicts = await Promise.all(
+      config.guaranteedCreateArticles.map((article) =>
+        this.detectGuaranteedCreateConflict(workspace.id, article)
+      )
+    );
+    const hydratedCreateArticles = config.guaranteedCreateArticles.map((article) => ({
+      ...article,
+      ...this.resolvePlacementSummaryInDb(workspaceDb, workspace.id, article)
+    }));
+
+    return {
+      analysisConfig: {
+        ...config,
+        guaranteedEditFamilies: hydratedEditFamilies,
+        guaranteedCreateArticles: hydratedCreateArticles
+      },
+      guaranteedCreateConflicts: guaranteedCreateConflicts.filter(
+        (conflict): conflict is PBIBatchGuaranteedCreateConflict => Boolean(conflict)
+      )
+    };
+  }
+
+  private async detectGuaranteedCreateConflict(
+    workspaceId: string,
+    article: PBIBatchGuaranteedCreateArticle
+  ): Promise<PBIBatchGuaranteedCreateConflict | null> {
+    const title = article.title.trim();
+    const targetLocale = article.targetLocale.trim();
+    if (!title || !targetLocale) {
+      return null;
+    }
+
+    const searchResponse = await this.searchArticles(workspaceId, {
+      workspaceId,
+      query: title,
+      locales: [targetLocale],
+      scope: 'live',
+      includeArchived: false
+    });
+
+    const strongMatches = dedupeGuaranteedCreateConflictMatches(
+      searchResponse.results
+        .filter((result) => isStrongGuaranteedCreateConflict(title, result.title))
+        .map((result): PBIBatchGuaranteedCreateConflictMatch => ({
+          familyId: result.familyId,
+          localeVariantId: result.localeVariantId,
+          locale: result.locale,
+          title: result.title,
+          score: result.score,
+          matchContext: result.matchContext,
+          snippet: result.snippet
+        }))
+    ).slice(0, 3);
+
+    if (strongMatches.length === 0) {
+      return null;
+    }
+
+    return {
+      clientId: article.clientId,
+      title,
+      targetLocale,
+      reason: `Existing live article coverage may already exist for "${title}" in ${targetLocale}.`,
+      matches: strongMatches
+    };
   }
 
   async setPBIBatchStatus(
@@ -10324,6 +10728,45 @@ export class WorkspaceRepository {
           updatedAt: new Date().toISOString()
         }
       );
+      const obsoleteBranches = workspaceDb.all<{ id: string; localeVariantId: string }>(
+        `SELECT id, locale_variant_id as localeVariantId
+         FROM draft_branches
+         WHERE workspace_id = @workspaceId
+           AND locale_variant_id = @localeVariantId
+           AND state = @state`,
+        {
+          workspaceId,
+          localeVariantId,
+          state: DraftBranchStatus.OBSOLETE
+        }
+      );
+      await this.purgeDraftBranches(workspace.path, workspaceDb, obsoleteBranches);
+    } finally {
+      workspaceDb.close();
+    }
+  }
+
+  async markDraftBranchesAsConflicted(workspaceId: string, localeVariantId: string): Promise<void> {
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.ensureWorkspaceDb(workspace.path);
+    const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
+    try {
+      workspaceDb.run(
+        `UPDATE draft_branches
+         SET state = @state, updated_at = @updatedAt
+         WHERE workspace_id = @workspaceId
+           AND locale_variant_id = @localeVariantId
+           AND state NOT IN (@conflictedState, @obsoleteState, @discardedState)`,
+        {
+          workspaceId,
+          localeVariantId,
+          state: DraftBranchStatus.CONFLICTED,
+          conflictedState: DraftBranchStatus.CONFLICTED,
+          obsoleteState: DraftBranchStatus.OBSOLETE,
+          discardedState: DraftBranchStatus.DISCARDED,
+          updatedAt: new Date().toISOString()
+        }
+      );
     } finally {
       workspaceDb.close();
     }
@@ -10337,12 +10780,30 @@ export class WorkspaceRepository {
     await this.ensureWorkspaceDb(workspace.path);
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
+      const obsoleteClauses = ['workspace_id = @workspaceId', 'state = @obsoleteState'];
+      const obsoleteParams: Record<string, unknown> = {
+        workspaceId,
+        obsoleteState: DraftBranchStatus.OBSOLETE
+      };
+      if (payload.localeVariantId) {
+        obsoleteClauses.push('locale_variant_id = @localeVariantId');
+        obsoleteParams.localeVariantId = payload.localeVariantId;
+      }
+      const obsoleteBranches = workspaceDb.all<{ id: string; localeVariantId: string }>(`
+        SELECT id,
+               locale_variant_id as localeVariantId
+        FROM draft_branches
+        WHERE ${obsoleteClauses.join(' AND ')}
+      `, obsoleteParams);
+      await this.purgeDraftBranches(workspace.path, workspaceDb, obsoleteBranches);
+
       const clauses = ['workspace_id = @workspaceId'];
       const params: Record<string, unknown> = { workspaceId };
       if (payload.localeVariantId) {
         clauses.push('locale_variant_id = @localeVariantId');
         params.localeVariantId = payload.localeVariantId;
       }
+      clauses.push(`state != '${DraftBranchStatus.OBSOLETE}'`);
       if (!payload.includeDiscarded) {
         clauses.push(`state != '${DraftBranchStatus.DISCARDED}'`);
       }
@@ -10388,6 +10849,10 @@ export class WorkspaceRepository {
     const workspaceDb = this.openWorkspaceDbWithRecovery(path.join(workspace.path, '.meta', DEFAULT_DB_FILE));
     try {
       const branch = this.getDraftBranchRow(workspaceDb, workspaceId, branchId);
+      if (normalizeDraftBranchStatus(branch.state) === DraftBranchStatus.OBSOLETE) {
+        await this.purgeDraftBranches(workspace.path, workspaceDb, [{ id: branch.id, localeVariantId: branch.localeVariantId }]);
+        throw new Error('Draft branch not found');
+      }
       const summary = await this.buildDraftBranchSummary(workspace.path, workspaceDb, branch);
       const editor = await this.buildDraftEditorPayload(workspace.path, workspaceDb, branch, summary);
       return {
@@ -10799,6 +11264,7 @@ export class WorkspaceRepository {
   private repairWorkspaceDb(dbPath: string) {
     const migrationResult = applyWorkspaceMigrations(dbPath);
     this.ensureKbAccessModeColumn(dbPath);
+    this.ensurePBIBatchAnalysisConfigColumn(dbPath);
     this.ensureAgentModelIdColumn(dbPath);
     this.ensureAcpModelIdColumn(dbPath);
     this.ensureAiRunsAgentModelIdColumn(dbPath);
@@ -11066,6 +11532,7 @@ export class WorkspaceRepository {
     await fs.mkdir(path.dirname(dbPath), { recursive: true });
     this.repairWorkspaceDb(dbPath);
     this.ensureKbAccessModeColumn(dbPath);
+    this.ensurePBIBatchAnalysisConfigColumn(dbPath);
     this.ensurePBIBatchWorkerStageBudgetMinutesColumn(dbPath);
     this.ensureAgentModelIdColumn(dbPath);
     this.ensureAcpModelIdColumn(dbPath);
@@ -11199,6 +11666,18 @@ export class WorkspaceRepository {
       const columns = db.all<{ name: string }>(`PRAGMA table_info(pbi_batches)`).map((c) => c.name);
       if (!columns.includes('analysis_worker_budget_minutes')) {
         db.exec(`ALTER TABLE pbi_batches ADD COLUMN analysis_worker_budget_minutes INTEGER`);
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  private ensurePBIBatchAnalysisConfigColumn(dbPath: string) {
+    const db = openWorkspaceDatabase(dbPath);
+    try {
+      const columns = db.all<{ name: string }>(`PRAGMA table_info(pbi_batches)`).map((c) => c.name);
+      if (!columns.includes('analysis_config_json')) {
+        db.exec(`ALTER TABLE pbi_batches ADD COLUMN analysis_config_json TEXT`);
       }
     } finally {
       db.close();
@@ -13135,7 +13614,7 @@ export class WorkspaceRepository {
     }
 
     if (proposal.action === ProposalAction.RETIRE && input.decision === ProposalReviewDecision.ACCEPT) {
-      return this.markProposalTargetRetired(workspaceDb, proposal);
+      return this.markProposalTargetRetired(workspacePath, workspaceDb, proposal);
     }
 
     if (proposal.action === ProposalAction.CREATE || proposal.action === ProposalAction.EDIT) {
@@ -13355,10 +13834,11 @@ export class WorkspaceRepository {
     };
   }
 
-  private markProposalTargetRetired(
+  private async markProposalTargetRetired(
+    workspacePath: string,
     workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
     proposal: ProposalReviewRecord
-  ): ProposalDecisionMutationResult {
+  ): Promise<ProposalDecisionMutationResult> {
     const retiredAtUtc = new Date().toISOString();
 
     if (proposal.localeVariantId) {
@@ -13385,6 +13865,19 @@ export class WorkspaceRepository {
           updatedAt: retiredAtUtc
         }
       );
+      const obsoleteBranches = workspaceDb.all<{ id: string; localeVariantId: string }>(
+        `SELECT id, locale_variant_id as localeVariantId
+         FROM draft_branches
+         WHERE workspace_id = @workspaceId
+           AND locale_variant_id = @localeVariantId
+           AND state = @state`,
+        {
+          workspaceId: proposal.workspaceId,
+          localeVariantId: proposal.localeVariantId,
+          state: DraftBranchStatus.OBSOLETE
+        }
+      );
+      await this.purgeDraftBranches(workspacePath, workspaceDb, obsoleteBranches);
 
       const family = workspaceDb.get<{ familyId: string }>(
         `SELECT family_id as familyId
@@ -13459,6 +13952,20 @@ export class WorkspaceRepository {
         updatedAt: retiredAtUtc
       }
     );
+    const obsoleteBranches = workspaceDb.all<{ id: string; localeVariantId: string }>(
+      `SELECT db.id, db.locale_variant_id as localeVariantId
+       FROM draft_branches db
+       JOIN locale_variants lv ON lv.id = db.locale_variant_id
+       WHERE db.workspace_id = @workspaceId
+         AND lv.family_id = @familyId
+         AND db.state = @state`,
+      {
+        familyId: proposal.familyId,
+        workspaceId: proposal.workspaceId,
+        state: DraftBranchStatus.OBSOLETE
+      }
+    );
+    await this.purgeDraftBranches(workspacePath, workspaceDb, obsoleteBranches);
 
     try {
       this.markArticleRelationFamiliesStale(workspaceDb, proposal.workspaceId, [proposal.familyId]);
@@ -13595,6 +14102,101 @@ export class WorkspaceRepository {
     return path.relative(workspacePath, absolutePath);
   }
 
+  private async purgeDraftBranches(
+    workspacePath: string,
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    branches: Array<{ id: string; localeVariantId: string }>
+  ): Promise<void> {
+    for (const branch of branches) {
+      const revisionRows = workspaceDb.all<{ id: string; filePath: string }>(
+        `SELECT id, file_path as filePath
+         FROM revisions
+         WHERE branch_id = @branchId`,
+        { branchId: branch.id }
+      );
+      const revisionIds = revisionRows.map((revision) => revision.id);
+      const sessionIds = workspaceDb.all<{ id: string }>(
+        `SELECT id
+         FROM article_ai_sessions
+         WHERE branch_id = @branchId`,
+        { branchId: branch.id }
+      ).map((session) => session.id);
+
+      if (sessionIds.length > 0) {
+        const sessionPlaceholders = sessionIds.map((_, index) => `@sessionId${index}`).join(', ');
+        const sessionParams = sessionIds.reduce<Record<string, string>>((acc, sessionId, index) => {
+          acc[`sessionId${index}`] = sessionId;
+          return acc;
+        }, {});
+        workspaceDb.run(
+          `DELETE FROM article_ai_messages
+           WHERE session_id IN (${sessionPlaceholders})`,
+          sessionParams
+        );
+      }
+
+      workspaceDb.run(
+        `DELETE FROM article_ai_sessions
+         WHERE branch_id = @branchId`,
+        { branchId: branch.id }
+      );
+
+      if (revisionIds.length > 0) {
+        const revisionPlaceholders = revisionIds.map((_, index) => `@revisionId${index}`).join(', ');
+        const revisionParams = revisionIds.reduce<Record<string, string>>((acc, revisionId, index) => {
+          acc[`revisionId${index}`] = revisionId;
+          return acc;
+        }, {});
+        workspaceDb.run(
+          `DELETE FROM placeholders
+           WHERE revision_id IN (${revisionPlaceholders})`,
+          revisionParams
+        );
+        workspaceDb.run(
+          `DELETE FROM publish_records
+           WHERE revision_id IN (${revisionPlaceholders})`,
+          revisionParams
+        );
+        workspaceDb.run(
+          `DELETE FROM article_lineage
+           WHERE predecessor_revision_id IN (${revisionPlaceholders})
+              OR successor_revision_id IN (${revisionPlaceholders})`,
+          revisionParams
+        );
+      }
+
+      workspaceDb.run(
+        `UPDATE proposals
+         SET branch_id = NULL
+         WHERE branch_id = @branchId`,
+        { branchId: branch.id }
+      );
+      workspaceDb.run(
+        `DELETE FROM draft_revision_commits
+         WHERE branch_id = @branchId`,
+        { branchId: branch.id }
+      );
+      workspaceDb.run(
+        `DELETE FROM revisions
+         WHERE branch_id = @branchId`,
+        { branchId: branch.id }
+      );
+      workspaceDb.run(
+        `DELETE FROM draft_branches
+         WHERE id = @branchId`,
+        { branchId: branch.id }
+      );
+
+      for (const revision of revisionRows) {
+        await fs.rm(resolveRevisionPath(workspacePath, revision.filePath), { force: true });
+      }
+      await fs.rm(path.join(workspacePath, 'drafts', branch.localeVariantId, branch.id), {
+        recursive: true,
+        force: true
+      });
+    }
+  }
+
   private async ensureProposalReviewArtifacts(
     workspacePath: string,
     workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
@@ -13661,7 +14263,25 @@ export class WorkspaceRepository {
     workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
     proposal: ProposalReviewRecord
   ): Promise<string> {
-    const revision = proposal.sourceRevisionId
+    const resolveLatestVariantRevision = (localeVariantId: string): { filePath: string } | null =>
+      workspaceDb.get<{ filePath: string }>(
+        `SELECT file_path as filePath
+         FROM revisions
+         WHERE locale_variant_id = @localeVariantId
+           AND revision_type = 'live'
+         ORDER BY revision_number DESC
+         LIMIT 1`,
+        { localeVariantId }
+      ) ?? workspaceDb.get<{ filePath: string }>(
+        `SELECT file_path as filePath
+         FROM revisions
+         WHERE locale_variant_id = @localeVariantId
+         ORDER BY revision_number DESC
+         LIMIT 1`,
+        { localeVariantId }
+      ) ?? null;
+
+    let revision = proposal.sourceRevisionId
       ? workspaceDb.get<{ filePath: string }>(
           `SELECT file_path as filePath
            FROM revisions
@@ -13669,24 +14289,52 @@ export class WorkspaceRepository {
            LIMIT 1`,
           { revisionId: proposal.sourceRevisionId }
         ) ?? null
-      : proposal.localeVariantId
-        ? workspaceDb.get<{ filePath: string }>(
-            `SELECT file_path as filePath
-             FROM revisions
-             WHERE locale_variant_id = @localeVariantId
-               AND revision_type = 'live'
-             ORDER BY revision_number DESC
+      : null;
+
+    if (!revision) {
+      const localeVariantId = proposal.localeVariantId?.trim();
+      if (localeVariantId) {
+        revision = resolveLatestVariantRevision(localeVariantId);
+      }
+    }
+
+    if (!revision && proposal.action !== ProposalAction.CREATE && proposal.familyId) {
+      const targetLocale = proposal.targetLocale?.trim()
+        ? normalizeLocaleCode(proposal.targetLocale)
+        : null;
+
+      // Batch-created edit proposals can reach review with family + locale identity but no variant id.
+      const matchedVariant = targetLocale
+        ? workspaceDb.get<{ id: string }>(
+            `SELECT id
+             FROM locale_variants
+             WHERE family_id = @familyId
+               AND lower(locale) = @targetLocale
              LIMIT 1`,
-            { localeVariantId: proposal.localeVariantId }
-          ) ?? workspaceDb.get<{ filePath: string }>(
-            `SELECT file_path as filePath
-             FROM revisions
-             WHERE locale_variant_id = @localeVariantId
-             ORDER BY revision_number DESC
-             LIMIT 1`,
-            { localeVariantId: proposal.localeVariantId }
+            {
+              familyId: proposal.familyId,
+              targetLocale
+            }
           ) ?? null
         : null;
+
+      const fallbackVariant = !matchedVariant
+        ? workspaceDb.all<{ id: string }>(
+            `SELECT id
+             FROM locale_variants
+             WHERE family_id = @familyId
+             ORDER BY locale ASC`,
+            { familyId: proposal.familyId }
+          )
+        : [];
+
+      const resolvedLocaleVariantId = matchedVariant?.id
+        ?? (fallbackVariant.length === 1 ? fallbackVariant[0]?.id ?? null : null);
+
+      if (resolvedLocaleVariantId) {
+        revision = resolveLatestVariantRevision(resolvedLocaleVariantId);
+      }
+    }
 
     if (!revision?.filePath) {
       return '';
@@ -13699,10 +14347,6 @@ export class WorkspaceRepository {
     proposal: ProposalReviewRecord,
     workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>
   ): ProposalReviewRecord {
-    if (proposal.targetTitle && proposal.targetTitle.trim()) {
-      return proposal;
-    }
-
     let familyId = proposal.familyId;
     let targetLocale = proposal.targetLocale;
     let targetTitle = proposal.targetTitle;
@@ -13743,11 +14387,106 @@ export class WorkspaceRepository {
       );
     }
 
+    const currentPlacement = familyId
+      ? this.getFamilyPlacementSummaryInDb(workspaceDb, proposal.workspaceId, familyId)
+      : undefined;
+    const suggestedPlacement = this.hydrateProposalPlacementSuggestionInDb(
+      workspaceDb,
+      proposal.workspaceId,
+      proposal.suggestedPlacement
+    );
+
     return {
       ...proposal,
       familyId,
       targetLocale,
-      targetTitle: targetTitle || undefined
+      targetTitle: targetTitle || undefined,
+      currentPlacement,
+      suggestedPlacement
+    };
+  }
+
+  private getFamilyPlacementSummaryInDb(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    familyId: string
+  ): ArticlePlacementSummary | undefined {
+    const family = workspaceDb.get<{ sectionId: string | null; categoryId: string | null }>(
+      `SELECT section_id as sectionId,
+              category_id as categoryId
+       FROM article_families
+       WHERE id = @familyId
+       LIMIT 1`,
+      { familyId }
+    );
+
+    return family
+      ? this.resolvePlacementSummaryInDb(workspaceDb, workspaceId, family)
+      : undefined;
+  }
+
+  private resolvePlacementSummaryInDb(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    placement: {
+      sectionId?: string | null;
+      sectionName?: string | null;
+      categoryId?: string | null;
+      categoryName?: string | null;
+    }
+  ): ArticlePlacementSummary | undefined {
+    const sectionId = normalizeFeatureMapScopeId(placement.sectionId);
+    const categoryId = normalizeFeatureMapScopeId(placement.categoryId);
+    const sectionName = placement.sectionName?.trim() || undefined;
+    const categoryName = placement.categoryName?.trim() || undefined;
+
+    if (!sectionId && !categoryId && !sectionName && !categoryName) {
+      return undefined;
+    }
+
+    const labels = this.resolveKbScopeDisplayNamesInDb(workspaceDb, workspaceId, [
+      ...(categoryId ? [{ scopeType: 'category' as const, scopeId: categoryId }] : []),
+      ...(sectionId ? [{ scopeType: 'section' as const, scopeId: sectionId }] : [])
+    ]);
+    const labelsByKey = new Map(
+      labels.map((label) => [`${label.scopeType}:${label.scopeId ?? ''}`, label.displayName])
+    );
+
+    return {
+      ...(categoryId ? { categoryId } : {}),
+      ...(categoryName || categoryId
+        ? { categoryName: categoryName ?? labelsByKey.get(`category:${categoryId ?? ''}`) }
+        : {}),
+      ...(sectionId ? { sectionId } : {}),
+      ...(sectionName || sectionId
+        ? { sectionName: sectionName ?? labelsByKey.get(`section:${sectionId ?? ''}`) }
+        : {})
+    };
+  }
+
+  private hydrateProposalPlacementSuggestionInDb(
+    workspaceDb: ReturnType<WorkspaceRepository['openWorkspaceDbWithRecovery']>,
+    workspaceId: string,
+    placement?: ProposalPlacementSuggestion
+  ): ProposalPlacementSuggestion | undefined {
+    if (!placement) {
+      return undefined;
+    }
+
+    const resolvedPlacement = this.resolvePlacementSummaryInDb(workspaceDb, workspaceId, placement);
+    const articleTitle = placement.articleTitle?.trim() || undefined;
+    const parentArticleId = placement.parentArticleId?.trim() || undefined;
+    const notes = placement.notes?.trim() || undefined;
+
+    if (!resolvedPlacement && !articleTitle && !parentArticleId && !notes) {
+      return undefined;
+    }
+
+    return {
+      ...resolvedPlacement,
+      ...(articleTitle ? { articleTitle } : {}),
+      ...(parentArticleId ? { parentArticleId } : {}),
+      ...(notes ? { notes } : {})
     };
   }
 
@@ -14067,6 +14806,7 @@ export class WorkspaceRepository {
     }
     const headHtml = await this.readRevisionSource(resolveRevisionPath(workspacePath, headRevision.filePath));
     const validationWarnings = await this.validateDraftBranchHtml(workspacePath, workspaceDb, branch, headHtml);
+    const placement = this.getFamilyPlacementSummaryInDb(workspaceDb, branch.workspaceId, variant.familyId);
 
     return {
       id: branch.id,
@@ -14089,6 +14829,7 @@ export class WorkspaceRepository {
       lastAutosavedAtUtc: branch.lastAutosavedAtUtc ?? undefined,
       lastManualSaveAtUtc: branch.lastManualSavedAtUtc ?? undefined,
       changeSummary: branch.changeSummary ?? summarizeDraftChanges(diffHtml(liveRevision ? await this.readRevisionSource(resolveRevisionPath(workspacePath, liveRevision.filePath)) : '', headHtml)),
+      placement,
       validationSummary: summarizeDraftValidationWarnings(validationWarnings)
     };
   }
@@ -14151,13 +14892,86 @@ export class WorkspaceRepository {
       promptTemplate: row.promptTemplate,
       toneRules: row.toneRules,
       examples: row.examples,
-      active: row.active,
+      active: Boolean(row.active),
       updatedAtUtc: row.updatedAtUtc,
       templateType: normalizeTemplatePackType(row.templateType),
       description: row.description ?? undefined,
       analysisSummary: analysis?.summary,
       analysis: analysis ?? undefined
     };
+  }
+
+  private enforceSingleActiveTemplatePerType(
+    workspaceDb: ReturnType<typeof openWorkspaceDatabase>,
+    workspaceId: string,
+    options?: {
+      templateType?: TemplatePackType;
+      preferredTemplateId?: string;
+    }
+  ): void {
+    const rows = workspaceDb.all<Array<{
+      id: string;
+      templateType: string | null;
+      active: number;
+      updatedAtUtc: string;
+    }>[number]>(
+      `SELECT id,
+              template_type as templateType,
+              active,
+              updated_at as updatedAtUtc
+         FROM template_packs
+        WHERE workspace_id = @workspaceId`,
+      { workspaceId }
+    );
+
+    const activeRowsByType = new Map<TemplatePackType, Array<{ id: string; updatedAtUtc: string }>>();
+    for (const row of rows) {
+      if (row.active !== 1) {
+        continue;
+      }
+      const normalizedType = normalizeTemplatePackType(row.templateType);
+      if (options?.templateType && normalizedType !== options.templateType) {
+        continue;
+      }
+      const entries = activeRowsByType.get(normalizedType) ?? [];
+      entries.push({ id: row.id, updatedAtUtc: row.updatedAtUtc });
+      activeRowsByType.set(normalizedType, entries);
+    }
+
+    const deactivateStatement = workspaceDb.prepare(
+      `UPDATE template_packs
+          SET active = 0
+        WHERE workspace_id = @workspaceId AND id = @templatePackId`
+    );
+
+    for (const [templateType, entries] of activeRowsByType.entries()) {
+      if (entries.length <= 1 && !(options?.preferredTemplateId && options.templateType === templateType)) {
+        continue;
+      }
+      const preferredTemplateId =
+        options?.templateType === templateType
+          ? options.preferredTemplateId?.trim()
+          : undefined;
+      const keepId = preferredTemplateId && entries.some((entry) => entry.id === preferredTemplateId)
+        ? preferredTemplateId
+        : entries
+            .slice()
+            .sort((left, right) => {
+              if (left.updatedAtUtc !== right.updatedAtUtc) {
+                return right.updatedAtUtc.localeCompare(left.updatedAtUtc);
+              }
+              return left.id.localeCompare(right.id);
+            })[0]?.id;
+      for (const entry of entries) {
+        if (entry.id === keepId) {
+          continue;
+        }
+        deactivateStatement.run({
+          workspaceId,
+          templatePackId: entry.id
+        });
+      }
+    }
   }
 
   private async ensureDefaultTemplatePacks(
@@ -14189,6 +15003,7 @@ export class WorkspaceRepository {
         }
       );
     }
+    this.enforceSingleActiveTemplatePerType(workspaceDb, workspaceId);
   }
 
   private async resolveArticleAiTarget(
@@ -14822,6 +15637,7 @@ function normalizeSearchScope(scope: SearchContext['scope'] | undefined): Search
 function normalizeDraftBranchStatus(value: string | null | undefined, hasConflict = false): DraftBranchStatus {
   switch (value) {
     case DraftBranchStatus.READY_TO_PUBLISH:
+      return hasConflict ? DraftBranchStatus.CONFLICTED : DraftBranchStatus.READY_TO_PUBLISH;
     case DraftBranchStatus.PUBLISHED:
     case DraftBranchStatus.OBSOLETE:
     case DraftBranchStatus.DISCARDED:
@@ -14861,6 +15677,7 @@ function normalizeArticleAiSessionStatus(value: string | null | undefined): Arti
 function normalizeTemplatePackType(value: string | null | undefined): TemplatePackType {
   switch (value) {
     case TemplatePackType.FAQ:
+    case TemplatePackType.PROPOSAL_CREATION:
     case TemplatePackType.TROUBLESHOOTING:
     case TemplatePackType.POLICY_NOTICE:
     case TemplatePackType.FEATURE_OVERVIEW:
@@ -15023,6 +15840,18 @@ function buildDefaultTemplatePacks(workspaceId: string): Array<{
       toneRules: 'Be precise and neutral. Avoid unnecessary marketing language.',
       active: true,
       description: 'For policy changes, deprecations, and operational notices.'
+    },
+    {
+      id: randomUUID(),
+      workspaceId,
+      name: 'Proposal Creation',
+      language: 'en-us',
+      templateType: TemplatePackType.PROPOSAL_CREATION,
+      promptTemplate: 'Write proposal-ready KB article HTML that is accurate to the approved product change, easy to review, and ready for Proposal Review. Keep the content factual, structured, and implementation-ready. When an image or screenshot is needed, insert the canonical image placeholder tag instead of inventing or replacing images.',
+      toneRules: 'Stay concrete and review-friendly. Preserve exact product terminology, use concise sections, and emit image needs as <image_placeholder description="..." /> tags.',
+      examples: '<h1>Assign Leadership Tiles</h1><p>Use this article to assign leadership tiles from the Team Dashboard.</p><ol><li>Open <strong>Dashboard</strong>.</li><li>Select the leadership tile.</li><li>Choose the assignee.</li></ol><image_placeholder description="Screenshot of Team Dashboard showing the Leadership tile assignment flow" />',
+      active: true,
+      description: 'Default guidance for proposal HTML created during batch analysis.'
     },
     {
       id: randomUUID(),
@@ -15491,7 +16320,9 @@ function normalizePlacement(value: unknown): ProposalPlacementSuggestion | undef
   const input = value as Record<string, unknown>;
   const placement: ProposalPlacementSuggestion = {
     categoryId: extractString(input.categoryId),
+    categoryName: extractString(input.categoryName),
     sectionId: extractString(input.sectionId),
+    sectionName: extractString(input.sectionName),
     articleTitle: extractString(input.articleTitle),
     parentArticleId: extractString(input.parentArticleId),
     notes: extractString(input.notes)
@@ -15508,6 +16339,204 @@ function safeParseJson<T = unknown>(value: string | null | undefined): T | null 
   } catch {
     return null;
   }
+}
+
+const PBI_BATCH_ANALYSIS_CONFIG_VERSION = 1;
+
+function createDefaultPBIBatchAnalysisConfig(updatedAtUtc = new Date().toISOString()): PBIBatchAnalysisConfig {
+  return {
+    version: PBI_BATCH_ANALYSIS_CONFIG_VERSION,
+    updatedAtUtc,
+    guaranteedEditFamilies: [],
+    guaranteedCreateArticles: []
+  };
+}
+
+function normalizePBIBatchAnalysisConfig(value: unknown): PBIBatchAnalysisConfig {
+  if (!value || typeof value !== 'object') {
+    return createDefaultPBIBatchAnalysisConfig();
+  }
+
+  const record = value as Record<string, unknown>;
+  const updatedAtUtc = extractString(record.updatedAtUtc) ?? new Date().toISOString();
+  const analysisGuidancePrompt = normalizeOptionalPromptText(extractString(record.analysisGuidancePrompt));
+
+  const guaranteedEditFamilies = Array.isArray(record.guaranteedEditFamilies)
+    ? record.guaranteedEditFamilies.flatMap((family): PBIBatchGuaranteedEditFamily[] => {
+        if (!family || typeof family !== 'object') {
+          return [];
+        }
+        const candidate = family as Record<string, unknown>;
+        const familyId = extractString(candidate.familyId);
+        const familyTitle = extractString(candidate.familyTitle);
+        const resolvedLocaleVariants = Array.isArray(candidate.resolvedLocaleVariants)
+          ? candidate.resolvedLocaleVariants.flatMap((variant): PBIBatchGuaranteedEditLocaleVariant[] => {
+              if (!variant || typeof variant !== 'object') {
+                return [];
+              }
+              const resolvedVariant = variant as Record<string, unknown>;
+              const localeVariantId = extractString(resolvedVariant.localeVariantId);
+              const locale = extractString(resolvedVariant.locale);
+              if (!localeVariantId || !locale) {
+                return [];
+              }
+              return [{
+                localeVariantId,
+                locale: normalizeLocaleCode(locale),
+                revisionId: extractString(resolvedVariant.revisionId),
+                revisionState: extractString(resolvedVariant.revisionState) as RevisionState | undefined,
+                updatedAtUtc: extractString(resolvedVariant.updatedAtUtc),
+                snippet: extractString(resolvedVariant.snippet)
+              }];
+            })
+          : [];
+
+        if (!familyId || !familyTitle || resolvedLocaleVariants.length === 0) {
+          return [];
+        }
+
+        return [{
+          familyId,
+          familyTitle,
+          selectedFromLocaleVariantId: extractString(candidate.selectedFromLocaleVariantId),
+          mode: 'all_live_locales',
+          resolvedLocaleVariants,
+          sectionId: extractString(candidate.sectionId),
+          sectionName: extractString(candidate.sectionName),
+          categoryId: extractString(candidate.categoryId),
+          categoryName: extractString(candidate.categoryName)
+        }];
+      })
+    : [];
+
+  const guaranteedCreateArticles = dedupeGuaranteedCreateArticles(
+    Array.isArray(record.guaranteedCreateArticles)
+      ? record.guaranteedCreateArticles.flatMap((article): PBIBatchGuaranteedCreateArticle[] => {
+          if (!article || typeof article !== 'object') {
+            return [];
+          }
+          const candidate = article as Record<string, unknown>;
+          const title = extractString(candidate.title);
+          const targetLocale = extractString(candidate.targetLocale);
+          if (!title || !targetLocale) {
+            return [];
+          }
+          return [{
+            clientId: extractString(candidate.clientId) ?? randomUUID(),
+            title,
+            targetLocale: normalizeLocaleCode(targetLocale),
+            source: 'manual',
+            categoryId: extractString(candidate.categoryId),
+            categoryName: extractString(candidate.categoryName),
+            sectionId: extractString(candidate.sectionId),
+            sectionName: extractString(candidate.sectionName)
+          }];
+        })
+      : []
+  );
+
+  return {
+    version: typeof record.version === 'number' && Number.isFinite(record.version)
+      ? record.version
+      : PBI_BATCH_ANALYSIS_CONFIG_VERSION,
+    updatedAtUtc,
+    guaranteedEditFamilies,
+    guaranteedCreateArticles,
+    ...(analysisGuidancePrompt ? { analysisGuidancePrompt } : {})
+  };
+}
+
+function normalizeOptionalPromptText(value?: string | null): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function normalizeLocaleCode(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function dedupeGuaranteedCreateArticles(
+  articles: PBIBatchGuaranteedCreateArticle[]
+): PBIBatchGuaranteedCreateArticle[] {
+  const seen = new Set<string>();
+  const deduped: PBIBatchGuaranteedCreateArticle[] = [];
+
+  for (const article of articles) {
+    const title = article.title.trim();
+    const targetLocale = normalizeLocaleCode(article.targetLocale);
+    if (!title || !targetLocale) {
+      continue;
+    }
+    const key = `${normalizeGuaranteedTargetTitle(title)}::${targetLocale}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push({
+      ...article,
+      title,
+      targetLocale
+    });
+  }
+
+  return deduped;
+}
+
+function dedupeGuaranteedCreateConflictMatches(
+  matches: PBIBatchGuaranteedCreateConflictMatch[]
+): PBIBatchGuaranteedCreateConflictMatch[] {
+  const seen = new Set<string>();
+  const deduped: PBIBatchGuaranteedCreateConflictMatch[] = [];
+
+  for (const match of matches) {
+    const key = `${match.localeVariantId}:${match.familyId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(match);
+  }
+
+  return deduped;
+}
+
+function normalizeGuaranteedTargetTitle(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenizeGuaranteedTargetTitle(value: string): string[] {
+  return normalizeGuaranteedTargetTitle(value)
+    .split(' ')
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function isStrongGuaranteedCreateConflict(requestedTitle: string, existingTitle: string): boolean {
+  const normalizedRequested = normalizeGuaranteedTargetTitle(requestedTitle);
+  const normalizedExisting = normalizeGuaranteedTargetTitle(existingTitle);
+  if (!normalizedRequested || !normalizedExisting) {
+    return false;
+  }
+  if (normalizedRequested === normalizedExisting) {
+    return true;
+  }
+
+  const requestedTokens = tokenizeGuaranteedTargetTitle(requestedTitle);
+  const existingTokens = tokenizeGuaranteedTargetTitle(existingTitle);
+  if (requestedTokens.length < 2 || existingTokens.length < 2) {
+    return false;
+  }
+
+  const requestedSet = new Set(requestedTokens);
+  const existingSet = new Set(existingTokens);
+  const requestedCovered = requestedTokens.every((token) => existingSet.has(token));
+  const existingCovered = existingTokens.every((token) => requestedSet.has(token));
+  return requestedCovered || existingCovered;
 }
 
 function variantToDraftCount(map: Map<string, number>, localeVariantId: string): number {

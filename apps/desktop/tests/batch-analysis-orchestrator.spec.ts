@@ -1,11 +1,13 @@
 import { expect, test } from '@playwright/test';
-import type { LocaleVariantRecord } from '@kb-vault/shared-types';
-import type {
-  BatchAnalysisIterationRecord,
-  BatchAnalysisPlan,
-  BatchAnalysisQuestion,
-  BatchPlanReview,
-  BatchPlannerPrefetch
+import {
+  TemplatePackType,
+  type LocaleVariantRecord,
+  type TemplatePackDetail,
+  type BatchAnalysisIterationRecord,
+  type BatchAnalysisPlan,
+  type BatchAnalysisQuestion,
+  type BatchPlanReview,
+  type BatchPlannerPrefetch
 } from '@kb-vault/shared-types';
 import { BatchAnalysisOrchestrator } from '../src/main/services/batch-analysis-orchestrator';
 
@@ -22,6 +24,10 @@ function createOrchestrator(overrides?: {
     targetTitle?: string;
     targetLocale?: string;
     sessionId?: string;
+    suggestedPlacement?: {
+      categoryId?: string;
+      sectionId?: string;
+    };
   }>>;
   updateBatchAnalysisPlanItemStatuses?: (payload: unknown) => Promise<void>;
   recordBatchWorkerExecutionReport?: (report: unknown) => Promise<void>;
@@ -64,6 +70,10 @@ function createPlan(overrides?: Partial<BatchAnalysisPlan>): BatchAnalysisPlan {
         action: 'create',
         targetType: 'new_article',
         targetTitle: 'Brand New Article',
+        suggestedPlacement: {
+          categoryId: 'category-default',
+          categoryName: 'Operations'
+        },
         reason: 'The feature appears new.',
         evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
         confidence: 0.84,
@@ -136,6 +146,23 @@ function createPlannerPrefetch(overrides?: Partial<BatchPlannerPrefetch>): Batch
   };
 }
 
+function createProposalTemplate(overrides?: Partial<TemplatePackDetail>): TemplatePackDetail {
+  return {
+    id: 'template-proposal-1',
+    workspaceId: 'workspace-1',
+    name: 'Proposal Creation',
+    language: 'en-us',
+    promptTemplate: 'Use <image_placeholder description="Describe the intended screenshot." /> whenever proposal HTML needs a future image.',
+    toneRules: 'Keep proposal HTML implementation-ready and concise.',
+    examples: '<article><image_placeholder description="Admin dashboard overview" /></article>',
+    active: true,
+    updatedAtUtc: new Date().toISOString(),
+    templateType: TemplatePackType.PROPOSAL_CREATION,
+    description: 'Default proposal creation guidance.',
+    ...overrides
+  };
+}
+
 test.describe('batch analysis orchestrator deterministic review guard', () => {
   test('planner prompt removes CLI-discovery wording and keeps lookup guidance provider-neutral', () => {
     const orchestrator = createOrchestrator();
@@ -147,6 +174,20 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
 
     expect(prompt).toContain('Only issue new KB lookups when you still have a concrete unresolved ambiguity');
     expect(prompt).not.toContain('KB CLI discovery');
+  });
+
+  test('planner prompt includes proposal creation template guidance when provided', () => {
+    const orchestrator = createOrchestrator();
+    const prompt = orchestrator.buildPlannerPrompt({
+      batchContext: { batchId: 'batch-1', workspaceId: 'workspace-1' },
+      uploadedPbis: { rows: [{ id: 'pbi-1', title: 'Add checklist reminders' }] },
+      plannerPrefetch: createPlannerPrefetch(),
+      proposalTemplate: createProposalTemplate()
+    });
+
+    expect(prompt).toContain('Active proposal creation template guidance:');
+    expect(prompt).toContain('Use this active template when reasoning about the expected structure');
+    expect(prompt).toContain('<image_placeholder description="Describe the intended screenshot." />');
   });
 
   test('planner retry prompts carry the original planner context into fresh ACP sessions', () => {
@@ -263,20 +304,127 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
           action: 'create',
           targetType: 'new_article',
           targetTitle: 'Assign Trainers to Course',
+          suggestedPlacement: {
+            categoryId: '200',
+            categoryName: 'Operations',
+            sectionId: '201',
+            sectionName: 'Billing Dashboard'
+          },
           reason: 'Net-new article for the workflow.',
           evidence: [{ kind: 'pbi', ref: 'pbi-2', summary: 'Imported PBI.' }],
           confidence: 0.82,
           executionStatus: 'pending'
         }
       ]
-    }));
+    }), {
+      proposalTemplate: createProposalTemplate()
+    });
 
     expect(prompt).toContain('Approved plan targets and execution hints below are authoritative.');
     expect(prompt).toContain('"strategy": "family_id"');
     expect(prompt).toContain('"familyId": "family-training-plans"');
     expect(prompt).toContain('"preferredLocaleVariantId": "variant-training-plans"');
     expect(prompt).toContain('"strategy": "target_title"');
+    expect(prompt).toContain('"suggestedPlacement": {');
+    expect(prompt).toContain('"categoryId": "200"');
     expect(prompt).toContain('Do not spend lookup turns trying to discover a localeVariantId for net-new work first.');
+    expect(prompt).toContain('Active proposal creation template guidance:');
+    expect(prompt).toContain('When you persist `proposedHtml`, treat this active template as authoritative guidance');
+    expect(prompt).toContain('<image_placeholder description="Describe the intended screenshot." />');
+  });
+
+  test('validateApprovedPlan rejects create items without authoritative category placement', () => {
+    const orchestrator = createOrchestrator();
+    const validation = orchestrator.validateApprovedPlan(createPlan({
+      items: [
+        {
+          planItemId: 'item-1',
+          pbiIds: ['pbi-1'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'Assign Trainers to Course',
+          suggestedPlacement: {
+            categoryName: 'Operations',
+            sectionName: 'Billing Dashboard'
+          },
+          reason: 'Net-new article for the workflow.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+          confidence: 0.82,
+          executionStatus: 'pending'
+        }
+      ]
+    }));
+
+    expect(validation.ok).toBe(false);
+    expect(validation.reasons).toContain(
+      'Create plan item item-1 (Assign Trainers to Course) is missing suggested category placement with an authoritative categoryId.'
+    );
+  });
+
+  test('recordWorkerPass blocks create output that drops approved placement', async () => {
+    const orchestrator = createOrchestrator({
+      listBatchProposalRecords: async () => [{
+        id: 'proposal-1',
+        action: 'create',
+        reviewStatus: 'pending_review',
+        queueOrder: 1,
+        updatedAtUtc: new Date().toISOString(),
+        targetTitle: 'Assign Trainers to Course',
+        targetLocale: 'en-us',
+        sessionId: 'worker-session-1'
+      }]
+    });
+
+    const { workerReport } = await orchestrator.recordWorkerPass({
+      iteration: {
+        id: 'iteration-1',
+        workspaceId: 'workspace-1',
+        batchId: 'batch-1',
+        iteration: 1,
+        stage: 'building',
+        role: 'worker',
+        status: 'running',
+        summary: 'Worker running.',
+        createdAtUtc: new Date().toISOString(),
+        updatedAtUtc: new Date().toISOString()
+      } as BatchAnalysisIterationRecord,
+      workspaceId: 'workspace-1',
+      batchId: 'batch-1',
+      approvedPlan: createPlan({
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'create',
+            targetType: 'new_article',
+            targetTitle: 'Assign Trainers to Course',
+            targetLocale: 'en-us',
+            suggestedPlacement: {
+              categoryId: '200',
+              categoryName: 'Operations',
+              sectionId: '201',
+              sectionName: 'Billing Dashboard'
+            },
+            reason: 'Net-new article for the workflow.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+            confidence: 0.82,
+            executionStatus: 'pending'
+          }
+        ]
+      }),
+      result: {
+        status: 'ok',
+        message: 'Worker completed.',
+        sessionId: 'worker-session-1',
+        endedAtUtc: new Date().toISOString()
+      }
+    });
+
+    expect(workerReport.executedItems[0]).toMatchObject({
+      planItemId: 'item-1',
+      status: 'blocked'
+    });
+    expect(workerReport.executedItems[0]?.note).toContain('did not preserve the approved placement');
   });
 
   test('repairs malformed plan PBI IDs and canonicalizes PBI evidence refs from uploaded batch rows', () => {
@@ -931,6 +1079,10 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
             action: 'create',
             targetType: 'new_article',
             targetTitle: 'New article',
+            suggestedPlacement: {
+              categoryId: 'category-new',
+              categoryName: 'Operations'
+            },
             reason: 'The plan already covers the PBI with a net-new article.',
             evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
             confidence: 0.89,
@@ -1189,6 +1341,10 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
             action: 'create',
             targetType: 'new_article',
             targetTitle: 'Duplicate a Food Item',
+            suggestedPlacement: {
+              categoryId: 'category-food',
+              categoryName: 'Operations'
+            },
             reason: 'New duplicate workflow.',
             evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
             confidence: 0.92,
@@ -1352,6 +1508,10 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
             action: 'create',
             targetType: 'new_article',
             targetTitle: 'Checklist escalation workflow',
+            suggestedPlacement: {
+              categoryId: 'category-escalation',
+              categoryName: 'Operations'
+            },
             reason: 'This topic appears net-new.',
             evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
             confidence: 0.85,
@@ -1494,7 +1654,8 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
           }
         ]
       }),
-      candidateQuestions
+      candidateQuestions,
+      proposalTemplate: createProposalTemplate()
     });
 
     expect(prompt).toContain('Deterministic planner prefetch:');
@@ -1503,6 +1664,7 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(prompt).toContain('edit-only or edit-heavy plan');
     expect(prompt).toContain('Candidate questions for reviewer adjudication:');
     expect(prompt).toContain('preserving its `id`');
+    expect(prompt).toContain('Active proposal creation template guidance:');
   });
 
   test('deterministic candidate question kept by reviewer becomes the blocking user-input question', () => {
@@ -1515,6 +1677,10 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
           action: 'create',
           targetType: 'new_article',
           targetTitle: 'Checklist escalation workflow',
+          suggestedPlacement: {
+            categoryId: 'category-escalation',
+            categoryName: 'Operations'
+          },
           reason: 'The planner chose a net-new article.',
           evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
           confidence: 0.84,
@@ -1581,6 +1747,10 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
           action: 'create',
           targetType: 'new_article',
           targetTitle: 'Checklist escalation workflow',
+          suggestedPlacement: {
+            categoryId: 'category-escalation',
+            categoryName: 'Operations'
+          },
           reason: 'The planner chose a net-new article.',
           evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
           confidence: 0.84,
@@ -1639,6 +1809,128 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
     expect(result.review.verdict).toBe('approved');
     expect(result.blockingUserInputQuestions).toHaveLength(0);
     expect(result.review.questions?.[0]?.status).toBe('dismissed');
+  });
+
+  test('forces revision when guaranteed edit family locales are missing from the plan', () => {
+    const orchestrator = createOrchestrator();
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan: createPlan({
+        items: [
+          {
+            planItemId: 'item-1',
+            pbiIds: ['pbi-1'],
+            action: 'create',
+            targetType: 'new_article',
+            targetTitle: 'Brand New Article',
+            reason: 'The planner only proposed net-new work.',
+            evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+            confidence: 0.77,
+            executionStatus: 'pending'
+          }
+        ]
+      }),
+      review: createReview(),
+      batchContext: {
+        analysisConfig: {
+          version: 1,
+          updatedAtUtc: new Date().toISOString(),
+          guaranteedEditFamilies: [
+            {
+              familyId: 'family-training',
+              familyTitle: 'Create & Edit Training Plans',
+              mode: 'all_live_locales',
+              resolvedLocaleVariants: [
+                { localeVariantId: 'variant-en', locale: 'en-us' },
+                { localeVariantId: 'variant-fr', locale: 'fr-fr' }
+              ]
+            }
+          ],
+          guaranteedCreateArticles: []
+        },
+        guaranteedCreateConflicts: []
+      }
+    });
+
+    expect(result.review.verdict).toBe('needs_revision');
+    expect(result.review.delta?.missingEdits).toEqual([
+      'Guaranteed edit target Create & Edit Training Plans (en-us) is missing a concrete edit plan item.',
+      'Guaranteed edit target Create & Edit Training Plans (fr-fr) is missing a concrete edit plan item.'
+    ]);
+  });
+
+  test('guaranteed create conflicts synthesize blocking user-input questions', () => {
+    const orchestrator = createOrchestrator();
+    const plan = createPlan({
+      items: [
+        {
+          planItemId: 'item-1',
+          pbiIds: ['pbi-1'],
+          action: 'create',
+          targetType: 'new_article',
+          targetTitle: 'Existing Setup Article',
+          targetLocale: 'en-us',
+          reason: 'The planner proposed a create.',
+          evidence: [{ kind: 'pbi', ref: 'pbi-1', summary: 'Imported PBI.' }],
+          confidence: 0.81,
+          executionStatus: 'pending'
+        }
+      ]
+    });
+    const batchContext = {
+      analysisConfig: {
+        version: 1,
+        updatedAtUtc: new Date().toISOString(),
+        guaranteedEditFamilies: [],
+        guaranteedCreateArticles: [
+          {
+            clientId: 'create-1',
+            title: 'Existing Setup Article',
+            targetLocale: 'en-us',
+            source: 'manual'
+          }
+        ]
+      },
+      guaranteedCreateConflicts: [
+        {
+          clientId: 'create-1',
+          title: 'Existing Setup Article',
+          targetLocale: 'en-us',
+          reason: 'Existing live article coverage may already exist.',
+          matches: [
+            {
+              familyId: 'family-setup',
+              localeVariantId: 'variant-setup',
+              locale: 'en-us',
+              title: 'Existing Setup Article',
+              score: 1.5,
+              matchContext: 'title',
+              snippet: 'Existing live article.'
+            }
+          ]
+        }
+      ]
+    };
+
+    const candidateQuestions = orchestrator.buildReviewCandidateQuestions({
+      plan,
+      batchContext
+    });
+    expect(candidateQuestions).toHaveLength(1);
+    expect(candidateQuestions[0]?.prompt).toContain('Should we still create a new article or convert this to an edit?');
+
+    const result = orchestrator.applyDeterministicPlanReviewGuard({
+      plan,
+      review: createReview({
+        verdict: 'approved',
+        questions: [candidateQuestions[0]!]
+      }),
+      candidateQuestions,
+      batchContext
+    });
+
+    expect(result.review.verdict).toBe('needs_user_input');
+    expect(result.blockingUserInputQuestions).toHaveLength(1);
+    expect(result.blockingUserInputQuestions[0]?.prompt).toContain('Existing Setup Article');
   });
 
   test('forces revision when multiple plan items target the same existing article', () => {
@@ -1770,11 +2062,14 @@ test.describe('batch analysis orchestrator deterministic review guard', () => {
           changeSummary: ['Duplicate item modal: Adds confirmation messaging.'],
           proposedContentPreview: 'This article now explains how to duplicate a food item.'
         }
-      ]
+      ],
+      proposalTemplate: createProposalTemplate()
     });
 
     expect(prompt).toContain('Proposal-scoped locale variants or article families whose external key starts with `proposal-` are generated draft artifacts, not live KB coverage.');
     expect(prompt).toContain('"targetState": "proposal_scoped_draft"');
     expect(prompt).toContain('"familyExternalKey": "proposal-123"');
+    expect(prompt).toContain('Active proposal creation template guidance:');
+    expect(prompt).toContain('Use this active template when judging whether the executed proposals match the expected proposal HTML structure');
   });
 });

@@ -1,4 +1,4 @@
-import type { EntityId, RevisionState } from './batch2';
+import type { ArticlePlacementSummary, EntityId, RevisionState } from './batch2';
 import type { ProposalDiffPayload } from './batch7';
 export declare enum DraftBranchStatus {
     ACTIVE = "active",
@@ -67,6 +67,7 @@ export interface DraftBranchSummary {
     lastAutosavedAtUtc?: string;
     lastManualSaveAtUtc?: string;
     changeSummary?: string;
+    placement?: ArticlePlacementSummary;
     validationSummary: DraftValidationSummary;
 }
 export interface DraftBranchSummaryCounts {

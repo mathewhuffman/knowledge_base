@@ -1,6 +1,7 @@
 import type { KbAccessMode } from './batch2';
 import type { AppWorkingStateEntityType } from './app-working-state';
 import type { AppRoute } from './routes';
+import type { ProposalPlacementSuggestion } from './batch7';
 
 export type AgentSessionType = 'batch_analysis' | 'article_edit' | 'assistant_chat';
 export type AgentSessionMode = 'plan' | 'agent' | 'ask';
@@ -425,6 +426,8 @@ export interface BatchPlanItem {
   targetArticleId?: string;
   targetFamilyId?: string;
   targetTitle: string;
+  targetLocale?: string;
+  suggestedPlacement?: ProposalPlacementSuggestion;
   reason: string;
   evidence: BatchPlanEvidenceItem[];
   confidence: number;

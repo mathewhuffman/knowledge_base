@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test, expect } from '@playwright/test';
-import { JobState, type JobEvent } from '@kb-vault/shared-types';
+import { DraftBranchStatus, JobState, type JobEvent } from '@kb-vault/shared-types';
 import { ZendeskClient } from '@kb-vault/zendesk-client';
 import { WorkspaceRepository } from '../src/main/services/workspace-repository';
 import { ZendeskSyncService } from '../src/main/services/zendesk-sync-service';
@@ -352,6 +352,108 @@ test.describe('zendesk sync service', () => {
       categorySource: 'zendesk_section_parent',
       taxonomyNote: 'Zendesk category 999 conflicts with section 201 parent 200; effective category follows the section parent.'
     }));
+  });
+
+  test('marks local drafts conflicted when live Zendesk content changes instead of deleting them', async () => {
+    const workspace = await repository.createWorkspace({
+      name: 'Sync Conflicts Drafts',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us'],
+      path: path.join(workspaceRoot, 'sync-conflicts-drafts')
+    });
+    patchZendeskCredentials(repository, workspace.id);
+
+    patchZendeskClient({
+      testConnection: async () => ({ ok: true, status: 200 }),
+      listCategories: async () => [{ id: 200, name: 'Operations' }],
+      listSections: async () => [{ id: 201, name: 'Billing', category_id: 200 }],
+      listArticles: async (locale, page = 1) => ({
+        items: page === 1
+          ? [{
+              id: 1001,
+              title: 'Billing Dashboard',
+              body: '<h1>Billing Dashboard</h1><p>Original live article.</p>',
+              locale,
+              section_id: 201,
+              category_id: 200,
+              updated_at: '2026-04-19T12:00:00.000Z'
+            }]
+          : [],
+        hasMore: false,
+        nextPage: null
+      })
+    });
+
+    const service = new ZendeskSyncService(repository);
+    await service.runSync(
+      {
+        workspaceId: workspace.id,
+        mode: 'full',
+        maxRetries: 0
+      },
+      () => undefined,
+      'zendesk.sync.run',
+      'job-conflict-baseline'
+    );
+
+    const family = await repository.getArticleFamilyByExternalKey(workspace.id, 'hc:1001');
+    expect(family).toBeTruthy();
+    const variant = await repository.getLocaleVariantByFamilyAndLocale(workspace.id, family!.id, 'en-us');
+    expect(variant).toBeTruthy();
+
+    const branch = await repository.createDraftBranch({
+      workspaceId: workspace.id,
+      localeVariantId: variant!.id,
+      name: 'Ready before sync',
+      sourceHtml: '<h1>Billing Dashboard</h1><p>Local draft edit.</p>'
+    });
+    await repository.setDraftBranchStatus({
+      workspaceId: workspace.id,
+      branchId: branch.branch.id,
+      status: DraftBranchStatus.READY_TO_PUBLISH
+    });
+
+    patchZendeskClient({
+      testConnection: async () => ({ ok: true, status: 200 }),
+      listCategories: async () => [{ id: 200, name: 'Operations' }],
+      listSections: async () => [{ id: 201, name: 'Billing', category_id: 200 }],
+      listArticles: async (locale, page = 1) => ({
+        items: page === 1
+          ? [{
+              id: 1001,
+              title: 'Billing Dashboard',
+              body: '<h1>Billing Dashboard</h1><p>Updated from Zendesk.</p>',
+              locale,
+              section_id: 201,
+              category_id: 200,
+              updated_at: '2026-04-20T12:00:00.000Z'
+            }]
+          : [],
+        hasMore: false,
+        nextPage: null
+      })
+    });
+
+    await service.runSync(
+      {
+        workspaceId: workspace.id,
+        mode: 'full',
+        maxRetries: 0
+      },
+      () => undefined,
+      'zendesk.sync.run',
+      'job-conflict-refresh'
+    );
+
+    const drafts = await repository.listDraftBranches(workspace.id, { workspaceId: workspace.id });
+    expect(drafts.branches).toHaveLength(1);
+    expect(drafts.branches[0]?.id).toBe(branch.branch.id);
+    expect(drafts.branches[0]?.status).toBe(DraftBranchStatus.CONFLICTED);
+
+    const editor = await repository.getDraftBranchEditor(workspace.id, branch.branch.id);
+    expect(editor.branch.status).toBe(DraftBranchStatus.CONFLICTED);
+    expect(editor.editor.html).toContain('Local draft edit.');
   });
 
   test('preserves cancellation when taxonomy refresh is interrupted', async () => {

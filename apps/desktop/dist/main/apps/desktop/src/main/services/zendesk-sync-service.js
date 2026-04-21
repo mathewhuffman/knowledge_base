@@ -285,7 +285,7 @@ class ZendeskSyncService {
                 metrics.syncedArticles += 1;
                 emitProgress(0, `Saved ${article.title}`);
                 if (existingLive) {
-                    await this.workspaceRepository.markDraftBranchesAsObsolete(workspaceId, variant.id);
+                    await this.workspaceRepository.markDraftBranchesAsConflicted(workspaceId, variant.id);
                 }
             }
             hasMore = Boolean(payload.hasMore);

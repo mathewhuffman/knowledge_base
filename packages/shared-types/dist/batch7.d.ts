@@ -1,4 +1,4 @@
-import type { EntityId, PBIRecord, PBIBatchStatus, ProposalAction } from './batch2';
+import type { ArticlePlacementSummary, EntityId, PBIRecord, PBIBatchStatus, ProposalAction } from './batch2';
 export declare enum ProposalReviewStatus {
     STAGED_ANALYSIS = "staged_analysis",
     PENDING_REVIEW = "pending_review",
@@ -15,9 +15,7 @@ export declare enum ProposalReviewDecision {
     APPLY_TO_BRANCH = "apply_to_branch",
     ARCHIVE = "archive"
 }
-export interface ProposalPlacementSuggestion {
-    categoryId?: string;
-    sectionId?: string;
+export interface ProposalPlacementSuggestion extends ArticlePlacementSummary {
     articleTitle?: string;
     parentArticleId?: string;
     notes?: string;
@@ -39,6 +37,7 @@ export interface ProposalReviewRecord {
     confidenceScore?: number;
     rationaleSummary?: string;
     aiNotes?: string;
+    currentPlacement?: ArticlePlacementSummary;
     suggestedPlacement?: ProposalPlacementSuggestion;
     sourceHtmlPath?: string;
     proposedHtmlPath?: string;

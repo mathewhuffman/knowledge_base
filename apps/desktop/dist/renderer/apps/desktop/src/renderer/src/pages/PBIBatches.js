@@ -15,7 +15,7 @@ const WIZARD_STEPS = ['upload', 'summary', 'scope', 'preflight'];
 const WIZARD_STEP_LABELS = {
     upload: 'Upload',
     summary: 'Review',
-    scope: 'Scope',
+    scope: 'Scope & Targets',
     preflight: 'Confirm',
 };
 const STATUS_LABEL = {
@@ -112,6 +112,63 @@ function recommendWorkerStageBudgetMinutes(scopedCount) {
     }
     return DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES;
 }
+function normalizeTitleKey(value) {
+    return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function makeClientId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    return `create-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+function buildGuaranteedEditFamilyFromExplorerNode(node, selectedFromLocaleVariantId) {
+    const resolvedLocaleVariants = node.locales
+        .filter((locale) => locale.revision.state !== 'retired' && !locale.hasConflicts)
+        .map((locale) => ({
+        localeVariantId: locale.localeVariantId,
+        locale: locale.locale
+    }))
+        .sort((left, right) => left.locale.localeCompare(right.locale));
+    if (resolvedLocaleVariants.length === 0) {
+        return null;
+    }
+    return {
+        familyId: node.familyId,
+        familyTitle: node.title,
+        selectedFromLocaleVariantId,
+        mode: 'all_live_locales',
+        resolvedLocaleVariants,
+        sectionId: node.sectionId,
+        sectionName: node.sectionName,
+        categoryId: node.categoryId,
+        categoryName: node.categoryName
+    };
+}
+function dedupeSearchResultsByFamily(results) {
+    const seen = new Set();
+    const deduped = [];
+    for (const result of results) {
+        if (seen.has(result.familyId)) {
+            continue;
+        }
+        seen.add(result.familyId);
+        deduped.push(result);
+    }
+    return deduped;
+}
+function createGuaranteedCreateArticle(title, targetLocale) {
+    const trimmedTitle = title.trim();
+    const trimmedLocale = targetLocale.trim().toLowerCase();
+    if (!trimmedTitle || !trimmedLocale) {
+        return null;
+    }
+    return {
+        clientId: makeClientId(),
+        title: trimmedTitle,
+        targetLocale: trimmedLocale,
+        source: 'manual'
+    };
+}
 /* ---------- Sub-components ---------- */
 function StepIndicator({ steps, current }) {
     const currentIndex = steps.indexOf(current);
@@ -151,8 +208,8 @@ function ScopeModePicker({ mode, onModeChange, scopedCount, }) {
                         onModeChange(opt.value);
                     } }, children: [_jsx("div", { className: "scope-mode-radio" }), _jsxs("div", { children: [_jsx("div", { className: "scope-mode-label", children: opt.label }), _jsx("div", { className: "scope-mode-desc", children: opt.desc })] })] }, opt.value))) }), scopedCount != null && (_jsxs("div", { className: "scope-feedback", children: [_jsx(IconCheckCircle, { size: 14 }), _jsxs("span", { children: [scopedCount, " row", scopedCount !== 1 ? 's' : '', " in scope for analysis"] })] }))] }));
 }
-function PreflightPanel({ batch, candidateCount, invalidCount, duplicateCount, ignoredCount, scopedCount, candidateTitles, workerStageBudgetMinutes, recommendedWorkerStageBudgetMinutes, onWorkerStageBudgetMinutesChange, }) {
-    return (_jsxs(_Fragment, { children: [(invalidCount > 0 || duplicateCount > 0) && (_jsxs("div", { className: "preflight-warning-banner", children: [_jsx(IconAlertCircle, { size: 14 }), _jsxs("div", { children: [invalidCount > 0 && _jsxs("div", { children: [invalidCount, " malformed row", invalidCount !== 1 ? 's' : '', " will be excluded."] }), duplicateCount > 0 && _jsxs("div", { children: [duplicateCount, " duplicate row", duplicateCount !== 1 ? 's' : '', " will be excluded."] }), ignoredCount > 0 && _jsxs("div", { children: [ignoredCount, " ignored row", ignoredCount !== 1 ? 's' : '', " will be excluded."] })] })] })), _jsxs("div", { className: "preflight-section", children: [_jsx("div", { className: "preflight-heading", children: "Preflight Checklist" }), _jsxs("div", { className: "preflight-checklist", children: [_jsxs("div", { className: "preflight-item", children: [_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" }), _jsxs("span", { children: ["Batch ", _jsx("strong", { children: batch.name }), " from ", batch.sourceFileName] })] }), _jsxs("div", { className: "preflight-item", children: [_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" }), _jsxs("span", { children: [candidateCount, " candidates identified"] })] }), _jsxs("div", { className: "preflight-item", children: [scopedCount > 0 ? (_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" })) : (_jsx(IconAlertCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--warn" })), _jsxs("span", { children: [scopedCount, " row", scopedCount !== 1 ? 's' : '', " in scope for AI analysis"] })] })] })] }), _jsxs("div", { className: "preflight-section", children: [_jsx("div", { className: "preflight-heading", children: "Worker Time Budget" }), _jsxs("label", { className: "preflight-budget-field", children: [_jsx("span", { className: "preflight-budget-label", children: "Let the build stage run this long before the watchdog cancels it." }), _jsxs("div", { className: "preflight-budget-input-row", children: [_jsx("input", { className: "preflight-budget-input", type: "number", min: MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, max: MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, step: 5, value: workerStageBudgetMinutes, onChange: (event) => {
+function PreflightPanel({ batch, candidateCount, invalidCount, duplicateCount, ignoredCount, scopedCount, candidateTitles, analysisConfig, guaranteedCreateConflicts, workerStageBudgetMinutes, recommendedWorkerStageBudgetMinutes, onWorkerStageBudgetMinutesChange, }) {
+    return (_jsxs(_Fragment, { children: [(invalidCount > 0 || duplicateCount > 0) && (_jsxs("div", { className: "preflight-warning-banner", children: [_jsx(IconAlertCircle, { size: 14 }), _jsxs("div", { children: [invalidCount > 0 && _jsxs("div", { children: [invalidCount, " malformed row", invalidCount !== 1 ? 's' : '', " will be excluded."] }), duplicateCount > 0 && _jsxs("div", { children: [duplicateCount, " duplicate row", duplicateCount !== 1 ? 's' : '', " will be excluded."] }), ignoredCount > 0 && _jsxs("div", { children: [ignoredCount, " ignored row", ignoredCount !== 1 ? 's' : '', " will be excluded."] })] })] })), _jsxs("div", { className: "preflight-section", children: [_jsx("div", { className: "preflight-heading", children: "Preflight Checklist" }), _jsxs("div", { className: "preflight-checklist", children: [_jsxs("div", { className: "preflight-item", children: [_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" }), _jsxs("span", { children: ["Batch ", _jsx("strong", { children: batch.name }), " from ", batch.sourceFileName] })] }), _jsxs("div", { className: "preflight-item", children: [_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" }), _jsxs("span", { children: [candidateCount, " candidates identified"] })] }), _jsxs("div", { className: "preflight-item", children: [scopedCount > 0 ? (_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" })) : (_jsx(IconAlertCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--warn" })), _jsxs("span", { children: [scopedCount, " row", scopedCount !== 1 ? 's' : '', " in scope for AI analysis"] })] }), _jsxs("div", { className: "preflight-item", children: [_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" }), _jsxs("span", { children: [analysisConfig.guaranteedEditFamilies.length, " guaranteed edit family", analysisConfig.guaranteedEditFamilies.length === 1 ? '' : 'ies', " covering", ' ', analysisConfig.guaranteedEditFamilies.reduce((total, family) => total + family.resolvedLocaleVariants.length, 0), " live locale", analysisConfig.guaranteedEditFamilies.reduce((total, family) => total + family.resolvedLocaleVariants.length, 0) === 1 ? '' : 's'] })] }), _jsxs("div", { className: "preflight-item", children: [_jsx(IconCheckCircle, { size: 14, className: "preflight-item-icon preflight-item-icon--pass" }), _jsxs("span", { children: [analysisConfig.guaranteedCreateArticles.length, " guaranteed create target", analysisConfig.guaranteedCreateArticles.length === 1 ? '' : 's'] })] })] })] }), (analysisConfig.guaranteedEditFamilies.length > 0 || analysisConfig.guaranteedCreateArticles.length > 0 || analysisConfig.analysisGuidancePrompt) && (_jsxs("div", { className: "preflight-section", children: [_jsx("div", { className: "preflight-heading", children: "Guaranteed Targets" }), analysisConfig.guaranteedEditFamilies.map((family) => (_jsxs("div", { className: "preflight-target-line", children: [_jsx("strong", { children: "Edit:" }), " ", family.familyTitle, " (", family.resolvedLocaleVariants.map((variant) => variant.locale).join(', '), ")"] }, family.familyId))), analysisConfig.guaranteedCreateArticles.map((article) => (_jsxs("div", { className: "preflight-target-line", children: [_jsx("strong", { children: "Create:" }), " ", article.title, " (", article.targetLocale, ")"] }, article.clientId))), analysisConfig.analysisGuidancePrompt && (_jsx("div", { className: "preflight-guidance-box", children: analysisConfig.analysisGuidancePrompt }))] })), guaranteedCreateConflicts.length > 0 && (_jsxs("div", { className: "preflight-section", children: [_jsx("div", { className: "preflight-heading", children: "Clarification Needed" }), _jsxs("div", { className: "preflight-warning-banner", children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("div", { children: guaranteedCreateConflicts.map((conflict) => (_jsxs("div", { children: [conflict.title, " (", conflict.targetLocale, ") overlaps ", conflict.matches.map((match) => `${match.title} (${match.locale})`).join(', '), " and will pause for user input before approval."] }, conflict.clientId))) })] })] })), _jsxs("div", { className: "preflight-section", children: [_jsx("div", { className: "preflight-heading", children: "Worker Time Budget" }), _jsxs("label", { className: "preflight-budget-field", children: [_jsx("span", { className: "preflight-budget-label", children: "Let the build stage run this long before the watchdog cancels it." }), _jsxs("div", { className: "preflight-budget-input-row", children: [_jsx("input", { className: "preflight-budget-input", type: "number", min: MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, max: MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES, step: 5, value: workerStageBudgetMinutes, onChange: (event) => {
                                             const nextValue = normalizeBatchAnalysisWorkerStageBudgetMinutes(event.target.value);
                                             onWorkerStageBudgetMinutesChange(nextValue ?? MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES);
                                         } }), _jsx("span", { className: "preflight-budget-suffix", children: "minutes" })] })] }), _jsxs("div", { className: "preflight-budget-note", children: ["Recommended: ", recommendedWorkerStageBudgetMinutes, " minutes for ", scopedCount, " scoped item", scopedCount === 1 ? '' : 's', ". This drives the worker timeout and gives the watchdog a small safety buffer on top."] })] }), candidateTitles.length > 0 && (_jsxs("div", { className: "preflight-section", children: [_jsx("div", { className: "preflight-heading", children: "Scoped Items Preview" }), _jsxs("div", { style: { display: 'flex', flexDirection: 'column', gap: 2 }, children: [candidateTitles.slice(0, 10).map((title, i) => (_jsxs("div", { style: { display: 'flex', alignItems: 'center', gap: 'var(--space-2)', fontSize: 'var(--text-xs)', padding: 'var(--space-1) 0' }, children: [_jsx(IconFileText, { size: 12, style: { color: 'var(--color-text-muted)', flexShrink: 0 } }), _jsx("span", { children: title })] }, i))), candidateTitles.length > 10 && (_jsxs("div", { style: { fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', paddingTop: 'var(--space-1)' }, children: ["and ", candidateTitles.length - 10, " more..."] }))] })] }))] }));
@@ -166,7 +223,13 @@ const WIZARD_INITIAL = {
     scopeMode: PBIBatchScopeMode.ALL,
     scopeSelectedRows: [],
     scopeSaving: false,
+    scopeError: null,
     scopeResult: null,
+    guaranteedEditFamilies: [],
+    guaranteedCreateArticles: [],
+    guaranteedCreateInput: '',
+    analysisGuidancePrompt: '',
+    guaranteedCreateConflicts: [],
     preflightLoading: false,
     preflightError: null,
     workerStageBudgetMinutes: DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
@@ -195,6 +258,11 @@ export const PBI = () => {
     const [cachedBatches, setCachedBatches] = useState([]);
     const [cachedSessions, setCachedSessions] = useState([]);
     const [persistedAnalysisStateByBatchId, setPersistedAnalysisStateByBatchId] = useState({});
+    const [articlePickerTree, setArticlePickerTree] = useState([]);
+    const [articlePickerTreeLoading, setArticlePickerTreeLoading] = useState(false);
+    const [articlePickerSearch, setArticlePickerSearch] = useState('');
+    const [articlePickerSearchLoading, setArticlePickerSearchLoading] = useState(false);
+    const [articlePickerSearchResults, setArticlePickerSearchResults] = useState([]);
     const batches = useMemo(() => {
         const data = batchListQuery.data;
         if (data && Array.isArray(data.batches)) {
@@ -215,6 +283,7 @@ export const PBI = () => {
     useEffect(() => {
         wizardRef.current = wizard;
     }, [wizard]);
+    const articleFamilyById = useMemo(() => new Map(articlePickerTree.map((node) => [node.familyId, node])), [articlePickerTree]);
     // Fetch batch list on mount
     useEffect(() => {
         if (activeWorkspace) {
@@ -278,6 +347,70 @@ export const PBI = () => {
         };
     }, [activeWorkspace?.id, batches]);
     useEffect(() => {
+        if (!activeWorkspace || !wizard.open || wizard.step !== 'scope') {
+            return;
+        }
+        let cancelled = false;
+        setArticlePickerTreeLoading(true);
+        void (async () => {
+            try {
+                const response = await window.kbv.invoke('workspace.explorer.getTree', {
+                    workspaceId: activeWorkspace.id
+                });
+                if (!cancelled) {
+                    setArticlePickerTree(response.ok && response.data?.nodes ? response.data.nodes : []);
+                }
+            }
+            finally {
+                if (!cancelled) {
+                    setArticlePickerTreeLoading(false);
+                }
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [activeWorkspace?.id, wizard.open, wizard.step]);
+    useEffect(() => {
+        if (!activeWorkspace || !wizard.open || wizard.step !== 'scope') {
+            return;
+        }
+        const query = articlePickerSearch.trim();
+        if (!query) {
+            setArticlePickerSearchResults([]);
+            setArticlePickerSearchLoading(false);
+            return;
+        }
+        let cancelled = false;
+        setArticlePickerSearchLoading(true);
+        const timeout = window.setTimeout(() => {
+            void (async () => {
+                try {
+                    const response = await window.kbv.invoke('workspace.search', {
+                        workspaceId: activeWorkspace.id,
+                        query,
+                        scope: 'live',
+                        includeArchived: false
+                    });
+                    if (!cancelled) {
+                        setArticlePickerSearchResults(response.ok && response.data?.results
+                            ? dedupeSearchResultsByFamily(response.data.results).slice(0, 8)
+                            : []);
+                    }
+                }
+                finally {
+                    if (!cancelled) {
+                        setArticlePickerSearchLoading(false);
+                    }
+                }
+            })();
+        }, 180);
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timeout);
+        };
+    }, [activeWorkspace?.id, articlePickerSearch, wizard.open, wizard.step]);
+    useEffect(() => {
         if (!activeWorkspace) {
             setActiveAnalysisBatchIds([]);
             return;
@@ -320,16 +453,25 @@ export const PBI = () => {
     const openWizard = useCallback(() => {
         setAnalysisBatch(null);
         setAnalysisAutoRun(false);
+        setArticlePickerSearch('');
+        setArticlePickerSearchResults([]);
+        setArticlePickerTree([]);
         setWizard({ ...WIZARD_INITIAL, open: true });
     }, []);
     const openWizardForFileDrag = useCallback(() => {
         setAnalysisBatch(null);
         setAnalysisAutoRun(false);
+        setArticlePickerSearch('');
+        setArticlePickerSearchResults([]);
+        setArticlePickerTree([]);
         setWizard((current) => (current.open ? current : { ...WIZARD_INITIAL, open: true }));
     }, []);
     const closeWizard = useCallback(() => {
         fileDragDepthRef.current = 0;
         setFileDragActive(false);
+        setArticlePickerSearch('');
+        setArticlePickerSearchResults([]);
+        setArticlePickerTree([]);
         setWizard(WIZARD_INITIAL);
         // Refresh batch list after close
         if (activeWorkspace) {
@@ -593,33 +735,158 @@ export const PBI = () => {
             void handleFileSelect(file);
         }
     }, [activeWorkspace, handleFileSelect]);
+    const markScopeDirty = useCallback(() => {
+        setWizard((s) => ({
+            ...s,
+            scopeResult: null,
+            scopeError: null,
+            preflightData: null,
+            preflightError: null,
+            guaranteedCreateConflicts: [],
+            submitError: null,
+        }));
+    }, []);
+    const handleSelectGuaranteedEditFamily = useCallback((familyId, selectedFromLocaleVariantId) => {
+        const familyNode = articleFamilyById.get(familyId);
+        const nextFamily = familyNode
+            ? buildGuaranteedEditFamilyFromExplorerNode(familyNode, selectedFromLocaleVariantId)
+            : null;
+        if (!nextFamily) {
+            setWizard((s) => ({
+                ...s,
+                scopeError: 'That article does not currently have any live locales to guarantee edits for.',
+            }));
+            return;
+        }
+        setWizard((s) => ({
+            ...s,
+            scopeResult: null,
+            scopeError: null,
+            preflightData: null,
+            preflightError: null,
+            guaranteedCreateConflicts: [],
+            guaranteedEditFamilies: s.guaranteedEditFamilies.some((family) => family.familyId === nextFamily.familyId)
+                ? s.guaranteedEditFamilies
+                : [...s.guaranteedEditFamilies, nextFamily].sort((left, right) => left.familyTitle.localeCompare(right.familyTitle)),
+            submitError: null,
+        }));
+        setArticlePickerSearch('');
+        setArticlePickerSearchResults([]);
+    }, [articleFamilyById]);
+    const handleRemoveGuaranteedEditFamily = useCallback((familyId) => {
+        setWizard((s) => ({
+            ...s,
+            scopeResult: null,
+            scopeError: null,
+            preflightData: null,
+            preflightError: null,
+            guaranteedCreateConflicts: [],
+            guaranteedEditFamilies: s.guaranteedEditFamilies.filter((family) => family.familyId !== familyId),
+            submitError: null,
+        }));
+    }, []);
+    const handleAddGuaranteedCreateArticle = useCallback(() => {
+        if (!activeWorkspace) {
+            return;
+        }
+        const nextArticle = createGuaranteedCreateArticle(wizard.guaranteedCreateInput, activeWorkspace.defaultLocale);
+        if (!nextArticle) {
+            return;
+        }
+        setWizard((s) => {
+            const alreadyExists = s.guaranteedCreateArticles.some((article) => normalizeTitleKey(article.title) === normalizeTitleKey(nextArticle.title)
+                && article.targetLocale === nextArticle.targetLocale);
+            return {
+                ...s,
+                scopeResult: null,
+                scopeError: null,
+                preflightData: null,
+                preflightError: null,
+                guaranteedCreateConflicts: [],
+                guaranteedCreateInput: '',
+                guaranteedCreateArticles: alreadyExists
+                    ? s.guaranteedCreateArticles
+                    : [...s.guaranteedCreateArticles, nextArticle].sort((left, right) => left.title.localeCompare(right.title)),
+                submitError: null,
+            };
+        });
+    }, [activeWorkspace, wizard.guaranteedCreateInput]);
+    const handleRemoveGuaranteedCreateArticle = useCallback((clientId) => {
+        setWizard((s) => ({
+            ...s,
+            scopeResult: null,
+            scopeError: null,
+            preflightData: null,
+            preflightError: null,
+            guaranteedCreateConflicts: [],
+            guaranteedCreateArticles: s.guaranteedCreateArticles.filter((article) => article.clientId !== clientId),
+            submitError: null,
+        }));
+    }, []);
     // ---- Scope step ----
     const handleScopeSet = useCallback(async () => {
         if (!activeWorkspace || !wizard.importResult)
             return;
-        setWizard((s) => ({ ...s, scopeSaving: true }));
+        setWizard((s) => ({ ...s, scopeSaving: true, scopeError: null }));
         try {
-            const res = await window.kbv.invoke('pbiBatch.scope.set', {
+            const scopeRes = await window.kbv.invoke('pbiBatch.scope.set', {
                 workspaceId: activeWorkspace.id,
                 batchId: wizard.importResult.batch.id,
                 mode: wizard.scopeMode,
                 selectedRows: wizard.scopeSelectedRows.length > 0 ? wizard.scopeSelectedRows : undefined,
             });
-            if (res.ok && res.data) {
+            const analysisConfigPayload = {
+                workspaceId: activeWorkspace.id,
+                batchId: wizard.importResult.batch.id,
+                analysisConfig: {
+                    guaranteedEditSelections: wizard.guaranteedEditFamilies.map((family) => ({
+                        familyId: family.familyId,
+                        localeVariantId: family.selectedFromLocaleVariantId,
+                    })),
+                    guaranteedCreateArticles: wizard.guaranteedCreateArticles.map((article) => ({
+                        clientId: article.clientId,
+                        title: article.title,
+                        targetLocale: article.targetLocale,
+                    })),
+                    analysisGuidancePrompt: wizard.analysisGuidancePrompt,
+                },
+            };
+            const analysisRes = await window.kbv.invoke('pbiBatch.analysisConfig.set', analysisConfigPayload);
+            if (scopeRes.ok && scopeRes.data && analysisRes.ok && analysisRes.data) {
                 setWizard((s) => ({
                     ...s,
                     scopeSaving: false,
-                    scopeResult: res.data.scope,
+                    scopeResult: scopeRes.data.scope,
+                    guaranteedEditFamilies: analysisRes.data.analysisConfig.guaranteedEditFamilies,
+                    guaranteedCreateArticles: analysisRes.data.analysisConfig.guaranteedCreateArticles,
+                    analysisGuidancePrompt: analysisRes.data.analysisConfig.analysisGuidancePrompt ?? '',
+                    guaranteedCreateConflicts: analysisRes.data.guaranteedCreateConflicts,
                 }));
             }
             else {
-                setWizard((s) => ({ ...s, scopeSaving: false }));
+                setWizard((s) => ({
+                    ...s,
+                    scopeSaving: false,
+                    scopeError: scopeRes.error?.message ?? analysisRes.error?.message ?? 'Failed to save scope and targets.',
+                }));
             }
         }
         catch {
-            setWizard((s) => ({ ...s, scopeSaving: false }));
+            setWizard((s) => ({
+                ...s,
+                scopeSaving: false,
+                scopeError: 'Failed to save scope and targets.',
+            }));
         }
-    }, [activeWorkspace, wizard.importResult, wizard.scopeMode, wizard.scopeSelectedRows]);
+    }, [
+        activeWorkspace,
+        wizard.analysisGuidancePrompt,
+        wizard.guaranteedCreateArticles,
+        wizard.guaranteedEditFamilies,
+        wizard.importResult,
+        wizard.scopeMode,
+        wizard.scopeSelectedRows,
+    ]);
     // ---- Preflight step ----
     const handleLoadPreflight = useCallback(async () => {
         if (!activeWorkspace || !wizard.importResult)
@@ -724,22 +991,63 @@ export const PBI = () => {
                     return null;
                 return (_jsxs(_Fragment, { children: [_jsx(ParseSummaryGrid, { summary: wizard.importResult.summary }), _jsx(RowReviewTable, { title: "Duplicate Rows", rows: wizard.importResult.duplicateRows, variant: "warning" }), _jsx(RowReviewTable, { title: "Malformed Rows", rows: wizard.importResult.invalidRows, variant: "danger" }), _jsx(RowReviewTable, { title: "Ignored Rows", rows: wizard.importResult.ignoredRows, variant: "neutral" })] }));
             case 'scope':
-                return (_jsxs(_Fragment, { children: [_jsx(ScopeModePicker, { mode: wizard.scopeMode, onModeChange: (m) => {
-                                setWizard((s) => ({ ...s, scopeMode: m, scopeResult: null }));
-                            }, scopedCount: wizard.scopeResult?.scopedCount ?? undefined }), wizard.scopeMode !== PBIBatchScopeMode.ALL && wizard.importResult && (_jsxs("div", { className: "scope-section", children: [_jsx("div", { className: "scope-section-heading", children: wizard.scopeMode === PBIBatchScopeMode.SELECTED_ONLY ? 'Select rows to include' : 'Select rows to exclude' }), _jsx("div", { style: { maxHeight: 240, overflowY: 'auto', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-md)', padding: 'var(--space-2)' }, children: wizard.importResult.rows
-                                        .filter((r) => r.validationStatus === 'candidate' || r.state === 'candidate')
-                                        .map((row) => {
-                                        const selected = wizard.scopeSelectedRows.includes(row.sourceRowNumber);
-                                        return (_jsxs("label", { className: "scope-row-checkbox", children: [_jsx("input", { type: "checkbox", checked: selected, onChange: () => {
-                                                        setWizard((s) => ({
-                                                            ...s,
-                                                            scopeResult: null,
-                                                            scopeSelectedRows: selected
-                                                                ? s.scopeSelectedRows.filter((n) => n !== row.sourceRowNumber)
-                                                                : [...s.scopeSelectedRows, row.sourceRowNumber],
-                                                        }));
-                                                    } }), _jsxs("span", { style: { fontFamily: 'var(--font-mono)', minWidth: 32 }, children: ["#", row.sourceRowNumber] }), _jsx("span", { style: { flex: 1 }, children: row.title || row.externalId })] }, row.id ?? row.sourceRowNumber));
-                                    }) })] }))] }));
+                {
+                    const browseFamilies = articlePickerTree
+                        .map((node) => buildGuaranteedEditFamilyFromExplorerNode(node))
+                        .filter((family) => Boolean(family))
+                        .slice(0, 12);
+                    return (_jsxs(_Fragment, { children: [wizard.scopeError && (_jsxs("div", { className: "preflight-warning-banner", style: { marginBottom: 'var(--space-4)' }, children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("span", { children: wizard.scopeError })] })), _jsx(ScopeModePicker, { mode: wizard.scopeMode, onModeChange: (m) => {
+                                    setWizard((s) => ({
+                                        ...s,
+                                        scopeMode: m,
+                                        scopeResult: null,
+                                        scopeError: null,
+                                        preflightData: null,
+                                        preflightError: null,
+                                        guaranteedCreateConflicts: [],
+                                        submitError: null,
+                                    }));
+                                }, scopedCount: wizard.scopeResult?.scopedCount ?? undefined }), wizard.scopeMode !== PBIBatchScopeMode.ALL && wizard.importResult && (_jsxs("div", { className: "scope-section", children: [_jsx("div", { className: "scope-section-heading", children: wizard.scopeMode === PBIBatchScopeMode.SELECTED_ONLY ? 'Select rows to include' : 'Select rows to exclude' }), _jsx("div", { style: { maxHeight: 240, overflowY: 'auto', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-md)', padding: 'var(--space-2)' }, children: wizard.importResult.rows
+                                            .filter((r) => r.validationStatus === 'candidate' || r.state === 'candidate')
+                                            .map((row) => {
+                                            const selected = wizard.scopeSelectedRows.includes(row.sourceRowNumber);
+                                            return (_jsxs("label", { className: "scope-row-checkbox", children: [_jsx("input", { type: "checkbox", checked: selected, onChange: () => {
+                                                            setWizard((s) => {
+                                                                const nextSelectedRows = selected
+                                                                    ? s.scopeSelectedRows.filter((n) => n !== row.sourceRowNumber)
+                                                                    : [...s.scopeSelectedRows, row.sourceRowNumber];
+                                                                return {
+                                                                    ...s,
+                                                                    scopeResult: null,
+                                                                    scopeError: null,
+                                                                    preflightData: null,
+                                                                    preflightError: null,
+                                                                    guaranteedCreateConflicts: [],
+                                                                    scopeSelectedRows: nextSelectedRows,
+                                                                    submitError: null,
+                                                                };
+                                                            });
+                                                        } }), _jsxs("span", { style: { fontFamily: 'var(--font-mono)', minWidth: 32 }, children: ["#", row.sourceRowNumber] }), _jsx("span", { style: { flex: 1 }, children: row.title || row.externalId })] }, row.id ?? row.sourceRowNumber));
+                                        }) })] })), _jsxs("div", { className: "scope-section", children: [_jsx("div", { className: "scope-section-heading", children: "Guaranteed Article Edits" }), _jsx("div", { className: "scope-section-copy", children: "Select existing KB articles that must be edited. Each selection expands to every live locale in that article family." }), _jsx("div", { className: "analysis-target-search-row", children: _jsx("input", { className: "input", value: articlePickerSearch, onChange: (event) => {
+                                                setArticlePickerSearch(event.target.value);
+                                            }, placeholder: "Search existing live articles by title" }) }), articlePickerSearchLoading && (_jsx("div", { className: "analysis-target-hint", children: "Searching articles..." })), !articlePickerSearchLoading && articlePickerSearch.trim() && articlePickerSearchResults.length === 0 && (_jsx("div", { className: "analysis-target-hint", children: "No live article matches yet." })), articlePickerSearchResults.length > 0 && (_jsx("div", { className: "analysis-target-search-results", children: articlePickerSearchResults.map((result) => {
+                                            const familyNode = articleFamilyById.get(result.familyId);
+                                            const resolvedFamily = familyNode ? buildGuaranteedEditFamilyFromExplorerNode(familyNode, result.localeVariantId) : null;
+                                            return (_jsxs("button", { className: "analysis-target-result", type: "button", onClick: () => handleSelectGuaranteedEditFamily(result.familyId, result.localeVariantId), disabled: !resolvedFamily, children: [_jsxs("div", { children: [_jsx("div", { className: "analysis-target-result-title", children: result.title }), _jsx("div", { className: "analysis-target-result-meta", children: resolvedFamily
+                                                                    ? `${resolvedFamily.resolvedLocaleVariants.length} live locale${resolvedFamily.resolvedLocaleVariants.length === 1 ? '' : 's'}`
+                                                                    : 'No live locales available' })] }), _jsx("span", { className: "analysis-target-result-snippet", children: result.snippet })] }, `${result.familyId}-${result.localeVariantId}`));
+                                        }) })), !articlePickerSearch.trim() && (_jsxs(_Fragment, { children: [_jsx("div", { className: "analysis-target-hint", children: articlePickerTreeLoading ? 'Loading article families...' : 'Quick pick from live article families:' }), _jsx("div", { className: "analysis-target-browse-list", children: browseFamilies.map((family) => (_jsxs("button", { className: "analysis-target-chip", type: "button", onClick: () => handleSelectGuaranteedEditFamily(family.familyId), children: [family.familyTitle, _jsx("span", { children: family.resolvedLocaleVariants.map((variant) => variant.locale).join(', ') })] }, family.familyId))) })] })), _jsxs("div", { className: "analysis-target-selected-list", children: [wizard.guaranteedEditFamilies.map((family) => (_jsxs("div", { className: "analysis-target-selected-card", children: [_jsxs("div", { children: [_jsx("div", { className: "analysis-target-selected-title", children: family.familyTitle }), _jsx("div", { className: "analysis-target-selected-meta", children: family.resolvedLocaleVariants.map((variant) => variant.locale).join(', ') })] }), _jsx("button", { className: "btn btn-ghost btn-icon", type: "button", onClick: () => handleRemoveGuaranteedEditFamily(family.familyId), "aria-label": `Remove ${family.familyTitle}`, children: _jsx(IconX, { size: 14 }) })] }, family.familyId))), wizard.guaranteedEditFamilies.length === 0 && (_jsx("div", { className: "analysis-target-hint", children: "No guaranteed edit targets selected yet." }))] })] }), _jsxs("div", { className: "scope-section", children: [_jsx("div", { className: "scope-section-heading", children: "Guaranteed Article Creates" }), _jsxs("div", { className: "scope-section-copy", children: ["Add article titles that must be created in ", activeWorkspace?.defaultLocale, "."] }), _jsxs("div", { className: "analysis-target-create-row", children: [_jsx("input", { className: "input", value: wizard.guaranteedCreateInput, onChange: (event) => {
+                                                    setWizard((s) => ({ ...s, guaranteedCreateInput: event.target.value }));
+                                                }, onKeyDown: (event) => {
+                                                    if (event.key === 'Enter') {
+                                                        event.preventDefault();
+                                                        handleAddGuaranteedCreateArticle();
+                                                    }
+                                                }, placeholder: "Type an article title and press Enter" }), _jsx("button", { className: "btn btn-secondary", type: "button", onClick: handleAddGuaranteedCreateArticle, children: "Add" })] }), _jsxs("div", { className: "analysis-target-selected-list", children: [wizard.guaranteedCreateArticles.map((article) => (_jsxs("div", { className: "analysis-target-selected-card", children: [_jsxs("div", { children: [_jsx("div", { className: "analysis-target-selected-title", children: article.title }), _jsx("div", { className: "analysis-target-selected-meta", children: article.targetLocale })] }), _jsx("button", { className: "btn btn-ghost btn-icon", type: "button", onClick: () => handleRemoveGuaranteedCreateArticle(article.clientId), "aria-label": `Remove ${article.title}`, children: _jsx(IconX, { size: 14 }) })] }, article.clientId))), wizard.guaranteedCreateArticles.length === 0 && (_jsx("div", { className: "analysis-target-hint", children: "No guaranteed create targets added yet." }))] }), wizard.guaranteedCreateConflicts.length > 0 && (_jsx("div", { className: "analysis-target-conflict-list", children: wizard.guaranteedCreateConflicts.map((conflict) => (_jsxs("div", { className: "analysis-target-conflict-card", children: [_jsxs("div", { className: "analysis-target-conflict-title", children: [conflict.title, " (", conflict.targetLocale, ")"] }), _jsx("div", { className: "analysis-target-conflict-copy", children: "This may already exist and will pause for clarification before planning continues." }), _jsx("div", { className: "analysis-target-conflict-matches", children: conflict.matches.map((match) => `${match.title} (${match.locale})`).join(', ') })] }, conflict.clientId))) }))] }), _jsxs("div", { className: "scope-section", children: [_jsx("div", { className: "scope-section-heading", children: "Analysis Guidance" }), _jsx("div", { className: "scope-section-copy", children: "Optional instructions for how the analyzer should think about the selected PBIs and article targets." }), _jsx("textarea", { className: "textarea", rows: 5, value: wizard.analysisGuidancePrompt, onChange: (event) => {
+                                            markScopeDirty();
+                                            setWizard((s) => ({ ...s, analysisGuidancePrompt: event.target.value }));
+                                        }, placeholder: "Optional guidance for the planner and reviewer" })] })] }));
+                }
             case 'preflight': {
                 if (wizard.preflightLoading)
                     return _jsx(LoadingState, { message: "Running preflight checks..." });
@@ -748,7 +1056,7 @@ export const PBI = () => {
                 if (!wizard.preflightData)
                     return null;
                 const recommendedWorkerStageBudgetMinutes = recommendWorkerStageBudgetMinutes(wizard.preflightData.scopePayload.scopedCount ?? 0);
-                return (_jsxs(_Fragment, { children: [wizard.submitError && (_jsxs("div", { className: "preflight-warning-banner", style: { marginBottom: 'var(--space-4)' }, children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("span", { children: wizard.submitError })] })), _jsx(PreflightPanel, { batch: wizard.preflightData.batch, candidateCount: wizard.preflightData.candidateRows.length, invalidCount: wizard.preflightData.invalidRows.length, duplicateCount: wizard.preflightData.duplicateRows.length, ignoredCount: wizard.preflightData.ignoredRows.length, scopedCount: wizard.preflightData.scopePayload.scopedCount ?? 0, candidateTitles: wizard.preflightData.candidateTitles, workerStageBudgetMinutes: wizard.workerStageBudgetMinutes, recommendedWorkerStageBudgetMinutes: recommendedWorkerStageBudgetMinutes, onWorkerStageBudgetMinutesChange: (minutes) => {
+                return (_jsxs(_Fragment, { children: [wizard.submitError && (_jsxs("div", { className: "preflight-warning-banner", style: { marginBottom: 'var(--space-4)' }, children: [_jsx(IconAlertCircle, { size: 14 }), _jsx("span", { children: wizard.submitError })] })), _jsx(PreflightPanel, { batch: wizard.preflightData.batch, candidateCount: wizard.preflightData.candidateRows.length, invalidCount: wizard.preflightData.invalidRows.length, duplicateCount: wizard.preflightData.duplicateRows.length, ignoredCount: wizard.preflightData.ignoredRows.length, scopedCount: wizard.preflightData.scopePayload.scopedCount ?? 0, candidateTitles: wizard.preflightData.candidateTitles, analysisConfig: wizard.preflightData.analysisConfig, guaranteedCreateConflicts: wizard.preflightData.guaranteedCreateConflicts, workerStageBudgetMinutes: wizard.workerStageBudgetMinutes, recommendedWorkerStageBudgetMinutes: recommendedWorkerStageBudgetMinutes, onWorkerStageBudgetMinutesChange: (minutes) => {
                                 setWizard((s) => ({
                                     ...s,
                                     workerStageBudgetMinutes: minutes,
@@ -764,7 +1072,7 @@ export const PBI = () => {
         const stepIndex = WIZARD_STEPS.indexOf(wizard.step);
         const isFirst = stepIndex === 0;
         const isLast = stepIndex === WIZARD_STEPS.length - 1;
-        return (_jsxs("div", { className: "wizard-footer", children: [_jsx("div", { className: "wizard-footer-left", children: !isFirst && wizard.step !== 'upload' && (_jsx("button", { className: "btn btn-ghost", onClick: () => goToStep(WIZARD_STEPS[stepIndex - 1]), children: "Back" })) }), _jsxs("div", { className: "wizard-footer-right", children: [_jsx("button", { className: "btn btn-ghost", onClick: closeWizard, children: "Cancel" }), wizard.step === 'summary' && (_jsx("button", { className: "btn btn-primary", onClick: () => goToStep('scope'), children: "Continue to Scoping" })), wizard.step === 'scope' && (_jsxs(_Fragment, { children: [!wizard.scopeResult && (_jsx("button", { className: "btn btn-secondary", disabled: wizard.scopeSaving, onClick: handleScopeSet, children: wizard.scopeSaving ? 'Saving...' : 'Apply Scope' })), wizard.scopeResult && (_jsx("button", { className: "btn btn-primary", onClick: () => goToStep('preflight'), children: "Continue to Preflight" }))] })), isLast && wizard.preflightData && (_jsx("button", { className: "btn btn-primary", disabled: wizard.submitting || (wizard.preflightData.scopePayload.scopedCount ?? 0) === 0, onClick: handleSubmitBatch, children: wizard.submitting ? 'Submitting...' : 'Submit for Analysis' }))] })] }));
+        return (_jsxs("div", { className: "wizard-footer", children: [_jsx("div", { className: "wizard-footer-left", children: !isFirst && wizard.step !== 'upload' && (_jsx("button", { className: "btn btn-ghost", onClick: () => goToStep(WIZARD_STEPS[stepIndex - 1]), children: "Back" })) }), _jsxs("div", { className: "wizard-footer-right", children: [_jsx("button", { className: "btn btn-ghost", onClick: closeWizard, children: "Cancel" }), wizard.step === 'summary' && (_jsx("button", { className: "btn btn-primary", onClick: () => goToStep('scope'), children: "Continue to Scope & Targets" })), wizard.step === 'scope' && (_jsxs(_Fragment, { children: [!wizard.scopeResult && (_jsx("button", { className: "btn btn-secondary", disabled: wizard.scopeSaving, onClick: handleScopeSet, children: wizard.scopeSaving ? 'Saving...' : 'Apply Scope & Targets' })), wizard.scopeResult && (_jsx("button", { className: "btn btn-primary", onClick: () => goToStep('preflight'), children: "Continue to Preflight" }))] })), isLast && wizard.preflightData && (_jsx("button", { className: "btn btn-primary", disabled: wizard.submitting || (wizard.preflightData.scopePayload.scopedCount ?? 0) === 0, onClick: handleSubmitBatch, children: wizard.submitting ? 'Submitting...' : 'Submit for Analysis' }))] })] }));
     };
     /* ---------- No workspace ---------- */
     if (!activeWorkspace) {

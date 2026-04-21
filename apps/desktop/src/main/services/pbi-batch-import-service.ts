@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
+  type PBIBatchPreflightResponse,
   PBIBatchScopeMode,
   PBIBatchScopePayload,
   type PBIBatchRecord,
@@ -155,17 +156,10 @@ export class PBIBatchImportService {
     };
   }
 
-  async getBatchPreflight(workspaceId: string, batchId: string): Promise<{
-    batch: PBIBatchRecord;
-    candidateRows: PBIRecord[];
-    invalidRows: PBIRecord[];
-    duplicateRows: PBIRecord[];
-    ignoredRows: PBIRecord[];
-    scopePayload: PBIBatchScopePayload;
-    candidateTitles: string[];
-  }> {
+  async getBatchPreflight(workspaceId: string, batchId: string): Promise<PBIBatchPreflightResponse> {
     const batch = await this.workspaceRepository.getPBIBatch(workspaceId, batchId);
     const allRows = await this.workspaceRepository.getPBIRecords(workspaceId, batchId);
+    const analysisState = await this.workspaceRepository.getPBIBatchAnalysisState(workspaceId, batchId);
     const candidateRows = allRows.filter((row) => row.validationStatus === PBIValidationStatus.CANDIDATE);
     const invalidRows = allRows.filter((row) => row.validationStatus === PBIValidationStatus.MALFORMED);
     const duplicateRows = allRows.filter((row) => row.validationStatus === PBIValidationStatus.DUPLICATE);
@@ -186,7 +180,17 @@ export class PBIBatchImportService {
     };
 
     const candidateTitles = candidateRows.slice(0, 8).map((row) => row.title ?? '').filter(Boolean);
-    return { batch, candidateRows, invalidRows, duplicateRows, ignoredRows, scopePayload, candidateTitles };
+    return {
+      batch,
+      candidateRows,
+      invalidRows,
+      duplicateRows,
+      ignoredRows,
+      scopePayload,
+      candidateTitles,
+      analysisConfig: analysisState.analysisConfig,
+      guaranteedCreateConflicts: analysisState.guaranteedCreateConflicts
+    };
   }
 
   private resolveSourceFormat(input: PBIBatchImportRequest): PBIImportFormat {

@@ -1157,6 +1157,15 @@ export const migrations: Migration[] = [
        WHERE source_section_id IS NULL
           OR source_category_id IS NULL;
     `
+  },
+  {
+    version: 26,
+    name: '0026_pbi_batch_analysis_config',
+    description: 'Persist batch analysis directives for guaranteed edits, guaranteed creates, and guidance prompt.',
+    sql: `
+      ALTER TABLE pbi_batches
+        ADD COLUMN analysis_config_json TEXT;
+    `
   }
 ];
 

@@ -296,6 +296,9 @@ function normalizeTemplatePackTypeInput(value) {
     switch (canonical) {
         case 'FAQ':
             return shared_types_1.TemplatePackType.FAQ;
+        case 'PROPOSAL_CREATION':
+        case 'PROPOSAL':
+            return shared_types_1.TemplatePackType.PROPOSAL_CREATION;
         case 'TROUBLESHOOTING':
             return shared_types_1.TemplatePackType.TROUBLESHOOTING;
         case 'POLICY_NOTICE':

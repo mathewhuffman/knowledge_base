@@ -295,6 +295,13 @@ export interface ArticleFamilyRecord {
   retiredAtUtc?: string;
 }
 
+export interface ArticlePlacementSummary {
+  categoryId?: string;
+  categoryName?: string;
+  sectionId?: string;
+  sectionName?: string;
+}
+
 export interface LocaleVariantRecord {
   id: EntityId;
   familyId: EntityId;
@@ -491,6 +498,113 @@ export interface PBIBatchScopePayload {
   scopedRowNumbers?: number[];
   scopedCount?: number;
   updatedAtUtc: string;
+}
+
+export interface PBIBatchGuaranteedEditLocaleVariant {
+  localeVariantId: EntityId;
+  locale: string;
+  revisionId?: EntityId;
+  revisionState?: RevisionState;
+  updatedAtUtc?: string;
+  snippet?: string;
+}
+
+export interface PBIBatchGuaranteedEditFamily {
+  familyId: EntityId;
+  familyTitle: string;
+  selectedFromLocaleVariantId?: EntityId;
+  mode: 'all_live_locales';
+  resolvedLocaleVariants: PBIBatchGuaranteedEditLocaleVariant[];
+  sectionId?: EntityId;
+  sectionName?: string;
+  categoryId?: EntityId;
+  categoryName?: string;
+}
+
+export interface PBIBatchGuaranteedCreateArticle extends ArticlePlacementSummary {
+  clientId: EntityId;
+  title: string;
+  targetLocale: string;
+  source: 'manual';
+}
+
+export interface PBIBatchGuaranteedCreateConflictMatch {
+  familyId: EntityId;
+  localeVariantId: EntityId;
+  locale: string;
+  title: string;
+  score: number;
+  matchContext?: SearchResult['matchContext'];
+  snippet?: string;
+}
+
+export interface PBIBatchGuaranteedCreateConflict {
+  clientId: EntityId;
+  title: string;
+  targetLocale: string;
+  reason: string;
+  matches: PBIBatchGuaranteedCreateConflictMatch[];
+}
+
+export interface PBIBatchAnalysisConfig {
+  version: number;
+  updatedAtUtc: string;
+  guaranteedEditFamilies: PBIBatchGuaranteedEditFamily[];
+  guaranteedCreateArticles: PBIBatchGuaranteedCreateArticle[];
+  analysisGuidancePrompt?: string;
+}
+
+export interface PBIBatchAnalysisEditSelectionInput {
+  familyId?: EntityId;
+  localeVariantId?: EntityId;
+}
+
+export interface PBIBatchAnalysisCreateArticleInput extends ArticlePlacementSummary {
+  clientId?: EntityId;
+  title: string;
+  targetLocale?: string;
+}
+
+export interface PBIBatchAnalysisConfigInput {
+  guaranteedEditSelections?: PBIBatchAnalysisEditSelectionInput[];
+  guaranteedCreateArticles?: PBIBatchAnalysisCreateArticleInput[];
+  analysisGuidancePrompt?: string;
+}
+
+export interface PBIBatchAnalysisConfigRequest {
+  workspaceId: EntityId;
+  batchId: EntityId;
+}
+
+export interface PBIBatchAnalysisConfigSetRequest extends PBIBatchAnalysisConfigRequest {
+  analysisConfig: PBIBatchAnalysisConfigInput;
+}
+
+export interface PBIBatchAnalysisConfigResponse extends PBIBatchAnalysisConfigRequest {
+  analysisConfig: PBIBatchAnalysisConfig;
+  guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
+}
+
+export interface PBIBatchPreflightResponse {
+  batch: PBIBatchRecord;
+  candidateRows: PBIRecord[];
+  invalidRows: PBIRecord[];
+  duplicateRows: PBIRecord[];
+  ignoredRows: PBIRecord[];
+  scopePayload: PBIBatchScopePayload;
+  candidateTitles: string[];
+  analysisConfig: PBIBatchAnalysisConfig;
+  guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
+}
+
+export interface PBIBatchContextResponse {
+  batch: PBIBatchRecord;
+  candidateRows: PBIRecord[];
+  malformedRows: PBIRecord[];
+  duplicateRows: PBIRecord[];
+  ignoredRows: PBIRecord[];
+  analysisConfig: PBIBatchAnalysisConfig;
+  guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
 }
 
 export interface PBIBatchRowsRequest {

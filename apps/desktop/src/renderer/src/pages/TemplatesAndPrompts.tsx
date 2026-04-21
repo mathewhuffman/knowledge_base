@@ -26,6 +26,7 @@ const TEMPLATE_TYPE_OPTIONS = [
   { value: TemplatePackType.TROUBLESHOOTING, label: 'Troubleshooting' },
   { value: TemplatePackType.POLICY_NOTICE, label: 'Policy / Notice' },
   { value: TemplatePackType.FEATURE_OVERVIEW, label: 'Feature Overview' },
+  { value: TemplatePackType.PROPOSAL_CREATION, label: 'Proposal Creation' },
 ];
 
 function templateTypeLabel(type: TemplatePackType): string {
@@ -305,7 +306,7 @@ export const TemplatesAndPrompts = () => {
               checked={draft.active}
               onChange={(e) => setDraft((prev) => ({ ...prev, active: e.target.checked }))}
             />
-            Template is active and available for article AI
+            Template is active for this type. Saving it will deactivate other templates of the same type.
           </label>
 
           {/* Prompt template */}

@@ -119,6 +119,7 @@ class PBIBatchImportService {
     async getBatchPreflight(workspaceId, batchId) {
         const batch = await this.workspaceRepository.getPBIBatch(workspaceId, batchId);
         const allRows = await this.workspaceRepository.getPBIRecords(workspaceId, batchId);
+        const analysisState = await this.workspaceRepository.getPBIBatchAnalysisState(workspaceId, batchId);
         const candidateRows = allRows.filter((row) => row.validationStatus === shared_types_1.PBIValidationStatus.CANDIDATE);
         const invalidRows = allRows.filter((row) => row.validationStatus === shared_types_1.PBIValidationStatus.MALFORMED);
         const duplicateRows = allRows.filter((row) => row.validationStatus === shared_types_1.PBIValidationStatus.DUPLICATE);
@@ -136,7 +137,17 @@ class PBIBatchImportService {
             updatedAtUtc: batch.importedAtUtc
         };
         const candidateTitles = candidateRows.slice(0, 8).map((row) => row.title ?? '').filter(Boolean);
-        return { batch, candidateRows, invalidRows, duplicateRows, ignoredRows, scopePayload, candidateTitles };
+        return {
+            batch,
+            candidateRows,
+            invalidRows,
+            duplicateRows,
+            ignoredRows,
+            scopePayload,
+            candidateTitles,
+            analysisConfig: analysisState.analysisConfig,
+            guaranteedCreateConflicts: analysisState.guaranteedCreateConflicts
+        };
     }
     resolveSourceFormat(input) {
         if (input.sourceFormat) {

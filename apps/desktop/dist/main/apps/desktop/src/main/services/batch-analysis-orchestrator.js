@@ -2,6 +2,21 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.BatchAnalysisOrchestrator = void 0;
 const node_crypto_1 = require("node:crypto");
+function buildProposalTemplateGuidanceSection(template, usageInstruction) {
+    if (!template) {
+        return '';
+    }
+    return [
+        'Active proposal creation template guidance:',
+        usageInstruction,
+        `Template name: ${template.name}`,
+        `Language: ${template.language}`,
+        template.description?.trim() ? `Description: ${template.description.trim()}` : '',
+        `Prompt template:\n${template.promptTemplate.trim()}`,
+        template.toneRules.trim() ? `Tone rules:\n${template.toneRules.trim()}` : '',
+        template.examples?.trim() ? `Examples:\n${template.examples.trim()}` : ''
+    ].filter(Boolean).join('\n');
+}
 class BatchAnalysisOrchestrator {
     workspaceRepository;
     constructor(workspaceRepository) {
@@ -473,10 +488,12 @@ class BatchAnalysisOrchestrator {
                 };
             }
             const normalizedTargetTitle = this.normalizeTitle(item.targetTitle);
-            const matchIndex = remainingProposals.findIndex((proposal) => proposal.sessionId === result.sessionId
+            const currentSessionMatches = remainingProposals.filter((proposal) => proposal.sessionId === result.sessionId
                 && proposal.action === item.action
                 && this.normalizeTitle(proposal.targetTitle ?? '') === normalizedTargetTitle);
-            if (matchIndex >= 0) {
+            const currentSessionExactMatch = currentSessionMatches.find((proposal) => doesPlacementMeetRequirement(proposal.suggestedPlacement, item.suggestedPlacement));
+            if (currentSessionExactMatch) {
+                const matchIndex = remainingProposals.findIndex((proposal) => proposal.id === currentSessionExactMatch.id);
                 const match = remainingProposals.splice(matchIndex, 1)[0];
                 return {
                     planItemId: item.planItemId,
@@ -486,6 +503,16 @@ class BatchAnalysisOrchestrator {
                     proposalId: match.id,
                     artifactIds: [match.id],
                     note: `Matched proposal generated in the current worker session for ${match.targetTitle ?? item.targetTitle}.`
+                };
+            }
+            if (currentSessionMatches.length > 0) {
+                return {
+                    planItemId: item.planItemId,
+                    action: item.action,
+                    targetTitle: item.targetTitle,
+                    status: 'blocked',
+                    artifactIds: currentSessionMatches.map((proposal) => proposal.id),
+                    note: `Current worker session generated proposal output for "${item.targetTitle}" but it did not preserve the approved placement (${describePlacementRequirement(item.suggestedPlacement)}).`
                 };
             }
             const conflictingCurrentSessionProposals = remainingProposals.filter((proposal) => proposal.sessionId === result.sessionId
@@ -501,8 +528,11 @@ class BatchAnalysisOrchestrator {
                     note: `Current worker session produced ${conflictingCurrentSessionProposals.map((proposal) => proposal.action).join(', ')} proposal output for "${item.targetTitle}", which conflicts with the approved ${item.action} action.`
                 };
             }
-            const fallbackMatchIndex = remainingProposals.findIndex((proposal) => proposal.action === item.action && this.normalizeTitle(proposal.targetTitle ?? '') === normalizedTargetTitle);
-            if (fallbackMatchIndex >= 0) {
+            const fallbackMatches = remainingProposals.filter((proposal) => proposal.action === item.action
+                && this.normalizeTitle(proposal.targetTitle ?? '') === normalizedTargetTitle);
+            const fallbackExactMatch = fallbackMatches.find((proposal) => doesPlacementMeetRequirement(proposal.suggestedPlacement, item.suggestedPlacement));
+            if (fallbackExactMatch) {
+                const fallbackMatchIndex = remainingProposals.findIndex((proposal) => proposal.id === fallbackExactMatch.id);
                 const match = remainingProposals.splice(fallbackMatchIndex, 1)[0];
                 return {
                     planItemId: item.planItemId,
@@ -512,6 +542,16 @@ class BatchAnalysisOrchestrator {
                     proposalId: match.id,
                     artifactIds: [match.id],
                     note: `Matched persisted proposal output for ${match.targetTitle ?? item.targetTitle}.`
+                };
+            }
+            if (fallbackMatches.length > 0) {
+                return {
+                    planItemId: item.planItemId,
+                    action: item.action,
+                    targetTitle: item.targetTitle,
+                    status: 'blocked',
+                    artifactIds: fallbackMatches.map((proposal) => proposal.id),
+                    note: `Persisted proposal output for "${item.targetTitle}" exists, but it did not preserve the approved placement (${describePlacementRequirement(item.suggestedPlacement)}).`
                 };
             }
             return {
@@ -536,6 +576,7 @@ class BatchAnalysisOrchestrator {
         return humanizeReadableText(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
     }
     buildPlannerPrompt(params) {
+        const hasUserDirectives = batchContextHasUserDirectives(params.batchContext);
         return [
             'Return only valid JSON.',
             'Create a complete structured batch analysis plan.',
@@ -552,11 +593,17 @@ class BatchAnalysisOrchestrator {
             'If a deterministic prefetch query already returned zero meaningful matches, treat that zero-result evidence as final unless you have a materially different query.',
             'If a question can be resolved by revising the plan with the existing evidence, revise the plan and do not emit a user-input question.',
             'Emit `requiresUserInput: true` only when the user must decide scope, intent, sequencing, or another product decision the planner cannot infer safely.',
+            'Every create plan item must include `suggestedPlacement` with a stable `categoryId`. Include `categoryName` plus optional `sectionId` and `sectionName` when the article belongs in a section.',
+            'For create placement, use existing article evidence first and call `list_categories` or `list_sections` only when you need authoritative Zendesk placement IDs or need to verify a section choice.',
+            hasUserDirectives
+                ? 'User directives inside the batch context summary are mandatory. Guaranteed edit families must be represented by concrete edit items for each listed live locale variant, guaranteed creates must preserve their requested `targetLocale` and any requested placement, and create-versus-edit ambiguity on a guaranteed create must be surfaced as user input instead of guessed.'
+                : '',
             params.resolvedUserAnswers && params.resolvedUserAnswers.length > 0
                 ? 'Incorporate every resolved user answer below into the revised plan. Close, remove, or resolve those questions instead of carrying them forward unchanged.'
                 : '',
             'JSON shape:',
-            '{"summary":string,"coverage":[{"pbiId":string,"outcome":"covered"|"gap"|"no_impact"|"blocked","planItemIds":string[],"notes"?:string}],"items":[{"planItemId":string,"pbiIds":string[],"action":"create"|"edit"|"retire"|"no_impact","targetType":"article"|"article_family"|"article_set"|"new_article"|"unknown","targetArticleId"?:string,"targetFamilyId"?:string,"targetTitle":string,"reason":string,"evidence":[{"kind":"pbi"|"article"|"search"|"review"|"transcript"|"other","ref":string,"summary":string}],"confidence":number,"dependsOn"?:string[],"executionStatus":"pending"}],"questions":[{"id"?:string,"prompt":string,"reason":string,"requiresUserInput":boolean,"linkedPbiIds":string[],"linkedPlanItemIds":string[],"linkedDiscoveryIds":string[]}],"openQuestions"?:string[]}',
+            '{"summary":string,"coverage":[{"pbiId":string,"outcome":"covered"|"gap"|"no_impact"|"blocked","planItemIds":string[],"notes"?:string}],"items":[{"planItemId":string,"pbiIds":string[],"action":"create"|"edit"|"retire"|"no_impact","targetType":"article"|"article_family"|"article_set"|"new_article"|"unknown","targetArticleId"?:string,"targetFamilyId"?:string,"targetTitle":string,"targetLocale"?:string,"suggestedPlacement"?:{"categoryId"?:string,"categoryName"?:string,"sectionId"?:string,"sectionName"?:string,"notes"?:string},"reason":string,"evidence":[{"kind":"pbi"|"article"|"search"|"review"|"transcript"|"other","ref":string,"summary":string}],"confidence":number,"dependsOn"?:string[],"executionStatus":"pending"}],"questions":[{"id"?:string,"prompt":string,"reason":string,"requiresUserInput":boolean,"linkedPbiIds":string[],"linkedPlanItemIds":string[],"linkedDiscoveryIds":string[]}],"openQuestions"?:string[]}',
+            buildProposalTemplateGuidanceSection(params.proposalTemplate, 'Use this active template when reasoning about the expected structure, tone, and placeholder conventions of any proposal HTML the worker will later draft.'),
             'Batch context summary:',
             JSON.stringify(compactBatchContextForPrompt(params.batchContext), null, 2),
             'Uploaded PBI summary:',
@@ -597,6 +644,7 @@ class BatchAnalysisOrchestrator {
         ].join('\n\n');
     }
     buildPlanReviewerPrompt(params) {
+        const hasUserDirectives = batchContextHasUserDirectives(params.batchContext);
         return [
             'Return only valid JSON.',
             'Review the submitted batch plan for completeness and correctness.',
@@ -615,8 +663,13 @@ class BatchAnalysisOrchestrator {
             'Reserve `needs_human_review` for issues that cannot be reduced to concrete user-answerable questions.',
             'If you return `needs_user_input`, include at least one final structured question with `requiresUserInput: true` and `status: "pending"`.',
             'Do not execute proposals or mutate KB content in this stage.',
+            'Do not approve create plan items that still omit a stable category placement. Section placement is optional, but when a section is proposed it should be represented with authoritative Zendesk IDs.',
+            hasUserDirectives
+                ? 'Treat batch-context user directives as hard requirements. Do not approve a plan that drops guaranteed edit locales, guaranteed creates, or requested guaranteed-create placement, and pause for user input instead of guessing when a guaranteed create conflicts with an existing live article.'
+                : '',
             'JSON shape:',
             '{"summary":string,"verdict":"approved"|"needs_revision"|"needs_user_input"|"needs_human_review","didAccountForEveryPbi":boolean,"hasMissingCreates":boolean,"hasMissingEdits":boolean,"hasTargetIssues":boolean,"hasOverlapOrConflict":boolean,"foundAdditionalArticleWork":boolean,"underScopedKbImpact":boolean,"delta":{"summary":string,"requestedChanges":string[],"missingPbiIds":string[],"missingCreates":string[],"missingEdits":string[],"additionalArticleWork":string[],"targetCorrections":string[],"overlapConflicts":string[]},"questions":[{"id"?:string,"prompt":string,"reason":string,"requiresUserInput":boolean,"status":"pending"|"answered"|"resolved"|"dismissed","linkedPbiIds":string[],"linkedPlanItemIds":string[],"linkedDiscoveryIds":string[]}]}',
+            buildProposalTemplateGuidanceSection(params.proposalTemplate, 'Use this active template as the review baseline for proposal structure, tone, and placeholder conventions whenever you judge whether the plan is likely to produce acceptable proposal HTML.'),
             'Batch context summary:',
             JSON.stringify(compactBatchContextForPrompt(params.batchContext), null, 2),
             'Uploaded PBI summary:',
@@ -635,7 +688,11 @@ class BatchAnalysisOrchestrator {
             plannerPrefetch: params.plannerPrefetch,
             discoveredWork: params.discoveredWork
         }).filter((question) => !existingPromptKeys.has(normalizeQuestionPromptKey(question.prompt)));
-        return mergeStructuredQuestions(baseQuestions, deterministicQuestions);
+        const userDirectiveQuestions = this.synthesizeUserDirectiveReviewCandidateQuestions({
+            plan: params.plan,
+            batchContext: params.batchContext
+        }).filter((question) => !existingPromptKeys.has(normalizeQuestionPromptKey(question.prompt)));
+        return mergeStructuredQuestions(baseQuestions, [...deterministicQuestions, ...userDirectiveQuestions]);
     }
     synthesizeDeterministicReviewCandidateQuestions(params) {
         if (!params.plannerPrefetch) {
@@ -689,6 +746,31 @@ class BatchAnalysisOrchestrator {
             }
             return deterministicQuestions;
         }));
+    }
+    synthesizeUserDirectiveReviewCandidateQuestions(params) {
+        const { guaranteedCreateConflicts } = extractBatchUserDirectives(params.batchContext);
+        if (guaranteedCreateConflicts.length === 0) {
+            return [];
+        }
+        const createdAtUtc = new Date().toISOString();
+        return guaranteedCreateConflicts.map((conflict) => {
+            const linkedPlanItemIds = params.plan.items
+                .filter((item) => item.action === 'create'
+                && this.normalizeTitle(item.targetTitle ?? '') === this.normalizeTitle(conflict.title))
+                .map((item) => item.planItemId);
+            const strongestMatch = conflict.matches[0];
+            return {
+                id: createDeterministicQuestionId('guaranteed-create-conflict', conflict.clientId, conflict.title),
+                prompt: `You requested guaranteed creation of ${conflict.title} (${conflict.targetLocale}), but ${strongestMatch?.title ?? 'an existing live article'} may already cover that topic. Should we still create a new article or convert this to an edit?`,
+                reason: `Guaranteed create target ${conflict.title} (${conflict.targetLocale}) strongly overlaps existing live KB coverage, so the system needs a user decision before approving create-versus-edit scope.`,
+                requiresUserInput: true,
+                linkedPbiIds: [],
+                linkedPlanItemIds,
+                linkedDiscoveryIds: [],
+                status: 'pending',
+                createdAtUtc
+            };
+        });
     }
     normalizeStructuredQuestions(params) {
         const createdAtUtc = new Date().toISOString();
@@ -810,6 +892,10 @@ class BatchAnalysisOrchestrator {
             items: items.map((item) => ({
                 ...item,
                 targetTitle: humanizeReadableText(item.targetTitle),
+                targetLocale: typeof item.targetLocale === 'string' && item.targetLocale.trim()
+                    ? item.targetLocale.trim().toLowerCase()
+                    : undefined,
+                suggestedPlacement: normalizeBatchPlanPlacement(item.suggestedPlacement),
                 reason: humanizeReadableText(item.reason),
                 evidence: Array.isArray(item.evidence)
                     ? item.evidence.map((evidence) => ({
@@ -874,7 +960,13 @@ class BatchAnalysisOrchestrator {
         };
     }
     validatePlanForExecution(params) {
-        const finalQuestions = mergeStructuredQuestions(params.candidateQuestions ?? params.plan.questions ?? [], params.review.questions ?? []);
+        let finalQuestions = mergeStructuredQuestions(params.candidateQuestions ?? params.plan.questions ?? [], params.review.questions ?? []);
+        const directiveValidation = this.validateUserDirectedTargets({
+            plan: params.plan,
+            finalQuestions,
+            batchContext: params.batchContext
+        });
+        finalQuestions = mergeStructuredQuestions(finalQuestions, directiveValidation.blockingQuestions);
         const blockingUserInputQuestions = collectBlockingUserInputQuestions(finalQuestions);
         const invalidCoverageReasons = this.validateApprovedPlan(params.plan).reasons;
         const conflictingTargets = this.findDeterministicTargetConflicts(params.plan);
@@ -883,6 +975,8 @@ class BatchAnalysisOrchestrator {
         const advisoryMissingEditTargets = this.findLikelyMissingEditTargets(params.plan, params.plannerPrefetch);
         const advisoryMissingCreateTargets = this.findLikelyMissingCreateTargets(params.plan, params.plannerPrefetch);
         const hasObjectiveBlockingIssues = invalidCoverageReasons.length > 0
+            || directiveValidation.missingGuaranteedEditTargets.length > 0
+            || directiveValidation.missingGuaranteedCreateTargets.length > 0
             || conflictingTargets.length > 0
             || unresolvedTargetIssues.length > 0
             || unresolvedReferenceIssues.length > 0;
@@ -891,12 +985,18 @@ class BatchAnalysisOrchestrator {
             ok: blockingUserInputQuestions.length === 0 && !hasObjectiveBlockingIssues,
             needsUserInput: blockingUserInputQuestions.length > 0,
             blockingUserInputQuestions,
-            invalidCoverageReasons,
+            invalidCoverageReasons: dedupePlanReviewStrings([
+                ...invalidCoverageReasons,
+                ...directiveValidation.missingGuaranteedEditTargets,
+                ...directiveValidation.missingGuaranteedCreateTargets
+            ]).slice(0, 20),
             conflictingTargets,
             unresolvedTargetIssues,
             unresolvedReferenceIssues,
             advisoryMissingEditTargets,
-            advisoryMissingCreateTargets
+            advisoryMissingCreateTargets,
+            missingGuaranteedEditTargets: directiveValidation.missingGuaranteedEditTargets,
+            missingGuaranteedCreateTargets: directiveValidation.missingGuaranteedCreateTargets
         };
     }
     applyDeterministicPlanReviewGuard(params) {
@@ -1005,6 +1105,14 @@ class BatchAnalysisOrchestrator {
             requestedChanges.push(...validation.invalidCoverageReasons);
             additionalArticleWork.push(...validation.invalidCoverageReasons);
         }
+        if (validation.missingGuaranteedEditTargets.length > 0) {
+            issueSummaries.push(`guaranteed edit coverage is missing for ${validation.missingGuaranteedEditTargets.length} locale target(s)`);
+            requestedChanges.push(...validation.missingGuaranteedEditTargets);
+        }
+        if (validation.missingGuaranteedCreateTargets.length > 0) {
+            issueSummaries.push(`guaranteed create coverage is missing for ${validation.missingGuaranteedCreateTargets.length} target(s)`);
+            requestedChanges.push(...validation.missingGuaranteedCreateTargets);
+        }
         if (validation.conflictingTargets.length > 0) {
             const titlesSummary = validation.conflictingTargets.join(', ');
             issueSummaries.push(`overlapping target coverage for ${titlesSummary}`);
@@ -1034,8 +1142,8 @@ class BatchAnalysisOrchestrator {
                 summary: (forcedRevision || malformedNeedsUserInput)
                     ? `Deterministic review found ${summaryText}.`
                     : params.review.summary,
-                hasMissingCreates: params.review.hasMissingCreates,
-                hasMissingEdits: params.review.hasMissingEdits,
+                hasMissingCreates: params.review.hasMissingCreates || validation.missingGuaranteedCreateTargets.length > 0,
+                hasMissingEdits: params.review.hasMissingEdits || validation.missingGuaranteedEditTargets.length > 0,
                 hasTargetIssues: params.review.hasTargetIssues || validation.invalidCoverageReasons.length > 0 || validation.conflictingTargets.length > 0 || validation.unresolvedTargetIssues.length > 0,
                 hasOverlapOrConflict: params.review.hasOverlapOrConflict || validation.conflictingTargets.length > 0,
                 foundAdditionalArticleWork: params.review.foundAdditionalArticleWork || validation.invalidCoverageReasons.length > 0,
@@ -1047,8 +1155,8 @@ class BatchAnalysisOrchestrator {
                         : `Deterministic review found ${summaryText}.`,
                     requestedChanges: dedupePlanReviewStrings(requestedChanges).slice(0, 20),
                     missingPbiIds: dedupePlanReviewStrings([...existingDelta.missingPbiIds, ...validation.invalidCoverageReasons, ...validation.unresolvedReferenceIssues]).slice(0, 20),
-                    missingCreates: dedupePlanReviewStrings(existingDelta.missingCreates).slice(0, 20),
-                    missingEdits: dedupePlanReviewStrings(existingDelta.missingEdits).slice(0, 20),
+                    missingCreates: dedupePlanReviewStrings([...existingDelta.missingCreates, ...validation.missingGuaranteedCreateTargets]).slice(0, 20),
+                    missingEdits: dedupePlanReviewStrings([...existingDelta.missingEdits, ...validation.missingGuaranteedEditTargets]).slice(0, 20),
                     additionalArticleWork: dedupePlanReviewStrings(additionalArticleWork).slice(0, 20),
                     targetCorrections: dedupePlanReviewStrings(targetCorrections).slice(0, 20),
                     overlapConflicts: dedupePlanReviewStrings(overlapConflicts).slice(0, 20)
@@ -1064,7 +1172,17 @@ class BatchAnalysisOrchestrator {
             unresolvedReferenceIssues: validation.unresolvedReferenceIssues
         };
     }
-    async buildWorkerPrompt(plan, extraInstructions) {
+    async buildWorkerPrompt(plan, extraInstructionsOrOptions) {
+        const extraInstructions = typeof extraInstructionsOrOptions === 'string'
+            ? extraInstructionsOrOptions
+            : extraInstructionsOrOptions?.extraInstructions;
+        const batchContext = typeof extraInstructionsOrOptions === 'string'
+            ? undefined
+            : extraInstructionsOrOptions?.batchContext;
+        const proposalTemplate = typeof extraInstructionsOrOptions === 'string'
+            ? undefined
+            : extraInstructionsOrOptions?.proposalTemplate;
+        const hasUserDirectives = batchContextHasUserDirectives(batchContext);
         const workerPlan = await this.buildWorkerPlanPromptPayload(plan);
         return [
             extraInstructions?.trim() ?? '',
@@ -1074,12 +1192,18 @@ class BatchAnalysisOrchestrator {
             'Use `create_proposals` as soon as you have enough content for one or more approved items, and batch proposal writes whenever practical.',
             'For approved edit/retire items, `create_proposals` may persist with `localeVariantId`, `familyId`, or `targetTitle` using the authoritative target already supplied in the plan.',
             'For approved create items, persist with `targetTitle` directly. Do not spend lookup turns trying to discover a localeVariantId for net-new work first.',
+            'Preserve any approved `suggestedPlacement` when you call `create_proposals`. If a create item somehow reaches execution without authoritative placement IDs, resolve that placement before persisting the proposal.',
+            hasUserDirectives
+                ? 'If a create plan item includes `targetLocale`, preserve that locale in the persisted proposal. User directives embedded in the batch context remain mandatory during execution, including any requested guaranteed-create placement.'
+                : '',
             'Use direct read actions only when they unblock missing article content, explain a failed write, or resolve a concrete ambiguity not already answered by the approved plan.',
             'Do not silently expand scope.',
             'If you discover new missing work, return it in the final JSON under `discoveredWork` and do not execute that new work yet.',
             'Every `discoveredWork` item must use a unique `discoveryId` within this response.',
             'Return only JSON with this shape:',
             '{"summary":string,"discoveredWork":[{"discoveryId":string,"discoveredAction":"create"|"edit"|"retire","suspectedTarget":string,"reason":string,"evidence":[{"kind":"pbi"|"article"|"search"|"review"|"transcript"|"other","ref":string,"summary":string}],"linkedPbiIds":string[],"confidence":number,"requiresPlanAmendment":boolean}]}',
+            buildProposalTemplateGuidanceSection(proposalTemplate, 'When you persist `proposedHtml`, treat this active template as authoritative guidance for structure, tone, examples, and placeholder conventions.'),
+            batchContext ? `Batch context summary:\n${JSON.stringify(compactBatchContextForPrompt(batchContext), null, 2)}` : '',
             JSON.stringify(workerPlan, null, 2)
         ].filter(Boolean).join('\n\n');
     }
@@ -1125,6 +1249,7 @@ class BatchAnalysisOrchestrator {
             plannerPrefetch: params.plannerPrefetch,
             priorPlan: params.approvedPlan,
             resolvedUserAnswers: params.resolvedUserAnswers,
+            proposalTemplate: params.proposalTemplate,
             reviewDelta: {
                 summary: 'Worker discovered additional scope requiring amendment review.',
                 requestedChanges: params.discoveredWork.map((item) => item.reason),
@@ -1138,6 +1263,7 @@ class BatchAnalysisOrchestrator {
         });
     }
     buildFinalReviewerPrompt(params) {
+        const hasUserDirectives = batchContextHasUserDirectives(params.batchContext);
         return [
             'Return only valid JSON.',
             'You are the final reviewer for the batch.',
@@ -1146,8 +1272,12 @@ class BatchAnalysisOrchestrator {
             'Proposal-scoped locale variants or article families whose external key starts with `proposal-` are generated draft artifacts, not live KB coverage.',
             'Do not use proposal-scoped locale variants to claim the live KB already covers a change.',
             'Use the persisted proposal snapshots below to judge what each proposal actually changes before calling something redundant.',
+            hasUserDirectives
+                ? 'Batch-context user directives are still mandatory at final review. Do not approve the batch if guaranteed edit/create targets were dropped or if a guaranteed create ambiguity still lacks a user decision.'
+                : '',
             'JSON shape:',
             '{"summary":string,"verdict":"approved"|"needs_rework"|"needs_human_review","allPbisMapped":boolean,"planExecutionComplete":boolean,"hasMissingArticleChanges":boolean,"hasUnresolvedDiscoveredWork":boolean,"delta":{"summary":string,"requestedRework":string[],"uncoveredPbiIds":string[],"missingArticleChanges":string[],"duplicateRiskTitles":string[],"unnecessaryChanges":string[],"unresolvedAmbiguities":string[]}}',
+            buildProposalTemplateGuidanceSection(params.proposalTemplate, 'Use this active template when judging whether the executed proposals match the expected proposal HTML structure, tone, and placeholder conventions.'),
             'Batch context summary:',
             JSON.stringify(compactBatchContextForPrompt(params.batchContext), null, 2),
             'Uploaded PBI summary:',
@@ -1214,7 +1344,76 @@ class BatchAnalysisOrchestrator {
                 }
             }
         }
+        for (const item of plan.items) {
+            if (item.action !== 'create') {
+                continue;
+            }
+            if (!normalizePlacementScopeId(item.suggestedPlacement?.categoryId)) {
+                reasons.push(`Create plan item ${item.planItemId} (${item.targetTitle}) is missing suggested category placement with an authoritative categoryId.`);
+            }
+        }
         return { ok: reasons.length === 0, reasons };
+    }
+    validateUserDirectedTargets(params) {
+        const { analysisConfig, guaranteedCreateConflicts } = extractBatchUserDirectives(params.batchContext);
+        if (!analysisConfig) {
+            return {
+                blockingQuestions: [],
+                missingGuaranteedEditTargets: [],
+                missingGuaranteedCreateTargets: []
+            };
+        }
+        const blockingQuestions = [];
+        const missingGuaranteedEditTargets = [];
+        const missingGuaranteedCreateTargets = [];
+        for (const family of analysisConfig.guaranteedEditFamilies) {
+            for (const variant of family.resolvedLocaleVariants) {
+                const hasMatchingEdit = params.plan.items.some((item) => item.action === 'edit'
+                    && (item.targetArticleId?.trim() === variant.localeVariantId
+                        || (family.resolvedLocaleVariants.length === 1 && item.targetFamilyId?.trim() === family.familyId)));
+                if (!hasMatchingEdit) {
+                    missingGuaranteedEditTargets.push(`Guaranteed edit target ${family.familyTitle} (${variant.locale}) is missing a concrete edit plan item.`);
+                }
+            }
+        }
+        for (const article of analysisConfig.guaranteedCreateArticles) {
+            const matchingConflict = guaranteedCreateConflicts.find((conflict) => conflict.clientId === article.clientId);
+            if (matchingConflict) {
+                const questionId = createDeterministicQuestionId('guaranteed-create-conflict', matchingConflict.clientId, matchingConflict.title);
+                const existingQuestion = params.finalQuestions.find((question) => question.id === questionId);
+                if (!existingQuestion || existingQuestion.status === 'pending') {
+                    blockingQuestions.push(existingQuestion ?? {
+                        id: questionId,
+                        prompt: `You requested guaranteed creation of ${matchingConflict.title} (${matchingConflict.targetLocale}), but ${matchingConflict.matches[0]?.title ?? 'an existing live article'} may already cover that topic. Should we still create a new article or convert this to an edit?`,
+                        reason: `Guaranteed create target ${matchingConflict.title} (${matchingConflict.targetLocale}) strongly overlaps existing live KB coverage, so the system needs a user decision before approving create-versus-edit scope.`,
+                        requiresUserInput: true,
+                        linkedPbiIds: [],
+                        linkedPlanItemIds: params.plan.items
+                            .filter((item) => this.normalizeTitle(item.targetTitle ?? '') === this.normalizeTitle(matchingConflict.title))
+                            .map((item) => item.planItemId),
+                        linkedDiscoveryIds: [],
+                        status: 'pending',
+                        createdAtUtc: new Date().toISOString()
+                    });
+                }
+                continue;
+            }
+            const matchingCreate = params.plan.items.find((item) => item.action === 'create'
+                && this.normalizeTitle(item.targetTitle ?? '') === this.normalizeTitle(article.title)
+                && normalizeLocaleForComparison(item.targetLocale) === normalizeLocaleForComparison(article.targetLocale));
+            if (!matchingCreate) {
+                missingGuaranteedCreateTargets.push(`Guaranteed create target ${article.title} (${article.targetLocale}) is missing a create plan item with the correct locale.`);
+                continue;
+            }
+            if (!doesPlacementMeetRequirement(matchingCreate.suggestedPlacement, article)) {
+                missingGuaranteedCreateTargets.push(`Guaranteed create target ${article.title} (${article.targetLocale}) is missing the requested category or section placement in its create plan item.`);
+            }
+        }
+        return {
+            blockingQuestions,
+            missingGuaranteedEditTargets: dedupePlanReviewStrings(missingGuaranteedEditTargets).slice(0, 20),
+            missingGuaranteedCreateTargets: dedupePlanReviewStrings(missingGuaranteedCreateTargets).slice(0, 20)
+        };
     }
     validateWorkerReport(plan, report) {
         const reasons = [];
@@ -1239,6 +1438,15 @@ class BatchAnalysisOrchestrator {
         const planValidation = this.validateApprovedPlan(params.plan);
         const workerValidation = this.validateWorkerReport(params.plan, params.workerReport);
         reasons.push(...planValidation.reasons, ...workerValidation.reasons);
+        const directiveValidation = this.validateUserDirectedTargets({
+            plan: params.plan,
+            finalQuestions: params.plan.questions ?? [],
+            batchContext: params.batchContext
+        });
+        reasons.push(...directiveValidation.missingGuaranteedEditTargets, ...directiveValidation.missingGuaranteedCreateTargets);
+        if (directiveValidation.blockingQuestions.length > 0) {
+            reasons.push(`Final approval blocked by ${directiveValidation.blockingQuestions.length} unresolved guaranteed-create ambiguity question(s).`);
+        }
         if (!params.finalReview.allPbisMapped) {
             reasons.push('Final review cannot approve while PBIs remain unmapped.');
         }
@@ -1440,11 +1648,15 @@ class BatchAnalysisOrchestrator {
                 authoritative: true,
                 canPersistImmediately: Boolean(targetTitle),
                 targetTitle: targetTitle || null,
+                targetLocale: item.targetLocale ?? null,
+                suggestedPlacement: item.suggestedPlacement ?? null,
                 note: 'Persist this net-new proposal with `targetTitle` directly. Locale variant lookup is unnecessary before `create_proposals`.',
                 recommendedProposalArgs: {
                     itemId: item.planItemId,
                     action: item.action,
                     ...(targetTitle ? { targetTitle } : {}),
+                    ...(item.targetLocale?.trim() ? { targetLocale: item.targetLocale.trim() } : {}),
+                    ...(item.suggestedPlacement ? { suggestedPlacement: item.suggestedPlacement } : {}),
                     relatedPbiIds: item.pbiIds
                 }
             };
@@ -1463,6 +1675,7 @@ class BatchAnalysisOrchestrator {
                     action: item.action,
                     localeVariantId: trimmedTargetArticleId,
                     ...(targetTitle ? { targetTitle } : {}),
+                    ...(item.suggestedPlacement ? { suggestedPlacement: item.suggestedPlacement } : {}),
                     relatedPbiIds: item.pbiIds
                 }
             };
@@ -1484,6 +1697,7 @@ class BatchAnalysisOrchestrator {
                     action: item.action,
                     familyId: trimmedTargetFamilyId,
                     ...(targetTitle ? { targetTitle } : {}),
+                    ...(item.suggestedPlacement ? { suggestedPlacement: item.suggestedPlacement } : {}),
                     relatedPbiIds: item.pbiIds
                 }
             };
@@ -1499,6 +1713,7 @@ class BatchAnalysisOrchestrator {
                     itemId: item.planItemId,
                     action: item.action,
                     targetTitle,
+                    ...(item.suggestedPlacement ? { suggestedPlacement: item.suggestedPlacement } : {}),
                     relatedPbiIds: item.pbiIds
                 }
             };
@@ -1598,6 +1813,7 @@ function compactBatchContextForPrompt(batchContext) {
     const batch = record.batch && typeof record.batch === 'object'
         ? record.batch
         : record;
+    const userDirectives = compactBatchUserDirectivesForPrompt(record);
     return {
         batchId: batch.id ?? record.batchId ?? null,
         workspaceId: batch.workspaceId ?? record.workspaceId ?? null,
@@ -1610,7 +1826,92 @@ function compactBatchContextForPrompt(batchContext) {
         scopedRowCount: batch.scopedRowCount ?? null,
         ignoredRowCount: batch.ignoredRowCount ?? countArray(record.ignoredRows),
         malformedRowCount: batch.malformedRowCount ?? countArray(record.malformedRows),
-        duplicateRowCount: batch.duplicateRowCount ?? countArray(record.duplicateRows)
+        duplicateRowCount: batch.duplicateRowCount ?? countArray(record.duplicateRows),
+        userDirectives
+    };
+}
+function batchContextHasUserDirectives(batchContext) {
+    const { analysisConfig, guaranteedCreateConflicts } = extractBatchUserDirectives(batchContext);
+    return Boolean(analysisConfig
+        && (analysisConfig.guaranteedEditFamilies.length > 0
+            || analysisConfig.guaranteedCreateArticles.length > 0
+            || Boolean(analysisConfig.analysisGuidancePrompt)
+            || guaranteedCreateConflicts.length > 0));
+}
+function compactBatchUserDirectivesForPrompt(batchContext) {
+    const { analysisConfig, guaranteedCreateConflicts } = extractBatchUserDirectives(batchContext);
+    if (!analysisConfig) {
+        return null;
+    }
+    const hasDirectives = analysisConfig.guaranteedEditFamilies.length > 0
+        || analysisConfig.guaranteedCreateArticles.length > 0
+        || Boolean(analysisConfig.analysisGuidancePrompt)
+        || guaranteedCreateConflicts.length > 0;
+    if (!hasDirectives) {
+        return null;
+    }
+    return {
+        guidancePrompt: truncatePromptText(analysisConfig.analysisGuidancePrompt, 320) ?? null,
+        guaranteedEditFamilies: analysisConfig.guaranteedEditFamilies.map((family) => ({
+            familyId: family.familyId,
+            familyTitle: family.familyTitle,
+            mode: family.mode,
+            requiredLocales: family.resolvedLocaleVariants.map((variant) => ({
+                locale: variant.locale,
+                localeVariantId: variant.localeVariantId,
+                snippet: truncatePromptText(variant.snippet, 140) ?? null
+            }))
+        })),
+        guaranteedCreateArticles: analysisConfig.guaranteedCreateArticles.map((article) => ({
+            clientId: article.clientId,
+            title: article.title,
+            targetLocale: article.targetLocale,
+            suggestedPlacement: compactPlacementForPrompt(article)
+        })),
+        guaranteedCreateConflicts: guaranteedCreateConflicts.map((conflict) => ({
+            clientId: conflict.clientId,
+            title: conflict.title,
+            targetLocale: conflict.targetLocale,
+            reason: truncatePromptText(conflict.reason, 180) ?? conflict.reason,
+            matches: conflict.matches.map((match) => ({
+                title: match.title,
+                locale: match.locale,
+                localeVariantId: match.localeVariantId,
+                score: match.score,
+                matchContext: match.matchContext ?? null,
+                snippet: truncatePromptText(match.snippet, 120) ?? null
+            }))
+        })),
+        rules: [
+            'Guaranteed edit families are mandatory.',
+            'Each listed guaranteed edit locale requires its own concrete edit plan item.',
+            'Guaranteed creates are mandatory unless the user resolves a create-versus-edit conflict differently.',
+            'Guaranteed create items should preserve targetLocale in the approved plan and persisted proposal.',
+            'Guaranteed create items should preserve any requested category or section placement.'
+        ]
+    };
+}
+function extractBatchUserDirectives(batchContext) {
+    if (!batchContext || typeof batchContext !== 'object') {
+        return {
+            analysisConfig: null,
+            guaranteedCreateConflicts: []
+        };
+    }
+    const record = batchContext;
+    const analysisConfigCandidate = record.analysisConfig;
+    const analysisConfig = analysisConfigCandidate
+        && typeof analysisConfigCandidate === 'object'
+        && Array.isArray(analysisConfigCandidate.guaranteedEditFamilies)
+        && Array.isArray(analysisConfigCandidate.guaranteedCreateArticles)
+        ? analysisConfigCandidate
+        : null;
+    const guaranteedCreateConflicts = Array.isArray(record.guaranteedCreateConflicts)
+        ? record.guaranteedCreateConflicts.filter((conflict) => Boolean(conflict && typeof conflict === 'object' && typeof conflict.title === 'string'))
+        : [];
+    return {
+        analysisConfig,
+        guaranteedCreateConflicts
     };
 }
 function extractUploadedPbiRows(uploadedPbis) {
@@ -1789,6 +2090,8 @@ function compactPlanItemForPrompt(item) {
         targetArticleId: item.targetArticleId ?? null,
         targetFamilyId: item.targetFamilyId ?? null,
         targetTitle: item.targetTitle,
+        targetLocale: item.targetLocale ?? null,
+        suggestedPlacement: compactPlacementForPrompt(item.suggestedPlacement),
         reason: truncatePromptText(item.reason, 220),
         evidence: item.evidence.map((evidence) => ({
             kind: evidence.kind,
@@ -1798,6 +2101,26 @@ function compactPlanItemForPrompt(item) {
         confidence: item.confidence,
         dependsOn: item.dependsOn ?? [],
         executionStatus: item.executionStatus
+    };
+}
+function compactPlacementForPrompt(placement) {
+    if (!placement) {
+        return null;
+    }
+    const categoryId = normalizePlacementScopeId(placement.categoryId);
+    const categoryName = normalizePromptString(placement.categoryName);
+    const sectionId = normalizePlacementScopeId(placement.sectionId);
+    const sectionName = normalizePromptString(placement.sectionName);
+    const notes = normalizePromptString(placement.notes);
+    if (!categoryId && !categoryName && !sectionId && !sectionName && !notes) {
+        return null;
+    }
+    return {
+        categoryId: categoryId || null,
+        categoryName: categoryName ?? null,
+        sectionId: sectionId || null,
+        sectionName: sectionName ?? null,
+        ...(notes ? { notes } : {})
     };
 }
 function compactPlanQuestionForPrompt(question) {
@@ -2258,6 +2581,56 @@ function createDeterministicQuestionId(kind, clusterId, title) {
         .replace(/^-+|-+$/g, '')
         .slice(0, 80);
     return `deterministic-${kind}-${clusterId}-${normalizedTitle || 'question'}`;
+}
+function normalizeLocaleForComparison(value) {
+    return value?.trim().toLowerCase() ?? '';
+}
+function normalizePlacementScopeId(value) {
+    return value?.trim() ?? '';
+}
+function normalizePromptString(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+function normalizeBatchPlanPlacement(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return undefined;
+    }
+    const input = value;
+    const placement = {
+        categoryId: normalizePromptString(input.categoryId),
+        categoryName: normalizePromptString(input.categoryName),
+        sectionId: normalizePromptString(input.sectionId),
+        sectionName: normalizePromptString(input.sectionName),
+        articleTitle: normalizePromptString(input.articleTitle),
+        parentArticleId: normalizePromptString(input.parentArticleId),
+        notes: normalizePromptString(input.notes)
+    };
+    return Object.values(placement).some(Boolean) ? placement : undefined;
+}
+function doesPlacementMeetRequirement(actual, required) {
+    const requiredCategoryId = normalizePlacementScopeId(required?.categoryId);
+    const requiredSectionId = normalizePlacementScopeId(required?.sectionId);
+    if (!requiredCategoryId && !requiredSectionId) {
+        return true;
+    }
+    const actualCategoryId = normalizePlacementScopeId(actual?.categoryId);
+    const actualSectionId = normalizePlacementScopeId(actual?.sectionId);
+    if (requiredCategoryId && actualCategoryId !== requiredCategoryId) {
+        return false;
+    }
+    if (requiredSectionId && actualSectionId !== requiredSectionId) {
+        return false;
+    }
+    return true;
+}
+function describePlacementRequirement(required) {
+    const categoryLabel = normalizePromptString(required?.categoryName) ?? normalizePlacementScopeId(required?.categoryId);
+    const sectionLabel = normalizePromptString(required?.sectionName) ?? normalizePlacementScopeId(required?.sectionId);
+    const parts = [
+        categoryLabel ? `category ${categoryLabel}` : '',
+        sectionLabel ? `section ${sectionLabel}` : ''
+    ].filter(Boolean);
+    return parts.length > 0 ? parts.join(' / ') : 'the approved placement';
 }
 function collectLinkedDiscoveryIds(params) {
     if (params.discoveredWork.length === 0) {

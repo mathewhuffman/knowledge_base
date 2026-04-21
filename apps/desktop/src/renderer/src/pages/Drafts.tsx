@@ -37,10 +37,12 @@ import {
   IconClock,
   IconZap,
   IconRefreshCw,
+  IconMapPin,
 } from '../components/icons';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
+import { PlacementSummary } from '../components/article/PlacementSummary';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -542,6 +544,8 @@ export const Drafts = () => {
   const redoMutation = useIpcMutation<DraftBranchGetResponse>('draft.branch.redo');
   const statusMutation = useIpcMutation<DraftBranchGetResponse>('draft.branch.status.set');
   const discardMutation = useIpcMutation<DraftBranchGetResponse>('draft.branch.discard');
+  const { execute: executeList } = listQuery;
+  const { execute: executeDetail, reset: resetDetail } = detailQuery;
 
   // ---------------------------------------------------------------------------
   // Data loading
@@ -549,20 +553,35 @@ export const Drafts = () => {
 
   useEffect(() => {
     if (!activeWorkspace) return;
-    void listQuery.execute({ workspaceId: activeWorkspace.id });
-  }, [activeWorkspace]);
+    void executeList({ workspaceId: activeWorkspace.id });
+  }, [activeWorkspace, executeList]);
 
   useEffect(() => {
-    const firstBranchId = listQuery.data?.branches[0]?.id;
-    if (!selectedBranchId && firstBranchId) {
-      setSelectedBranchId(firstBranchId);
+    if (!listQuery.data) {
+      return;
+    }
+    const branches = listQuery.data?.branches ?? [];
+    if (branches.length === 0) {
+      if (selectedBranchId !== null) {
+        setSelectedBranchId(null);
+      }
+      return;
+    }
+    const currentStillExists = selectedBranchId
+      ? branches.some((branch) => branch.id === selectedBranchId)
+      : false;
+    if (!currentStillExists) {
+      setSelectedBranchId(branches[0].id);
     }
   }, [listQuery.data, selectedBranchId]);
 
   useEffect(() => {
-    if (!activeWorkspace || !selectedBranchId) return;
-    void detailQuery.execute({ workspaceId: activeWorkspace.id, branchId: selectedBranchId });
-  }, [activeWorkspace, selectedBranchId]);
+    if (!activeWorkspace || !selectedBranchId) {
+      resetDetail();
+      return;
+    }
+    void executeDetail({ workspaceId: activeWorkspace.id, branchId: selectedBranchId });
+  }, [activeWorkspace, selectedBranchId, executeDetail, resetDetail]);
 
   useEffect(() => {
     if (detailQuery.data) {
@@ -577,16 +596,28 @@ export const Drafts = () => {
 
   const refresh = useCallback(async (branchId?: string) => {
     if (!activeWorkspace) return;
-    await listQuery.execute({ workspaceId: activeWorkspace.id });
-    const nextBranchId = branchId ?? selectedBranchId;
-    if (nextBranchId) {
-      const detail = await detailQuery.execute({ workspaceId: activeWorkspace.id, branchId: nextBranchId });
-      if (detail) {
-        setDraftHtml(detail.editor.html);
-        setOriginalHtml(detail.editor.html);
-      }
+    const nextList = await executeList({ workspaceId: activeWorkspace.id });
+    const availableBranches = nextList?.branches ?? [];
+    const preferredBranchId = branchId ?? selectedBranchId;
+    const resolvedBranchId = preferredBranchId && availableBranches.some((branch) => branch.id === preferredBranchId)
+      ? preferredBranchId
+      : (availableBranches[0]?.id ?? null);
+
+    setSelectedBranchId(resolvedBranchId);
+
+    if (!resolvedBranchId) {
+      resetDetail();
+      setDraftHtml('');
+      setOriginalHtml('');
+      return;
     }
-  }, [activeWorkspace, selectedBranchId]);
+
+    const detail = await executeDetail({ workspaceId: activeWorkspace.id, branchId: resolvedBranchId });
+    if (detail) {
+      setDraftHtml(detail.editor.html);
+      setOriginalHtml(detail.editor.html);
+    }
+  }, [activeWorkspace, selectedBranchId, executeDetail, executeList, resetDetail]);
 
   const saveDraft = useCallback(async (autosave = false) => {
     if (!activeWorkspace || !selectedBranchId || !detailQuery.data) return;
@@ -671,7 +702,6 @@ export const Drafts = () => {
   const selected = detailQuery.data;
   const branchStatus = selected?.branch.status;
   const isEditable = branchStatus === DraftBranchStatus.ACTIVE || branchStatus === DraftBranchStatus.READY_TO_PUBLISH;
-  const isObsoleteOrDiscarded = branchStatus === DraftBranchStatus.OBSOLETE || branchStatus === DraftBranchStatus.DISCARDED;
 
   useRegisterAiAssistantView({
     enabled: Boolean(activeWorkspace && selected),
@@ -977,6 +1007,18 @@ export const Drafts = () => {
                 {/* Right sidebar (not shown in compare mode) */}
                 {tab !== 'compare' && (
                   <div className="draft-sidebar">
+                    <div className="draft-sidebar-section">
+                      <div className="draft-sidebar-section-title">
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-1)' }}>
+                          <IconMapPin size={12} /> Article Location
+                        </span>
+                      </div>
+                      <PlacementSummary
+                        current={selected.branch.placement}
+                        emptyMessage="This draft target does not have placement metadata yet."
+                      />
+                    </div>
+
                     {/* Validation */}
                     <div className="draft-sidebar-section">
                       <div className="draft-sidebar-section-title">

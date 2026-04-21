@@ -35,4 +35,5 @@ export var TemplatePackType;
     TemplatePackType["TROUBLESHOOTING"] = "troubleshooting";
     TemplatePackType["POLICY_NOTICE"] = "policy_notice";
     TemplatePackType["FEATURE_OVERVIEW"] = "feature_overview";
+    TemplatePackType["PROPOSAL_CREATION"] = "proposal_creation";
 })(TemplatePackType || (TemplatePackType = {}));

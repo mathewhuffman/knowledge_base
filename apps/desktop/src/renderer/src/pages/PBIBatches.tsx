@@ -1,18 +1,27 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
+  type ExplorerNode,
   MAX_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
   MIN_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
+  type PBIBatchAnalysisConfigResponse,
+  type PBIBatchAnalysisConfigSetRequest,
   PBIBatchStatus,
   PBIBatchScopeMode,
+  type PBIBatchGuaranteedCreateArticle,
+  type PBIBatchGuaranteedCreateConflict,
+  type PBIBatchGuaranteedEditFamily,
   normalizeBatchAnalysisWorkerStageBudgetMinutes,
   type PBIBatchRecord,
+  type PBIBatchPreflightResponse,
   type PBIRecord,
   type PBIBatchImportSummary,
   type PBIBatchScopePayload,
   type PBIBatchDeleteRequest,
   type AgentSessionRecord,
   type PersistedAgentAnalysisRunResponse,
+  type SearchResponse,
+  type SearchResult,
 } from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
@@ -42,7 +51,7 @@ const WIZARD_STEPS: WizardStep[] = ['upload', 'summary', 'scope', 'preflight'];
 const WIZARD_STEP_LABELS: Record<WizardStep, string> = {
   upload: 'Upload',
   summary: 'Review',
-  scope: 'Scope',
+  scope: 'Scope & Targets',
   preflight: 'Confirm',
 };
 
@@ -150,6 +159,73 @@ function recommendWorkerStageBudgetMinutes(scopedCount: number): number {
     return 15;
   }
   return DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES;
+}
+
+function normalizeTitleKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function makeClientId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `create-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildGuaranteedEditFamilyFromExplorerNode(
+  node: ExplorerNode,
+  selectedFromLocaleVariantId?: string
+): PBIBatchGuaranteedEditFamily | null {
+  const resolvedLocaleVariants = node.locales
+    .filter((locale) => locale.revision.state !== 'retired' && !locale.hasConflicts)
+    .map((locale) => ({
+      localeVariantId: locale.localeVariantId,
+      locale: locale.locale
+    }))
+    .sort((left, right) => left.locale.localeCompare(right.locale));
+
+  if (resolvedLocaleVariants.length === 0) {
+    return null;
+  }
+
+  return {
+    familyId: node.familyId,
+    familyTitle: node.title,
+    selectedFromLocaleVariantId,
+    mode: 'all_live_locales',
+    resolvedLocaleVariants,
+    sectionId: node.sectionId,
+    sectionName: node.sectionName,
+    categoryId: node.categoryId,
+    categoryName: node.categoryName
+  };
+}
+
+function dedupeSearchResultsByFamily(results: SearchResult[]): SearchResult[] {
+  const seen = new Set<string>();
+  const deduped: SearchResult[] = [];
+  for (const result of results) {
+    if (seen.has(result.familyId)) {
+      continue;
+    }
+    seen.add(result.familyId);
+    deduped.push(result);
+  }
+  return deduped;
+}
+
+function createGuaranteedCreateArticle(title: string, targetLocale: string): PBIBatchGuaranteedCreateArticle | null {
+  const trimmedTitle = title.trim();
+  const trimmedLocale = targetLocale.trim().toLowerCase();
+  if (!trimmedTitle || !trimmedLocale) {
+    return null;
+  }
+  return {
+    clientId: makeClientId(),
+    title: trimmedTitle,
+    targetLocale: trimmedLocale,
+    source: 'manual'
+  };
 }
 
 /* ---------- Sub-components ---------- */
@@ -288,6 +364,8 @@ function PreflightPanel({
   ignoredCount,
   scopedCount,
   candidateTitles,
+  analysisConfig,
+  guaranteedCreateConflicts,
   workerStageBudgetMinutes,
   recommendedWorkerStageBudgetMinutes,
   onWorkerStageBudgetMinutesChange,
@@ -299,6 +377,8 @@ function PreflightPanel({
   ignoredCount: number;
   scopedCount: number;
   candidateTitles: string[];
+  analysisConfig: PBIBatchPreflightResponse['analysisConfig'];
+  guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
   workerStageBudgetMinutes: number;
   recommendedWorkerStageBudgetMinutes: number;
   onWorkerStageBudgetMinutesChange: (minutes: number) => void;
@@ -335,8 +415,56 @@ function PreflightPanel({
             )}
             <span>{scopedCount} row{scopedCount !== 1 ? 's' : ''} in scope for AI analysis</span>
           </div>
+          <div className="preflight-item">
+            <IconCheckCircle size={14} className="preflight-item-icon preflight-item-icon--pass" />
+            <span>
+              {analysisConfig.guaranteedEditFamilies.length} guaranteed edit family
+              {analysisConfig.guaranteedEditFamilies.length === 1 ? '' : 'ies'} covering{' '}
+              {analysisConfig.guaranteedEditFamilies.reduce((total, family) => total + family.resolvedLocaleVariants.length, 0)} live locale
+              {analysisConfig.guaranteedEditFamilies.reduce((total, family) => total + family.resolvedLocaleVariants.length, 0) === 1 ? '' : 's'}
+            </span>
+          </div>
+          <div className="preflight-item">
+            <IconCheckCircle size={14} className="preflight-item-icon preflight-item-icon--pass" />
+            <span>{analysisConfig.guaranteedCreateArticles.length} guaranteed create target{analysisConfig.guaranteedCreateArticles.length === 1 ? '' : 's'}</span>
+          </div>
         </div>
       </div>
+
+      {(analysisConfig.guaranteedEditFamilies.length > 0 || analysisConfig.guaranteedCreateArticles.length > 0 || analysisConfig.analysisGuidancePrompt) && (
+        <div className="preflight-section">
+          <div className="preflight-heading">Guaranteed Targets</div>
+          {analysisConfig.guaranteedEditFamilies.map((family) => (
+            <div key={family.familyId} className="preflight-target-line">
+              <strong>Edit:</strong> {family.familyTitle} ({family.resolvedLocaleVariants.map((variant) => variant.locale).join(', ')})
+            </div>
+          ))}
+          {analysisConfig.guaranteedCreateArticles.map((article) => (
+            <div key={article.clientId} className="preflight-target-line">
+              <strong>Create:</strong> {article.title} ({article.targetLocale})
+            </div>
+          ))}
+          {analysisConfig.analysisGuidancePrompt && (
+            <div className="preflight-guidance-box">{analysisConfig.analysisGuidancePrompt}</div>
+          )}
+        </div>
+      )}
+
+      {guaranteedCreateConflicts.length > 0 && (
+        <div className="preflight-section">
+          <div className="preflight-heading">Clarification Needed</div>
+          <div className="preflight-warning-banner">
+            <IconAlertCircle size={14} />
+            <div>
+              {guaranteedCreateConflicts.map((conflict) => (
+                <div key={conflict.clientId}>
+                  {conflict.title} ({conflict.targetLocale}) overlaps {conflict.matches.map((match) => `${match.title} (${match.locale})`).join(', ')} and will pause for user input before approval.
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="preflight-section">
         <div className="preflight-heading">Worker Time Budget</div>
@@ -401,20 +529,18 @@ interface WizardState {
   scopeMode: PBIBatchScopeMode;
   scopeSelectedRows: number[];
   scopeSaving: boolean;
+  scopeError: string | null;
   scopeResult: PBIBatchScopePayload | null;
+  guaranteedEditFamilies: PBIBatchGuaranteedEditFamily[];
+  guaranteedCreateArticles: PBIBatchGuaranteedCreateArticle[];
+  guaranteedCreateInput: string;
+  analysisGuidancePrompt: string;
+  guaranteedCreateConflicts: PBIBatchGuaranteedCreateConflict[];
   preflightLoading: boolean;
   preflightError: string | null;
   workerStageBudgetMinutes: number;
   workerStageBudgetDirty: boolean;
-  preflightData: {
-    batch: PBIBatchRecord;
-    candidateRows: PBIRecord[];
-    invalidRows: PBIRecord[];
-    duplicateRows: PBIRecord[];
-    ignoredRows: PBIRecord[];
-    scopePayload: PBIBatchScopePayload;
-    candidateTitles: string[];
-  } | null;
+  preflightData: PBIBatchPreflightResponse | null;
   submitting: boolean;
   submitError: string | null;
 }
@@ -428,7 +554,13 @@ const WIZARD_INITIAL: WizardState = {
   scopeMode: PBIBatchScopeMode.ALL,
   scopeSelectedRows: [],
   scopeSaving: false,
+  scopeError: null,
   scopeResult: null,
+  guaranteedEditFamilies: [],
+  guaranteedCreateArticles: [],
+  guaranteedCreateInput: '',
+  analysisGuidancePrompt: '',
+  guaranteedCreateConflicts: [],
   preflightLoading: false,
   preflightError: null,
   workerStageBudgetMinutes: DEFAULT_BATCH_ANALYSIS_WORKER_STAGE_BUDGET_MINUTES,
@@ -460,6 +592,11 @@ export const PBI = () => {
   const [cachedBatches, setCachedBatches] = useState<PBIBatchRecord[]>([]);
   const [cachedSessions, setCachedSessions] = useState<AgentSessionRecord[]>([]);
   const [persistedAnalysisStateByBatchId, setPersistedAnalysisStateByBatchId] = useState<Record<string, PersistedAnalysisState>>({});
+  const [articlePickerTree, setArticlePickerTree] = useState<ExplorerNode[]>([]);
+  const [articlePickerTreeLoading, setArticlePickerTreeLoading] = useState(false);
+  const [articlePickerSearch, setArticlePickerSearch] = useState('');
+  const [articlePickerSearchLoading, setArticlePickerSearchLoading] = useState(false);
+  const [articlePickerSearchResults, setArticlePickerSearchResults] = useState<SearchResult[]>([]);
   const batches = useMemo(() => {
     const data = batchListQuery.data;
     if (data && Array.isArray(data.batches)) {
@@ -483,6 +620,11 @@ export const PBI = () => {
   useEffect(() => {
     wizardRef.current = wizard;
   }, [wizard]);
+
+  const articleFamilyById = useMemo(
+    () => new Map(articlePickerTree.map((node) => [node.familyId, node])),
+    [articlePickerTree]
+  );
 
   // Fetch batch list on mount
   useEffect(() => {
@@ -558,6 +700,75 @@ export const PBI = () => {
   }, [activeWorkspace?.id, batches]);
 
   useEffect(() => {
+    if (!activeWorkspace || !wizard.open || wizard.step !== 'scope') {
+      return;
+    }
+    let cancelled = false;
+    setArticlePickerTreeLoading(true);
+    void (async () => {
+      try {
+        const response = await window.kbv.invoke<{ workspaceId?: string; nodes: ExplorerNode[] }>('workspace.explorer.getTree', {
+          workspaceId: activeWorkspace.id
+        });
+        if (!cancelled) {
+          setArticlePickerTree(response.ok && response.data?.nodes ? response.data.nodes : []);
+        }
+      } finally {
+        if (!cancelled) {
+          setArticlePickerTreeLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace?.id, wizard.open, wizard.step]);
+
+  useEffect(() => {
+    if (!activeWorkspace || !wizard.open || wizard.step !== 'scope') {
+      return;
+    }
+    const query = articlePickerSearch.trim();
+    if (!query) {
+      setArticlePickerSearchResults([]);
+      setArticlePickerSearchLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setArticlePickerSearchLoading(true);
+    const timeout = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const response = await window.kbv.invoke<SearchResponse>('workspace.search', {
+            workspaceId: activeWorkspace.id,
+            query,
+            scope: 'live',
+            includeArchived: false
+          });
+          if (!cancelled) {
+            setArticlePickerSearchResults(
+              response.ok && response.data?.results
+                ? dedupeSearchResultsByFamily(response.data.results).slice(0, 8)
+                : []
+            );
+          }
+        } finally {
+          if (!cancelled) {
+            setArticlePickerSearchLoading(false);
+          }
+        }
+      })();
+    }, 180);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [activeWorkspace?.id, articlePickerSearch, wizard.open, wizard.step]);
+
+  useEffect(() => {
     if (!activeWorkspace) {
       setActiveAnalysisBatchIds([]);
       return;
@@ -607,18 +818,27 @@ export const PBI = () => {
   const openWizard = useCallback(() => {
     setAnalysisBatch(null);
     setAnalysisAutoRun(false);
+    setArticlePickerSearch('');
+    setArticlePickerSearchResults([]);
+    setArticlePickerTree([]);
     setWizard({ ...WIZARD_INITIAL, open: true });
   }, []);
 
   const openWizardForFileDrag = useCallback(() => {
     setAnalysisBatch(null);
     setAnalysisAutoRun(false);
+    setArticlePickerSearch('');
+    setArticlePickerSearchResults([]);
+    setArticlePickerTree([]);
     setWizard((current) => (current.open ? current : { ...WIZARD_INITIAL, open: true }));
   }, []);
 
   const closeWizard = useCallback(() => {
     fileDragDepthRef.current = 0;
     setFileDragActive(false);
+    setArticlePickerSearch('');
+    setArticlePickerSearchResults([]);
+    setArticlePickerTree([]);
     setWizard(WIZARD_INITIAL);
     // Refresh batch list after close
     if (activeWorkspace) {
@@ -908,33 +1128,170 @@ export const PBI = () => {
     }
   }, [activeWorkspace, handleFileSelect]);
 
+  const markScopeDirty = useCallback(() => {
+    setWizard((s) => ({
+      ...s,
+      scopeResult: null,
+      scopeError: null,
+      preflightData: null,
+      preflightError: null,
+      guaranteedCreateConflicts: [],
+      submitError: null,
+    }));
+  }, []);
+
+  const handleSelectGuaranteedEditFamily = useCallback((familyId: string, selectedFromLocaleVariantId?: string) => {
+    const familyNode = articleFamilyById.get(familyId);
+    const nextFamily = familyNode
+      ? buildGuaranteedEditFamilyFromExplorerNode(familyNode, selectedFromLocaleVariantId)
+      : null;
+    if (!nextFamily) {
+      setWizard((s) => ({
+        ...s,
+        scopeError: 'That article does not currently have any live locales to guarantee edits for.',
+      }));
+      return;
+    }
+
+    setWizard((s) => ({
+      ...s,
+      scopeResult: null,
+      scopeError: null,
+      preflightData: null,
+      preflightError: null,
+      guaranteedCreateConflicts: [],
+      guaranteedEditFamilies: s.guaranteedEditFamilies.some((family) => family.familyId === nextFamily.familyId)
+        ? s.guaranteedEditFamilies
+        : [...s.guaranteedEditFamilies, nextFamily].sort((left, right) => left.familyTitle.localeCompare(right.familyTitle)),
+      submitError: null,
+    }));
+    setArticlePickerSearch('');
+    setArticlePickerSearchResults([]);
+  }, [articleFamilyById]);
+
+  const handleRemoveGuaranteedEditFamily = useCallback((familyId: string) => {
+    setWizard((s) => ({
+      ...s,
+      scopeResult: null,
+      scopeError: null,
+      preflightData: null,
+      preflightError: null,
+      guaranteedCreateConflicts: [],
+      guaranteedEditFamilies: s.guaranteedEditFamilies.filter((family) => family.familyId !== familyId),
+      submitError: null,
+    }));
+  }, []);
+
+  const handleAddGuaranteedCreateArticle = useCallback(() => {
+    if (!activeWorkspace) {
+      return;
+    }
+    const nextArticle = createGuaranteedCreateArticle(wizard.guaranteedCreateInput, activeWorkspace.defaultLocale);
+    if (!nextArticle) {
+      return;
+    }
+    setWizard((s) => {
+      const alreadyExists = s.guaranteedCreateArticles.some((article) =>
+        normalizeTitleKey(article.title) === normalizeTitleKey(nextArticle.title)
+        && article.targetLocale === nextArticle.targetLocale
+      );
+      return {
+        ...s,
+        scopeResult: null,
+        scopeError: null,
+        preflightData: null,
+        preflightError: null,
+        guaranteedCreateConflicts: [],
+        guaranteedCreateInput: '',
+        guaranteedCreateArticles: alreadyExists
+          ? s.guaranteedCreateArticles
+          : [...s.guaranteedCreateArticles, nextArticle].sort((left, right) => left.title.localeCompare(right.title)),
+        submitError: null,
+      };
+    });
+  }, [activeWorkspace, wizard.guaranteedCreateInput]);
+
+  const handleRemoveGuaranteedCreateArticle = useCallback((clientId: string) => {
+    setWizard((s) => ({
+      ...s,
+      scopeResult: null,
+      scopeError: null,
+      preflightData: null,
+      preflightError: null,
+      guaranteedCreateConflicts: [],
+      guaranteedCreateArticles: s.guaranteedCreateArticles.filter((article) => article.clientId !== clientId),
+      submitError: null,
+    }));
+  }, []);
+
   // ---- Scope step ----
   const handleScopeSet = useCallback(async () => {
     if (!activeWorkspace || !wizard.importResult) return;
 
-    setWizard((s) => ({ ...s, scopeSaving: true }));
+    setWizard((s) => ({ ...s, scopeSaving: true, scopeError: null }));
 
     try {
-      const res = await window.kbv.invoke<{ batch: PBIBatchRecord; scope: PBIBatchScopePayload }>('pbiBatch.scope.set', {
+      const scopeRes = await window.kbv.invoke<{ batch: PBIBatchRecord; scope: PBIBatchScopePayload }>('pbiBatch.scope.set', {
         workspaceId: activeWorkspace.id,
         batchId: wizard.importResult.batch.id,
         mode: wizard.scopeMode,
         selectedRows: wizard.scopeSelectedRows.length > 0 ? wizard.scopeSelectedRows : undefined,
       });
 
-      if (res.ok && res.data) {
+      const analysisConfigPayload: PBIBatchAnalysisConfigSetRequest = {
+        workspaceId: activeWorkspace.id,
+        batchId: wizard.importResult.batch.id,
+        analysisConfig: {
+          guaranteedEditSelections: wizard.guaranteedEditFamilies.map((family) => ({
+            familyId: family.familyId,
+            localeVariantId: family.selectedFromLocaleVariantId,
+          })),
+          guaranteedCreateArticles: wizard.guaranteedCreateArticles.map((article) => ({
+            clientId: article.clientId,
+            title: article.title,
+            targetLocale: article.targetLocale,
+          })),
+          analysisGuidancePrompt: wizard.analysisGuidancePrompt,
+        },
+      };
+      const analysisRes = await window.kbv.invoke<PBIBatchAnalysisConfigResponse>(
+        'pbiBatch.analysisConfig.set',
+        analysisConfigPayload
+      );
+
+      if (scopeRes.ok && scopeRes.data && analysisRes.ok && analysisRes.data) {
         setWizard((s) => ({
           ...s,
           scopeSaving: false,
-          scopeResult: res.data!.scope,
+          scopeResult: scopeRes.data!.scope,
+          guaranteedEditFamilies: analysisRes.data!.analysisConfig.guaranteedEditFamilies,
+          guaranteedCreateArticles: analysisRes.data!.analysisConfig.guaranteedCreateArticles,
+          analysisGuidancePrompt: analysisRes.data!.analysisConfig.analysisGuidancePrompt ?? '',
+          guaranteedCreateConflicts: analysisRes.data!.guaranteedCreateConflicts,
         }));
       } else {
-        setWizard((s) => ({ ...s, scopeSaving: false }));
+        setWizard((s) => ({
+          ...s,
+          scopeSaving: false,
+          scopeError: scopeRes.error?.message ?? analysisRes.error?.message ?? 'Failed to save scope and targets.',
+        }));
       }
     } catch {
-      setWizard((s) => ({ ...s, scopeSaving: false }));
+      setWizard((s) => ({
+        ...s,
+        scopeSaving: false,
+        scopeError: 'Failed to save scope and targets.',
+      }));
     }
-  }, [activeWorkspace, wizard.importResult, wizard.scopeMode, wizard.scopeSelectedRows]);
+  }, [
+    activeWorkspace,
+    wizard.analysisGuidancePrompt,
+    wizard.guaranteedCreateArticles,
+    wizard.guaranteedEditFamilies,
+    wizard.importResult,
+    wizard.scopeMode,
+    wizard.scopeSelectedRows,
+  ]);
 
   // ---- Preflight step ----
   const handleLoadPreflight = useCallback(async () => {
@@ -1083,12 +1440,32 @@ export const PBI = () => {
         );
 
       case 'scope':
+        {
+        const browseFamilies = articlePickerTree
+          .map((node) => buildGuaranteedEditFamilyFromExplorerNode(node))
+          .filter((family): family is PBIBatchGuaranteedEditFamily => Boolean(family))
+          .slice(0, 12);
         return (
           <>
+            {wizard.scopeError && (
+              <div className="preflight-warning-banner" style={{ marginBottom: 'var(--space-4)' }}>
+                <IconAlertCircle size={14} />
+                <span>{wizard.scopeError}</span>
+              </div>
+            )}
             <ScopeModePicker
               mode={wizard.scopeMode}
               onModeChange={(m) => {
-                setWizard((s) => ({ ...s, scopeMode: m, scopeResult: null }));
+                setWizard((s) => ({
+                  ...s,
+                  scopeMode: m,
+                  scopeResult: null,
+                  scopeError: null,
+                  preflightData: null,
+                  preflightError: null,
+                  guaranteedCreateConflicts: [],
+                  submitError: null,
+                }));
               }}
               scopedCount={wizard.scopeResult?.scopedCount ?? undefined}
             />
@@ -1108,13 +1485,21 @@ export const PBI = () => {
                             type="checkbox"
                             checked={selected}
                             onChange={() => {
-                              setWizard((s) => ({
-                                ...s,
-                                scopeResult: null,
-                                scopeSelectedRows: selected
+                              setWizard((s) => {
+                                const nextSelectedRows = selected
                                   ? s.scopeSelectedRows.filter((n) => n !== row.sourceRowNumber)
-                                  : [...s.scopeSelectedRows, row.sourceRowNumber],
-                              }));
+                                  : [...s.scopeSelectedRows, row.sourceRowNumber];
+                                return {
+                                  ...s,
+                                  scopeResult: null,
+                                  scopeError: null,
+                                  preflightData: null,
+                                  preflightError: null,
+                                  guaranteedCreateConflicts: [],
+                                  scopeSelectedRows: nextSelectedRows,
+                                  submitError: null,
+                                };
+                              });
                             }}
                           />
                           <span style={{ fontFamily: 'var(--font-mono)', minWidth: 32 }}>#{row.sourceRowNumber}</span>
@@ -1125,8 +1510,183 @@ export const PBI = () => {
                 </div>
               </div>
             )}
+
+            <div className="scope-section">
+              <div className="scope-section-heading">Guaranteed Article Edits</div>
+              <div className="scope-section-copy">
+                Select existing KB articles that must be edited. Each selection expands to every live locale in that article family.
+              </div>
+              <div className="analysis-target-search-row">
+                <input
+                  className="input"
+                  value={articlePickerSearch}
+                  onChange={(event) => {
+                    setArticlePickerSearch(event.target.value);
+                  }}
+                  placeholder="Search existing live articles by title"
+                />
+              </div>
+              {articlePickerSearchLoading && (
+                <div className="analysis-target-hint">Searching articles...</div>
+              )}
+              {!articlePickerSearchLoading && articlePickerSearch.trim() && articlePickerSearchResults.length === 0 && (
+                <div className="analysis-target-hint">No live article matches yet.</div>
+              )}
+              {articlePickerSearchResults.length > 0 && (
+                <div className="analysis-target-search-results">
+                  {articlePickerSearchResults.map((result) => {
+                    const familyNode = articleFamilyById.get(result.familyId);
+                    const resolvedFamily = familyNode ? buildGuaranteedEditFamilyFromExplorerNode(familyNode, result.localeVariantId) : null;
+                    return (
+                      <button
+                        key={`${result.familyId}-${result.localeVariantId}`}
+                        className="analysis-target-result"
+                        type="button"
+                        onClick={() => handleSelectGuaranteedEditFamily(result.familyId, result.localeVariantId)}
+                        disabled={!resolvedFamily}
+                      >
+                        <div>
+                          <div className="analysis-target-result-title">{result.title}</div>
+                          <div className="analysis-target-result-meta">
+                            {resolvedFamily
+                              ? `${resolvedFamily.resolvedLocaleVariants.length} live locale${resolvedFamily.resolvedLocaleVariants.length === 1 ? '' : 's'}`
+                              : 'No live locales available'}
+                          </div>
+                        </div>
+                        <span className="analysis-target-result-snippet">{result.snippet}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {!articlePickerSearch.trim() && (
+                <>
+                  <div className="analysis-target-hint">
+                    {articlePickerTreeLoading ? 'Loading article families...' : 'Quick pick from live article families:'}
+                  </div>
+                  <div className="analysis-target-browse-list">
+                    {browseFamilies.map((family) => (
+                      <button
+                        key={family.familyId}
+                        className="analysis-target-chip"
+                        type="button"
+                        onClick={() => handleSelectGuaranteedEditFamily(family.familyId)}
+                      >
+                        {family.familyTitle}
+                        <span>{family.resolvedLocaleVariants.map((variant) => variant.locale).join(', ')}</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+              <div className="analysis-target-selected-list">
+                {wizard.guaranteedEditFamilies.map((family) => (
+                  <div key={family.familyId} className="analysis-target-selected-card">
+                    <div>
+                      <div className="analysis-target-selected-title">{family.familyTitle}</div>
+                      <div className="analysis-target-selected-meta">
+                        {family.resolvedLocaleVariants.map((variant) => variant.locale).join(', ')}
+                      </div>
+                    </div>
+                    <button
+                      className="btn btn-ghost btn-icon"
+                      type="button"
+                      onClick={() => handleRemoveGuaranteedEditFamily(family.familyId)}
+                      aria-label={`Remove ${family.familyTitle}`}
+                    >
+                      <IconX size={14} />
+                    </button>
+                  </div>
+                ))}
+                {wizard.guaranteedEditFamilies.length === 0 && (
+                  <div className="analysis-target-hint">No guaranteed edit targets selected yet.</div>
+                )}
+              </div>
+            </div>
+
+            <div className="scope-section">
+              <div className="scope-section-heading">Guaranteed Article Creates</div>
+              <div className="scope-section-copy">
+                Add article titles that must be created in {activeWorkspace?.defaultLocale}.
+              </div>
+              <div className="analysis-target-create-row">
+                <input
+                  className="input"
+                  value={wizard.guaranteedCreateInput}
+                  onChange={(event) => {
+                    setWizard((s) => ({ ...s, guaranteedCreateInput: event.target.value }));
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      handleAddGuaranteedCreateArticle();
+                    }
+                  }}
+                  placeholder="Type an article title and press Enter"
+                />
+                <button className="btn btn-secondary" type="button" onClick={handleAddGuaranteedCreateArticle}>
+                  Add
+                </button>
+              </div>
+              <div className="analysis-target-selected-list">
+                {wizard.guaranteedCreateArticles.map((article) => (
+                  <div key={article.clientId} className="analysis-target-selected-card">
+                    <div>
+                      <div className="analysis-target-selected-title">{article.title}</div>
+                      <div className="analysis-target-selected-meta">{article.targetLocale}</div>
+                    </div>
+                    <button
+                      className="btn btn-ghost btn-icon"
+                      type="button"
+                      onClick={() => handleRemoveGuaranteedCreateArticle(article.clientId)}
+                      aria-label={`Remove ${article.title}`}
+                    >
+                      <IconX size={14} />
+                    </button>
+                  </div>
+                ))}
+                {wizard.guaranteedCreateArticles.length === 0 && (
+                  <div className="analysis-target-hint">No guaranteed create targets added yet.</div>
+                )}
+              </div>
+              {wizard.guaranteedCreateConflicts.length > 0 && (
+                <div className="analysis-target-conflict-list">
+                  {wizard.guaranteedCreateConflicts.map((conflict) => (
+                    <div key={conflict.clientId} className="analysis-target-conflict-card">
+                      <div className="analysis-target-conflict-title">
+                        {conflict.title} ({conflict.targetLocale})
+                      </div>
+                      <div className="analysis-target-conflict-copy">
+                        This may already exist and will pause for clarification before planning continues.
+                      </div>
+                      <div className="analysis-target-conflict-matches">
+                        {conflict.matches.map((match) => `${match.title} (${match.locale})`).join(', ')}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="scope-section">
+              <div className="scope-section-heading">Analysis Guidance</div>
+              <div className="scope-section-copy">
+                Optional instructions for how the analyzer should think about the selected PBIs and article targets.
+              </div>
+              <textarea
+                className="textarea"
+                rows={5}
+                value={wizard.analysisGuidancePrompt}
+                onChange={(event) => {
+                  markScopeDirty();
+                  setWizard((s) => ({ ...s, analysisGuidancePrompt: event.target.value }));
+                }}
+                placeholder="Optional guidance for the planner and reviewer"
+              />
+            </div>
           </>
         );
+        }
 
       case 'preflight': {
         if (wizard.preflightLoading) return <LoadingState message="Running preflight checks..." />;
@@ -1151,6 +1711,8 @@ export const PBI = () => {
               ignoredCount={wizard.preflightData.ignoredRows.length}
               scopedCount={wizard.preflightData.scopePayload.scopedCount ?? 0}
               candidateTitles={wizard.preflightData.candidateTitles}
+              analysisConfig={wizard.preflightData.analysisConfig}
+              guaranteedCreateConflicts={wizard.preflightData.guaranteedCreateConflicts}
               workerStageBudgetMinutes={wizard.workerStageBudgetMinutes}
               recommendedWorkerStageBudgetMinutes={recommendedWorkerStageBudgetMinutes}
               onWorkerStageBudgetMinutesChange={(minutes) => {
@@ -1188,7 +1750,7 @@ export const PBI = () => {
           <button className="btn btn-ghost" onClick={closeWizard}>Cancel</button>
           {wizard.step === 'summary' && (
             <button className="btn btn-primary" onClick={() => goToStep('scope')}>
-              Continue to Scoping
+              Continue to Scope & Targets
             </button>
           )}
           {wizard.step === 'scope' && (
@@ -1199,7 +1761,7 @@ export const PBI = () => {
                   disabled={wizard.scopeSaving}
                   onClick={handleScopeSet}
                 >
-                  {wizard.scopeSaving ? 'Saving...' : 'Apply Scope'}
+                  {wizard.scopeSaving ? 'Saving...' : 'Apply Scope & Targets'}
                 </button>
               )}
               {wizard.scopeResult && (

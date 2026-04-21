@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { test, expect } from '@playwright/test';
@@ -960,6 +960,124 @@ test.describe('workspace repository content model', () => {
 
     expect(context?.batch.id).toBe(batch.id);
     expect(context?.candidateRows).toHaveLength(2);
+  });
+
+  test('persists batch analysis config with frozen locale expansion and surfaces guaranteed create conflicts', async () => {
+    const created = await repository.createWorkspace({
+      name: `BatchAnalysisConfig-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint Targets',
+      'sprint-targets.csv',
+      'imports/sprint-targets.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    await repository.upsertKbScopeCatalogEntries(created.id, [
+      {
+        workspaceId: created.id,
+        scopeType: 'category',
+        scopeId: '200',
+        displayName: 'Operations',
+        source: 'zendesk'
+      },
+      {
+        workspaceId: created.id,
+        scopeType: 'section',
+        scopeId: '201',
+        parentScopeId: '200',
+        displayName: 'Billing Dashboard',
+        source: 'zendesk'
+      }
+    ]);
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'existing-setup-article',
+      title: 'Existing Setup Article'
+    });
+    const enVariant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'en-us',
+      status: RevisionState.LIVE
+    });
+    const frVariant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'fr-fr',
+      status: RevisionState.LIVE
+    });
+    await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: enVariant.id,
+      revisionType: RevisionState.LIVE,
+      filePath: 'articles/existing-setup-article/en-us.html',
+      revisionNumber: 1,
+      status: RevisionStatus.ACTIVE
+    });
+    await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: frVariant.id,
+      revisionType: RevisionState.LIVE,
+      filePath: 'articles/existing-setup-article/fr-fr.html',
+      revisionNumber: 1,
+      status: RevisionStatus.ACTIVE
+    });
+
+    const analysisState = await repository.setPBIBatchAnalysisConfig(created.id, batch.id, {
+      guaranteedEditSelections: [{ familyId: family.id }],
+      guaranteedCreateArticles: [
+        {
+          clientId: 'create-setup',
+          title: 'Existing Setup Article',
+          targetLocale: 'en-us',
+          categoryId: '200',
+          sectionId: '201'
+        }
+      ],
+      analysisGuidancePrompt: 'Prefer reuse where possible.'
+    });
+
+    expect(analysisState.analysisConfig.guaranteedEditFamilies).toHaveLength(1);
+    expect(
+      analysisState.analysisConfig.guaranteedEditFamilies[0]?.resolvedLocaleVariants.map((variant) => variant.locale)
+    ).toEqual(['en-us', 'fr-fr']);
+    expect(analysisState.analysisConfig.guaranteedCreateArticles[0]).toMatchObject({
+      clientId: 'create-setup',
+      title: 'Existing Setup Article',
+      targetLocale: 'en-us',
+      categoryId: '200',
+      categoryName: 'Operations',
+      sectionId: '201',
+      sectionName: 'Billing Dashboard'
+    });
+    expect(analysisState.analysisConfig.analysisGuidancePrompt).toBe('Prefer reuse where possible.');
+    expect(analysisState.guaranteedCreateConflicts).toHaveLength(1);
+    expect(analysisState.guaranteedCreateConflicts[0]?.matches[0]?.title).toBe('Existing Setup Article');
+
+    const context = await repository.getBatchContext(created.id, batch.id);
+    expect(context?.analysisConfig.guaranteedEditFamilies).toHaveLength(1);
+    expect(context?.analysisConfig.guaranteedCreateArticles[0]).toMatchObject({
+      categoryId: '200',
+      categoryName: 'Operations',
+      sectionId: '201',
+      sectionName: 'Billing Dashboard'
+    });
+    expect(context?.guaranteedCreateConflicts).toHaveLength(1);
   });
 
   test('preserves latest approved plan when a newer revision draft exists and returns plans newest-first', async () => {
@@ -2024,6 +2142,88 @@ test.describe('workspace repository content model', () => {
     expect(visibleBatchList.batches[0]?.pendingReviewCount).toBe(1);
   });
 
+  test('hydrates edit proposal diffs from family and locale when variant identity is missing', async () => {
+    const created = await repository.createWorkspace({
+      name: `ProposalDiffRecovery-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'kb-proposal-diff-recovery',
+      title: 'Proposal Diff Recovery'
+    });
+    const variant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'en-us',
+      status: RevisionState.LIVE
+    });
+
+    const relativeLivePath = 'articles/proposal-diff-recovery/live.html';
+    const absoluteLivePath = path.join(created.path, relativeLivePath);
+    await mkdir(path.dirname(absoluteLivePath), { recursive: true });
+    await writeFile(
+      absoluteLivePath,
+      '<h1>Proposal Diff Recovery</h1>\n<p>Old flow.</p>',
+      'utf8'
+    );
+
+    await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      revisionType: RevisionState.LIVE,
+      filePath: relativeLivePath,
+      revisionNumber: 1,
+      status: RevisionStatus.OPEN
+    });
+
+    const batch = await repository.createPBIBatch(
+      created.id,
+      'Sprint 43',
+      'sprint-43.csv',
+      'imports/sprint-43.csv',
+      PBIImportFormat.CSV,
+      1,
+      {
+        candidateRowCount: 1,
+        malformedRowCount: 0,
+        duplicateRowCount: 0,
+        ignoredRowCount: 0,
+        scopedRowCount: 1
+      },
+      PBIBatchScopeMode.ALL
+    );
+
+    const proposal = await repository.createAgentProposal({
+      workspaceId: created.id,
+      batchId: batch.id,
+      action: 'edit',
+      familyId: family.id,
+      targetTitle: 'Proposal Diff Recovery',
+      targetLocale: 'en-us',
+      proposedHtml: '<h1>Proposal Diff Recovery</h1>\n<p>New flow.</p>'
+    });
+
+    const detail = await repository.getProposalReviewDetail(created.id, proposal.id);
+
+    expect(detail.diff.beforeHtml).toContain('Old flow.');
+    expect(detail.diff.afterHtml).toContain('New flow.');
+    expect(detail.diff.sourceDiff.lines).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'removed',
+          content: '<p>Old flow.</p>'
+        }),
+        expect.objectContaining({
+          kind: 'added',
+          content: '<p>New flow.</p>'
+        })
+      ])
+    );
+  });
+
   test('lists PBI library rows across the full workspace', async () => {
     const created = await repository.createWorkspace({
       name: `PBILibraryWorkspace-${randomUUID()}`,
@@ -2773,6 +2973,53 @@ test.describe('workspace repository content model', () => {
     expect(redone.branch.headRevisionId).toBe(saved.branch.headRevisionId);
   });
 
+  test('purges obsolete draft branches instead of keeping them in the draft listing', async () => {
+    const created = await repository.createWorkspace({
+      name: `DraftObsoletePurge-${randomUUID()}`,
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us'
+    });
+
+    const family = await repository.createArticleFamily({
+      workspaceId: created.id,
+      externalKey: 'kb-obsolete-purge',
+      title: 'Obsolete Purge'
+    });
+    const variant = await repository.createLocaleVariant({
+      workspaceId: created.id,
+      familyId: family.id,
+      locale: 'en-us',
+      status: RevisionState.LIVE
+    });
+    await repository.createRevision({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      revisionType: RevisionState.LIVE,
+      filePath: 'articles/obsolete-purge/live.html',
+      revisionNumber: 1,
+      status: RevisionStatus.OPEN
+    });
+
+    const branch = await repository.createDraftBranch({
+      workspaceId: created.id,
+      localeVariantId: variant.id,
+      name: 'Soon obsolete',
+      sourceHtml: '<h1>Obsolete Purge</h1><p>Draft to delete.</p>'
+    });
+    const headRevision = await repository.getRevision(created.id, branch.branch.headRevisionId);
+    const draftFilePath = path.join(created.path, headRevision.filePath);
+
+    await expect(access(draftFilePath)).resolves.toBeUndefined();
+
+    await repository.markDraftBranchesAsObsolete(created.id, variant.id);
+
+    const list = await repository.listDraftBranches(created.id, { workspaceId: created.id });
+    expect(list.branches).toHaveLength(0);
+    await expect(repository.getDraftBranchEditor(created.id, branch.branch.id)).rejects.toThrow('Draft branch not found');
+    await expect(repository.getRevision(created.id, branch.branch.headRevisionId)).rejects.toThrow('Revision not found');
+    await expect(access(draftFilePath)).rejects.toBeTruthy();
+  });
+
   test('supports batch 9 article ai persistence and template CRUD', async () => {
     const created = await repository.createWorkspace({
       name: `ArticleAi-${randomUUID()}`,
@@ -2815,6 +3062,21 @@ test.describe('workspace repository content model', () => {
 
     const templateList = await repository.listTemplatePackSummaries({ workspaceId: created.id, includeInactive: true });
     expect(templateList.templates.length).toBeGreaterThan(0);
+    expect(
+      templateList.templates.filter(
+        (template) => template.templateType === TemplatePackType.PROPOSAL_CREATION && template.active
+      )
+    ).toHaveLength(1);
+    const activeProposalTemplate = await repository.getActiveTemplatePackByType(
+      created.id,
+      TemplatePackType.PROPOSAL_CREATION
+    );
+    expect(activeProposalTemplate?.templateType).toBe(TemplatePackType.PROPOSAL_CREATION);
+    expect(activeProposalTemplate?.active).toBe(true);
+    const initialActiveTroubleshootingTemplate = templateList.templates.find(
+      (template) => template.templateType === TemplatePackType.TROUBLESHOOTING && template.active
+    );
+    expect(initialActiveTroubleshootingTemplate).toBeTruthy();
 
     const submitted = await repository.submitArticleAiMessage(
       {
@@ -2881,6 +3143,25 @@ test.describe('workspace repository content model', () => {
       examples: '<h1>Resolver un error</h1>'
     });
     expect(savedTemplate.templateType).toBe(TemplatePackType.TROUBLESHOOTING);
+    const reloadedTemplateList = await repository.listTemplatePackSummaries({
+      workspaceId: created.id,
+      includeInactive: true
+    });
+    expect(
+      reloadedTemplateList.templates.filter(
+        (template) => template.templateType === TemplatePackType.TROUBLESHOOTING && template.active
+      )
+    ).toHaveLength(1);
+    const activeTroubleshootingTemplate = await repository.getActiveTemplatePackByType(
+      created.id,
+      TemplatePackType.TROUBLESHOOTING
+    );
+    expect(activeTroubleshootingTemplate?.id).toBe(savedTemplate.id);
+    expect(
+      reloadedTemplateList.templates.find(
+        (template) => template.id === initialActiveTroubleshootingTemplate!.id
+      )?.active
+    ).toBe(false);
 
     const analyzed = await repository.analyzeTemplatePack({
       workspaceId: created.id,
