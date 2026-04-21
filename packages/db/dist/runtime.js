@@ -35,7 +35,8 @@ const CATALOG_SQL = `
     zendesk_brand_id TEXT,
     default_locale TEXT NOT NULL,
     enabled_locales TEXT NOT NULL,
-    state TEXT NOT NULL
+    state TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0
   );
 `;
 const MIGRATION_STATE_TABLE = `

@@ -3,6 +3,10 @@
   "compilerOptions": {
     "jsx": "react-jsx",
     "outDir": "./dist/renderer",
+    "baseUrl": ".",
+    "paths": {
+      "@kb-vault/shared-types": ["../../packages/shared-types/src"]
+    },
     "types": ["node"]
   },
   "include": ["src/renderer/**/*"]

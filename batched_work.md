@@ -833,6 +833,10 @@ Build the article-scoped AI refinement loop.
 What Codex needs to build:
 
 article-level ACP session lifecycle
+article-level chat session model so the user can type freeform requests to the LLM inside the article/draft context
+chat message persistence for article AI conversations
+reset-chat action that deletes the persisted article chat history and starts a fresh new chat session
+chat turn execution that applies the user’s typed request against the current article/draft context
 request types:
 rewrite for tone
 shorten
@@ -844,9 +848,11 @@ update locale
 insert image placeholders
 article-scoped context packing
 branch-aware prompt assembly
-AI patch proposal storage
-full rewrite proposal storage
-accept/reject patch application
+conversation-aware prompt assembly that includes the active article/draft plus recent chat turns
+in-view AI edit result generation that updates the article viewer immediately after the LLM returns changes
+direct accept/reject application flow inside the article editing view
+session-local pending AI edit state so the user can compare current content vs AI-updated content before accepting or rejecting
+accepted article AI edits persisted as revisions/history entries so they appear in the article history tab
 template pack CRUD
 template type support:
 standard how-to
@@ -862,8 +868,12 @@ locale-aware prompt behavior for English and Spanish
 Codex handoff to Claude must include:
 
 article AI session payload
-patch proposal payload
-rewrite proposal payload
+article AI chat transcript payload
+article AI message submission payload
+reset chat action payload
+article AI updated-content payload
+direct accept/reject edit payload
+article history update payload for accepted article AI edits
 template CRUD payloads
 preset action payloads
 locale-aware edit request payloads
@@ -871,7 +881,12 @@ locale-aware edit request payloads
 Definition of done:
 
 user can open any article/draft and ask AI to improve it
-AI edits still return as proposals or patches
+article chat history persists until the user explicitly resets it
+the user can reset article chat history and start fresh
+AI-requested article changes appear immediately in the article view when the LLM returns
+article-level AI edits do not go through Proposal Review
+the user can accept or reject AI-generated article updates directly in the article view
+accepted article AI edits show up in the article history tab
 templates and prompt packs are editable locally
 Claude Batch 9
 
@@ -882,8 +897,13 @@ Claude should build:
 article AI chat sidebar
 quick action presets
 prompt composer
-proposal preview inside article context
-accept/reject controls
+chat input for freeform article edit requests
+conversation transcript UX for the persisted article chat history
+reset chat flow and its confirmation/state handling
+the article-view update experience when AI returns changed content
+the direct accept/reject decision experience for AI-generated article updates in this view
+how to show pending AI edits versus current article content
+how accepted AI edits appear in and connect back to article history
 template library views
 create/edit template screens
 style guide editing screens
@@ -893,6 +913,8 @@ side-by-side context panels if useful
 Definition of done:
 
 article-level AI help feels fast and controlled
+users can ask for arbitrary article improvements in a chat window, not just click presets
+the direct AI edit flow feels safe and understandable without sending the user into Proposal Review
 templates are understandable and editable by non-engineers
 Batch 10 — Publish pipeline, Zendesk write-side sync, and conflict resolution
 

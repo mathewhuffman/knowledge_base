@@ -2,7 +2,16 @@ import { AppError, AppErrorCode } from './errors';
 export declare const IPC_CHANNELS: {
     INVOKE: string;
     JOB_INVOKE: string;
+    JOB_CANCEL: string;
     JOB_EVENT: string;
+    APP_WORKING_STATE_EVENT: string;
+    AI_ASSISTANT_EVENT: string;
+    AI_ASSISTANT_PRESENTATION_EVENT: string;
+    AI_ASSISTANT_CONTEXT_EVENT: string;
+    AI_ASSISTANT_WINDOW_MOVE: string;
+    AI_ASSISTANT_WINDOW_RESIZE: string;
+    AI_ASSISTANT_WINDOW_DRAG_END: string;
+    APP_NAVIGATION_EVENT: string;
 };
 export interface RpcRequest {
     method: string;
@@ -35,6 +44,7 @@ export interface JobStatus {
     message?: string;
     startedAt?: string;
     endedAt?: string;
+    metadata?: Record<string, unknown>;
 }
 export interface JobEvent extends JobStatus, JobRecord {
 }
@@ -47,5 +57,8 @@ export interface JobRunContext {
 export interface JobPayload {
     jobId: string;
     state: JobState;
+}
+export interface JobCancelPayload {
+    jobId: string;
 }
 export declare const createErrorResult: (code: AppErrorCode, message: string, requestId?: string) => RpcResponse;

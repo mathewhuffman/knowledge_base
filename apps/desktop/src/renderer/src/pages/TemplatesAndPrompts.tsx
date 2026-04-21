@@ -1,74 +1,488 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  AppRoute,
+  TemplatePackType,
+  buildAppWorkingStateVersionToken,
+  type TemplatePackDetail,
+  type TemplatePackListResponse
+} from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/Badge';
-import { IconPlus, IconLayout } from '../components/icons';
+import { EmptyState } from '../components/EmptyState';
+import { LoadingState } from '../components/LoadingState';
+import { ErrorState } from '../components/ErrorState';
+import { ConfirmationDialog } from '../components/ConfirmationDialog';
+import { IconPlus, IconLayout, IconZap, IconTrash2, IconCheckCircle } from '../components/icons';
+import { useWorkspace } from '../context/WorkspaceContext';
+import { useIpc, useIpcMutation } from '../hooks/useIpc';
+import { useRegisterAiAssistantView } from '../components/assistant/AssistantContext';
+import { usePersistedResize } from '../hooks/usePersistedResize';
+
+const NEW_TEMPLATE_ID = 'new-template-draft';
+
+const TEMPLATE_TYPE_OPTIONS = [
+  { value: TemplatePackType.STANDARD_HOW_TO, label: 'Standard How-To' },
+  { value: TemplatePackType.FAQ, label: 'FAQ' },
+  { value: TemplatePackType.TROUBLESHOOTING, label: 'Troubleshooting' },
+  { value: TemplatePackType.POLICY_NOTICE, label: 'Policy / Notice' },
+  { value: TemplatePackType.FEATURE_OVERVIEW, label: 'Feature Overview' },
+  { value: TemplatePackType.PROPOSAL_CREATION, label: 'Proposal Creation' },
+];
+
+function templateTypeLabel(type: TemplatePackType): string {
+  return TEMPLATE_TYPE_OPTIONS.find(o => o.value === type)?.label ?? type.replace(/_/g, ' ');
+}
+
+function emptyForm(): Omit<TemplatePackDetail, 'id' | 'workspaceId' | 'updatedAtUtc' | 'active'> & { active: boolean } {
+  return {
+    name: '',
+    language: 'en-us',
+    templateType: TemplatePackType.STANDARD_HOW_TO,
+    promptTemplate: '',
+    toneRules: '',
+    description: '',
+    examples: '',
+    active: true,
+    analysisSummary: undefined,
+    analysis: undefined,
+  };
+}
 
 export const TemplatesAndPrompts = () => {
-  const [activeTab, setActiveTab] = useState<'templates' | 'prompts'>('templates');
+  const { activeWorkspace } = useWorkspace();
+  const listQuery = useIpc<TemplatePackListResponse>('template.pack.list');
+  const saveMutation = useIpcMutation<TemplatePackDetail>('template.pack.save');
+  const deleteMutation = useIpcMutation<{ templatePackId: string }>('template.pack.delete');
+  const analyzeMutation = useIpcMutation<TemplatePackDetail>('template.pack.analyze');
 
-  const templates = [
-    { name: 'Standard How-To', type: 'how-to', articles: 64, desc: 'Step-by-step instructional article format' },
-    { name: 'FAQ', type: 'faq', articles: 23, desc: 'Question-and-answer format for common issues' },
-    { name: 'Troubleshooting', type: 'troubleshooting', articles: 18, desc: 'Problem-solution format with diagnostics' },
-    { name: 'Policy / Notice', type: 'policy', articles: 12, desc: 'Informational policy or notice format' },
-    { name: 'Feature Overview', type: 'overview', articles: 25, desc: 'High-level feature introduction and summary' },
-  ];
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isCreatingNew, setIsCreatingNew] = useState(false);
+  const [draft, setDraft] = useState<ReturnType<typeof emptyForm>>(emptyForm());
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+
+  const prompt = usePersistedResize('tpl-prompt', 140);
+  const tone = usePersistedResize('tpl-tone', 100);
+  const examples = usePersistedResize('tpl-examples', 100);
+
+  useEffect(() => {
+    if (!activeWorkspace) return;
+    setIsCreatingNew(false);
+    setSelectedId(null);
+    setDraft(emptyForm());
+    void listQuery.execute({ workspaceId: activeWorkspace.id, includeInactive: true });
+  }, [activeWorkspace]);
+
+  const templates: TemplatePackDetail[] = listQuery.data?.templates ?? [];
+  const visibleTemplates = useMemo<TemplatePackDetail[]>(() => {
+    if (!activeWorkspace || !isCreatingNew) return templates;
+    return [
+      {
+        id: NEW_TEMPLATE_ID,
+        workspaceId: activeWorkspace.id,
+        name: draft.name || 'Untitled template',
+        language: draft.language,
+        promptTemplate: draft.promptTemplate,
+        toneRules: draft.toneRules,
+        examples: draft.examples,
+        active: draft.active,
+        updatedAtUtc: '',
+        templateType: draft.templateType,
+        description: draft.description || 'No description yet.',
+        analysisSummary: draft.analysisSummary,
+        analysis: draft.analysis,
+      },
+      ...templates,
+    ];
+  }, [activeWorkspace, draft, isCreatingNew, templates]);
+
+  useEffect(() => {
+    const firstId = templates[0]?.id;
+    if (isCreatingNew) {
+      return;
+    }
+    if (selectedId && templates.some((template) => template.id === selectedId)) {
+      return;
+    }
+    if (firstId) {
+      setSelectedId(firstId);
+    }
+  }, [isCreatingNew, selectedId, templates]);
+
+  const selected: TemplatePackDetail | null = useMemo(
+    () => templates.find((template) => template.id === selectedId) ?? null,
+    [templates, selectedId]
+  );
+
+  useEffect(() => {
+    if (isCreatingNew) {
+      setDraft(emptyForm());
+    } else if (selected) {
+      setDraft({
+        ...selected,
+        description: selected.description ?? '',
+        examples: selected.examples ?? '',
+      });
+    } else if (!selectedId) {
+      setDraft(emptyForm());
+    }
+  }, [isCreatingNew, selected, selectedId]);
+
+  const templateVersionToken = useMemo(
+    () => buildAppWorkingStateVersionToken({
+      route: AppRoute.TEMPLATES_AND_PROMPTS,
+      entityType: 'template_pack',
+      entityId: selectedId ?? 'new-template',
+      currentValues: draft as Record<string, unknown>
+    }),
+    [draft, selectedId]
+  );
+
+  useRegisterAiAssistantView({
+    enabled: Boolean(activeWorkspace),
+    context: {
+      workspaceId: activeWorkspace?.id ?? '',
+      route: AppRoute.TEMPLATES_AND_PROMPTS,
+      routeLabel: 'Templates & Prompts',
+      subject: {
+        type: 'template_pack',
+        id: selectedId ?? 'new-template',
+        title: draft.name || selected?.name || 'Template Pack',
+        locale: draft.language
+      },
+      workingState: {
+        kind: 'template_pack',
+        versionToken: templateVersionToken,
+        payload: draft
+      },
+      capabilities: {
+        canChat: true,
+        canCreateProposal: false,
+        canPatchProposal: false,
+        canPatchDraft: false,
+        canPatchTemplate: true,
+        canUseUnsavedWorkingState: true
+      },
+      backingData: {
+        selectedTemplateId: selectedId,
+        templatePackId: selectedId,
+        persistedTemplate: selected
+      }
+    },
+    applyUiActions: (actions) => {
+      actions.forEach((action) => {
+        if (action.type === 'replace_template_form') {
+          setDraft((prev) => ({
+            ...prev,
+            ...action.payload,
+            templateType: (action.payload.templateType as TemplatePackType | undefined) ?? prev.templateType
+          }));
+        }
+      });
+    },
+    applyWorkingStatePatch: (patch) => {
+      setDraft((prev) => ({
+        ...prev,
+        ...patch,
+        templateType: (patch.templateType as TemplatePackType | undefined) ?? prev.templateType
+      }));
+    }
+  });
+
+  const refresh = async () => {
+    if (!activeWorkspace) return;
+    await listQuery.execute({ workspaceId: activeWorkspace.id, includeInactive: true });
+  };
+
+  if (!activeWorkspace) {
+    return (
+      <>
+        <PageHeader title="Templates & Prompts" subtitle="Open a workspace to manage article templates." />
+        <div className="route-content">
+          <EmptyState icon={<IconLayout size={40} />} title="No workspace selected" description="Choose a workspace to edit local template packs." />
+        </div>
+      </>
+    );
+  }
+
+  const busy = saveMutation.loading || deleteMutation.loading || analyzeMutation.loading;
+  const isNewTemplate = isCreatingNew;
+  const canSave = draft.name.trim() && draft.promptTemplate.trim() && draft.toneRules.trim();
 
   return (
     <>
       <PageHeader
         title="Templates & Prompts"
-        subtitle="Manage AI generation templates and style guidance"
-        actions={
-          <button className="btn btn-primary">
+        subtitle="Edit local template packs and prompt guidance for article AI"
+        actions={(
+          <button
+            className="btn btn-primary"
+            onClick={() => {
+              setIsCreatingNew(true);
+              setSelectedId(null);
+              setDraft(emptyForm());
+            }}
+          >
             <IconPlus size={14} />
             New Template
           </button>
-        }
+        )}
       />
-      <div className="route-content">
-        <div className="tab-bar" style={{ marginBottom: 'var(--space-5)' }}>
-          <button className={`tab-item ${activeTab === 'templates' ? 'active' : ''}`} onClick={() => setActiveTab('templates')}>
-            Article Templates
-          </button>
-          <button className={`tab-item ${activeTab === 'prompts' ? 'active' : ''}`} onClick={() => setActiveTab('prompts')}>
-            Prompt Packs
-          </button>
+      <div className="route-content" style={{ display: 'grid', gridTemplateColumns: '320px minmax(0, 1fr)', gap: 'var(--space-5)', alignItems: 'start' }}>
+        {/* ---- Template list panel ---- */}
+        <div className="panel template-list-panel" style={{ padding: 'var(--space-3)' }}>
+          {listQuery.loading && !listQuery.data ? (
+            <LoadingState message="Loading template packs..." />
+          ) : listQuery.error && !listQuery.data ? (
+            <ErrorState title="Unable to load templates" description={listQuery.error} />
+          ) : visibleTemplates.length === 0 ? (
+            <EmptyState icon={<IconLayout size={32} />} title="No templates yet" description="Create your first local template pack." />
+          ) : (
+            visibleTemplates.map((template) => (
+              <button
+                key={template.id}
+                type="button"
+                className={`template-card${(template.id === selectedId || (isCreatingNew && template.id === NEW_TEMPLATE_ID)) ? ' selected' : ''}`}
+                onClick={() => {
+                  if (template.id === NEW_TEMPLATE_ID) {
+                    setIsCreatingNew(true);
+                    setSelectedId(null);
+                    return;
+                  }
+                  setIsCreatingNew(false);
+                  setSelectedId(template.id);
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--space-2)' }}>
+                  <span className="template-card-title">{template.name}</span>
+                  <Badge variant={template.active ? 'success' : 'neutral'}>
+                    {template.active ? 'active' : 'inactive'}
+                  </Badge>
+                </div>
+                <div className="template-card-desc">
+                  {template.description || 'No description yet.'}
+                </div>
+                <div className="template-card-tags">
+                  <Badge variant="neutral">{template.language}</Badge>
+                  <Badge variant="primary">{templateTypeLabel(template.templateType)}</Badge>
+                </div>
+                {template.analysisSummary && (
+                  <div className="template-card-analysis">{template.analysisSummary}</div>
+                )}
+              </button>
+            ))
+          )}
         </div>
 
-        {activeTab === 'templates' && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 'var(--space-4)' }}>
-            {templates.map((t) => (
-              <div key={t.name} className="card card-interactive card-padded">
-                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--space-3)', marginBottom: 'var(--space-3)' }}>
-                  <div style={{ width: 36, height: 36, borderRadius: 'var(--radius-md)', background: 'var(--color-bg-muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <IconLayout size={18} />
-                  </div>
-                  <div>
-                    <div style={{ fontWeight: 'var(--weight-semibold)', fontSize: 'var(--text-sm)', marginBottom: 2 }}>{t.name}</div>
-                    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>{t.desc}</div>
-                  </div>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-                  <Badge variant="neutral">{t.type}</Badge>
-                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>{t.articles} articles use this</span>
-                </div>
-              </div>
-            ))}
+        {/* ---- Template editor panel ---- */}
+        <div className="panel template-editor" style={{ padding: 'var(--space-5)' }}>
+          {/* Header row: name / language / type */}
+          <div className="template-editor-row template-editor-row-3">
+            <div className="template-field">
+              <label className="template-field-label" htmlFor="tpl-name">Name</label>
+              <input id="tpl-name" className="input" value={draft.name} onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))} placeholder="e.g. Standard How-To" />
+            </div>
+            <div className="template-field">
+              <label className="template-field-label" htmlFor="tpl-lang">Language</label>
+              <input id="tpl-lang" className="input" value={draft.language} onChange={(e) => setDraft((prev) => ({ ...prev, language: e.target.value }))} placeholder="en-us" />
+            </div>
+            <div className="template-field">
+              <label className="template-field-label" htmlFor="tpl-type">Type</label>
+              <select id="tpl-type" className="input" value={draft.templateType} onChange={(e) => setDraft((prev) => ({ ...prev, templateType: e.target.value as TemplatePackType }))}>
+                {TEMPLATE_TYPE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+            </div>
           </div>
-        )}
 
-        {activeTab === 'prompts' && (
-          <div className="panel" style={{ textAlign: 'center', padding: 'var(--space-10)' }}>
-            <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)', marginBottom: 'var(--space-3)' }}>
-              Prompt packs control how the AI generates and edits articles.
-            </div>
-            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
-              Prompt pack management will be available after Batch 9.
+          {/* Description */}
+          <div className="template-field">
+            <label className="template-field-label" htmlFor="tpl-desc">Description</label>
+            <input id="tpl-desc" className="input" value={draft.description} onChange={(e) => setDraft((prev) => ({ ...prev, description: e.target.value }))} placeholder="Short summary of this template's purpose" />
+          </div>
+
+          {/* Active toggle */}
+          <label className="template-active-toggle">
+            <input
+              type="checkbox"
+              checked={draft.active}
+              onChange={(e) => setDraft((prev) => ({ ...prev, active: e.target.checked }))}
+            />
+            Template is active for this type. Saving it will deactivate other templates of the same type.
+          </label>
+
+          {/* Prompt template */}
+          <div className="template-field">
+            <label className="template-field-label" htmlFor="tpl-prompt">Prompt template</label>
+            <div className="resizable-textarea-wrapper">
+              <textarea
+                id="tpl-prompt"
+                ref={prompt.textareaRef}
+                className="draft-source-editor template-resizable-textarea"
+                value={draft.promptTemplate}
+                onChange={(e) => setDraft((prev) => ({ ...prev, promptTemplate: e.target.value }))}
+                placeholder="Write a task-focused help article that covers..."
+              />
+              <div className="resize-handle" {...prompt.handleProps} />
             </div>
           </div>
-        )}
+
+          {/* Tone rules */}
+          <div className="template-field">
+            <label className="template-field-label" htmlFor="tpl-tone">Tone / style guidance</label>
+            <div className="resizable-textarea-wrapper">
+              <textarea
+                id="tpl-tone"
+                ref={tone.textareaRef}
+                className="draft-source-editor template-resizable-textarea"
+                value={draft.toneRules}
+                onChange={(e) => setDraft((prev) => ({ ...prev, toneRules: e.target.value }))}
+                placeholder="Use concise, direct instructions. Avoid jargon..."
+              />
+              <div className="resize-handle" {...tone.handleProps} />
+            </div>
+          </div>
+
+          {/* Example content */}
+          <div className="template-field">
+            <label className="template-field-label" htmlFor="tpl-examples">Example content</label>
+            <div className="resizable-textarea-wrapper">
+              <textarea
+                id="tpl-examples"
+                ref={examples.textareaRef}
+                className="draft-source-editor template-resizable-textarea"
+                value={draft.examples ?? ''}
+                onChange={(e) => setDraft((prev) => ({ ...prev, examples: e.target.value }))}
+                placeholder="Paste or write an example article that follows this template..."
+              />
+              <div className="resize-handle" {...examples.handleProps} />
+            </div>
+          </div>
+
+          {/* Analysis results */}
+          {selected?.analysis && (
+            <div className="template-analysis-card">
+              <div className="template-analysis-header">
+                <IconZap size={14} />
+                <span className="template-analysis-title">Template Analysis</span>
+                <Badge variant="primary">{selected.analysis.score}/100</Badge>
+              </div>
+              <div className="template-analysis-summary">{selected.analysis.summary}</div>
+
+              <div className="template-analysis-sections">
+                {selected.analysis.strengths.length > 0 && (
+                  <div>
+                    <div className="template-analysis-section-title">Strengths</div>
+                    <ul className="template-analysis-list strengths">
+                      {selected.analysis.strengths.map((s, i) => <li key={i}>{s}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {selected.analysis.gaps.length > 0 && (
+                  <div>
+                    <div className="template-analysis-section-title">Gaps</div>
+                    <ul className="template-analysis-list gaps">
+                      {selected.analysis.gaps.map((g, i) => <li key={i}>{g}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+
+              {selected.analysis.suggestions.length > 0 && (
+                <div className="template-analysis-suggestions">
+                  {selected.analysis.suggestions.map((suggestion) => (
+                    <div key={suggestion.title} className="template-analysis-suggestion">
+                      <span className={`template-analysis-suggestion-priority ${suggestion.priority}`}>
+                        {suggestion.priority}
+                      </span>
+                      <div>
+                        <strong>{suggestion.title}:</strong> {suggestion.detail}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Actions */}
+          <div className="template-editor-actions">
+            <button
+              className="btn btn-primary"
+              disabled={busy || !canSave}
+              onClick={async () => {
+                const saved = await saveMutation.mutate({
+                  workspaceId: activeWorkspace.id,
+                  templatePackId: selectedId ?? undefined,
+                  name: draft.name,
+                  language: draft.language,
+                  templateType: draft.templateType,
+                  promptTemplate: draft.promptTemplate,
+                  toneRules: draft.toneRules,
+                  description: draft.description,
+                  examples: draft.examples,
+                  active: draft.active,
+                });
+                if (saved) {
+                  setIsCreatingNew(false);
+                  setSelectedId(saved.id);
+                  await refresh();
+                }
+              }}
+            >
+              <IconCheckCircle size={14} />
+              {isNewTemplate ? 'Create template' : 'Save changes'}
+            </button>
+
+            {selectedId && (
+              <>
+                <button
+                  className="btn btn-secondary"
+                  disabled={busy}
+                  onClick={async () => {
+                    const analyzed = await analyzeMutation.mutate({ workspaceId: activeWorkspace.id, templatePackId: selectedId });
+                    if (analyzed) {
+                      await refresh();
+                    }
+                  }}
+                >
+                  <IconZap size={14} /> Analyze quality
+                </button>
+                <button
+                  className="btn btn-danger"
+                  disabled={busy}
+                  onClick={() => setShowDeleteDialog(true)}
+                >
+                  <IconTrash2 size={14} /> Delete
+                </button>
+              </>
+            )}
+          </div>
+        </div>
       </div>
+
+      {/* Delete confirmation */}
+      <ConfirmationDialog
+        open={showDeleteDialog}
+        title="Delete Template Pack"
+        message={
+          <>
+            <p>Are you sure you want to delete <strong>{selected?.name}</strong>?</p>
+            <p>This action cannot be undone. Articles using this template will fall back to default context.</p>
+          </>
+        }
+        confirmText="Delete Template"
+        variant="danger"
+        isProcessing={deleteMutation.loading}
+        onClose={() => setShowDeleteDialog(false)}
+        onConfirm={async () => {
+          if (!selectedId) return;
+          await deleteMutation.mutate({ workspaceId: activeWorkspace.id, templatePackId: selectedId });
+          setShowDeleteDialog(false);
+          setIsCreatingNew(false);
+          setSelectedId(null);
+          setDraft(emptyForm());
+          await refresh();
+        }}
+      />
     </>
   );
 };

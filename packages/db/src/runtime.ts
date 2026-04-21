@@ -22,7 +22,8 @@ const CATALOG_SQL = `
     zendesk_brand_id TEXT,
     default_locale TEXT NOT NULL,
     enabled_locales TEXT NOT NULL,
-    state TEXT NOT NULL
+    state TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0
   );
 `;
 
@@ -38,6 +39,7 @@ export interface CatalogWorkspaceRow {
   default_locale: string;
   enabled_locales: string;
   state: string;
+  is_default?: number;
 }
 
 export interface MigrationStateRow {

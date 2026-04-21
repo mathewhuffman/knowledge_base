@@ -32,12 +32,9 @@ function safePragma(db: BetterSqlite3Db, pragma: string) {
 
 export function openDatabase({ dbPath }: OpenOptions): SQLite {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  console.error('[sqlite-open] new BetterSqlite3 start', { dbPath });
   const db = new BetterSqlite3(dbPath);
-  console.error('[sqlite-open] new BetterSqlite3 created', { dbPath, hasRun: true });
   safePragma(db, 'journal_mode = WAL');
   safePragma(db, 'foreign_keys = ON');
-  console.error('[sqlite-open] better-sqlite3 init complete', { dbPath });
   return wrapDatabase(db);
 }
 

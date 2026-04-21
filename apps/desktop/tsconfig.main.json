@@ -10,7 +10,10 @@
     "skipLibCheck": true,
     "outDir": "./dist/main",
     "baseUrl": ".",
-    "paths": {},
+    "paths": {
+      "@kb-vault/agent-runtime": ["../../packages/agent-runtime/src"],
+      "@kb-vault/shared-types": ["../../packages/shared-types/src"]
+    },
     "types": ["node"],
     "lib": ["ES2022"],
     "noEmitOnError": true

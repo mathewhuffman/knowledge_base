@@ -2,7 +2,9 @@ export declare enum AppRoute {
     WORKSPACE_SWITCHER = "workspace_switcher",
     KB_VAULT_HOME = "kb_vault_home",
     ARTICLE_EXPLORER = "article_explorer",
+    RELATIONS_GRAPH = "relations_graph",// Feature Map surface; legacy route id retained for compatibility.
     PBI_BATCHES = "pbi_batches",
+    PBI_LIBRARY = "pbi_library",
     PROPOSAL_REVIEW = "proposal_review",
     DRAFTS = "drafts",
     PUBLISH_QUEUE = "publish_queue",

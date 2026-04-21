@@ -1,7 +1,7 @@
 # KB Vault — Project Breakdown
-**Version:** 1.0  
-**Date:** 2026-03-21  
-**Status:** Planning baseline  
+**Version:** 1.1  
+**Date:** 2026-04-16  
+**Status:** Implemented CLI/MCP parity baseline with strict KB access mode selection  
 **Product module:** KB Vault  
 **App shell:** Modular desktop app with KB Vault as the first module
 
@@ -308,11 +308,27 @@ Depending on proposal type:
   - no draft is created
 
 ## 7.7 Edit with AI at article level
-1. User opens any draft branch.
-2. User chats with the LLM inside KB Vault.
-3. The app routes the request through ACP using article-scoped context.
-4. AI returns a proposed edit patch or a full proposed rewrite.
-5. User can accept the proposal into the branch, reject it, or manually edit further.
+1. User opens a live article, draft branch, proposal review screen, or template pack.
+2. User opens the global AI assistant from the in-app launcher or from an already detached assistant window.
+3. The assistant can live in one of four presentation states:
+   - `embedded_closed`
+   - `embedded_open`
+   - `detached_launcher`
+   - `detached_panel`
+4. The user can drag the embedded launcher out of the main app window to create a detached launcher window.
+5. The user can drag the embedded open panel out of the main app window to create a detached panel window.
+6. Native window close on the detached launcher or detached panel reattaches the assistant to the main app in `embedded_closed`.
+7. Clicking the assistant UI close button behaves differently by state:
+   - embedded panel close -> `embedded_closed`
+   - detached panel close -> `detached_launcher`
+8. The app registers the current route and subject as assistant context in the main window and publishes that context so the detached window stays route-aware and entity-aware.
+9. User can have a normal back-and-forth conversation in ask mode without creating changes.
+10. If the user asks for content changes:
+   - from a live article, AI creates a proposal candidate that the user can `Create Proposal` or `Dismiss`
+   - from a draft, AI returns a draft patch that updates the working copy through the shared app working-state mutation/event flow
+   - from Proposal Review, AI returns a proposal patch that updates the review working copy
+   - from Templates & Prompts, AI uses the currently selected KB access mode to execute an app working-state mutation against the desktop app
+11. User remains the explicit decision-maker for any persisted change.
 
 ## 7.8 Publish selected drafts
 1. User selects one or more draft branches for publish.
@@ -382,7 +398,7 @@ The article detail surface must support:
 - publish history
 - asset placeholders
 - manual edit mode
-- AI chat side panel
+- global AI assistant that can be embedded in the app shell or detached into a real desktop window while preserving route-aware context
 
 ## 8.4 PBI import requirements
 The import pipeline must:
@@ -442,7 +458,7 @@ The app must:
 - run a persistent ACP client session without requiring visible user interaction in Cursor
 - create or resume sessions per:
   - PBI batch,
-  - article editing conversation,
+  - assistant conversation,
   - optionally workspace background context
 - maintain local mapping between app objects and ACP sessions
 - support structured request/response handling
@@ -450,12 +466,26 @@ The app must:
 - keep the app usable if Cursor is not available
 
 ### ACP usage model
-Two primary ACP session types:
+Three primary ACP session types:
 
 1. **Batch analysis session**
    - used for bulk PBI -> proposal generation
-2. **Article editing session**
-   - used when the user chats on a specific article branch
+2. **Ask-mode assistant chat session**
+   - used for conversational back-and-forth in the global assistant
+   - uses a dedicated ask-mode system prompt
+   - defaults to `informational_response` for normal conversation
+3. **Edit-capable assistant session**
+   - used when the user asks for concrete changes in an allowed route context
+   - returns typed artifacts such as proposal candidates, proposal patches, or draft patches
+   - for live mutable forms, executes explicit KB app commands and reports only confirmed results
+
+### Assistant result normalization
+Every assistant turn must be normalized before rendering in the transcript.
+
+- If the model returns a JSON object as plain text, the app must parse it and display only the user-facing `response` value for `informational_response`.
+- Internal reasoning, schema commentary, and transport metadata must never be shown in visible chat output.
+- Runtime stop metadata such as `stop reason` must be stripped from user-visible content.
+- Normal conversational turns must not render proposal decision controls.
 
 ## 8.7 MCP tool server
 KB Vault must expose a local MCP server so Cursor can call workspace-aware tools.
@@ -475,6 +505,8 @@ Minimum MCP tool set:
 - `get_pbi`
 - `get_pbi_subset`
 - `get_article_history`
+- `app_get_form_schema`
+- `app_patch_form`
 - `propose_create_kb`
 - `propose_edit_kb`
 - `propose_retire_kb`
@@ -482,6 +514,14 @@ Minimum MCP tool set:
 
 ### Tooling rule
 The model may gather context and return proposal payloads, but it may not directly publish, delete live content, or mutate Zendesk without explicit user action.
+
+### KB access mode rule
+KB Vault now supports both CLI and MCP as first-class KB access transports.
+
+- The workspace-selected `KB access Mode` is authoritative for assistant chat, batch analysis, article edit, and proposal-creation AI work.
+- The app must not silently switch between CLI and MCP mid-run.
+- If the selected mode is unhealthy, the run fails clearly before execution begins.
+- MCP readiness should validate bridge configuration, bridge reachability, and the expected registered tool set.
 
 ## 8.8 Proposal schema and review model
 Every AI batch result must be normalized into structured proposals.
@@ -575,7 +615,12 @@ The editor should support:
 - safe handling of inline styles and supported tags
 
 ## 8.11 Article-level AI editing
-From any article or draft branch, the user can ask the AI to:
+From any live article, draft branch, proposal review screen, or template pack, the user can ask the AI to:
+
+- open the global assistant in embedded or detached mode with route-aware context
+- type a freeform request to the LLM in natural language
+- receive an AI response grounded in the current article or branch context
+- have the AI perform the requested improvement within that chat flow
 
 - rewrite for tone
 - refactor structure
@@ -586,7 +631,64 @@ From any article or draft branch, the user can ask the AI to:
 - update Spanish or English locale variants
 - insert image placeholders
 
-All article-level AI edits must still come back as proposals or patches that the user can accept or reject.
+This should feel like an in-context editing chat, not a hidden backend action. The user should be able to describe the requested change in their own words, review the AI response, and then accept or reject the resulting patch or proposal.
+
+The assistant presentation model must support:
+
+- `embedded_closed`
+  - only the in-app launcher is visible
+  - clicking it opens the embedded panel
+  - dragging it out of the main window detaches into `detached_launcher`
+- `embedded_open`
+  - the in-app panel is visible
+  - clicking the panel close button returns to `embedded_closed`
+  - dragging the panel out of the main window detaches into `detached_panel`
+- `detached_launcher`
+  - a small standalone assistant launcher window
+  - clicking it opens `detached_panel`
+  - native window close reattaches the assistant as `embedded_closed`
+- `detached_panel`
+  - the full standalone assistant chat window
+  - clicking the assistant UI close button collapses to `detached_launcher`
+  - native window close reattaches the assistant as `embedded_closed`
+
+When the assistant is detached, the main app must not render a competing embedded launcher or embedded panel. The main window remains the source of truth for route/entity context, navigation, and live working-state registration so detached turns still stream, preserve history, preserve unread state, update Drafts live, update Proposal Review live, update Templates & Prompts live, and navigate the main window when a proposal is created.
+
+The assistant must support two distinct modes inside the same panel:
+
+- **Ask mode**
+  - used for greetings, questions, explanations, summaries, and normal back-and-forth
+  - stores chat messages in a route/entity-scoped assistant transcript
+  - displays only the assistant-visible response text
+  - does not show proposal controls
+- **Change mode**
+  - used when the user clearly asks the AI to make or propose changes
+  - returns a typed artifact based on route capabilities or executes an explicit app mutation command for live form edits
+  - may show explicit decision controls such as `Create Proposal` or `Dismiss`
+
+Article chat history should persist for each article or draft until the user chooses to reset it. The UI should provide a clear `Reset Chat` action that deletes that article’s chat history and starts a fresh conversation.
+
+The chat transcript should behave like a normal messaging surface:
+
+- the user’s message appears in the transcript immediately when sent
+- transcript content remains text-selectable so users can copy assistant output
+- optimistic local messages are replaced by the persisted transcript when the turn completes
+
+When the user asks the AI to make article changes, the resulting artifact should be routed by context:
+
+- live article context -> proposal candidate
+- draft context -> draft patch
+- proposal review context -> proposal patch
+- template context -> app working-state mutation through the selected transport with confirmed UI mutation
+
+Live article requests for changes should not silently mutate the article view. They should create a proposal candidate first, and only after user confirmation should the app create a proposal record.
+
+Draft and proposal working-copy changes may update the visible screen immediately, but they remain user-controlled until the user saves, accepts, or dismisses the resulting work.
+
+Template and other form-based working-state changes must not be inferred from assistant prose.  
+They should update only after the assistant successfully executes a real app mutation command and the desktop app confirms the applied patch.
+
+Draft working-copy updates must use that same shared mutation/event path so detached assistant turns update the visible Drafts screen without relying on window-local callbacks.
 
 ## 8.12 Templates and prompt packs
 The workspace must provide editable template and prompt management.
@@ -598,6 +700,18 @@ Users should be able to:
 - create new templates
 - ask AI to analyze current KB style and propose improved templates
 - assign template preferences by article type
+
+Template editing should use the generic app working-state mutation system rather than field-specific assistant JSON parsing.
+The implemented transports are:
+
+- CLI:
+  - `kb app get-form-schema --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --json`
+  - `kb app patch-form --workspace-id ... --route templates_and_prompts --entity-type template_pack --entity-id ... --version-token ... --patch '{...}' --json`
+- MCP:
+  - `app_get_form_schema`
+  - `app_patch_form`
+
+These contracts are intentionally generic so additional editable screens can adopt the same pattern later while reusing the same desktop mutation layer.
 - maintain tone/style guidance inside the workspace
 
 Initial template types:
@@ -1224,7 +1338,9 @@ A context packet may contain:
 - previously returned notes if resuming
 
 ## 14.4 MCP tool philosophy
-MCP tools should expose read-heavy context retrieval and proposal-intent operations.  
+KB Vault supports two KB access transports: CLI and MCP. The selected workspace mode is authoritative for the run, and the app does not silently fall back to the other provider.
+
+MCP tools should expose read-heavy context retrieval, proposal-intent operations, and parity app working-state mutation primitives.  
 The LLM should have access to:
 - discover relevant articles,
 - inspect live and draft versions,
@@ -1239,13 +1355,40 @@ It should **not** have permission to:
 - modify OS-level secrets,
 - execute unrestricted local commands.
 
+For desktop-local mutable working states, both CLI and MCP now reach the same scoped desktop mutation layer.
+Those operations are allowed only to mutate the currently registered route/entity working state inside the app, not durable external systems.
+Proposal Review remains a separate assistant contract: the preferred mutation path there is `proposal_patch`, not generic form mutation commands.
+
 ## 14.5 Output contract
-ACP responses should be normalized against a strict JSON schema before any proposal is stored.
+ACP responses for proposal and draft flows should still be normalized against a strict JSON schema before any proposal is stored.
 
 If the agent returns malformed data:
 1. attempt structured repair locally,
 2. if needed, re-ask the agent for schema-conformant output,
 3. do not silently coerce ambiguous outputs into accepted proposals.
+
+For live form mutations, the source of truth is not the JSON response body by itself.  
+The source of truth is the result of a real app mutation operation executed during the assistant turn.
+
+The implemented command/tool contract is:
+
+- CLI:
+  - `kb app get-form-schema`
+    - returns editable fields, types, current values, and a version token for the active working state
+  - `kb app patch-form`
+    - sends a structured patch to the desktop app loopback service
+- MCP:
+  - `app_get_form_schema`
+    - returns the same editable field schema and version token contract
+  - `app_patch_form`
+    - sends the same structured patch shape through the MCP runtime
+
+Shared semantics for both transports:
+- validate route, entity type, entity id, allowed keys, and value types
+- support stale-state protection through `versionToken`
+- return `applied`, `appliedPatch`, `ignoredKeys`, `validationErrors`, and `nextVersionToken`
+
+The assistant must not claim a field changed unless the selected transport's real mutation call succeeded.
 
 ## 14.6 Agent notes
 The agent must be allowed to return notes at:
@@ -1254,6 +1397,65 @@ The agent must be allowed to return notes at:
 - per-proposal level
 
 These notes are stored and shown to the user as supporting context, not hidden system reasoning.
+`record_agent_notes` now persists those notes in local workspace storage.
+
+## 14.7 App working-state mutation model
+KB Vault should use one generic desktop mutation primitive for live editable forms:
+
+- transport:
+  - CLI: `kb app get-form-schema` and `kb app patch-form`
+  - MCP: `app_get_form_schema` and `app_patch_form`
+- target identity: `workspaceId`, `route`, `entityType`, `entityId`
+- concurrency control: `versionToken`
+- patch payload: `Record<string, unknown>`
+
+The desktop app should maintain a registry of currently mutable working states.  
+Each registered screen provides:
+
+- route
+- entity type
+- entity id
+- current version token
+- current values
+- allowed field schema
+- page/entity-specific validator
+
+The first implemented vertical slice was:
+
+- route: `templates_and_prompts`
+- entity type: `template_pack`
+- supported fields:
+  - `name`
+  - `language`
+  - `templateType`
+  - `promptTemplate`
+  - `toneRules`
+  - `description`
+  - `examples`
+  - `active`
+
+This replaces the earlier template-specific approach where assistant prose or returned JSON was parsed after the fact and treated as if a mutation had already happened.
+Proposal Review continues to use `proposal_patch` as the primary assistant-facing mutation contract, even though the same desktop mutation service can support low-level working-state persistence behind the scenes.
+
+## 14.8 Current implementation status
+Implemented as of April 16, 2026:
+
+- strict KB access mode resolution with no silent CLI/MCP fallback
+- shared KB access mode preflight helpers for assistant chat, batch analysis, and article-edit runs
+- shared generic app working-state request/response types plus MCP input schemas
+- desktop main-process working-state mutation service reused by both the CLI loopback and MCP runtime tools
+- KB CLI support for `kb app get-form-schema` and `kb app patch-form`
+- MCP support for `app_get_form_schema` and `app_patch_form`
+- template-pack validator and apply flow through the shared mutation layer
+- provider-specific prompt guidance so MCP sessions use MCP tools and CLI sessions use KB CLI commands
+- Proposal Review guidance standardized on `proposal_patch`
+- local proposal persistence with provider provenance metadata
+- `record_agent_notes` persistence in workspace storage
+- corrected `get_locale_variant` contract using `localeVariantId`
+- richer MCP health checks covering bridge config, reachability, and expected tool registration
+- paired tests covering strict mode behavior, provider-pure prompts, MCP form mutation parity, and proposal provenance
+
+Follow-on hardening is now incremental rather than foundational. Future work can continue to expand additional editable screens onto the same mutation layer and broaden smoke coverage, but the core CLI/MCP parity refactor is in place.
 
 ---
 
@@ -1367,7 +1569,22 @@ Users must be able to directly edit:
 - related article links
 
 ## 17.2 AI editing within an article
-The article screen must support a local AI conversation panel.
+The article screen must support access to the global AI assistant while the article viewer is open.
+
+The embedded launcher lives in the bottom-right corner of the app shell and must remain visible above the article viewer whenever the assistant is not detached.
+
+The user must be able to:
+
+- click the embedded launcher to open the embedded panel
+- drag the embedded launcher out of the app window to create a detached launcher window
+- drag the embedded open panel out of the app window to create a detached assistant panel window
+- close the detached window natively and see the assistant reattach in the app as `embedded_closed`
+
+When the current context is a live article:
+
+- the assistant behaves as article-aware ask mode by default
+- normal chat stays conversational
+- change requests produce proposal candidates rather than silent article mutations
 
 Typical commands:
 - “Rewrite this to match the current tone”
@@ -1378,12 +1595,14 @@ Typical commands:
 - “Create the Spanish variant”
 
 ## 17.3 AI acceptance behavior
-Even in article-level chat, AI changes should land as:
-- a proposed patch,
-- a proposed full replacement,
-- or a proposed structured section insertion.
+Even in article-level chat, AI changes must land as explicit typed artifacts.
 
-User must explicitly accept the change into the branch.
+- Live article change request -> proposal candidate
+- Draft change request -> draft patch
+- Proposal review change request -> proposal patch
+- Template change request -> template patch
+
+User must explicitly accept, dismiss, save, or otherwise confirm the relevant artifact before a durable product action occurs.
 
 ## 17.4 Local edit history
 Every manual and accepted AI change should create a new draft revision record.

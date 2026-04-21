@@ -23,6 +23,11 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+body.body--assistant-detached,
+body.body--assistant-detached #root {
+  background: transparent;
+}
+
 /* Electron: prevent user selection on chrome elements */
 .app-shell {
   -webkit-user-select: none;

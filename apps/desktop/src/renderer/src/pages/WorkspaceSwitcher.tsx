@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { type MouseEvent, useState } from 'react';
 import type { WorkspaceCreateRequest, WorkspaceState } from '@kb-vault/shared-types';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState } from '../components/EmptyState';
@@ -17,7 +17,7 @@ function workspaceStateToChip(state: WorkspaceState): 'active' | 'retired' | 'co
 }
 
 export const WorkspaceSwitcher = () => {
-  const { workspaces, loading, error, openWorkspace, createWorkspace, refreshList } = useWorkspace();
+  const { workspaces, loading, error, openWorkspace, setDefaultWorkspace, createWorkspace, refreshList } = useWorkspace();
   const [showCreate, setShowCreate] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -36,6 +36,12 @@ export const WorkspaceSwitcher = () => {
 
   const handleOpen = async (workspaceId: string) => {
     await openWorkspace(workspaceId);
+  };
+
+  const handleSetDefault = async (workspaceId: string, event: MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    await setDefaultWorkspace(workspaceId);
   };
 
   const openCreate = () => {
@@ -141,6 +147,15 @@ export const WorkspaceSwitcher = () => {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
                   <Badge variant="neutral">{ws.articleCount} articles</Badge>
                   {ws.draftCount > 0 && <Badge variant="primary">{ws.draftCount} drafts</Badge>}
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={(event) => handleSetDefault(ws.id, event)}
+                    disabled={ws.isDefaultWorkspace}
+                  >
+                    {ws.isDefaultWorkspace ? 'Default' : 'Set default'}
+                  </button>
+                  {ws.isDefaultWorkspace ? <Badge variant="primary">Primary</Badge> : null}
                   <StatusChip status={workspaceStateToChip(ws.state)} />
                 </div>
               </div>

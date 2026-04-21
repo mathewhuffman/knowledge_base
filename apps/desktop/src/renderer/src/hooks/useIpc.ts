@@ -60,29 +60,37 @@ export function useIpcMutation<T>(method: string) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const mutate = useCallback(
-    async (payload?: unknown): Promise<T | null> => {
+  const mutateDetailed = useCallback(
+    async (payload?: unknown): Promise<{ data: T | null; error: string | null }> => {
       setLoading(true);
       setError(null);
       try {
         const response: RpcResponse<T> = await window.kbv.invoke<T>(method, payload);
         setLoading(false);
         if (response.ok && response.data !== undefined) {
-          return response.data;
-        } else {
-          const errMsg = response.error?.message ?? `IPC mutation "${method}" failed`;
-          setError(errMsg);
-          return null;
+          return { data: response.data, error: null };
         }
+
+        const errMsg = response.error?.message ?? `IPC mutation "${method}" failed`;
+        setError(errMsg);
+        return { data: null, error: errMsg };
       } catch (err) {
         setLoading(false);
         const errMsg = err instanceof Error ? err.message : String(err);
         setError(errMsg);
-        return null;
+        return { data: null, error: errMsg };
       }
     },
     [method],
   );
 
-  return { mutate, loading, error };
+  const mutate = useCallback(
+    async (payload?: unknown): Promise<T | null> => {
+      const result = await mutateDetailed(payload);
+      return result.data;
+    },
+    [mutateDetailed],
+  );
+
+  return { mutate, mutateDetailed, loading, error };
 }

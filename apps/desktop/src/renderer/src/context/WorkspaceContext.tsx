@@ -14,6 +14,8 @@ interface WorkspaceContextValue {
   refreshList: () => Promise<void>;
   /** Open a workspace by ID */
   openWorkspace: (workspaceId: EntityId) => Promise<boolean>;
+  /** Set workspace as default for next launch */
+  setDefaultWorkspace: (workspaceId: EntityId) => Promise<boolean>;
   /** Create a new workspace */
   createWorkspace: (payload: unknown) => Promise<WorkspaceRecord | null>;
   /** Close the active workspace (go back to switcher) */
@@ -27,43 +29,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceRecord | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const refreshList = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    const startedAt = performance.now();
-    try {
-      const res = await window.kbv.invoke<WorkspaceListItem[] | { workspaces: WorkspaceListItem[] }>('workspace.list');
-      console.log('[renderer] workspace.list', {
-        elapsedMs: performance.now() - startedAt,
-        ok: res.ok,
-        hasData: Boolean(res.data),
-        error: res.error?.message
-      });
-      if (res.ok && res.data) {
-        if (Array.isArray(res.data)) {
-          setWorkspaces(res.data);
-        } else if (Array.isArray((res.data as { workspaces?: unknown }).workspaces)) {
-          setWorkspaces((res.data as { workspaces: WorkspaceListItem[] }).workspaces);
-        } else {
-          setWorkspaces([]);
-          setError('Unexpected workspace.list payload shape');
-        }
-      } else {
-        const message = res.error?.message ?? 'Failed to load workspaces';
-        if (message === 'Maximum call stack size exceeded') {
-          setWorkspaces([]);
-          setError(null);
-        } else {
-          setError(message);
-        }
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
 
   const openWorkspace = useCallback(async (workspaceId: EntityId): Promise<boolean> => {
     setLoading(true);
@@ -93,6 +58,85 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       return false;
     }
   }, []);
+
+  const refreshList = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    const startedAt = performance.now();
+    try {
+      const res = await window.kbv.invoke<WorkspaceListItem[] | { workspaces: WorkspaceListItem[] }>('workspace.list');
+      console.log('[renderer] workspace.list', {
+        elapsedMs: performance.now() - startedAt,
+        ok: res.ok,
+        hasData: Boolean(res.data),
+        error: res.error?.message
+      });
+      if (res.ok && res.data) {
+        if (Array.isArray(res.data)) {
+          const workspaceItems = res.data as WorkspaceListItem[];
+          setWorkspaces(workspaceItems);
+          if (!activeWorkspace && workspaceItems.length > 0) {
+            const defaultWorkspace = workspaceItems.find((item) => item.isDefaultWorkspace) ?? workspaceItems[0];
+            if (defaultWorkspace) {
+              await openWorkspace(defaultWorkspace.id);
+            }
+          }
+        } else if (Array.isArray((res.data as { workspaces?: unknown }).workspaces)) {
+          const workspaceItems = (res.data as { workspaces: WorkspaceListItem[] }).workspaces;
+          setWorkspaces(workspaceItems);
+          if (!activeWorkspace && workspaceItems.length > 0) {
+            const defaultWorkspace = workspaceItems.find((item) => item.isDefaultWorkspace) ?? workspaceItems[0];
+            if (defaultWorkspace) {
+              await openWorkspace(defaultWorkspace.id);
+            }
+          }
+        } else {
+          setWorkspaces([]);
+          setError('Unexpected workspace.list payload shape');
+        }
+      } else {
+        const message = res.error?.message ?? 'Failed to load workspaces';
+        if (message === 'Maximum call stack size exceeded') {
+          setWorkspaces([]);
+          setError(null);
+        } else {
+          setError(message);
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [activeWorkspace, openWorkspace]);
+
+  const setDefaultWorkspace = useCallback(async (workspaceId: EntityId): Promise<boolean> => {
+    setLoading(true);
+    setError(null);
+    const startedAt = performance.now();
+    try {
+      const res = await window.kbv.invoke<boolean>('workspace.default.set', { workspaceId });
+      console.log('[renderer] workspace.default.set', {
+        elapsedMs: performance.now() - startedAt,
+        workspaceId,
+        ok: res.ok,
+        hasData: Boolean(res.data),
+        error: res.error?.message
+      });
+      if (res.ok) {
+        await refreshList();
+        setLoading(false);
+        return true;
+      }
+      setError(res.error?.message ?? 'Failed to set default workspace');
+      setLoading(false);
+      return false;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setLoading(false);
+      return false;
+    }
+  }, [refreshList]);
 
   const createWorkspace = useCallback(async (payload: unknown): Promise<WorkspaceRecord | null> => {
     setLoading(true);
@@ -145,6 +189,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         error,
         refreshList,
         openWorkspace,
+        setDefaultWorkspace,
         createWorkspace,
         closeWorkspace,
       }}

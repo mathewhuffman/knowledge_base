@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "20.16.0",
+    "pnpm": "9.0.0"
+  },
+  "volta": {
+    "node": "20.16.0",
+    "pnpm": "9.0.0"
+  },
   "packageManager": "pnpm@9.0.0",
   "workspaces": [
     "apps/desktop",
@@ -15,7 +23,7 @@
     "packages/html-preview"
   ],
   "scripts": {
-    "dev": "pnpm -C apps/desktop dev",
+    "dev": "sh -lc 'KBV_CURSOR_BINARY=${KBV_CURSOR_BINARY:-$(command -v agent || echo \"$HOME/.local/bin/agent\")} KBV_MCP_TOOLS=1 VITE_DEV_SERVER_URL=http://localhost:5173 pnpm -C apps/desktop dev'",
     "build": "pnpm -r run build",
     "lint": "pnpm -r run lint",
     "test": "pnpm -r run test"

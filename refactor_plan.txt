@@ -1,0 +1,65 @@
+The main architectural finding is this: the app is currently MCP-hardwired in three places, and the new CLI is not a drop-in replacement yet. The runtime always boots MCP bridge infrastructure, session creation injects MCP servers, and the prompt text explicitly tells the model to use MCP. Separately, the kb CLI in kbVaultClient.ts is an HTTP client, but this Electron app does not currently expose the local HTTP routes it expects. Also, ACP is currently initialized with terminal: false, which likely blocks shell-based kb usage.
+
+Recommended Implementation Plan
+Use a workspace-level KB access mode, not an app-global toggle. That fits the current settings model cleanly and lets different workspaces opt into MCP or CLI without inventing a second config system.
+
+Codex Part 1: Backend, architecture, contracts, plumbing
+Add a new persisted mode field such as kbAccessMode: 'mcp' | 'cli' to workspace settings. Extend shared types, repository methods, command validation, and add a DB migration on workspace_settings.
+Make agent.health.check workspace-aware instead of effectively global. It should report the selected mode plus provider-specific readiness.
+Introduce a main-process local loopback KB API service, bound to 127.0.0.1 on an ephemeral port, that implements the exact routes the CLI expects:
+GET /health
+GET /workspaces/:workspaceId/batches/:batchId/context
+GET /workspaces/:workspaceId/articles/search
+GET /workspaces/:workspaceId/articles/variants/:localeVariantId
+GET /workspaces/:workspaceId/articles/families/:articleFamilyId
+POST /workspaces/:workspaceId/articles/related
+Build those routes as thin adapters over existing repository/runtime methods so the CLI gets its expected JSON envelopes without duplicating business logic.
+Add a small CLI integration service in main that resolves the kb binary path, verifies it exists, and runs a real kb health --json probe in CLI mode. Support a configurable binary override like KBV_KB_CLI_BINARY, defaulting to kb on PATH.
+Refactor agent runtime to be provider-aware:
+MCP mode: keep current MCP server path.
+CLI mode: do not attach MCP servers, do not mention MCP in prompt text, and allow terminal access needed for shelling out to kb.
+Replace the current single MCP-specific prompt builder with provider-specific KB guidance:
+MCP mode: current tool guidance stays.
+CLI mode: tell the model to use only kb commands, always with --json, one command at a time, and explicitly not to use MCP.
+Important hardening: stop relying on a project-level .cursor/mcp.json in CLI mode. Ideally remove the always-on write in main.ts entirely and pass MCP servers only through session config when mode is mcp. That prevents accidental MCP discovery when CLI mode is selected.
+Update ACP initialization so CLI mode can actually execute shell commands. If capabilities are transport-global, rebuild/restart the transport when mode changes so CLI mode and MCP mode stay isolated enough.
+Extend renderer-facing contracts:
+AgentHealthCheckResponse should expose selected mode, active provider, and provider-specific status blocks.
+Session records should include which KB access mode they were created under.
+Keep existing job APIs unless a future explicit override is needed.
+Add tests:
+migration and settings persistence
+loopback API route payloads
+CLI health probe behavior
+prompt-generation tests proving CLI mode contains zero MCP references
+regression tests that MCP mode still behaves as it does now
+Update docs/handoffs/contracts after implementation.
+Opus Part 2: Design and UI/UX
+Design the mode toggle in the AI Runtime settings section.
+Design the “active KB access” indicator so it visually matches the current health/status system.
+Create mode-specific health cards and microcopy:
+CLI mode should surface CLI active/readiness without mentioning MCP.
+MCP mode should preserve existing MCP-oriented language.
+Update the batch analysis UX and session detail UX so the active access mode is visible during runs.
+Adjust labels/tabs/states so CLI mode feels first-class, not bolted on.
+Design empty/error/help states for:
+CLI binary missing
+CLI API not reachable
+provider switched but runtime not refreshed
+Ensure the UI never references MCP anywhere when the selected mode is CLI.
+Implementation Order
+
+Persisted mode + shared contracts.
+Loopback HTTP API for kb.
+Provider-aware runtime and prompt switching.
+Health/status contract expansion.
+Minimal renderer plumbing for Opus.
+Opus polish and UI composition.
+Tests and docs.
+Acceptance Criteria
+
+User can switch a workspace between MCP and CLI mode.
+Health UI shows which mode is active and whether it is ready.
+In CLI mode, the LLM prompt contains CLI instructions only and no MCP mention at all.
+In CLI mode, the agent can actually use kb against the local app-backed API.
+In MCP mode, current behavior remains intact.
