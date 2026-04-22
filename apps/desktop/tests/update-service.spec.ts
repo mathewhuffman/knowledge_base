@@ -8,6 +8,7 @@ class FakeUpdater extends EventEmitter implements UpdaterLike {
   autoInstallOnAppQuit = false;
   forceDevUpdateConfig = false;
   logger?: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
+  quitAndInstallCallCount = 0;
 
   nextVersion = '0.2.0';
   nextReleaseNotes = 'Improved updater flow.';
@@ -33,6 +34,8 @@ class FakeUpdater extends EventEmitter implements UpdaterLike {
   }
 
   quitAndInstall(): void {
+    this.quitAndInstallCallCount += 1;
+    this.emit('before-quit-for-update');
     this.emit('quit-and-install');
   }
 }
@@ -95,6 +98,36 @@ test.describe('app update service', () => {
     expect(service.getState().downloadProgressPercent).toBe(100);
     expect(service.getState().downloadedVersion).toBe('0.2.0');
     expect(service.getState().shouldShowModal).toBe(true);
+
+    service.dispose();
+  });
+
+  test('prepares app shutdown before install and keeps install-on-quit fallback enabled', async () => {
+    const updater = new FakeUpdater();
+    const lifecycleEvents: string[] = [];
+    const service = new AppUpdateService({
+      updater,
+      currentVersion: '0.1.0',
+      isUpdateSupported: true,
+      startupDelayMs: 60_000,
+      recurringIntervalMs: 60_000,
+      getPreferences: () => ({}),
+      setPreferences: () => undefined,
+      onBeforeQuitForUpdate: () => {
+        lifecycleEvents.push('prepare-for-quit');
+      }
+    });
+
+    service.initialize();
+    await service.checkForUpdates('manual');
+    await service.downloadUpdate();
+
+    expect(updater.autoInstallOnAppQuit).toBe(true);
+
+    service.quitAndInstall();
+
+    expect(updater.quitAndInstallCallCount).toBe(1);
+    expect(lifecycleEvents).toEqual(['prepare-for-quit']);
 
     service.dispose();
   });

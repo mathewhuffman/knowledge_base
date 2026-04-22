@@ -42,6 +42,33 @@ function getMacSystemCertificates() {
         'security find-certificate -a -p ~/Library/Keychains/login.keychain-db 2>/dev/null', { encoding: 'utf8', timeout: 5000 });
     return splitPemCertificates(pemBundle);
 }
+function getProtectedWorkspaceRoots(appRoot) {
+    const protectedRoots = new Set();
+    const addProtectedRoot = (candidate) => {
+        const normalized = candidate?.trim();
+        if (!normalized) {
+            return;
+        }
+        protectedRoots.add(node_path_1.default.resolve(normalized));
+    };
+    if (electron_1.app.isPackaged) {
+        addProtectedRoot(process.resourcesPath);
+        addProtectedRoot(node_path_1.default.dirname(process.resourcesPath));
+        if (process.platform === 'darwin') {
+            addProtectedRoot(node_path_1.default.dirname(node_path_1.default.dirname(process.resourcesPath)));
+        }
+    }
+    else {
+        addProtectedRoot(node_path_1.default.join(appRoot, 'apps', 'desktop', 'release'));
+    }
+    return [...protectedRoots];
+}
+function resolveAcpWorkingDirectory(appRoot) {
+    if (electron_1.app.isPackaged) {
+        return process.resourcesPath;
+    }
+    return appRoot;
+}
 // Electron's main-process network stack can miss enterprise roots installed in
 // the macOS keychain. Merge them into Node's default trust store up front.
 try {
@@ -181,10 +208,16 @@ async function bootstrapApp() {
     const appRoot = electron_1.app.isPackaged ? electron_1.app.getAppPath() : process.cwd();
     const assistantPresentationService = new assistant_presentation_service_1.AssistantPresentationService((0, app_preferences_1.getAssistantPresentationPreferences)(), app_preferences_1.setAssistantPresentationPreferences);
     const assistantViewContextService = new assistant_view_context_service_1.AssistantViewContextService();
+    const prepareForAppQuit = () => {
+        assistantWindowManager?.handleBeforeQuit();
+        void mcpBridge?.stop();
+        void kbCliLoopback?.stop();
+    };
     appUpdateService = new update_service_1.AppUpdateService({
         getPreferences: app_preferences_1.getAppUpdatePreferences,
         setPreferences: app_preferences_1.setAppUpdatePreferences,
-        logger: logger_1.logger
+        logger: logger_1.logger,
+        onBeforeQuitForUpdate: prepareForAppQuit
     });
     logger_1.logger.info('Booting KnowledgeBase', {
         workspaceRoot,
@@ -284,7 +317,7 @@ async function bootstrapApp() {
             data: appUpdateService ? appUpdateService.getState() : null
         };
     });
-    process.env.KBV_ACP_CWD = appRoot;
+    process.env.KBV_ACP_CWD = resolveAcpWorkingDirectory(appRoot);
     const emitAppWorkingStateEvent = (event) => {
         broadcast(shared_types_1.IPC_CHANNELS.APP_WORKING_STATE_EVENT, event);
     };
@@ -306,7 +339,9 @@ async function bootstrapApp() {
         window.focus();
         window.webContents.send(shared_types_1.IPC_CHANNELS.APP_NAVIGATION_EVENT, event);
     };
-    const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = (0, command_registry_1.registerCoreCommands)(commandBus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent, assistantPresentationService, assistantViewContextService, dispatchAppNavigation);
+    const { agentRuntime, kbCliLoopback: cliLoopback, kbCliRuntime } = (0, command_registry_1.registerCoreCommands)(commandBus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent, assistantPresentationService, assistantViewContextService, dispatchAppNavigation, {
+        protectedWorkspaceRoots: getProtectedWorkspaceRoots(appRoot)
+    });
     kbCliLoopback = cliLoopback;
     mcpBridge = new mcp_bridge_service_1.McpBridgeService(agentRuntime);
     await mcpBridge.start();

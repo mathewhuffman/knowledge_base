@@ -2234,8 +2234,10 @@ function buildArticleAiPrompt(params) {
         `User request: ${params.request.message.trim()}`
     ].filter(Boolean).join('\n\n');
 }
-function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent, assistantPresentationService, assistantViewContextService, dispatchAppNavigation) {
-    const workspaceRepository = new workspace_repository_1.WorkspaceRepository(workspaceRoot);
+function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent, emitAiAssistantEvent, assistantPresentationService, assistantViewContextService, dispatchAppNavigation, options = {}) {
+    const workspaceRepository = new workspace_repository_1.WorkspaceRepository(workspaceRoot, {
+        protectedRoots: options.protectedWorkspaceRoots
+    });
     const batchAnalysisOrchestrator = new batch_analysis_orchestrator_1.BatchAnalysisOrchestrator(workspaceRepository);
     const zendeskSyncService = new zendesk_sync_service_1.ZendeskSyncService(workspaceRepository);
     const pbiBatchImportService = new pbi_batch_import_service_1.PBIBatchImportService(workspaceRepository);

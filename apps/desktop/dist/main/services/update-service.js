@@ -122,6 +122,7 @@ class AppUpdateService {
     recurringIntervalMs;
     isUpdateSupported;
     log;
+    onBeforeQuitForUpdate;
     preferences;
     state;
     initialized = false;
@@ -130,6 +131,7 @@ class AppUpdateService {
     startupTimer = null;
     checkPromise = null;
     downloadPromise = null;
+    preparedForQuitAndInstall = false;
     subscribers = new Set();
     constructor(options) {
         this.updater = options.updater ?? getAutoUpdater();
@@ -140,11 +142,12 @@ class AppUpdateService {
         this.recurringIntervalMs = options.recurringIntervalMs ?? RECURRING_AUTO_CHECK_INTERVAL_MS;
         this.isUpdateSupported = options.isUpdateSupported ?? resolveUpdateSupport();
         this.log = options.logger ?? logger_1.logger;
+        this.onBeforeQuitForUpdate = options.onBeforeQuitForUpdate;
         this.preferences = normalizePreferences(this.getStoredPreferences());
         this.state = buildInitialState(this.currentVersion, this.preferences, this.isUpdateSupported);
         if (this.isUpdateSupported) {
             this.updater.autoDownload = false;
-            this.updater.autoInstallOnAppQuit = false;
+            this.updater.autoInstallOnAppQuit = true;
             this.updater.logger = this.log;
             if (!electron_1.app?.isPackaged) {
                 this.updater.forceDevUpdateConfig = true;
@@ -169,6 +172,7 @@ class AppUpdateService {
             const normalized = normalizeUpdateInfo(info);
             const shouldShowModal = Boolean(normalized
                 && (this.lastCheckSource === 'manual' || this.preferences.dismissedVersion !== normalized.version));
+            this.preparedForQuitAndInstall = false;
             this.updateState({
                 status: 'available',
                 updateInfo: normalized,
@@ -179,6 +183,7 @@ class AppUpdateService {
             });
         });
         this.updater.on('update-not-available', () => {
+            this.preparedForQuitAndInstall = false;
             this.updateState({
                 status: 'not_available',
                 updateInfo: null,
@@ -199,6 +204,7 @@ class AppUpdateService {
         this.updater.on('update-downloaded', (rawInfo) => {
             const info = rawInfo;
             const normalized = normalizeUpdateInfo(info);
+            this.preparedForQuitAndInstall = false;
             this.updateState({
                 status: 'downloaded',
                 updateInfo: normalized,
@@ -219,6 +225,9 @@ class AppUpdateService {
                 errorMessage: error.message || 'Update check failed.',
                 downloadProgressPercent: null
             });
+        });
+        this.updater.on('before-quit-for-update', () => {
+            this.prepareForQuitAndInstall('updater-event');
         });
         this.refreshAutoCheckSchedule();
     }
@@ -356,6 +365,7 @@ class AppUpdateService {
         if (!this.isUpdateSupported || this.state.status !== 'downloaded') {
             return;
         }
+        this.prepareForQuitAndInstall('user-request');
         this.updater.quitAndInstall(false, true);
     }
     refreshAutoCheckSchedule() {
@@ -390,6 +400,18 @@ class AppUpdateService {
         this.subscribers.forEach((listener) => {
             listener(this.state);
         });
+    }
+    prepareForQuitAndInstall(reason) {
+        if (this.preparedForQuitAndInstall) {
+            return;
+        }
+        this.preparedForQuitAndInstall = true;
+        this.log.info('app-update-service.prepare-for-quit-and-install', {
+            reason,
+            currentVersion: this.state.currentVersion,
+            downloadedVersion: this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null
+        });
+        this.onBeforeQuitForUpdate?.();
     }
 }
 exports.AppUpdateService = AppUpdateService;

@@ -35,6 +35,7 @@ interface AppUpdateServiceOptions {
   startupDelayMs?: number;
   recurringIntervalMs?: number;
   isUpdateSupported?: boolean;
+  onBeforeQuitForUpdate?: () => void;
 }
 
 type NormalizedUpdatePreferences = {
@@ -137,6 +138,7 @@ export class AppUpdateService {
   private readonly recurringIntervalMs: number;
   private readonly isUpdateSupported: boolean;
   private readonly log: Pick<typeof logger, 'info' | 'warn' | 'error'>;
+  private readonly onBeforeQuitForUpdate?: () => void;
 
   private preferences: NormalizedUpdatePreferences;
   private state: AppUpdateState;
@@ -146,6 +148,7 @@ export class AppUpdateService {
   private startupTimer: NodeJS.Timeout | null = null;
   private checkPromise: Promise<AppUpdateState> | null = null;
   private downloadPromise: Promise<AppUpdateState> | null = null;
+  private preparedForQuitAndInstall = false;
   private readonly subscribers = new Set<(state: AppUpdateState) => void>();
 
   constructor(options: AppUpdateServiceOptions) {
@@ -157,12 +160,13 @@ export class AppUpdateService {
     this.recurringIntervalMs = options.recurringIntervalMs ?? RECURRING_AUTO_CHECK_INTERVAL_MS;
     this.isUpdateSupported = options.isUpdateSupported ?? resolveUpdateSupport();
     this.log = options.logger ?? logger;
+    this.onBeforeQuitForUpdate = options.onBeforeQuitForUpdate;
     this.preferences = normalizePreferences(this.getStoredPreferences());
     this.state = buildInitialState(this.currentVersion, this.preferences, this.isUpdateSupported);
 
     if (this.isUpdateSupported) {
       this.updater.autoDownload = false;
-      this.updater.autoInstallOnAppQuit = false;
+      this.updater.autoInstallOnAppQuit = true;
       this.updater.logger = this.log;
       if (!app?.isPackaged) {
         this.updater.forceDevUpdateConfig = true;
@@ -193,6 +197,7 @@ export class AppUpdateService {
         normalized
         && (this.lastCheckSource === 'manual' || this.preferences.dismissedVersion !== normalized.version)
       );
+      this.preparedForQuitAndInstall = false;
 
       this.updateState({
         status: 'available',
@@ -205,6 +210,7 @@ export class AppUpdateService {
     });
 
     this.updater.on('update-not-available', () => {
+      this.preparedForQuitAndInstall = false;
       this.updateState({
         status: 'not_available',
         updateInfo: null,
@@ -227,6 +233,7 @@ export class AppUpdateService {
     this.updater.on('update-downloaded', (rawInfo) => {
       const info = rawInfo as UpdateInfo;
       const normalized = normalizeUpdateInfo(info);
+      this.preparedForQuitAndInstall = false;
       this.updateState({
         status: 'downloaded',
         updateInfo: normalized,
@@ -249,6 +256,10 @@ export class AppUpdateService {
         errorMessage: error.message || 'Update check failed.',
         downloadProgressPercent: null
       });
+    });
+
+    this.updater.on('before-quit-for-update', () => {
+      this.prepareForQuitAndInstall('updater-event');
     });
 
     this.refreshAutoCheckSchedule();
@@ -412,6 +423,7 @@ export class AppUpdateService {
       return;
     }
 
+    this.prepareForQuitAndInstall('user-request');
     this.updater.quitAndInstall(false, true);
   }
 
@@ -453,5 +465,19 @@ export class AppUpdateService {
     this.subscribers.forEach((listener) => {
       listener(this.state);
     });
+  }
+
+  private prepareForQuitAndInstall(reason: 'user-request' | 'updater-event'): void {
+    if (this.preparedForQuitAndInstall) {
+      return;
+    }
+
+    this.preparedForQuitAndInstall = true;
+    this.log.info('app-update-service.prepare-for-quit-and-install', {
+      reason,
+      currentVersion: this.state.currentVersion,
+      downloadedVersion: this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null
+    });
+    this.onBeforeQuitForUpdate?.();
   }
 }

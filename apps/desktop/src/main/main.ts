@@ -264,10 +264,16 @@ async function bootstrapApp() {
     setAssistantPresentationPreferences
   );
   const assistantViewContextService = new AssistantViewContextService();
+  const prepareForAppQuit = () => {
+    assistantWindowManager?.handleBeforeQuit();
+    void mcpBridge?.stop();
+    void kbCliLoopback?.stop();
+  };
   appUpdateService = new AppUpdateService({
     getPreferences: getAppUpdatePreferences,
     setPreferences: setAppUpdatePreferences,
-    logger
+    logger,
+    onBeforeQuitForUpdate: prepareForAppQuit
   });
 
   logger.info('Booting KnowledgeBase', {

@@ -172,15 +172,17 @@ const DEFAULT_ACP_MODEL_ID = 'composer-2[fast=true]';
 class WorkspaceRepository {
     workspaceRoot;
     catalogDbPath;
+    protectedWorkspaceRoots;
     articleRelationsV2ExportService;
     articleRelationsV2FeatureMapService;
     articleRelationsV2QueryService;
     articleRelationsV2RelationOrchestrator;
     lastCatalogFailureMs = 0;
     lastCatalogFailureMessage;
-    constructor(workspaceRoot) {
+    constructor(workspaceRoot, options = {}) {
         this.workspaceRoot = workspaceRoot;
         this.catalogDbPath = node_path_1.default.join(this.workspaceRoot, CATALOG_DB_PATH);
+        this.protectedWorkspaceRoots = normalizeProtectedWorkspaceRoots(options.protectedRoots);
         this.articleRelationsV2ExportService = new export_service_1.ArticleRelationsV2ExportService({
             fileExists: async (filePath) => this.fileExists(filePath),
             readTextFile: async (filePath) => promises_1.default.readFile(filePath, 'utf8')
@@ -208,6 +210,14 @@ class WorkspaceRepository {
             return undefined;
         }
         return normalized;
+    }
+    assertWorkspacePathIsSafe(resolvedPath) {
+        for (const protectedRoot of this.protectedWorkspaceRoots) {
+            if (!isSameOrNestedPath(resolvedPath, protectedRoot)) {
+                continue;
+            }
+            throw new Error(`Workspace paths must live outside the app install/build directories so updates do not replace user data. Choose a folder outside ${protectedRoot}.`);
+        }
     }
     async listWorkspaces() {
         const catalog = await this.openCatalogWithRecovery();
@@ -570,9 +580,10 @@ class WorkspaceRepository {
             hasPathOverride: Boolean(payload.path),
             enabledLocalesCount: payload.enabledLocales?.length ?? 0
         });
-        const catalog = await this.openCatalogWithRecovery();
         const now = new Date().toISOString();
         const resolvedPath = workspacePath(payload.path, this.workspaceRoot, payload.name);
+        this.assertWorkspacePathIsSafe(resolvedPath);
+        const catalog = await this.openCatalogWithRecovery();
         try {
             const existing = catalog.get(`SELECT id FROM workspaces WHERE name = @name OR path = @path`, { name: payload.name, path: resolvedPath });
             if (existing) {
@@ -14904,6 +14915,28 @@ function buildWorkspaceItemFromCatalog(row, articleCount, draftCount) {
 }
 function workspacePath(inputPath, root, name) {
     return node_path_1.default.resolve(inputPath ?? node_path_1.default.join(root, sanitizeName(name)));
+}
+function normalizeProtectedWorkspaceRoots(protectedRoots) {
+    if (!Array.isArray(protectedRoots) || protectedRoots.length === 0) {
+        return [];
+    }
+    return Array.from(new Set(protectedRoots
+        .map((value) => value?.trim())
+        .filter((value) => Boolean(value))
+        .map(normalizeComparablePath)));
+}
+function isSameOrNestedPath(candidatePath, parentPath) {
+    const normalizedCandidatePath = normalizeComparablePath(candidatePath);
+    const normalizedParentPath = normalizeComparablePath(parentPath);
+    if (normalizedCandidatePath === normalizedParentPath) {
+        return true;
+    }
+    const relativePath = node_path_1.default.relative(normalizedParentPath, normalizedCandidatePath);
+    return relativePath !== '' && !relativePath.startsWith('..') && !node_path_1.default.isAbsolute(relativePath);
+}
+function normalizeComparablePath(value) {
+    const resolved = node_path_1.default.resolve(value);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 function normalizeLocales(locales) {
     return locales && locales.length > 0 ? locales : ['en-us'];
