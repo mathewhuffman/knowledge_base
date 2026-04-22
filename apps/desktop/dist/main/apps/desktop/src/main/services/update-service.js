@@ -49,6 +49,9 @@ const STARTUP_AUTO_CHECK_DELAY_MS = 5_000;
 const RECURRING_AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const SHIPIT_BUNDLE_IDENTIFIER = 'com.kbvault.desktop';
 const SHIPIT_SERVICE_LABEL = `${SHIPIT_BUNDLE_IDENTIFIER}.ShipIt`;
+const SHIPIT_KICKSTART_LOG_FILENAME = 'ShipItKickstart.log';
+const SHIPIT_KICKSTART_RETRY_COUNT = 10;
+const SHIPIT_KICKSTART_RETRY_INTERVAL_SECONDS = 1;
 const MAX_DIAGNOSTIC_SNIPPET_LENGTH = 4_000;
 function getAutoUpdater() {
     const { autoUpdater } = electronUpdater;
@@ -193,7 +196,8 @@ function collectInstallTargetDiagnostics(executablePath, isInApplicationsFolder)
         bundleXattrs: null,
         shipItState: null,
         stagedBundleXattrs: null,
-        shipItLaunchd: null
+        shipItLaunchd: null,
+        shipItKickstartLog: null
     };
 }
 function truncateDiagnosticSnippet(value) {
@@ -265,8 +269,47 @@ function collectXattrDiagnostics(targetPath) {
         maclBytes: macl?.length ?? null
     };
 }
+function collectFileSnippetDiagnostics(targetPath) {
+    if (!targetPath) {
+        return null;
+    }
+    const resolvedPath = node_path_1.default.resolve(targetPath);
+    if (!node_fs_1.default.existsSync(resolvedPath)) {
+        return {
+            path: resolvedPath,
+            exists: false,
+            snippet: null
+        };
+    }
+    try {
+        return {
+            path: resolvedPath,
+            exists: true,
+            snippet: truncateDiagnosticSnippet(node_fs_1.default.readFileSync(resolvedPath, 'utf8'))
+        };
+    }
+    catch (error) {
+        return {
+            path: resolvedPath,
+            exists: true,
+            snippet: truncateDiagnosticSnippet(error instanceof Error ? error.message : String(error))
+        };
+    }
+}
+function resolveShipItCacheDirectory() {
+    return node_path_1.default.join(node_os_1.default.homedir(), 'Library', 'Caches', `${SHIPIT_BUNDLE_IDENTIFIER}.ShipIt`);
+}
 function resolveShipItStatePath() {
-    return node_path_1.default.join(node_os_1.default.homedir(), 'Library', 'Caches', `${SHIPIT_BUNDLE_IDENTIFIER}.ShipIt`, 'ShipItState.plist');
+    return node_path_1.default.join(resolveShipItCacheDirectory(), 'ShipItState.plist');
+}
+function resolveShipItKickstartLogPath() {
+    return node_path_1.default.join(resolveShipItCacheDirectory(), SHIPIT_KICKSTART_LOG_FILENAME);
+}
+function resolveShipItLaunchdServicePath() {
+    if (typeof process.getuid !== 'function') {
+        return null;
+    }
+    return `gui/${process.getuid()}/${SHIPIT_SERVICE_LABEL}`;
 }
 function fileUrlToPathSafe(urlValue) {
     if (!urlValue) {
@@ -335,10 +378,10 @@ function collectShipItStateDiagnostics() {
     };
 }
 function collectLaunchdServiceDiagnostics() {
-    if (typeof process.getuid !== 'function') {
+    const servicePath = resolveShipItLaunchdServicePath();
+    if (!servicePath) {
         return null;
     }
-    const servicePath = `gui/${process.getuid()}/${SHIPIT_SERVICE_LABEL}`;
     try {
         const result = (0, node_child_process_1.spawnSync)('launchctl', ['print', servicePath], {
             encoding: 'utf8'
@@ -361,6 +404,36 @@ function collectLaunchdServiceDiagnostics() {
             snippet: truncateDiagnosticSnippet(error instanceof Error ? error.message : String(error))
         };
     }
+}
+function defaultLaunchShipItKickstartHelper(options) {
+    const script = [
+        'SERVICE="$1"',
+        'LOG="$2"',
+        'mkdir -p "$(dirname "$LOG")"',
+        ': > "$LOG"',
+        'printf "%s helper-start service=%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SERVICE" >> "$LOG"',
+        'attempt=1',
+        `while [ "$attempt" -le "${SHIPIT_KICKSTART_RETRY_COUNT}" ]; do`,
+        '  if /bin/launchctl print "$SERVICE" >/dev/null 2>&1; then',
+        '    printf "%s job-present attempt=%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$attempt" >> "$LOG"',
+        '    /bin/launchctl kickstart -kp "$SERVICE" >> "$LOG" 2>&1',
+        '    status=$?',
+        '    printf "%s kickstart-exit=%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" >> "$LOG"',
+        '    /bin/launchctl print "$SERVICE" >> "$LOG" 2>&1',
+        '    exit 0',
+        '  fi',
+        '  printf "%s job-missing attempt=%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$attempt" >> "$LOG"',
+        `  /bin/sleep ${SHIPIT_KICKSTART_RETRY_INTERVAL_SECONDS}`,
+        '  attempt=$((attempt + 1))',
+        'done',
+        'printf "%s job-missing-after-retries\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"',
+        'exit 0'
+    ].join('\n');
+    const child = (0, node_child_process_1.spawn)('/bin/sh', ['-c', script, 'shipit-kickstart-helper', options.servicePath, options.logPath], {
+        detached: true,
+        stdio: 'ignore'
+    });
+    child.unref();
 }
 function resolveUpdateSupport() {
     if (electron_1.app?.isPackaged) {
@@ -409,6 +482,7 @@ class AppUpdateService {
     onBeforeQuitForUpdate;
     executablePath;
     platform;
+    launchShipItKickstartHelper;
     preferences;
     state;
     initialized = false;
@@ -431,6 +505,7 @@ class AppUpdateService {
         this.onBeforeQuitForUpdate = options.onBeforeQuitForUpdate;
         this.executablePath = options.executablePath ?? electron_1.app?.getPath?.('exe') ?? process.execPath;
         this.platform = options.platform ?? process.platform;
+        this.launchShipItKickstartHelper = options.launchShipItKickstartHelper ?? defaultLaunchShipItKickstartHelper;
         this.preferences = normalizePreferences(this.getStoredPreferences());
         this.preferences = this.reconcileInstallAttemptState(this.preferences);
         this.state = buildInitialState(this.currentVersion, this.preferences, this.isUpdateSupported);
@@ -678,6 +753,33 @@ class AppUpdateService {
             attemptedVersion: this.preferences.installAttemptVersion,
             attemptedAt: this.preferences.installAttemptedAt
         });
+        if (this.platform === 'darwin') {
+            const servicePath = resolveShipItLaunchdServicePath();
+            const kickstartLogPath = resolveShipItKickstartLogPath();
+            if (servicePath) {
+                try {
+                    this.launchShipItKickstartHelper({
+                        servicePath,
+                        logPath: kickstartLogPath
+                    });
+                    this.log.info('app-update-service.shipit-kickstart-helper-launched', {
+                        attemptedVersion: this.preferences.installAttemptVersion,
+                        attemptedAt: this.preferences.installAttemptedAt,
+                        servicePath,
+                        logPath: kickstartLogPath
+                    });
+                }
+                catch (error) {
+                    this.log.warn('app-update-service.shipit-kickstart-helper-failed', {
+                        attemptedVersion: this.preferences.installAttemptVersion,
+                        attemptedAt: this.preferences.installAttemptedAt,
+                        servicePath,
+                        logPath: kickstartLogPath,
+                        error: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
+        }
         this.prepareForQuitAndInstall('user-request');
         this.updater.quitAndInstall(false, true);
         this.log.info('app-update-service.quit-and-install-dispatched', {
@@ -852,7 +954,8 @@ class AppUpdateService {
             bundleXattrs: collectXattrDiagnostics(diagnostics.bundlePath),
             shipItState,
             stagedBundleXattrs: collectXattrDiagnostics(shipItState?.stagedBundlePath ?? null),
-            shipItLaunchd: collectLaunchdServiceDiagnostics()
+            shipItLaunchd: collectLaunchdServiceDiagnostics(),
+            shipItKickstartLog: collectFileSnippetDiagnostics(resolveShipItKickstartLogPath())
         };
     }
 }

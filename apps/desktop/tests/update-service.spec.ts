@@ -126,6 +126,7 @@ test.describe('app update service', () => {
   test('prepares app shutdown before install and keeps install-on-quit fallback enabled', async () => {
     const updater = new FakeUpdater();
     const lifecycleEvents: string[] = [];
+    const launchedHelpers: Array<{ servicePath: string; logPath: string }> = [];
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-update-service-'));
     const executablePath = path.join(
       tempRoot,
@@ -147,6 +148,9 @@ test.describe('app update service', () => {
       setPreferences: () => undefined,
       executablePath,
       platform: 'darwin',
+      launchShipItKickstartHelper: (options) => {
+        launchedHelpers.push(options);
+      },
       onBeforeQuitForUpdate: () => {
         lifecycleEvents.push('prepare-for-quit');
       }
@@ -163,6 +167,12 @@ test.describe('app update service', () => {
 
       expect(updater.quitAndInstallCallCount).toBe(1);
       expect(lifecycleEvents).toEqual(['prepare-for-quit']);
+      expect(launchedHelpers).toEqual([
+        expect.objectContaining({
+          servicePath: `gui/${process.getuid?.()}/com.kbvault.desktop.ShipIt`
+        })
+      ]);
+      expect(launchedHelpers[0]?.logPath).toContain('ShipItKickstart.log');
 
       service.dispose();
     } finally {
@@ -276,6 +286,9 @@ test.describe('app update service', () => {
         shipItLaunchd: expect.objectContaining({
           label: 'com.kbvault.desktop.ShipIt',
           servicePath: expect.any(String)
+        }),
+        shipItKickstartLog: expect.objectContaining({
+          path: expect.stringContaining('ShipItKickstart.log')
         })
       });
 
