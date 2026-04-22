@@ -1,4 +1,7 @@
+import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
+import os from 'node:os';
+import path from 'node:path';
 import { expect, test } from '@playwright/test';
 import type { AppUpdatePreferences } from '@kb-vault/shared-types';
 import { AppUpdateService, type UpdaterLike } from '../src/main/services/update-service';
@@ -105,6 +108,17 @@ test.describe('app update service', () => {
   test('prepares app shutdown before install and keeps install-on-quit fallback enabled', async () => {
     const updater = new FakeUpdater();
     const lifecycleEvents: string[] = [];
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-update-service-'));
+    const executablePath = path.join(
+      tempRoot,
+      'Applications',
+      'KnowledgeBase.app',
+      'Contents',
+      'MacOS',
+      'KnowledgeBase'
+    );
+    fs.mkdirSync(path.dirname(executablePath), { recursive: true });
+    fs.writeFileSync(executablePath, '');
     const service = new AppUpdateService({
       updater,
       currentVersion: '0.1.0',
@@ -113,22 +127,73 @@ test.describe('app update service', () => {
       recurringIntervalMs: 60_000,
       getPreferences: () => ({}),
       setPreferences: () => undefined,
+      executablePath,
+      platform: 'darwin',
       onBeforeQuitForUpdate: () => {
         lifecycleEvents.push('prepare-for-quit');
       }
     });
 
-    service.initialize();
-    await service.checkForUpdates('manual');
-    await service.downloadUpdate();
+    try {
+      service.initialize();
+      await service.checkForUpdates('manual');
+      await service.downloadUpdate();
 
-    expect(updater.autoInstallOnAppQuit).toBe(true);
+      expect(updater.autoInstallOnAppQuit).toBe(true);
 
-    service.quitAndInstall();
+      service.quitAndInstall();
 
-    expect(updater.quitAndInstallCallCount).toBe(1);
-    expect(lifecycleEvents).toEqual(['prepare-for-quit']);
+      expect(updater.quitAndInstallCallCount).toBe(1);
+      expect(lifecycleEvents).toEqual(['prepare-for-quit']);
 
-    service.dispose();
+      service.dispose();
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('shows a clear macOS install error when the app bundle location is not writable', async () => {
+    const updater = new FakeUpdater();
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-update-service-'));
+    const lockedApplicationsPath = path.join(tempRoot, 'Applications');
+    const executablePath = path.join(
+      lockedApplicationsPath,
+      'KnowledgeBase.app',
+      'Contents',
+      'MacOS',
+      'KnowledgeBase'
+    );
+    fs.mkdirSync(path.dirname(executablePath), { recursive: true });
+    fs.writeFileSync(executablePath, '');
+    fs.chmodSync(lockedApplicationsPath, 0o555);
+
+    try {
+      const service = new AppUpdateService({
+        updater,
+        currentVersion: '0.1.0',
+        isUpdateSupported: true,
+        startupDelayMs: 60_000,
+        recurringIntervalMs: 60_000,
+        getPreferences: () => ({}),
+        setPreferences: () => undefined,
+        executablePath,
+        platform: 'darwin'
+      });
+
+      service.initialize();
+      await service.checkForUpdates('manual');
+      await service.downloadUpdate();
+
+      service.quitAndInstall();
+
+      expect(updater.quitAndInstallCallCount).toBe(0);
+      expect(service.getState().status).toBe('error');
+      expect(service.getState().errorMessage).toContain(lockedApplicationsPath);
+
+      service.dispose();
+    } finally {
+      fs.chmodSync(lockedApplicationsPath, 0o755);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });

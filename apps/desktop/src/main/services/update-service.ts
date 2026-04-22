@@ -36,6 +36,8 @@ interface AppUpdateServiceOptions {
   recurringIntervalMs?: number;
   isUpdateSupported?: boolean;
   onBeforeQuitForUpdate?: () => void;
+  executablePath?: string;
+  platform?: NodeJS.Platform;
 }
 
 type NormalizedUpdatePreferences = {
@@ -109,6 +111,22 @@ function resolveUpdateSupport(): boolean {
     && fs.existsSync(path.join(process.cwd(), 'dev-app-update.yml'));
 }
 
+function resolveInstalledBundlePath(executablePath: string): string | null {
+  let currentPath = path.resolve(executablePath);
+
+  while (true) {
+    if (currentPath.endsWith('.app')) {
+      return currentPath;
+    }
+
+    const parentPath = path.dirname(currentPath);
+    if (parentPath === currentPath) {
+      return null;
+    }
+    currentPath = parentPath;
+  }
+}
+
 function buildInitialState(
   currentVersion: string,
   preferences: NormalizedUpdatePreferences,
@@ -139,6 +157,8 @@ export class AppUpdateService {
   private readonly isUpdateSupported: boolean;
   private readonly log: Pick<typeof logger, 'info' | 'warn' | 'error'>;
   private readonly onBeforeQuitForUpdate?: () => void;
+  private readonly executablePath: string;
+  private readonly platform: NodeJS.Platform;
 
   private preferences: NormalizedUpdatePreferences;
   private state: AppUpdateState;
@@ -161,6 +181,8 @@ export class AppUpdateService {
     this.isUpdateSupported = options.isUpdateSupported ?? resolveUpdateSupport();
     this.log = options.logger ?? logger;
     this.onBeforeQuitForUpdate = options.onBeforeQuitForUpdate;
+    this.executablePath = options.executablePath ?? app?.getPath?.('exe') ?? process.execPath;
+    this.platform = options.platform ?? process.platform;
     this.preferences = normalizePreferences(this.getStoredPreferences());
     this.state = buildInitialState(this.currentVersion, this.preferences, this.isUpdateSupported);
 
@@ -423,6 +445,20 @@ export class AppUpdateService {
       return;
     }
 
+    const installIssue = this.resolveInstallabilityIssue();
+    if (installIssue) {
+      this.log.warn('app-update-service.install-preflight-failed', {
+        executablePath: this.executablePath,
+        issue: installIssue
+      });
+      this.updateState({
+        status: 'error',
+        errorMessage: installIssue,
+        shouldShowModal: true
+      });
+      return;
+    }
+
     this.prepareForQuitAndInstall('user-request');
     this.updater.quitAndInstall(false, true);
   }
@@ -479,5 +515,29 @@ export class AppUpdateService {
       downloadedVersion: this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null
     });
     this.onBeforeQuitForUpdate?.();
+  }
+
+  private resolveInstallabilityIssue(): string | null {
+    if (this.platform !== 'darwin') {
+      return null;
+    }
+
+    const bundlePath = resolveInstalledBundlePath(this.executablePath);
+    if (!bundlePath) {
+      return 'KnowledgeBase could not determine the installed app bundle location for this update.';
+    }
+
+    if (bundlePath.startsWith('/Volumes/')) {
+      return 'KnowledgeBase is running from a mounted volume. Move it to /Applications or ~/Applications, then try the update again.';
+    }
+
+    const bundleParentPath = path.dirname(bundlePath);
+    try {
+      fs.accessSync(bundleParentPath, fs.constants.W_OK);
+    } catch {
+      return `KnowledgeBase cannot install updates because ${bundleParentPath} is not writable for this account. Move the app to ~/Applications or reinstall it so this user owns the app, then try again.`;
+    }
+
+    return null;
   }
 }
