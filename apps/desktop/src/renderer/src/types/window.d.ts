@@ -1,4 +1,5 @@
 import {
+  type AppUpdateStateChangedEvent,
   type AiAssistantContextChangedEvent,
   type AiAssistantDetachedWindowMoveRequest,
   type AiAssistantDetachedWindowResizeRequest,
@@ -17,6 +18,7 @@ export interface KbvApi {
   cancelJob: (jobId: string) => Promise<JobPayload>;
   emitJobEvents: (handler: (event: JobEvent) => void) => () => void;
   emitAppWorkingStateEvents: (handler: (event: AppWorkingStatePatchAppliedEvent) => void) => () => void;
+  emitAppUpdateEvents: (handler: (event: AppUpdateStateChangedEvent) => void) => () => void;
   emitAiAssistantEvents: (handler: (event: AiAssistantStreamEvent) => void) => () => void;
   emitAiAssistantPresentationEvents: (handler: (event: AiAssistantPresentationChangedEvent) => void) => () => void;
   emitAiAssistantContextEvents: (handler: (event: AiAssistantContextChangedEvent) => void) => () => void;

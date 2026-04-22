@@ -142,7 +142,7 @@ export function Sidebar({ activeRoute, onNavigate, workspaceName, isConnected, c
         <div className="sidebar-header">
           <div className="sidebar-logo">
             <div className="sidebar-logo-icon" aria-hidden="true">KB</div>
-            <span className="sidebar-logo-text">KB Vault</span>
+            <span className="sidebar-logo-text">KnowledgeBase</span>
           </div>
         </div>
 

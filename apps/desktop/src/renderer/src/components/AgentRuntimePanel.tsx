@@ -624,7 +624,7 @@ export function HealthStatusPanel({ workspaceId }: HealthStatusPanelProps) {
                 <HealthCheckItem
                   label="Provider Selection"
                   ok
-                  detail={`Strict mode: KB Vault will only use ${providerHealth.selectedMode.toUpperCase()} until you switch providers manually.`}
+                  detail={`Strict mode: KnowledgeBase will only use ${providerHealth.selectedMode.toUpperCase()} until you switch providers manually.`}
                 />
                 {activeProvider && (
                   <HealthCheckItem
@@ -761,12 +761,12 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
     },
     mcp: {
       label: 'MCP (Model Context Protocol)',
-      helper: 'Optional advanced mode for MCP-backed KB tools and compatibility workflows. KB Vault will not auto-switch providers.',
+      helper: 'Optional advanced mode for MCP-backed KB tools and compatibility workflows. KnowledgeBase will not auto-switch providers.',
       icon: 'server',
     },
     cli: {
       label: 'CLI (Command Line)',
-      helper: 'Optional advanced mode for CLI-backed KB access and debugging. KB Vault will use CLI only when you select it.',
+      helper: 'Optional advanced mode for CLI-backed KB access and debugging. KnowledgeBase will use CLI only when you select it.',
       icon: 'terminal',
     },
   };
@@ -885,7 +885,7 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
               </div>
               <p className="agent-mode-switch-body">
                 Future agent sessions will use the {pendingMode.toUpperCase()} provider exactly as selected.
-                Any running sessions will keep their current mode until they finish, and KB Vault will not auto-switch providers.
+                Any running sessions will keep their current mode until they finish, and KnowledgeBase will not auto-switch providers.
               </p>
               {!availableModes.includes(pendingMode) && (
                 <div className="agent-mode-switch-warning" role="alert">
@@ -893,7 +893,7 @@ function KbAccessModeToggle({ workspaceId, currentMode, availableModes, onModeCh
                   <span>
                     The {pendingMode.toUpperCase()} provider is currently offline.
                     New sessions will fail preflight until it becomes healthy.
-                    KB Vault will not auto-switch to the other provider.
+                    KnowledgeBase will not auto-switch to the other provider.
                   </span>
                 </div>
               )}
@@ -2268,7 +2268,7 @@ export function CursorUnavailableBanner() {
       <div className="agent-unavailable-content">
         <div className="agent-unavailable-title">Cursor Is Not Available</div>
         <div className="agent-unavailable-desc">
-          KB Vault needs Cursor with ACP (Agent Control Protocol) enabled to run AI analysis and editing.
+          KnowledgeBase needs Cursor with ACP (Agent Control Protocol) enabled to run AI analysis and editing.
           This is required for both MCP and CLI access modes.
         </div>
         <div className="agent-unavailable-steps" role="list" aria-label="Steps to resolve">

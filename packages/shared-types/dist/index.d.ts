@@ -10,3 +10,4 @@ export * from './batch9';
 export * from './direct';
 export * from './ai-assistant';
 export * from './app-working-state';
+export * from './updates';

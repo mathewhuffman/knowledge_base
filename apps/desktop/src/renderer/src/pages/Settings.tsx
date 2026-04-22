@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type {
+  AppUpdateState,
   WorkspaceSettingsRecord,
   RepositoryStructurePayload,
   ZendeskCredentialRecord,
@@ -18,6 +19,7 @@ import { LoadingState } from '../components/LoadingState';
 import { HealthStatusPanel, SessionListPanel, SessionDetailPanel } from '../components/AgentRuntimePanel';
 import type { AgentSessionRecord } from '@kb-vault/shared-types';
 import { IconSettings, IconSearch, IconRefreshCw, IconCheckCircle, IconAlertCircle, IconFolder } from '../components/icons';
+import { useAppUpdate } from '../context/AppUpdateContext';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 
@@ -104,6 +106,43 @@ function formatRelativeTime(utc: string): string {
   if (hrs < 24) return `${hrs}h ago`;
   const days = Math.floor(hrs / 24);
   return `${days}d ago`;
+}
+
+function appUpdateBadgeVariant(state: AppUpdateState | null): 'neutral' | 'primary' | 'success' | 'warning' | 'danger' {
+  switch (state?.status) {
+    case 'checking':
+    case 'downloading':
+      return 'primary';
+    case 'downloaded':
+      return 'success';
+    case 'available':
+      return 'warning';
+    case 'error':
+      return 'danger';
+    case 'not_available':
+      return 'success';
+    default:
+      return 'neutral';
+  }
+}
+
+function appUpdateBadgeLabel(state: AppUpdateState | null): string {
+  switch (state?.status) {
+    case 'checking':
+      return 'Checking';
+    case 'available':
+      return 'Update available';
+    case 'not_available':
+      return 'Up to date';
+    case 'downloading':
+      return 'Downloading';
+    case 'downloaded':
+      return 'Ready to install';
+    case 'error':
+      return 'Error';
+    default:
+      return 'Idle';
+  }
 }
 
 /* ================================================================== */
@@ -742,13 +781,19 @@ function formatModelCost(model: AgentRuntimeModelOption): string {
 /* ================================================================== */
 export const Settings = () => {
   const { activeWorkspace } = useWorkspace();
+  const {
+    state: appUpdateState,
+    loading: appUpdateLoading,
+    checkForUpdates,
+    setAutoCheckEnabled
+  } = useAppUpdate();
   const settingsQuery = useIpc<WorkspaceSettingsRecord>('workspace.settings.get');
   const repoQuery = useIpc<RepositoryStructurePayload>('workspace.repository.info');
   const settingsMutation = useIpcMutation<WorkspaceSettingsRecord>('workspace.settings.update');
   const credentialsQuery = useIpc<ZendeskCredentialRecord | null>('zendesk.credentials.get');
   const runtimeOptionsQuery = useIpc<AgentRuntimeOptionsResponse>('agent.runtime.options.get');
 
-  const [activeSection, setActiveSection] = useState('zendesk');
+  const [activeSection, setActiveSection] = useState(activeWorkspace ? 'zendesk' : 'application');
   const [selectedSession, setSelectedSession] = useState<AgentSessionRecord | null>(null);
 
   // Form state for locale settings
@@ -765,7 +810,7 @@ export const Settings = () => {
   const [zendeskPlaceholderAssetPolicy, setZendeskPlaceholderAssetPolicy] = useState<'block' | 'upload'>('upload');
   const [zendeskRequireLiveConfirmation, setZendeskRequireLiveConfirmation] = useState(true);
   const [zendeskBlockLiveOnWarnings, setZendeskBlockLiveOnWarnings] = useState(true);
-  const [zendeskFallbackCategoryName, setZendeskFallbackCategoryName] = useState('KB Vault Imports');
+  const [zendeskFallbackCategoryName, setZendeskFallbackCategoryName] = useState('KnowledgeBase Imports');
   const [zendeskFallbackSectionName, setZendeskFallbackSectionName] = useState('Unsorted');
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [publishSaveSuccess, setPublishSaveSuccess] = useState(false);
@@ -773,6 +818,21 @@ export const Settings = () => {
   const [runtimeValidationError, setRuntimeValidationError] = useState('');
   const [acpRuntimeSaveSuccess, setAcpRuntimeSaveSuccess] = useState(false);
   const [acpRuntimeValidationError, setAcpRuntimeValidationError] = useState('');
+  const sections = activeWorkspace
+    ? [
+        { id: 'zendesk', label: 'Zendesk Connection' },
+        { id: 'locales', label: 'Locales' },
+        { id: 'publish', label: 'Publish' },
+        { id: 'ai', label: 'AI Runtime' },
+        { id: 'application', label: 'Updates' },
+        { id: 'workspace', label: 'Workspace' },
+        { id: 'storage', label: 'Storage' },
+        { id: 'about', label: 'About' },
+      ]
+    : [
+        { id: 'application', label: 'Updates' },
+        { id: 'about', label: 'About' },
+      ];
 
   useEffect(() => {
     if (activeWorkspace) {
@@ -805,14 +865,20 @@ export const Settings = () => {
 
   useEffect(() => {
     const options = runtimeOptionsQuery.data;
-    if (!options || settingsQuery.data?.agentModelId) {
+    if (!options || settingsQuery.data?.agentModelId || settingsQuery.data?.acpModelId || agentModelId) {
       return;
     }
     const fallbackModelId = options.currentModelId ?? options.modelCatalog?.[0]?.id ?? '';
     if (fallbackModelId) {
       setAgentModelId(fallbackModelId);
     }
-  }, [runtimeOptionsQuery.data, settingsQuery.data?.agentModelId]);
+  }, [agentModelId, runtimeOptionsQuery.data, settingsQuery.data?.acpModelId, settingsQuery.data?.agentModelId]);
+
+  useEffect(() => {
+    if (!sections.some((section) => section.id === activeSection)) {
+      setActiveSection(sections[0]?.id ?? 'application');
+    }
+  }, [activeSection, sections]);
 
   const handleToggleLocale = (locale: string) => {
     if (locale === defaultLocale) return;
@@ -931,38 +997,13 @@ export const Settings = () => {
     }
   };
 
-  const sections = [
-    { id: 'zendesk', label: 'Zendesk Connection' },
-    { id: 'locales', label: 'Locales' },
-    { id: 'publish', label: 'Publish' },
-    { id: 'ai', label: 'AI Runtime' },
-    { id: 'workspace', label: 'Workspace' },
-    { id: 'storage', label: 'Storage' },
-    { id: 'about', label: 'About' },
-  ];
-
-  if (!activeWorkspace) {
-    return (
-      <>
-        <PageHeader title="Settings" subtitle="No workspace selected" />
-        <div className="route-content">
-          <EmptyState
-            icon={<IconSettings size={48} />}
-            title="No workspace open"
-            description="Open a workspace to configure its settings."
-          />
-        </div>
-      </>
-    );
-  }
-
   const selectedModel = runtimeOptionsQuery.data?.modelCatalog?.find((model) => model.id === agentModelId);
   const modelOptions = runtimeOptionsQuery.data?.modelCatalog ?? [];
   const selectedAcpModel = ACP_MODEL_OPTIONS.find((model) => model.id === acpModelId) ?? null;
 
   return (
     <>
-      <PageHeader title="Settings" subtitle={activeWorkspace.name} />
+      <PageHeader title="Settings" subtitle={activeWorkspace?.name ?? 'Application'} />
       <div className="route-content" style={{ display: 'flex', gap: 'var(--space-6)' }}>
         {/* Section nav */}
         <div style={{ width: 180, flexShrink: 0 }}>
@@ -982,7 +1023,15 @@ export const Settings = () => {
 
         {/* Content */}
         <div style={{ flex: 1, maxWidth: 680 }}>
-          {activeSection === 'zendesk' && (
+          {!activeWorkspace && (
+            <div className="card card-padded" style={{ marginBottom: 'var(--space-4)' }}>
+              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>
+                Workspace-specific settings become available after you open a workspace. App updates and version info remain available here anytime.
+              </div>
+            </div>
+          )}
+
+          {activeSection === 'zendesk' && activeWorkspace && (
             <div>
               <h3 className="settings-heading">Zendesk Connection</h3>
 
@@ -1002,7 +1051,7 @@ export const Settings = () => {
             </div>
           )}
 
-          {activeSection === 'locales' && (
+          {activeSection === 'locales' && activeWorkspace && (
             <div>
               <h3 className="settings-heading">Locale Configuration</h3>
 
@@ -1065,7 +1114,7 @@ export const Settings = () => {
             </div>
           )}
 
-          {activeSection === 'publish' && (
+          {activeSection === 'publish' && activeWorkspace && (
             <div>
               <h3 className="settings-heading">Publish Defaults</h3>
 
@@ -1156,13 +1205,13 @@ export const Settings = () => {
                         checked: zendeskAllowCategoryCreation,
                         onChange: () => setZendeskAllowCategoryCreation((value) => !value),
                         label: 'Allow category auto-create',
-                        detail: 'Lets KB Vault create missing Zendesk categories during publish.'
+                        detail: 'Lets KnowledgeBase create missing Zendesk categories during publish.'
                       },
                       {
                         checked: zendeskAllowSectionCreation,
                         onChange: () => setZendeskAllowSectionCreation((value) => !value),
                         label: 'Allow section auto-create',
-                        detail: 'Lets KB Vault create missing Zendesk sections during publish.'
+                        detail: 'Lets KnowledgeBase create missing Zendesk sections during publish.'
                       },
                       {
                         checked: zendeskRequireLiveConfirmation,
@@ -1212,7 +1261,7 @@ export const Settings = () => {
             </div>
           )}
 
-          {activeSection === 'ai' && (
+          {activeSection === 'ai' && activeWorkspace && (
             <div>
               <h3 className="settings-heading">AI Runtime</h3>
               <div className="card card-padded" style={{ marginBottom: 'var(--space-4)' }}>
@@ -1241,6 +1290,7 @@ export const Settings = () => {
                           value={agentModelId}
                           onChange={(e) => setAgentModelId(e.target.value)}
                         >
+                          <option value="" disabled>Select preferred model...</option>
                           {modelOptions.map((model) => (
                             <option key={model.id} value={model.id}>
                               {model.provider !== 'Unknown' ? `${model.provider} - ${model.name}` : model.name}
@@ -1252,10 +1302,13 @@ export const Settings = () => {
                             {formatModelCost(selectedModel)}
                           </div>
                         )}
+                        <div className="settings-hint" style={{ marginTop: 'var(--space-2)' }}>
+                          Optional override. ACP is now the default session model unless you explicitly save a different preferred model.
+                        </div>
                       </>
                     ) : (
                       <div className="settings-hint">
-                        No agent models were discovered. KB Vault will try <code>agent --list-models</code>, <code>agent models</code>, and an ACP runtime probe. Check that your local agent runtime is installed and reachable.
+                        No agent models were discovered. KnowledgeBase will try <code>agent --list-models</code>, <code>agent models</code>, and an ACP runtime probe. Check that your local agent runtime is installed and reachable.
                       </div>
                     )}
                     {!runtimeOptionsQuery.loading && runtimeOptionsQuery.error && (
@@ -1340,7 +1393,109 @@ export const Settings = () => {
             </div>
           )}
 
-          {activeSection === 'workspace' && (
+          {activeSection === 'application' && (
+            <div>
+              <h3 className="settings-heading">Application Updates</h3>
+              <div className="card card-padded">
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
+                    <div>
+                      <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)', marginBottom: 'var(--space-1)' }}>
+                        Current version
+                      </div>
+                      <div style={{ fontSize: 'var(--text-lg)', fontWeight: 'var(--weight-semibold)' }}>
+                        {appUpdateState?.currentVersion ?? 'Loading...'}
+                      </div>
+                    </div>
+                    <Badge variant={appUpdateBadgeVariant(appUpdateState)}>
+                      {appUpdateLoading ? 'Loading...' : appUpdateBadgeLabel(appUpdateState)}
+                    </Badge>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
+                    <div>
+                      <div className="settings-label" style={{ marginBottom: 'var(--space-1)' }}>Automatically check for updates</div>
+                      <div className="settings-hint" style={{ marginBottom: 0 }}>
+                        Enabled by default. KnowledgeBase checks on launch and periodically while the app stays open.
+                      </div>
+                    </div>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-2)', fontSize: 'var(--text-sm)' }}>
+                      <input
+                        type="checkbox"
+                        checked={appUpdateState?.autoCheckEnabled ?? true}
+                        onChange={(e) => {
+                          void setAutoCheckEnabled(e.target.checked);
+                        }}
+                        disabled={appUpdateLoading}
+                      />
+                      <span>{appUpdateState?.autoCheckEnabled ?? true ? 'On' : 'Off'}</span>
+                    </label>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => void checkForUpdates()}
+                      disabled={appUpdateLoading || appUpdateState?.status === 'checking' || !appUpdateState?.isUpdateSupported}
+                    >
+                      {appUpdateState?.status === 'checking' ? 'Checking...' : 'Check for Updates'}
+                    </button>
+                    {appUpdateState?.lastCheckedAt ? (
+                      <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                        Last checked {new Date(appUpdateState.lastCheckedAt).toLocaleString()}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {!appUpdateState?.isUpdateSupported && (
+                    <div className="settings-hint" style={{ marginBottom: 0 }}>
+                      Update checks work in packaged builds. The release workflow publishes installer assets and update metadata to GitHub Releases.
+                    </div>
+                  )}
+
+                  {appUpdateState?.status === 'available' && appUpdateState.updateInfo && (
+                    <div className="settings-test-result settings-test-result--success">
+                      <IconCheckCircle size={16} />
+                      <div>
+                        <div style={{ fontWeight: 'var(--weight-medium)' }}>
+                          Version {appUpdateState.updateInfo.version} is available
+                        </div>
+                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                          The update popup includes release notes and download controls.
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {appUpdateState?.status === 'downloaded' && (
+                    <div className="settings-test-result settings-test-result--success">
+                      <IconCheckCircle size={16} />
+                      <div>
+                        <div style={{ fontWeight: 'var(--weight-medium)' }}>Update downloaded</div>
+                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                          Restart KnowledgeBase from the update popup when you're ready to install it.
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {appUpdateState?.status === 'error' && appUpdateState.errorMessage && (
+                    <div className="settings-test-result settings-test-result--failed">
+                      <IconAlertCircle size={16} />
+                      <div>
+                        <div style={{ fontWeight: 'var(--weight-medium)' }}>Update check failed</div>
+                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                          {appUpdateState.errorMessage}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeSection === 'workspace' && activeWorkspace && (
             <div>
               <h3 className="settings-heading">Workspace Settings</h3>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
@@ -1360,7 +1515,7 @@ export const Settings = () => {
             </div>
           )}
 
-          {activeSection === 'storage' && (
+          {activeSection === 'storage' && activeWorkspace && (
             <div>
               <h3 className="settings-heading">Local Repository Structure</h3>
               {repoQuery.loading ? (
@@ -1392,10 +1547,12 @@ export const Settings = () => {
 
           {activeSection === 'about' && (
             <div>
-              <h3 className="settings-heading">About KB Vault</h3>
+              <h3 className="settings-heading">About KnowledgeBase</h3>
               <div className="card card-padded">
-                <div style={{ fontSize: 'var(--text-sm)', marginBottom: 'var(--space-2)' }}><strong>Version:</strong> 0.1.0</div>
-                <div style={{ fontSize: 'var(--text-sm)', marginBottom: 'var(--space-2)' }}><strong>Workspace ID:</strong> {activeWorkspace.id}</div>
+                <div style={{ fontSize: 'var(--text-sm)', marginBottom: 'var(--space-2)' }}><strong>Version:</strong> {appUpdateState?.currentVersion ?? 'Loading...'}</div>
+                {activeWorkspace && (
+                  <div style={{ fontSize: 'var(--text-sm)', marginBottom: 'var(--space-2)' }}><strong>Workspace ID:</strong> {activeWorkspace.id}</div>
+                )}
                 <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>Local-first Electron desktop application for automating Zendesk KB maintenance from bulk PBI uploads.</div>
               </div>
             </div>

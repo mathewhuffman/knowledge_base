@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { app } from 'electron';
-import type { AiAssistantPresentationPreferences } from '@kb-vault/shared-types';
+import type { AiAssistantPresentationPreferences, AppUpdatePreferences } from '@kb-vault/shared-types';
 import { logger } from './logger';
 
 type AppPreferences = {
@@ -9,6 +9,7 @@ type AppPreferences = {
     sidebarCollapsed?: boolean;
     assistant?: AiAssistantPresentationPreferences;
   };
+  updates?: AppUpdatePreferences;
 };
 
 function getPreferencesPath(): string {
@@ -111,5 +112,35 @@ export function setAssistantPresentationPreferences(nextPreferences: AiAssistant
       ...preferences.ui,
       assistant: nextPreferences
     }
+  });
+}
+
+export function getAppUpdatePreferences(): AppUpdatePreferences {
+  const preferences = readPreferences().updates;
+  if (!preferences || typeof preferences !== 'object') {
+    logger.info('app-preferences.getAppUpdatePreferences.empty');
+    return {};
+  }
+
+  logger.info('app-preferences.getAppUpdatePreferences.success', {
+    autoCheckEnabled: preferences.autoCheckEnabled ?? null,
+    dismissedVersion: preferences.dismissedVersion ?? null,
+    lastCheckedAt: preferences.lastCheckedAt ?? null
+  });
+
+  return preferences;
+}
+
+export function setAppUpdatePreferences(nextPreferences: AppUpdatePreferences): void {
+  logger.info('app-preferences.setAppUpdatePreferences.begin', {
+    autoCheckEnabled: nextPreferences.autoCheckEnabled ?? null,
+    dismissedVersion: nextPreferences.dismissedVersion ?? null,
+    lastCheckedAt: nextPreferences.lastCheckedAt ?? null
+  });
+
+  const preferences = readPreferences();
+  writePreferences({
+    ...preferences,
+    updates: nextPreferences
   });
 }

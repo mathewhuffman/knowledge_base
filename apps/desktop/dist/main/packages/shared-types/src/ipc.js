@@ -7,6 +7,7 @@ exports.IPC_CHANNELS = {
     JOB_CANCEL: 'kbv:job:cancel',
     JOB_EVENT: 'kbv:job:event',
     APP_WORKING_STATE_EVENT: 'kbv:app-working-state:event',
+    APP_UPDATE_EVENT: 'kbv:app-update:event',
     AI_ASSISTANT_EVENT: 'kbv:ai-assistant:event',
     AI_ASSISTANT_PRESENTATION_EVENT: 'kbv:ai-assistant:presentation:event',
     AI_ASSISTANT_CONTEXT_EVENT: 'kbv:ai-assistant:context:event',

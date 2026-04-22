@@ -193,7 +193,7 @@ function sortSessionsChronologically(sessions: AiSessionRecord[]): AiSessionReco
 
 const ROUTE_LABELS: Record<AppRoute, string> = {
   [AppRoute.WORKSPACE_SWITCHER]: 'Workspace Switcher',
-  [AppRoute.KB_VAULT_HOME]: 'KB Vault Home',
+  [AppRoute.KB_VAULT_HOME]: 'KnowledgeBase Home',
   [AppRoute.ARTICLE_EXPLORER]: 'Article Explorer',
   [AppRoute.RELATIONS_GRAPH]: 'Feature Map',
   [AppRoute.PBI_BATCHES]: 'PBI Batches',

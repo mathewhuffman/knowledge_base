@@ -168,6 +168,7 @@ const ACP_ALLOWED_MODEL_IDS = new Set([
     'gemini-2.5-flash[]',
     'kimi-k2.5[]'
 ]);
+const DEFAULT_ACP_MODEL_ID = 'composer-2[fast=true]';
 class WorkspaceRepository {
     workspaceRoot;
     catalogDbPath;
@@ -265,6 +266,7 @@ class WorkspaceRepository {
             , zendesk_block_live_on_warnings, zendesk_fallback_category_name, zendesk_fallback_section_name
            FROM workspace_settings WHERE workspace_id = @workspaceId`, { workspaceId: id });
                 if (settings) {
+                    const normalizedAcpModelId = this.normalizeAcpModelId(settings.acp_model_id) ?? DEFAULT_ACP_MODEL_ID;
                     return {
                         workspaceId: settings.workspace_id,
                         zendeskSubdomain: settings.zendesk_subdomain,
@@ -273,7 +275,7 @@ class WorkspaceRepository {
                         enabledLocales: safeParseLocales(settings.enabled_locales),
                         kbAccessMode: normalizeKbAccessMode(settings.kb_access_mode),
                         agentModelId: this.normalizeAgentModelId(settings.agent_model_id),
-                        acpModelId: this.normalizeAcpModelId(settings.acp_model_id),
+                        acpModelId: normalizedAcpModelId,
                         zendeskPermissionGroupId: normalizeZendeskPublishId(settings.zendesk_permission_group_id),
                         zendeskLiveUserSegmentId: normalizeZendeskPublishId(settings.zendesk_live_user_segment_id),
                         zendeskNotifySubscribers: normalizeBooleanColumn(settings.zendesk_notify_subscribers, DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS),
@@ -308,7 +310,7 @@ class WorkspaceRepository {
                     enabledLocales: JSON.stringify(enabledLocales),
                     kbAccessMode: DEFAULT_KB_ACCESS_MODE,
                     agentModelId: null,
-                    acpModelId: null,
+                    acpModelId: DEFAULT_ACP_MODEL_ID,
                     zendeskPermissionGroupId: null,
                     zendeskLiveUserSegmentId: null,
                     zendeskNotifySubscribers: DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS ? 1 : 0,
@@ -330,7 +332,7 @@ class WorkspaceRepository {
                     enabledLocales,
                     kbAccessMode: DEFAULT_KB_ACCESS_MODE,
                     agentModelId: undefined,
-                    acpModelId: undefined,
+                    acpModelId: DEFAULT_ACP_MODEL_ID,
                     zendeskPermissionGroupId: undefined,
                     zendeskLiveUserSegmentId: undefined,
                     zendeskNotifySubscribers: DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS,
@@ -438,7 +440,7 @@ class WorkspaceRepository {
                     : this.normalizeAgentModelId(existing?.agent_model_id);
                 const nextAcpModelId = payload.acpModelId !== undefined
                     ? this.normalizeAcpModelId(payload.acpModelId)
-                    : this.normalizeAcpModelId(existing?.acp_model_id);
+                    : this.normalizeAcpModelId(existing?.acp_model_id) ?? DEFAULT_ACP_MODEL_ID;
                 const nextZendeskPermissionGroupId = payload.zendeskPermissionGroupId !== undefined
                     ? normalizeZendeskPublishId(payload.zendeskPermissionGroupId)
                     : normalizeZendeskPublishId(existing?.zendesk_permission_group_id);
@@ -630,7 +632,7 @@ class WorkspaceRepository {
                     enabledLocales: JSON.stringify(enabledLocales),
                     kbAccessMode: DEFAULT_KB_ACCESS_MODE,
                     agentModelId: null,
-                    acpModelId: null,
+                    acpModelId: DEFAULT_ACP_MODEL_ID,
                     updatedAt: now
                 });
             }

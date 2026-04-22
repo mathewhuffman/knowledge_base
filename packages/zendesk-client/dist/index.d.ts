@@ -151,6 +151,7 @@ export declare class ZendeskClient {
     isConfigured(): boolean;
     static fromConfig(config: ZendeskClientConfig, credentials: ZendeskCredentials): ZendeskClient;
     private getAuthHeader;
+    private sendRequest;
     private request;
     private requestWithRetry;
     testConnection(): Promise<ZendeskConnectionTest>;

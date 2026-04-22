@@ -1,8 +1,13 @@
 import { app, BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import tls from 'node:tls';
 import {
   IPC_CHANNELS,
+  type AppUpdateCheckRequest,
+  type AppUpdateSetAutoCheckRequest,
+  type AppUpdateStateChangedEvent,
   type AiAssistantContextChangedEvent,
   type AiAssistantDetachedWindowMoveRequest,
   type AiAssistantDetachedWindowResizeRequest,
@@ -22,14 +27,91 @@ import { JobRegistry } from './services/job-runner';
 import { registerCoreCommands } from './services/command-registry';
 import { McpBridgeService } from './services/mcp-bridge-service';
 import {
+  getAppUpdatePreferences,
   getAssistantPresentationPreferences,
   getStoredSidebarCollapsedPreference,
+  setAppUpdatePreferences,
   setAssistantPresentationPreferences,
   setSidebarCollapsedPreference
 } from './services/app-preferences';
 import { AssistantPresentationService } from './services/assistant-presentation-service';
 import { AssistantViewContextService } from './services/assistant-view-context-service';
 import { AssistantWindowManager } from './services/assistant-window-manager';
+import { AppUpdateService } from './services/update-service';
+
+type NodeTlsWithSystemCerts = typeof tls & {
+  getCACertificates?: (type?: 'default' | 'bundled' | 'system' | 'extra') => string[];
+  setDefaultCACertificates?: (certs: string[]) => void;
+};
+
+function splitPemCertificates(pemBundle: string): string[] {
+  const matches = pemBundle.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+  return matches?.map((certificate) => certificate.trim()).filter(Boolean) ?? [];
+}
+
+function getDefaultCaCertificates(): string[] {
+  const tlsWithSystemCerts = tls as NodeTlsWithSystemCerts;
+  if (typeof tlsWithSystemCerts.getCACertificates === 'function') {
+    return tlsWithSystemCerts.getCACertificates('default');
+  }
+  return [...tls.rootCertificates];
+}
+
+function getMacSystemCertificates(): string[] {
+  const tlsWithSystemCerts = tls as NodeTlsWithSystemCerts;
+  if (typeof tlsWithSystemCerts.getCACertificates === 'function') {
+    return tlsWithSystemCerts.getCACertificates('system');
+  }
+
+  const pemBundle = execSync(
+    'security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null; ' +
+    'security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null; ' +
+    'security find-certificate -a -p ~/Library/Keychains/login.keychain-db 2>/dev/null',
+    { encoding: 'utf8', timeout: 5000 }
+  );
+  return splitPemCertificates(pemBundle);
+}
+
+function getProtectedWorkspaceRoots(appRoot: string): string[] {
+  const protectedRoots = new Set<string>();
+  const addProtectedRoot = (candidate?: string | null) => {
+    const normalized = candidate?.trim();
+    if (!normalized) {
+      return;
+    }
+    protectedRoots.add(path.resolve(normalized));
+  };
+
+  if (app.isPackaged) {
+    addProtectedRoot(process.resourcesPath);
+    addProtectedRoot(path.dirname(process.resourcesPath));
+    if (process.platform === 'darwin') {
+      addProtectedRoot(path.dirname(path.dirname(process.resourcesPath)));
+    }
+  } else {
+    addProtectedRoot(path.join(appRoot, 'apps', 'desktop', 'release'));
+  }
+
+  return [...protectedRoots];
+}
+
+// Electron's main-process network stack can miss enterprise roots installed in
+// the macOS keychain. Merge them into Node's default trust store up front.
+try {
+  if (process.platform === 'darwin') {
+    const tlsWithSystemCerts = tls as NodeTlsWithSystemCerts;
+    if (typeof tlsWithSystemCerts.setDefaultCACertificates === 'function') {
+      const mergedCertificates = Array.from(
+        new Set([...getDefaultCaCertificates(), ...getMacSystemCertificates()])
+      );
+      if (mergedCertificates.length > 0) {
+        tlsWithSystemCerts.setDefaultCACertificates(mergedCertificates);
+      }
+    }
+  }
+} catch {
+  // Fall back to Node's bundled trust store if the system keychain can't be read.
+}
 
 const commandBus = new CommandBus();
 const jobs = new JobRegistry();
@@ -37,6 +119,7 @@ let mcpBridge: McpBridgeService | null = null;
 let kbCliLoopback: { start: () => Promise<void>; stop: () => Promise<void> } | null = null;
 let mainWindow: BrowserWindow | null = null;
 let assistantWindowManager: AssistantWindowManager | null = null;
+let appUpdateService: AppUpdateService | null = null;
 
 function broadcast(channel: string, payload: unknown): void {
   BrowserWindow.getAllWindows().forEach((window) => {
@@ -85,7 +168,7 @@ function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1280,
     height: 860,
-    title: 'KB Vault',
+    title: 'KnowledgeBase',
     webPreferences: {
       preload: path.join(appRoot, 'dist', 'preload', 'index.js'),
       contextIsolation: true,
@@ -174,8 +257,13 @@ async function bootstrapApp() {
     setAssistantPresentationPreferences
   );
   const assistantViewContextService = new AssistantViewContextService();
+  appUpdateService = new AppUpdateService({
+    getPreferences: getAppUpdatePreferences,
+    setPreferences: setAppUpdatePreferences,
+    logger
+  });
 
-  logger.info('Booting KB Vault', {
+  logger.info('Booting KnowledgeBase', {
     workspaceRoot,
     featureFlags: config.featureFlags,
     environment: process.env.NODE_ENV ?? 'development'
@@ -188,6 +276,11 @@ async function bootstrapApp() {
 
   assistantViewContextService.subscribe((event: AiAssistantContextChangedEvent) => {
     broadcast(IPC_CHANNELS.AI_ASSISTANT_CONTEXT_EVENT, event);
+  });
+
+  appUpdateService.subscribe((state) => {
+    const event: AppUpdateStateChangedEvent = { state };
+    broadcast(IPC_CHANNELS.APP_UPDATE_EVENT, event);
   });
 
   assistantWindowManager = new AssistantWindowManager({
@@ -243,6 +336,48 @@ async function bootstrapApp() {
     }
   } as RpcResponse));
 
+  commandBus.register('system.updates.getState', async () => ({
+    ok: true,
+    data: appUpdateService ? appUpdateService.getState() : null
+  } as RpcResponse));
+
+  commandBus.register('system.updates.check', async (payload) => {
+    const source = ((payload as AppUpdateCheckRequest | undefined)?.source ?? 'manual') === 'automatic'
+      ? 'automatic'
+      : 'manual';
+
+    return {
+      ok: true,
+      data: appUpdateService ? await appUpdateService.checkForUpdates(source) : null
+    } as RpcResponse;
+  });
+
+  commandBus.register('system.updates.download', async () => ({
+    ok: true,
+    data: appUpdateService ? await appUpdateService.downloadUpdate() : null
+  } as RpcResponse));
+
+  commandBus.register('system.updates.setAutoCheckEnabled', async (payload) => {
+    const enabled = (payload as AppUpdateSetAutoCheckRequest | undefined)?.enabled !== false;
+    return {
+      ok: true,
+      data: appUpdateService ? await appUpdateService.setAutoCheckEnabled(enabled) : null
+    } as RpcResponse;
+  });
+
+  commandBus.register('system.updates.dismiss', async () => ({
+    ok: true,
+    data: appUpdateService ? appUpdateService.dismissModal() : null
+  } as RpcResponse));
+
+  commandBus.register('system.updates.quitAndInstall', async () => {
+    appUpdateService?.quitAndInstall();
+    return {
+      ok: true,
+      data: appUpdateService ? appUpdateService.getState() : null
+    } as RpcResponse;
+  });
+
   process.env.KBV_ACP_CWD = appRoot;
 
   const emitAppWorkingStateEvent = (event: AppWorkingStatePatchAppliedEvent) => {
@@ -277,7 +412,10 @@ async function bootstrapApp() {
     emitAiAssistantEvent,
     assistantPresentationService,
     assistantViewContextService,
-    dispatchAppNavigation
+    dispatchAppNavigation,
+    {
+      protectedWorkspaceRoots: getProtectedWorkspaceRoots(appRoot)
+    }
   );
   kbCliLoopback = cliLoopback;
   mcpBridge = new McpBridgeService(agentRuntime);
@@ -311,6 +449,7 @@ app.whenReady().then(async () => {
   await bootstrapApp();
   registerIpcHandlers();
   createMainWindow();
+  appUpdateService?.initialize();
 
   app.on('activate', () => {
     if (!mainWindow || mainWindow.isDestroyed()) {
@@ -326,6 +465,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  appUpdateService?.dispose();
   assistantWindowManager?.handleBeforeQuit();
   void mcpBridge?.stop();
   void kbCliLoopback?.stop();

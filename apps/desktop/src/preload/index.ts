@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import {
+  type AppUpdateStateChangedEvent,
   type AiAssistantDetachedWindowMoveRequest,
   type AiAssistantDetachedWindowResizeRequest,
   type AppWorkingStatePatchAppliedEvent,
@@ -20,6 +21,7 @@ const IPC_CHANNELS = {
   JOB_CANCEL: 'kbv:job:cancel',
   JOB_EVENT: 'kbv:job:event',
   APP_WORKING_STATE_EVENT: 'kbv:app-working-state:event',
+  APP_UPDATE_EVENT: 'kbv:app-update:event',
   AI_ASSISTANT_EVENT: 'kbv:ai-assistant:event',
   AI_ASSISTANT_PRESENTATION_EVENT: 'kbv:ai-assistant:presentation:event',
   AI_ASSISTANT_CONTEXT_EVENT: 'kbv:ai-assistant:context:event',
@@ -51,6 +53,14 @@ const emitAppWorkingStateEvents = (cb: (event: AppWorkingStatePatchAppliedEvent)
   ipcRenderer.on(IPC_CHANNELS.APP_WORKING_STATE_EVENT, listener);
   return () => {
     ipcRenderer.removeListener(IPC_CHANNELS.APP_WORKING_STATE_EVENT, listener);
+  };
+};
+
+const emitAppUpdateEvents = (cb: (event: AppUpdateStateChangedEvent) => void) => {
+  const listener = (_event: Electron.IpcRendererEvent, data: AppUpdateStateChangedEvent) => cb(data);
+  ipcRenderer.on(IPC_CHANNELS.APP_UPDATE_EVENT, listener);
+  return () => {
+    ipcRenderer.removeListener(IPC_CHANNELS.APP_UPDATE_EVENT, listener);
   };
 };
 
@@ -102,6 +112,7 @@ contextBridge.exposeInMainWorld('kbv', {
   invoke,
   emitJobEvents,
   emitAppWorkingStateEvents,
+  emitAppUpdateEvents,
   emitAiAssistantEvents,
   emitAiAssistantPresentationEvents,
   emitAiAssistantContextEvents,

@@ -21,7 +21,7 @@ const ASSISTANT_CHAT_RESEARCH_TRANSCRIPT_MAX_WAIT_MS = 60_000;
 const ASSISTANT_CHAT_TRANSCRIPT_POLL_MS = 250;
 function buildAssistantChatCompletionFollowupPrompt(kbAccessMode) {
     const lookupInstruction = kbAccessMode === 'mcp'
-        ? 'Use only direct KB Vault MCP tools if one final targeted lookup is still truly required.'
+        ? 'Use only direct KnowledgeBase MCP tools if one final targeted lookup is still truly required.'
         : kbAccessMode === 'cli'
             ? 'Use only exact kb CLI commands if one final targeted lookup is still truly required.'
             : 'If one final KB lookup or confirmed app mutation is still required, return exactly one `needs_action` direct-action JSON envelope in this follow-up. Do not describe transport internals or ad-hoc environment exploration.';
@@ -665,11 +665,11 @@ class AiAssistantService {
         const providerRules = kbAccessMode === 'mcp'
             ? [
                 '- If the answer is already clear from the provided context, answer immediately without using tools.',
-                '- If workspace knowledge is needed, use the minimum KB Vault MCP tool path required to answer accurately.',
+                '- If workspace knowledge is needed, use the minimum KnowledgeBase MCP tool path required to answer accurately.',
                 '- For app-feature, workflow, or terminology questions, default to this sequence: `search_kb`, `get_article` for the best 1-3 matches, then answer the user clearly.',
                 '- If the user explicitly asks you to research, ponder, look up, or investigate something, do that work and then return the final findings in the same turn. Do not stop on a progress update.',
                 '- Keep progress, working notes, and intermediate reasoning out of the user-visible reply. If the runtime supports separate thought updates, use those instead of status messages.',
-                '- When research or data lookup is needed, use only the direct KB Vault MCP tools needed for the answer. Do not use terminal commands, kb CLI commands, list_mcp_resources, fetch_mcp_resource, grep, Read File, codebase search, or filesystem exploration.',
+                '- When research or data lookup is needed, use only the direct KnowledgeBase MCP tools needed for the answer. Do not use terminal commands, kb CLI commands, list_mcp_resources, fetch_mcp_resource, grep, Read File, codebase search, or filesystem exploration.',
                 '- Prefer `search_kb` first and `get_article` second for ordinary user questions about the app.',
                 '- Use `get_article_family` only when one clearly relevant article needs family or locale context.',
                 '- Use `get_batch_context`, `find_related_articles`, proposal tools, and app mutation tools only when the route or user request clearly requires them.',
@@ -721,7 +721,7 @@ class AiAssistantService {
                 '- If you use `payload.htmlMutations`, the app will materialize the final HTML locally from the current article HTML.',
                 '- For broad rewrites, return the full final article HTML in `html` or `payload.proposedHtml`.',
                 '- Do not use `payload.lineEdits` for `proposal_candidate`. Line edits are only for `proposal_patch` in Proposal Review.',
-                '- Do not claim KB Vault MCP tools are unavailable because they are not shown in a generic tool list. In MCP mode, call the KB Vault MCP tools named in this prompt directly when needed.'
+                '- Do not claim KnowledgeBase MCP tools are unavailable because they are not shown in a generic tool list. In MCP mode, call the KnowledgeBase MCP tools named in this prompt directly when needed.'
             ]
             : kbAccessMode === 'direct'
                 ? [
@@ -778,7 +778,7 @@ class AiAssistantService {
                     ]
             : [];
         return [
-            'You are the KB Vault global AI assistant.',
+            'You are the KnowledgeBase global AI assistant.',
             'For every assistant-chat reply, return JSON. The `response` field is the only user-visible text.',
             'Write in clear, natural English. Do not imitate malformed wording from prior assistant turns or raw source content.',
             'When you do return JSON, use this schema:',
