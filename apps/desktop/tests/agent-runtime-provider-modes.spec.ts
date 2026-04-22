@@ -140,6 +140,93 @@ rl.on('line', (line) => {
   return binaryPath;
 }
 
+async function createFakeAgentBinary(root: string, logPath: string): Promise<string> {
+  const binaryPath = path.join(root, 'agent');
+  const source = `#!/usr/bin/env node
+const fs = require('node:fs');
+const net = require('node:net');
+const readline = require('node:readline');
+
+const logPath = process.env.KBV_TEST_ACP_LOG_PATH;
+const sessionId = 'acp-session-test';
+
+function append(entry) {
+  fs.appendFileSync(logPath, JSON.stringify(entry) + '\\n', 'utf8');
+}
+
+if (process.argv.includes('--list-models') || process.argv.includes('models')) {
+  process.stdout.write('composer-2\\n');
+  process.exit(0);
+}
+
+function touchConfiguredMcpServers(params) {
+  const mcpServers = Array.isArray(params && params.mcpServers) ? params.mcpServers : [];
+  for (const server of mcpServers) {
+    const envEntries = Array.isArray(server && server.env) ? server.env : [];
+    const socketEntry = envEntries.find((entry) =>
+      entry
+      && entry.name === 'KBV_MCP_BRIDGE_SOCKET_PATH'
+      && typeof entry.value === 'string'
+      && entry.value.trim().length > 0
+    );
+    if (!socketEntry) {
+      continue;
+    }
+    const socket = net.createConnection(socketEntry.value, () => {
+      socket.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'fake-acp-tools-list',
+        method: 'tools/list',
+        params: {}
+      }) + '\\n');
+    });
+    socket.on('error', () => undefined);
+    socket.on('data', () => {
+      socket.end();
+    });
+  }
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  const message = JSON.parse(trimmed);
+  append({ method: message.method, params: message.params });
+
+  if (message.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'authenticate') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/new') {
+    touchConfiguredMcpServers(message.params);
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId, availableModels: ['composer-2'], currentModelId: 'composer-2' } }) + '\\n');
+    return;
+  }
+
+  if (message.method === 'session/prompt') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { status: 'ok' } }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) + '\\n');
+});
+`;
+
+  await writeFile(binaryPath, source, 'utf8');
+  await chmod(binaryPath, 0o755);
+  return binaryPath;
+}
+
 async function createDirectPlannerLoopAcpBinary(root: string, logPath: string): Promise<string> {
   const binaryPath = path.join(root, 'fake-agent-direct-planner-loop');
   const source = `#!/usr/bin/env node
@@ -2852,6 +2939,41 @@ test.describe('agent runtime provider modes', () => {
       expect(health.providers.direct.ok).toBe(true);
       expect(health.providers.direct.acpReachable).toBe(true);
       expect(health.providers.direct.message).toContain('Direct executor ready');
+      expect(health.availableModes).toContain('direct');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  test('runtime normalizes ACP cwd when packaged startup points it at a file path', async () => {
+    const logPath = path.join(tempRoot, 'direct-health-file-cwd-log.jsonl');
+    const binaryPath = await createFakeAgentBinary(tempRoot, logPath);
+    const packagedAsarPath = path.join(tempRoot, 'app.asar');
+    await writeFile(packagedAsarPath, 'packaged-app-placeholder', 'utf8');
+    process.env.KBV_CURSOR_BINARY = binaryPath;
+    process.env.KBV_ACP_CWD = packagedAsarPath;
+    process.env.KBV_TEST_ACP_LOG_PATH = logPath;
+    delete process.env.KBV_MCP_TOOLS;
+    delete process.env.KBV_MCP_BRIDGE_SOCKET_PATH;
+    delete process.env.KBV_MCP_BRIDGE_SCRIPT;
+
+    const runtime = new CursorAcpRuntime(tempRoot, buildToolContext(), {
+      getDirectHealth: async () => ({
+        mode: 'direct',
+        provider: 'direct',
+        ok: true,
+        message: 'Direct executor ready for assistant chat, article edit, and batch analysis'
+      }),
+      getWorkspaceAgentModel: async () => 'composer-2'
+    });
+
+    try {
+      const options = await runtime.getRuntimeOptions('workspace-1');
+      expect(options.availableModels).toContain('composer-2');
+
+      const health = await runtime.checkHealth('workspace-1', 'direct', 'direct');
+      expect(health.providers.direct.ok).toBe(true);
+      expect(health.providers.direct.acpReachable).toBe(true);
       expect(health.availableModes).toContain('direct');
     } finally {
       await runtime.stop();

@@ -133,6 +133,25 @@ function resolveDefaultCursorBinary(): string {
   return DEFAULT_CURSOR_BINARY;
 }
 
+function resolveAcpWorkingDirectory(configuredCwd?: string): string {
+  const candidates = [configuredCwd?.trim(), process.cwd()].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    try {
+      const resolved = path.resolve(candidate);
+      const stats = fs.statSync(resolved);
+      if (stats.isDirectory()) {
+        return resolved;
+      }
+      if (stats.isFile()) {
+        return path.dirname(resolved);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return process.cwd();
+}
+
 function hasBinaryOnPath(binary: string): boolean {
   const searchPath = process.env.PATH ?? '';
   return searchPath.split(path.delimiter).some((dir) => {
@@ -2356,7 +2375,7 @@ export class CursorAcpRuntime {
     runtimeOptions: KbRuntimeOptions = {},
     debugLogger?: RuntimeDebugLogger
   ) {
-    const acpCwd = process.env.KBV_ACP_CWD?.trim() || process.cwd();
+    const acpCwd = resolveAcpWorkingDirectory(process.env.KBV_ACP_CWD);
     const cursorBinary = process.env[KBV_CURSOR_BINARY_ENV]?.trim() || resolveDefaultCursorBinary();
     this.config = {
       workspaceRoot,

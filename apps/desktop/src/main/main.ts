@@ -95,6 +95,13 @@ function getProtectedWorkspaceRoots(appRoot: string): string[] {
   return [...protectedRoots];
 }
 
+function resolveAcpWorkingDirectory(appRoot: string): string {
+  if (app.isPackaged) {
+    return process.resourcesPath;
+  }
+  return appRoot;
+}
+
 // Electron's main-process network stack can miss enterprise roots installed in
 // the macOS keychain. Merge them into Node's default trust store up front.
 try {
@@ -378,7 +385,7 @@ async function bootstrapApp() {
     } as RpcResponse;
   });
 
-  process.env.KBV_ACP_CWD = appRoot;
+  process.env.KBV_ACP_CWD = resolveAcpWorkingDirectory(appRoot);
 
   const emitAppWorkingStateEvent = (event: AppWorkingStatePatchAppliedEvent) => {
     broadcast(IPC_CHANNELS.APP_WORKING_STATE_EVENT, event);
