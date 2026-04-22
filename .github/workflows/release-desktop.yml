@@ -92,11 +92,12 @@ jobs:
 
       - name: Verify macOS signing and notarization
         run: |
-          APP_PATH="$(find apps/desktop/release/mac -maxdepth 1 -name '*.app' -print -quit)"
+          APP_PATH="$(find apps/desktop/release -maxdepth 2 -name '*.app' -print -quit)"
           DMG_PATH="$(find apps/desktop/release -maxdepth 1 -name '*.dmg' -print -quit)"
 
           if [ -z "$APP_PATH" ] || [ -z "$DMG_PATH" ]; then
             echo "Expected macOS release artifacts were not found." >&2
+            find apps/desktop/release -maxdepth 2 -print || true
             exit 1
           fi
 
