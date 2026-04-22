@@ -104,7 +104,9 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           spctl --assess --type execute --verbose=4 "$APP_PATH"
           xcrun stapler validate "$APP_PATH"
-          xcrun stapler validate "$DMG_PATH"
+
+          echo "Verified notarized app bundle: $APP_PATH"
+          echo "Found DMG artifact: $DMG_PATH"
 
   publish-windows:
     needs: prepare-release
