@@ -254,7 +254,7 @@ test.describe('app update service', () => {
       await service.checkForUpdates('automatic');
 
       expect(service.getState().status).toBe('available');
-      expect(service.getState().errorMessage).toContain('did not replace');
+      expect(service.getState().errorMessage).toContain('update handoff may not have completed');
       expect(storedPreferences.installAttemptVersion).toBeNull();
 
       const pendingLog = entries.find((entry) => entry.message === 'app-update-service.install-attempt-pending-after-relaunch');
@@ -266,7 +266,17 @@ test.describe('app update service', () => {
         currentVersion: '0.1.0',
         attemptedVersion: '0.2.0',
         availableVersion: '0.2.0',
-        bundlePath: path.join(tempRoot, 'Applications', 'KnowledgeBase.app')
+        bundlePath: path.join(tempRoot, 'Applications', 'KnowledgeBase.app'),
+        bundleXattrs: expect.objectContaining({
+          path: path.join(tempRoot, 'Applications', 'KnowledgeBase.app')
+        }),
+        shipItState: expect.objectContaining({
+          statePath: expect.any(String)
+        }),
+        shipItLaunchd: expect.objectContaining({
+          label: 'com.kbvault.desktop.ShipIt',
+          servicePath: expect.any(String)
+        })
       });
 
       service.dispose();

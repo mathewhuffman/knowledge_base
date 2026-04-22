@@ -1,6 +1,8 @@
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { app } from 'electron';
 import * as electronUpdater from 'electron-updater';
 import type { ProgressInfo, UpdateInfo } from 'electron-updater';
@@ -15,6 +17,9 @@ import { logger } from './logger';
 
 const STARTUP_AUTO_CHECK_DELAY_MS = 5_000;
 const RECURRING_AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const SHIPIT_BUNDLE_IDENTIFIER = 'com.kbvault.desktop';
+const SHIPIT_SERVICE_LABEL = `${SHIPIT_BUNDLE_IDENTIFIER}.ShipIt`;
+const MAX_DIAGNOSTIC_SNIPPET_LENGTH = 4_000;
 
 export interface UpdaterLike {
   autoDownload: boolean;
@@ -79,6 +84,40 @@ type InstallTargetDiagnostics = {
   executableDetails: FileStatDetails;
   bundleDetails: FileStatDetails;
   bundleParentDetails: FileStatDetails;
+  bundleXattrs: XattrDiagnostics | null;
+  shipItState: ShipItStateDiagnostics | null;
+  stagedBundleXattrs: XattrDiagnostics | null;
+  shipItLaunchd: LaunchdServiceDiagnostics | null;
+};
+
+type XattrDiagnostics = {
+  path: string;
+  exists: boolean;
+  names: string[];
+  quarantine: string | null;
+  provenanceBytes: number | null;
+  maclBytes: number | null;
+};
+
+type ShipItStateDiagnostics = {
+  statePath: string;
+  exists: boolean;
+  launchAfterInstallation: boolean | null;
+  updateBundleURL: string | null;
+  targetBundleURL: string | null;
+  bundleIdentifier: string | null;
+  useUpdateBundleName: boolean | null;
+  stagedBundlePath: string | null;
+  parseError: string | null;
+  rawSnippet: string | null;
+};
+
+type LaunchdServiceDiagnostics = {
+  label: string;
+  servicePath: string;
+  present: boolean;
+  exitCode: number | null;
+  snippet: string | null;
 };
 
 function getAutoUpdater(): UpdaterLike {
@@ -238,8 +277,194 @@ function collectInstallTargetDiagnostics(
     processGid: typeof process.getgid === 'function' ? process.getgid() : null,
     executableDetails: readStatDetails(normalizedExecutablePath),
     bundleDetails: readStatDetails(bundlePath),
-    bundleParentDetails: readStatDetails(bundleParentPath)
+    bundleParentDetails: readStatDetails(bundleParentPath),
+    bundleXattrs: null,
+    shipItState: null,
+    stagedBundleXattrs: null,
+    shipItLaunchd: null
   };
+}
+
+function truncateDiagnosticSnippet(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.length <= MAX_DIAGNOSTIC_SNIPPET_LENGTH) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, MAX_DIAGNOSTIC_SNIPPET_LENGTH - 1)}…`;
+}
+
+function readXattrValue(targetPath: string, attributeName: string): Buffer | null {
+  try {
+    const result = spawnSync('xattr', ['-p', attributeName, targetPath], {
+      encoding: null
+    });
+    if (result.status !== 0 || !result.stdout) {
+      return null;
+    }
+
+    return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
+function collectXattrDiagnostics(targetPath: string | null): XattrDiagnostics | null {
+  if (!targetPath) {
+    return null;
+  }
+
+  const resolvedPath = path.resolve(targetPath);
+  if (!fs.existsSync(resolvedPath)) {
+    return {
+      path: resolvedPath,
+      exists: false,
+      names: [],
+      quarantine: null,
+      provenanceBytes: null,
+      maclBytes: null
+    };
+  }
+
+  let names: string[] = [];
+  try {
+    const result = spawnSync('xattr', [resolvedPath], {
+      encoding: 'utf8'
+    });
+    if (result.status === 0 && result.stdout) {
+      names = result.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    }
+  } catch {
+    names = [];
+  }
+
+  const quarantine = readXattrValue(resolvedPath, 'com.apple.quarantine');
+  const provenance = readXattrValue(resolvedPath, 'com.apple.provenance');
+  const macl = readXattrValue(resolvedPath, 'com.apple.macl');
+
+  return {
+    path: resolvedPath,
+    exists: true,
+    names,
+    quarantine: quarantine ? quarantine.toString('utf8').trim() : null,
+    provenanceBytes: provenance?.length ?? null,
+    maclBytes: macl?.length ?? null
+  };
+}
+
+function resolveShipItStatePath(): string {
+  return path.join(os.homedir(), 'Library', 'Caches', `${SHIPIT_BUNDLE_IDENTIFIER}.ShipIt`, 'ShipItState.plist');
+}
+
+function fileUrlToPathSafe(urlValue: string | null): string | null {
+  if (!urlValue) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(urlValue);
+    if (parsed.protocol !== 'file:') {
+      return null;
+    }
+
+    return fileURLToPath(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function collectShipItStateDiagnostics(): ShipItStateDiagnostics | null {
+  const statePath = resolveShipItStatePath();
+  if (!fs.existsSync(statePath)) {
+    return {
+      statePath,
+      exists: false,
+      launchAfterInstallation: null,
+      updateBundleURL: null,
+      targetBundleURL: null,
+      bundleIdentifier: null,
+      useUpdateBundleName: null,
+      stagedBundlePath: null,
+      parseError: null,
+      rawSnippet: null
+    };
+  }
+
+  let rawText = '';
+  try {
+    rawText = fs.readFileSync(statePath, 'utf8');
+  } catch {
+    rawText = '';
+  }
+
+  let parsedState: Record<string, unknown> | null = null;
+  let parseError: string | null = null;
+  try {
+    const plutilResult = spawnSync('plutil', ['-convert', 'json', '-o', '-', statePath], {
+      encoding: 'utf8'
+    });
+    const jsonText = plutilResult.status === 0 && plutilResult.stdout
+      ? plutilResult.stdout
+      : rawText;
+    parsedState = JSON.parse(jsonText) as Record<string, unknown>;
+  } catch (error) {
+    parseError = error instanceof Error ? error.message : String(error);
+  }
+
+  const updateBundleURL = typeof parsedState?.updateBundleURL === 'string' ? parsedState.updateBundleURL : null;
+  return {
+    statePath,
+    exists: true,
+    launchAfterInstallation:
+      typeof parsedState?.launchAfterInstallation === 'boolean' ? parsedState.launchAfterInstallation : null,
+    updateBundleURL,
+    targetBundleURL: typeof parsedState?.targetBundleURL === 'string' ? parsedState.targetBundleURL : null,
+    bundleIdentifier: typeof parsedState?.bundleIdentifier === 'string' ? parsedState.bundleIdentifier : null,
+    useUpdateBundleName: typeof parsedState?.useUpdateBundleName === 'boolean' ? parsedState.useUpdateBundleName : null,
+    stagedBundlePath: fileUrlToPathSafe(updateBundleURL),
+    parseError,
+    rawSnippet: truncateDiagnosticSnippet(rawText)
+  };
+}
+
+function collectLaunchdServiceDiagnostics(): LaunchdServiceDiagnostics | null {
+  if (typeof process.getuid !== 'function') {
+    return null;
+  }
+
+  const servicePath = `gui/${process.getuid()}/${SHIPIT_SERVICE_LABEL}`;
+  try {
+    const result = spawnSync('launchctl', ['print', servicePath], {
+      encoding: 'utf8'
+    });
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+    return {
+      label: SHIPIT_SERVICE_LABEL,
+      servicePath,
+      present: result.status === 0,
+      exitCode: typeof result.status === 'number' ? result.status : null,
+      snippet: truncateDiagnosticSnippet(output)
+    };
+  } catch (error) {
+    return {
+      label: SHIPIT_SERVICE_LABEL,
+      servicePath,
+      present: false,
+      exitCode: null,
+      snippet: truncateDiagnosticSnippet(error instanceof Error ? error.message : String(error))
+    };
+  }
 }
 
 function resolveUpdateSupport(): boolean {
@@ -330,11 +555,6 @@ export class AppUpdateService {
     if (this.isUpdateSupported) {
       this.updater.autoDownload = false;
       this.updater.autoInstallOnAppQuit = true;
-      if (this.platform === 'darwin') {
-        // Avoid relying on an immediate background relaunch while Gatekeeper is
-        // still evaluating the freshly updated app bundle.
-        this.updater.autoRunAppAfterInstall = false;
-      }
       this.updater.logger = this.log;
       if (!app?.isPackaged) {
         this.updater.forceDevUpdateConfig = true;
@@ -620,6 +840,12 @@ export class AppUpdateService {
     });
     this.prepareForQuitAndInstall('user-request');
     this.updater.quitAndInstall(false, true);
+    this.log.info('app-update-service.quit-and-install-dispatched', {
+      attemptedVersion: this.preferences.installAttemptVersion,
+      attemptedAt: this.preferences.installAttemptedAt,
+      shipItLaunchd: installDiagnostics.shipItLaunchd,
+      shipItState: installDiagnostics.shipItState
+    });
   }
 
   private refreshAutoCheckSchedule(): void {
@@ -776,10 +1002,10 @@ export class AppUpdateService {
     const bundlePath = resolveInstalledBundlePath(this.executablePath);
     if (this.platform === 'darwin') {
       if (bundlePath) {
-        return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from ${bundlePath} or reinstall the latest DMG manually if needed.`;
+        return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active afterward. The update handoff may not have completed, or macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from ${bundlePath} or reinstall the latest DMG manually if needed.`;
       }
 
-      return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from /Applications or reinstall the latest DMG manually if needed.`;
+      return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active afterward. The update handoff may not have completed, or macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from /Applications or reinstall the latest DMG manually if needed.`;
     }
 
     if (bundlePath) {
@@ -799,11 +1025,24 @@ export class AppUpdateService {
       }
     }
 
-    return {
+    const diagnostics = {
       ...collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder),
       autoRunAppAfterInstall: typeof this.updater.autoRunAppAfterInstall === 'boolean'
         ? this.updater.autoRunAppAfterInstall
         : null
+    };
+
+    if (this.platform !== 'darwin') {
+      return diagnostics;
+    }
+
+    const shipItState = collectShipItStateDiagnostics();
+    return {
+      ...diagnostics,
+      bundleXattrs: collectXattrDiagnostics(diagnostics.bundlePath),
+      shipItState,
+      stagedBundleXattrs: collectXattrDiagnostics(shipItState?.stagedBundlePath ?? null),
+      shipItLaunchd: collectLaunchdServiceDiagnostics()
     };
   }
 }

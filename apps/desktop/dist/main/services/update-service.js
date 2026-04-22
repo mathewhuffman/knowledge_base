@@ -38,13 +38,18 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AppUpdateService = void 0;
 const node_fs_1 = __importDefault(require("node:fs"));
+const node_child_process_1 = require("node:child_process");
 const node_os_1 = __importDefault(require("node:os"));
 const node_path_1 = __importDefault(require("node:path"));
+const node_url_1 = require("node:url");
 const electron_1 = require("electron");
 const electronUpdater = __importStar(require("electron-updater"));
 const logger_1 = require("./logger");
 const STARTUP_AUTO_CHECK_DELAY_MS = 5_000;
 const RECURRING_AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const SHIPIT_BUNDLE_IDENTIFIER = 'com.kbvault.desktop';
+const SHIPIT_SERVICE_LABEL = `${SHIPIT_BUNDLE_IDENTIFIER}.ShipIt`;
+const MAX_DIAGNOSTIC_SNIPPET_LENGTH = 4_000;
 function getAutoUpdater() {
     const { autoUpdater } = electronUpdater;
     return autoUpdater;
@@ -184,8 +189,178 @@ function collectInstallTargetDiagnostics(executablePath, isInApplicationsFolder)
         processGid: typeof process.getgid === 'function' ? process.getgid() : null,
         executableDetails: readStatDetails(normalizedExecutablePath),
         bundleDetails: readStatDetails(bundlePath),
-        bundleParentDetails: readStatDetails(bundleParentPath)
+        bundleParentDetails: readStatDetails(bundleParentPath),
+        bundleXattrs: null,
+        shipItState: null,
+        stagedBundleXattrs: null,
+        shipItLaunchd: null
     };
+}
+function truncateDiagnosticSnippet(value) {
+    if (!value) {
+        return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return null;
+    }
+    if (trimmed.length <= MAX_DIAGNOSTIC_SNIPPET_LENGTH) {
+        return trimmed;
+    }
+    return `${trimmed.slice(0, MAX_DIAGNOSTIC_SNIPPET_LENGTH - 1)}…`;
+}
+function readXattrValue(targetPath, attributeName) {
+    try {
+        const result = (0, node_child_process_1.spawnSync)('xattr', ['-p', attributeName, targetPath], {
+            encoding: null
+        });
+        if (result.status !== 0 || !result.stdout) {
+            return null;
+        }
+        return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout);
+    }
+    catch {
+        return null;
+    }
+}
+function collectXattrDiagnostics(targetPath) {
+    if (!targetPath) {
+        return null;
+    }
+    const resolvedPath = node_path_1.default.resolve(targetPath);
+    if (!node_fs_1.default.existsSync(resolvedPath)) {
+        return {
+            path: resolvedPath,
+            exists: false,
+            names: [],
+            quarantine: null,
+            provenanceBytes: null,
+            maclBytes: null
+        };
+    }
+    let names = [];
+    try {
+        const result = (0, node_child_process_1.spawnSync)('xattr', [resolvedPath], {
+            encoding: 'utf8'
+        });
+        if (result.status === 0 && result.stdout) {
+            names = result.stdout
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean);
+        }
+    }
+    catch {
+        names = [];
+    }
+    const quarantine = readXattrValue(resolvedPath, 'com.apple.quarantine');
+    const provenance = readXattrValue(resolvedPath, 'com.apple.provenance');
+    const macl = readXattrValue(resolvedPath, 'com.apple.macl');
+    return {
+        path: resolvedPath,
+        exists: true,
+        names,
+        quarantine: quarantine ? quarantine.toString('utf8').trim() : null,
+        provenanceBytes: provenance?.length ?? null,
+        maclBytes: macl?.length ?? null
+    };
+}
+function resolveShipItStatePath() {
+    return node_path_1.default.join(node_os_1.default.homedir(), 'Library', 'Caches', `${SHIPIT_BUNDLE_IDENTIFIER}.ShipIt`, 'ShipItState.plist');
+}
+function fileUrlToPathSafe(urlValue) {
+    if (!urlValue) {
+        return null;
+    }
+    try {
+        const parsed = new URL(urlValue);
+        if (parsed.protocol !== 'file:') {
+            return null;
+        }
+        return (0, node_url_1.fileURLToPath)(parsed);
+    }
+    catch {
+        return null;
+    }
+}
+function collectShipItStateDiagnostics() {
+    const statePath = resolveShipItStatePath();
+    if (!node_fs_1.default.existsSync(statePath)) {
+        return {
+            statePath,
+            exists: false,
+            launchAfterInstallation: null,
+            updateBundleURL: null,
+            targetBundleURL: null,
+            bundleIdentifier: null,
+            useUpdateBundleName: null,
+            stagedBundlePath: null,
+            parseError: null,
+            rawSnippet: null
+        };
+    }
+    let rawText = '';
+    try {
+        rawText = node_fs_1.default.readFileSync(statePath, 'utf8');
+    }
+    catch {
+        rawText = '';
+    }
+    let parsedState = null;
+    let parseError = null;
+    try {
+        const plutilResult = (0, node_child_process_1.spawnSync)('plutil', ['-convert', 'json', '-o', '-', statePath], {
+            encoding: 'utf8'
+        });
+        const jsonText = plutilResult.status === 0 && plutilResult.stdout
+            ? plutilResult.stdout
+            : rawText;
+        parsedState = JSON.parse(jsonText);
+    }
+    catch (error) {
+        parseError = error instanceof Error ? error.message : String(error);
+    }
+    const updateBundleURL = typeof parsedState?.updateBundleURL === 'string' ? parsedState.updateBundleURL : null;
+    return {
+        statePath,
+        exists: true,
+        launchAfterInstallation: typeof parsedState?.launchAfterInstallation === 'boolean' ? parsedState.launchAfterInstallation : null,
+        updateBundleURL,
+        targetBundleURL: typeof parsedState?.targetBundleURL === 'string' ? parsedState.targetBundleURL : null,
+        bundleIdentifier: typeof parsedState?.bundleIdentifier === 'string' ? parsedState.bundleIdentifier : null,
+        useUpdateBundleName: typeof parsedState?.useUpdateBundleName === 'boolean' ? parsedState.useUpdateBundleName : null,
+        stagedBundlePath: fileUrlToPathSafe(updateBundleURL),
+        parseError,
+        rawSnippet: truncateDiagnosticSnippet(rawText)
+    };
+}
+function collectLaunchdServiceDiagnostics() {
+    if (typeof process.getuid !== 'function') {
+        return null;
+    }
+    const servicePath = `gui/${process.getuid()}/${SHIPIT_SERVICE_LABEL}`;
+    try {
+        const result = (0, node_child_process_1.spawnSync)('launchctl', ['print', servicePath], {
+            encoding: 'utf8'
+        });
+        const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+        return {
+            label: SHIPIT_SERVICE_LABEL,
+            servicePath,
+            present: result.status === 0,
+            exitCode: typeof result.status === 'number' ? result.status : null,
+            snippet: truncateDiagnosticSnippet(output)
+        };
+    }
+    catch (error) {
+        return {
+            label: SHIPIT_SERVICE_LABEL,
+            servicePath,
+            present: false,
+            exitCode: null,
+            snippet: truncateDiagnosticSnippet(error instanceof Error ? error.message : String(error))
+        };
+    }
 }
 function resolveUpdateSupport() {
     if (electron_1.app?.isPackaged) {
@@ -262,11 +437,6 @@ class AppUpdateService {
         if (this.isUpdateSupported) {
             this.updater.autoDownload = false;
             this.updater.autoInstallOnAppQuit = true;
-            if (this.platform === 'darwin') {
-                // Avoid relying on an immediate background relaunch while Gatekeeper is
-                // still evaluating the freshly updated app bundle.
-                this.updater.autoRunAppAfterInstall = false;
-            }
             this.updater.logger = this.log;
             if (!electron_1.app?.isPackaged) {
                 this.updater.forceDevUpdateConfig = true;
@@ -510,6 +680,12 @@ class AppUpdateService {
         });
         this.prepareForQuitAndInstall('user-request');
         this.updater.quitAndInstall(false, true);
+        this.log.info('app-update-service.quit-and-install-dispatched', {
+            attemptedVersion: this.preferences.installAttemptVersion,
+            attemptedAt: this.preferences.installAttemptedAt,
+            shipItLaunchd: installDiagnostics.shipItLaunchd,
+            shipItState: installDiagnostics.shipItState
+        });
     }
     refreshAutoCheckSchedule() {
         this.clearTimers();
@@ -642,9 +818,9 @@ class AppUpdateService {
         const bundlePath = resolveInstalledBundlePath(this.executablePath);
         if (this.platform === 'darwin') {
             if (bundlePath) {
-                return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from ${bundlePath} or reinstall the latest DMG manually if needed.`;
+                return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active afterward. The update handoff may not have completed, or macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from ${bundlePath} or reinstall the latest DMG manually if needed.`;
             }
-            return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from /Applications or reinstall the latest DMG manually if needed.`;
+            return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active afterward. The update handoff may not have completed, or macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from /Applications or reinstall the latest DMG manually if needed.`;
         }
         if (bundlePath) {
             return `KnowledgeBase restarted, but version ${targetVersion} did not replace ${bundlePath}. Check the updater logs for the recorded bundle diagnostics, close any duplicate KnowledgeBase copies, and reinstall the latest DMG manually if needed.`;
@@ -661,11 +837,22 @@ class AppUpdateService {
                 isInApplicationsFolder = null;
             }
         }
-        return {
+        const diagnostics = {
             ...collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder),
             autoRunAppAfterInstall: typeof this.updater.autoRunAppAfterInstall === 'boolean'
                 ? this.updater.autoRunAppAfterInstall
                 : null
+        };
+        if (this.platform !== 'darwin') {
+            return diagnostics;
+        }
+        const shipItState = collectShipItStateDiagnostics();
+        return {
+            ...diagnostics,
+            bundleXattrs: collectXattrDiagnostics(diagnostics.bundlePath),
+            shipItState,
+            stagedBundleXattrs: collectXattrDiagnostics(shipItState?.stagedBundlePath ?? null),
+            shipItLaunchd: collectLaunchdServiceDiagnostics()
         };
     }
 }

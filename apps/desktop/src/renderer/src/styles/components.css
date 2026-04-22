@@ -1405,6 +1405,14 @@
   color: var(--color-danger);
 }
 
+.update-copyable-text {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .update-modal__notes {
   display: flex;
   flex-direction: column;

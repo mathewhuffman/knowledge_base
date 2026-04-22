@@ -138,7 +138,7 @@ export function AppUpdateModal({
             <IconCheckCircle size={16} />
             <span>
               {isMac
-                ? 'The update is ready. KnowledgeBase will close to install it. Reopen it from /Applications after the install finishes.'
+                ? "The update is ready. KnowledgeBase will close to install it. If it doesn't reopen automatically, open it from /Applications."
                 : 'The update is ready. Restart KnowledgeBase when you want to install it.'}
             </span>
           </div>
@@ -147,7 +147,7 @@ export function AppUpdateModal({
         {state.errorMessage && (
           <div className="update-modal__status update-modal__status--error">
             <IconAlertCircle size={16} />
-            <span>{state.errorMessage}</span>
+            <span className="update-copyable-text">{state.errorMessage}</span>
           </div>
         )}
 

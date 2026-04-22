@@ -1,6 +1,6 @@
 {
   "name": "@kb-vault/desktop",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "private": true,
   "description": "Local-first Electron desktop application for automating Zendesk KB maintenance from bulk PBI uploads.",
   "main": "dist/main/main.js",

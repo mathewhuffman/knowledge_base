@@ -1484,7 +1484,7 @@ export const Settings = () => {
                         <div style={{ fontWeight: 'var(--weight-medium)' }}>Update downloaded</div>
                         <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
                           {isMac
-                            ? 'Quit KnowledgeBase from the update popup when you are ready to install it, then reopen it from /Applications.'
+                            ? "Choose Quit and Install from the update popup when you are ready. If KnowledgeBase doesn't reopen automatically, open it from /Applications."
                             : 'Restart KnowledgeBase from the update popup when you are ready to install it.'}
                         </div>
                       </div>
@@ -1496,7 +1496,7 @@ export const Settings = () => {
                       <IconAlertCircle size={16} />
                       <div>
                         <div style={{ fontWeight: 'var(--weight-medium)' }}>Update check failed</div>
-                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                        <div className="update-copyable-text" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
                           {appUpdateState.errorMessage}
                         </div>
                       </div>
