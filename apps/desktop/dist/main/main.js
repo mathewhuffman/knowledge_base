@@ -6,6 +6,42 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
+const node_child_process_1 = require("node:child_process");
+const node_tls_1 = __importDefault(require("node:tls"));
+function splitPemCertificates(pemBundle) {
+    const matches = pemBundle.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+    return matches?.map((certificate) => certificate.trim()).filter(Boolean) ?? [];
+}
+function loadMacSystemCertificates() {
+    const tlsWithSystemCerts = node_tls_1.default;
+    if (typeof tlsWithSystemCerts.getCACertificates === 'function') {
+        return tlsWithSystemCerts.getCACertificates('system');
+    }
+    const pemBundle = (0, node_child_process_1.execSync)('security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null; ' +
+        'security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null; ' +
+        'security find-certificate -a -p ~/Library/Keychains/login.keychain-db 2>/dev/null', { encoding: 'utf8', timeout: 5000 });
+    return splitPemCertificates(pemBundle);
+}
+// On macOS, Electron's main-process fetch may not trust enterprise root CAs
+// installed in the system keychain. Merge those certificates into Node's
+// default CA set before any network requests run.
+try {
+    if (process.platform === 'darwin') {
+        const tlsWithSystemCerts = node_tls_1.default;
+        if (typeof tlsWithSystemCerts.setDefaultCACertificates === 'function') {
+            const defaultCertificates = typeof tlsWithSystemCerts.getCACertificates === 'function'
+                ? tlsWithSystemCerts.getCACertificates('default')
+                : node_tls_1.default.rootCertificates;
+            const systemCertificates = loadMacSystemCertificates();
+            if (systemCertificates.length > 0) {
+                tlsWithSystemCerts.setDefaultCACertificates(Array.from(new Set([...defaultCertificates, ...systemCertificates])));
+            }
+        }
+    }
+}
+catch {
+    // Non-fatal: continue with default CA store
+}
 const shared_types_1 = require("@kb-vault/shared-types");
 const workspace_root_1 = require("./config/workspace-root");
 const config_loader_1 = require("./config/config-loader");

@@ -5,7 +5,9 @@
     "moduleResolution": "Node",
     "outDir": "./dist",
     "rootDir": "./src",
-    "declaration": true
+    "declaration": true,
+    "types": ["node"],
+    "typeRoots": ["../../apps/desktop/node_modules/@types"]
   },
   "include": ["src/**/*"]
 }

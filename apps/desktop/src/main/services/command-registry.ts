@@ -2898,7 +2898,18 @@ export function registerCoreCommands(
   const appWorkingStateService = new AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
   const buildZendeskClient = async (workspaceId: string): Promise<ZendeskClient> => {
     const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
+    logger.info('buildZendeskClient.settings', {
+      workspaceId,
+      zendeskSubdomain: settings.zendeskSubdomain ?? '(missing)',
+      hasSubdomain: Boolean(settings.zendeskSubdomain)
+    });
     const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
+    logger.info('buildZendeskClient.credentials', {
+      workspaceId,
+      hasCredentials: Boolean(credentials),
+      email: credentials?.email ?? '(missing)',
+      hasApiToken: Boolean(credentials?.apiToken)
+    });
     if (!credentials) {
       throw new Error('Zendesk credentials are not configured for this workspace');
     }
@@ -8725,14 +8736,22 @@ export function registerCoreCommands(
   bus.register('zendesk.connection.test', async (payload) => {
     try {
       const workspaceId = (payload as { workspaceId?: string })?.workspaceId;
+      logger.info('zendesk.connection.test', { workspaceId: workspaceId ?? '(missing)' });
       if (!workspaceId) {
         return createErrorResult(AppErrorCode.INVALID_REQUEST, 'zendesk.connection.test requires workspaceId');
       }
 
       const client = await buildZendeskClient(workspaceId);
+      logger.info('zendesk.connection.test.client_built', { workspaceId, isConfigured: client.isConfigured() });
       const result = await client.testConnection();
+      logger.info('zendesk.connection.test.result', { workspaceId, ok: result.ok, status: result.status });
       return { ok: true, data: { ...result, workspaceId, checkedAtUtc: new Date().toISOString() } };
     } catch (error) {
+      logger.error('zendesk.connection.test.error', {
+        message: (error as Error).message,
+        cause: String((error as Error & { cause?: unknown }).cause ?? ''),
+        stack: (error as Error).stack
+      });
       if ((error as Error).message === 'Workspace not found') {
         return createErrorResult(AppErrorCode.NOT_FOUND, 'Workspace not found');
       }

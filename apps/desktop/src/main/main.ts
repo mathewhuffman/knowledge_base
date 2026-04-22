@@ -1,6 +1,55 @@
 import { app, BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
+import tls from 'node:tls';
+
+type NodeTlsWithSystemCerts = typeof tls & {
+  getCACertificates?: (type?: 'default' | 'bundled' | 'system' | 'extra') => string[];
+  setDefaultCACertificates?: (certs: string[]) => void;
+};
+
+function splitPemCertificates(pemBundle: string): string[] {
+  const matches = pemBundle.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+  return matches?.map((certificate) => certificate.trim()).filter(Boolean) ?? [];
+}
+
+function loadMacSystemCertificates(): string[] {
+  const tlsWithSystemCerts = tls as NodeTlsWithSystemCerts;
+  if (typeof tlsWithSystemCerts.getCACertificates === 'function') {
+    return tlsWithSystemCerts.getCACertificates('system');
+  }
+
+  const pemBundle = execSync(
+    'security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null; ' +
+    'security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null; ' +
+    'security find-certificate -a -p ~/Library/Keychains/login.keychain-db 2>/dev/null',
+    { encoding: 'utf8', timeout: 5000 }
+  );
+  return splitPemCertificates(pemBundle);
+}
+
+// On macOS, Electron's main-process fetch may not trust enterprise root CAs
+// installed in the system keychain. Merge those certificates into Node's
+// default CA set before any network requests run.
+try {
+  if (process.platform === 'darwin') {
+    const tlsWithSystemCerts = tls as NodeTlsWithSystemCerts;
+    if (typeof tlsWithSystemCerts.setDefaultCACertificates === 'function') {
+      const defaultCertificates = typeof tlsWithSystemCerts.getCACertificates === 'function'
+        ? tlsWithSystemCerts.getCACertificates('default')
+        : tls.rootCertificates;
+      const systemCertificates = loadMacSystemCertificates();
+      if (systemCertificates.length > 0) {
+        tlsWithSystemCerts.setDefaultCACertificates(
+          Array.from(new Set([...defaultCertificates, ...systemCertificates]))
+        );
+      }
+    }
+  }
+} catch {
+  // Non-fatal: continue with default CA store
+}
 import {
   IPC_CHANNELS,
   type AiAssistantContextChangedEvent,

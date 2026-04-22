@@ -2261,7 +2261,18 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
     const appWorkingStateService = new app_working_state_service_1.AppWorkingStateService((event) => emitAppWorkingStateEvent?.(event));
     const buildZendeskClient = async (workspaceId) => {
         const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
+        logger_1.logger.info('buildZendeskClient.settings', {
+            workspaceId,
+            zendeskSubdomain: settings.zendeskSubdomain ?? '(missing)',
+            hasSubdomain: Boolean(settings.zendeskSubdomain)
+        });
         const credentials = await workspaceRepository.getZendeskCredentialsForSync(workspaceId);
+        logger_1.logger.info('buildZendeskClient.credentials', {
+            workspaceId,
+            hasCredentials: Boolean(credentials),
+            email: credentials?.email ?? '(missing)',
+            hasApiToken: Boolean(credentials?.apiToken)
+        });
         if (!credentials) {
             throw new Error('Zendesk credentials are not configured for this workspace');
         }
@@ -7590,14 +7601,22 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
     bus.register('zendesk.connection.test', async (payload) => {
         try {
             const workspaceId = payload?.workspaceId;
+            logger_1.logger.info('zendesk.connection.test', { workspaceId: workspaceId ?? '(missing)' });
             if (!workspaceId) {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.INVALID_REQUEST, 'zendesk.connection.test requires workspaceId');
             }
             const client = await buildZendeskClient(workspaceId);
+            logger_1.logger.info('zendesk.connection.test.client_built', { workspaceId, isConfigured: client.isConfigured() });
             const result = await client.testConnection();
+            logger_1.logger.info('zendesk.connection.test.result', { workspaceId, ok: result.ok, status: result.status });
             return { ok: true, data: { ...result, workspaceId, checkedAtUtc: new Date().toISOString() } };
         }
         catch (error) {
+            logger_1.logger.error('zendesk.connection.test.error', {
+                message: error.message,
+                cause: String(error.cause ?? ''),
+                stack: error.stack
+            });
             if (error.message === 'Workspace not found') {
                 return (0, shared_types_1.createErrorResult)(shared_types_1.AppErrorCode.NOT_FOUND, 'Workspace not found');
             }

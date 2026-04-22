@@ -1,3 +1,7 @@
+import { execSync } from 'node:child_process';
+import http from 'node:http';
+import https from 'node:https';
+
 export interface ZendeskCredentials {
   subdomain: string;
   email: string;
@@ -188,6 +192,61 @@ interface ZendeskRequestOptions {
   headers?: Record<string, string>;
 }
 
+interface ZendeskResponseData {
+  status: number;
+  statusText: string;
+  bodyText: string;
+}
+
+let macOsCertificateBundle: string | null | undefined;
+
+function getMacOsCertificateBundle(): string | undefined {
+  if (process.platform !== 'darwin') {
+    return undefined;
+  }
+  if (macOsCertificateBundle !== undefined) {
+    return macOsCertificateBundle ?? undefined;
+  }
+  try {
+    const pemBundle = execSync(
+      'security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null; ' +
+      'security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null; ' +
+      'security find-certificate -a -p ~/Library/Keychains/login.keychain-db 2>/dev/null',
+      { encoding: 'utf8', timeout: 5000 }
+    ).trim();
+    macOsCertificateBundle = pemBundle || null;
+  } catch {
+    macOsCertificateBundle = null;
+  }
+  return macOsCertificateBundle ?? undefined;
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  const target = name.toLowerCase();
+  return Object.keys(headers).some((key) => key.toLowerCase() === target);
+}
+
+async function normalizeRequestBody(
+  body: BodyInit | Record<string, unknown> | undefined
+): Promise<string | Uint8Array | undefined> {
+  if (!body) {
+    return undefined;
+  }
+  if (typeof body === 'string' || body instanceof Uint8Array) {
+    return body;
+  }
+  if (body instanceof ArrayBuffer) {
+    return new Uint8Array(body);
+  }
+  if (ArrayBuffer.isView(body)) {
+    return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  }
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    return new Uint8Array(await body.arrayBuffer());
+  }
+  return JSON.stringify(body);
+}
+
 export class ZendeskClient {
   private readonly baseHost: string;
   private readonly timeoutMs: number;
@@ -223,6 +282,54 @@ export class ZendeskClient {
     throw new Error('Missing base64 encoder for Zendesk auth');
   }
 
+  private async sendRequest(url: URL, options: ZendeskRequestOptions = {}): Promise<ZendeskResponseData> {
+    const headers: Record<string, string> = {
+      ...(options.headers ?? {})
+    };
+    const body = await normalizeRequestBody(options.body);
+    if (body && !hasHeader(headers, 'Content-Length')) {
+      headers['Content-Length'] = String(typeof body === 'string' ? Buffer.byteLength(body) : body.byteLength);
+    }
+
+    return new Promise<ZendeskResponseData>((resolve, reject) => {
+      const requestOptions: https.RequestOptions = {
+        method: options.method ?? 'GET',
+        headers,
+        timeout: this.timeoutMs
+      };
+      if (url.protocol === 'https:') {
+        const ca = getMacOsCertificateBundle();
+        if (ca) {
+          requestOptions.ca = ca;
+        }
+      }
+
+      const request = (url.protocol === 'https:' ? https : http).request(url, requestOptions, (response) => {
+        const chunks: Uint8Array[] = [];
+        response.on('data', (chunk: string | Uint8Array) => {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        });
+        response.on('end', () => {
+          resolve({
+            status: response.statusCode ?? 0,
+            statusText: response.statusMessage ?? '',
+            bodyText: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8')
+          });
+        });
+      });
+
+      request.on('timeout', () => {
+        request.destroy(new Error(`Request timed out after ${this.timeoutMs}ms`));
+      });
+      request.on('error', reject);
+
+      if (body) {
+        request.write(body);
+      }
+      request.end();
+    });
+  }
+
   private async request<T>(path: string, options: ZendeskRequestOptions = {}): Promise<T> {
     const url = new URL(path, `${this.baseHost}/`);
     Object.entries(options.params ?? {}).forEach(([key, value]) => {
@@ -231,37 +338,27 @@ export class ZendeskClient {
       }
       url.searchParams.set(key, String(value));
     });
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-    const body = options.body;
-    const isFormData = typeof FormData !== 'undefined' && body instanceof FormData;
     const headers: Record<string, string> = {
       Accept: 'application/json',
       Authorization: this.getAuthHeader(),
       ...(options.headers ?? {})
     };
-    if (body && !isFormData && !headers['Content-Type']) {
+    if (options.body && typeof FormData !== 'undefined' && options.body instanceof FormData) {
+      throw new Error('ZendeskClient does not support FormData request bodies');
+    }
+    if (options.body && !hasHeader(headers, 'Content-Type')) {
       headers['Content-Type'] = 'application/json';
     }
-    const response = await fetch(url, {
-      method: options.method ?? 'GET',
-      headers,
-      body: body
-        ? (isFormData || typeof body === 'string' || body instanceof Blob
-          ? body
-          : JSON.stringify(body))
-        : undefined,
-      signal: controller.signal
+    const response = await this.sendRequest(url, {
+      ...options,
+      headers
     });
-    clearTimeout(timeout);
 
-    if (!response.ok) {
-      const responseBody = await response.text().catch(() => '');
+    if (response.status < 200 || response.status >= 300) {
       throw new ZendeskApiError(
         `Zendesk API error for ${path}: ${response.status} ${response.statusText}`,
         response.status,
-        responseBody
+        response.bodyText
       );
     }
 
@@ -269,11 +366,10 @@ export class ZendeskClient {
       return undefined as T;
     }
 
-    const text = await response.text();
-    if (!text.trim()) {
+    if (!response.bodyText.trim()) {
       return undefined as T;
     }
-    return JSON.parse(text) as T;
+    return JSON.parse(response.bodyText) as T;
   }
 
   private async requestWithRetry<T>(path: string, options: ZendeskRequestOptions = {}, attempts = 3): Promise<T> {
@@ -533,17 +629,16 @@ export class ZendeskClient {
   }
 
   async uploadGuideMedia(uploadUrl: string, headers: Record<string, string>, body: BodyInit): Promise<void> {
-    const response = await fetch(uploadUrl, {
+    const response = await this.sendRequest(new URL(uploadUrl), {
       method: 'PUT',
       headers,
       body
     });
-    if (!response.ok) {
-      const responseBody = await response.text().catch(() => '');
+    if (response.status < 200 || response.status >= 300) {
       throw new ZendeskApiError(
         `Zendesk media upload failed: ${response.status} ${response.statusText}`,
         response.status,
-        responseBody
+        response.bodyText
       );
     }
   }
