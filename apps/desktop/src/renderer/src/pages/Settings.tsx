@@ -22,6 +22,7 @@ import { IconSettings, IconSearch, IconRefreshCw, IconCheckCircle, IconAlertCirc
 import { useAppUpdate } from '../context/AppUpdateContext';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
+import { isMacPlatform } from '../utils/platform';
 
 const LOCALE_OPTIONS = [
   { value: 'en-us', label: 'English (en-US)' },
@@ -788,6 +789,7 @@ function formatModelCost(model: AgentRuntimeModelOption): string {
 /* Main Settings page                                                  */
 /* ================================================================== */
 export const Settings = () => {
+  const isMac = isMacPlatform();
   const { activeWorkspace } = useWorkspace();
   const {
     state: appUpdateState,
@@ -1481,7 +1483,9 @@ export const Settings = () => {
                       <div>
                         <div style={{ fontWeight: 'var(--weight-medium)' }}>Update downloaded</div>
                         <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
-                          Restart KnowledgeBase from the update popup when you're ready to install it.
+                          {isMac
+                            ? 'Quit KnowledgeBase from the update popup when you are ready to install it, then reopen it from /Applications.'
+                            : 'Restart KnowledgeBase from the update popup when you are ready to install it.'}
                         </div>
                       </div>
                     </div>

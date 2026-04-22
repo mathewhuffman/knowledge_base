@@ -168,6 +168,7 @@ function collectInstallTargetDiagnostics(executablePath, isInApplicationsFolder)
         executablePath: normalizedExecutablePath,
         executableRealPath,
         executableWritable: isWritable(normalizedExecutablePath),
+        autoRunAppAfterInstall: null,
         bundlePath,
         bundleRealPath,
         bundleWritable: isWritable(bundlePath),
@@ -261,6 +262,11 @@ class AppUpdateService {
         if (this.isUpdateSupported) {
             this.updater.autoDownload = false;
             this.updater.autoInstallOnAppQuit = true;
+            if (this.platform === 'darwin') {
+                // Avoid relying on an immediate background relaunch while Gatekeeper is
+                // still evaluating the freshly updated app bundle.
+                this.updater.autoRunAppAfterInstall = false;
+            }
             this.updater.logger = this.log;
             if (!electron_1.app?.isPackaged) {
                 this.updater.forceDevUpdateConfig = true;
@@ -634,6 +640,12 @@ class AppUpdateService {
     }
     buildInstallFailureMessage(targetVersion) {
         const bundlePath = resolveInstalledBundlePath(this.executablePath);
+        if (this.platform === 'darwin') {
+            if (bundlePath) {
+                return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from ${bundlePath} or reinstall the latest DMG manually if needed.`;
+            }
+            return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from /Applications or reinstall the latest DMG manually if needed.`;
+        }
         if (bundlePath) {
             return `KnowledgeBase restarted, but version ${targetVersion} did not replace ${bundlePath}. Check the updater logs for the recorded bundle diagnostics, close any duplicate KnowledgeBase copies, and reinstall the latest DMG manually if needed.`;
         }
@@ -649,7 +661,12 @@ class AppUpdateService {
                 isInApplicationsFolder = null;
             }
         }
-        return collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder);
+        return {
+            ...collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder),
+            autoRunAppAfterInstall: typeof this.updater.autoRunAppAfterInstall === 'boolean'
+                ? this.updater.autoRunAppAfterInstall
+                : null
+        };
     }
 }
 exports.AppUpdateService = AppUpdateService;

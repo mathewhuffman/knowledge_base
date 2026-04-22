@@ -2,6 +2,7 @@ import type { AppUpdateState } from '@kb-vault/shared-types';
 import { Modal } from './Modal';
 import { Badge } from './Badge';
 import { IconAlertCircle, IconCheckCircle, IconRefreshCw } from './icons';
+import { isMacPlatform } from '../utils/platform';
 
 interface AppUpdateModalProps {
   open: boolean;
@@ -39,6 +40,7 @@ export function AppUpdateModal({
     return null;
   }
 
+  const isMac = isMacPlatform();
   const footer = (
     <div className="update-modal__footer">
       <button className="btn btn-secondary" onClick={onClose}>
@@ -46,7 +48,7 @@ export function AppUpdateModal({
       </button>
       {state.status === 'downloaded' ? (
         <button className="btn btn-primary" onClick={onRestartAndInstall}>
-          Restart and Install
+          {isMac ? 'Quit and Install' : 'Restart and Install'}
         </button>
       ) : (
         <button
@@ -134,7 +136,11 @@ export function AppUpdateModal({
         {state.status === 'downloaded' && (
           <div className="update-modal__status update-modal__status--success">
             <IconCheckCircle size={16} />
-            <span>The update is ready. Restart KnowledgeBase when you want to install it.</span>
+            <span>
+              {isMac
+                ? 'The update is ready. KnowledgeBase will close to install it. Reopen it from /Applications after the install finishes.'
+                : 'The update is ready. Restart KnowledgeBase when you want to install it.'}
+            </span>
           </div>
         )}
 

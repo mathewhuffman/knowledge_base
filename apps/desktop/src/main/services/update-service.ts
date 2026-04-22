@@ -19,6 +19,7 @@ const RECURRING_AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export interface UpdaterLike {
   autoDownload: boolean;
   autoInstallOnAppQuit: boolean;
+  autoRunAppAfterInstall?: boolean;
   forceDevUpdateConfig?: boolean;
   logger?: Pick<typeof logger, 'info' | 'warn' | 'error'> | null;
   on(event: string, listener: (...args: unknown[]) => void): this;
@@ -61,6 +62,7 @@ type InstallTargetDiagnostics = {
   executablePath: string;
   executableRealPath: string | null;
   executableWritable: boolean | null;
+  autoRunAppAfterInstall: boolean | null;
   bundlePath: string | null;
   bundleRealPath: string | null;
   bundleWritable: boolean | null;
@@ -220,6 +222,7 @@ function collectInstallTargetDiagnostics(
     executablePath: normalizedExecutablePath,
     executableRealPath,
     executableWritable: isWritable(normalizedExecutablePath),
+    autoRunAppAfterInstall: null,
     bundlePath,
     bundleRealPath,
     bundleWritable: isWritable(bundlePath),
@@ -327,6 +330,11 @@ export class AppUpdateService {
     if (this.isUpdateSupported) {
       this.updater.autoDownload = false;
       this.updater.autoInstallOnAppQuit = true;
+      if (this.platform === 'darwin') {
+        // Avoid relying on an immediate background relaunch while Gatekeeper is
+        // still evaluating the freshly updated app bundle.
+        this.updater.autoRunAppAfterInstall = false;
+      }
       this.updater.logger = this.log;
       if (!app?.isPackaged) {
         this.updater.forceDevUpdateConfig = true;
@@ -766,6 +774,14 @@ export class AppUpdateService {
 
   private buildInstallFailureMessage(targetVersion: string): string {
     const bundlePath = resolveInstalledBundlePath(this.executablePath);
+    if (this.platform === 'darwin') {
+      if (bundlePath) {
+        return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from ${bundlePath} or reinstall the latest DMG manually if needed.`;
+      }
+
+      return `KnowledgeBase closed for the ${targetVersion} update, but that version was not active after relaunch. macOS may have blocked the updated app from reopening automatically. Check the updater logs for the recorded bundle diagnostics, then reopen KnowledgeBase from /Applications or reinstall the latest DMG manually if needed.`;
+    }
+
     if (bundlePath) {
       return `KnowledgeBase restarted, but version ${targetVersion} did not replace ${bundlePath}. Check the updater logs for the recorded bundle diagnostics, close any duplicate KnowledgeBase copies, and reinstall the latest DMG manually if needed.`;
     }
@@ -783,6 +799,11 @@ export class AppUpdateService {
       }
     }
 
-    return collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder);
+    return {
+      ...collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder),
+      autoRunAppAfterInstall: typeof this.updater.autoRunAppAfterInstall === 'boolean'
+        ? this.updater.autoRunAppAfterInstall
+        : null
+    };
   }
 }
