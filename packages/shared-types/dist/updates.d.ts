@@ -14,6 +14,8 @@ export interface AppUpdatePreferences {
     autoCheckEnabled?: boolean;
     dismissedVersion?: string | null;
     lastCheckedAt?: string | null;
+    installAttemptVersion?: string | null;
+    installAttemptedAt?: string | null;
 }
 export interface AppUpdateState {
     currentVersion: string;

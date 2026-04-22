@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { app } from 'electron';
 import * as electronUpdater from 'electron-updater';
@@ -44,6 +45,38 @@ type NormalizedUpdatePreferences = {
   autoCheckEnabled: boolean;
   dismissedVersion: string | null;
   lastCheckedAt: string | null;
+  installAttemptVersion: string | null;
+  installAttemptedAt: string | null;
+};
+
+type FileStatDetails = {
+  exists: boolean;
+  mode: string | null;
+  uid: number | null;
+  gid: number | null;
+  mtimeMs: number | null;
+};
+
+type InstallTargetDiagnostics = {
+  executablePath: string;
+  executableRealPath: string | null;
+  executableWritable: boolean | null;
+  bundlePath: string | null;
+  bundleRealPath: string | null;
+  bundleWritable: boolean | null;
+  bundleExists: boolean;
+  bundleParentPath: string | null;
+  bundleParentWritable: boolean | null;
+  bundleParentExists: boolean;
+  launchedFromMountedVolume: boolean;
+  launchedFromApplications: boolean;
+  launchedFromUserApplications: boolean;
+  appIsInApplicationsFolder: boolean | null;
+  processUid: number | null;
+  processGid: number | null;
+  executableDetails: FileStatDetails;
+  bundleDetails: FileStatDetails;
+  bundleParentDetails: FileStatDetails;
 };
 
 function getAutoUpdater(): UpdaterLike {
@@ -98,7 +131,111 @@ function normalizePreferences(preferences: AppUpdatePreferences | null | undefin
       : null,
     lastCheckedAt: typeof preferences?.lastCheckedAt === 'string' && preferences.lastCheckedAt.trim()
       ? preferences.lastCheckedAt
+      : null,
+    installAttemptVersion:
+      typeof preferences?.installAttemptVersion === 'string' && preferences.installAttemptVersion.trim()
+        ? preferences.installAttemptVersion.trim()
+        : null,
+    installAttemptedAt: typeof preferences?.installAttemptedAt === 'string' && preferences.installAttemptedAt.trim()
+      ? preferences.installAttemptedAt
       : null
+  };
+}
+
+function isWritable(targetPath: string | null): boolean | null {
+  if (!targetPath) {
+    return null;
+  }
+
+  try {
+    fs.accessSync(targetPath, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveRealPath(targetPath: string | null): string | null {
+  if (!targetPath) {
+    return null;
+  }
+
+  try {
+    return fs.realpathSync(targetPath);
+  } catch {
+    return null;
+  }
+}
+
+function readStatDetails(targetPath: string | null): FileStatDetails {
+  if (!targetPath) {
+    return {
+      exists: false,
+      mode: null,
+      uid: null,
+      gid: null,
+      mtimeMs: null
+    };
+  }
+
+  try {
+    const stats = fs.statSync(targetPath);
+    return {
+      exists: true,
+      mode: `0${(stats.mode & 0o777).toString(8)}`,
+      uid: typeof stats.uid === 'number' ? stats.uid : null,
+      gid: typeof stats.gid === 'number' ? stats.gid : null,
+      mtimeMs: Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : null
+    };
+  } catch {
+    return {
+      exists: false,
+      mode: null,
+      uid: null,
+      gid: null,
+      mtimeMs: null
+    };
+  }
+}
+
+function compareVersions(left: string, right: string): number {
+  return left.localeCompare(right, undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  });
+}
+
+function collectInstallTargetDiagnostics(
+  executablePath: string,
+  isInApplicationsFolder: boolean | null
+): InstallTargetDiagnostics {
+  const normalizedExecutablePath = path.resolve(executablePath);
+  const bundlePath = resolveInstalledBundlePath(normalizedExecutablePath);
+  const bundleParentPath = bundlePath ? path.dirname(bundlePath) : null;
+  const bundleRealPath = resolveRealPath(bundlePath);
+  const executableRealPath = resolveRealPath(normalizedExecutablePath);
+  const userApplicationsPath = path.join(os.homedir(), 'Applications');
+
+  return {
+    executablePath: normalizedExecutablePath,
+    executableRealPath,
+    executableWritable: isWritable(normalizedExecutablePath),
+    bundlePath,
+    bundleRealPath,
+    bundleWritable: isWritable(bundlePath),
+    bundleExists: Boolean(bundlePath && fs.existsSync(bundlePath)),
+    bundleParentPath,
+    bundleParentWritable: isWritable(bundleParentPath),
+    bundleParentExists: Boolean(bundleParentPath && fs.existsSync(bundleParentPath)),
+    launchedFromMountedVolume: Boolean(bundlePath?.startsWith('/Volumes/')),
+    launchedFromApplications: Boolean(bundlePath?.startsWith('/Applications/')),
+    launchedFromUserApplications: Boolean(bundlePath?.startsWith(userApplicationsPath)),
+    appIsInApplicationsFolder: isInApplicationsFolder,
+    processUid: typeof process.getuid === 'function' ? process.getuid() : null,
+    processGid: typeof process.getgid === 'function' ? process.getgid() : null,
+    executableDetails: readStatDetails(normalizedExecutablePath),
+    bundleDetails: readStatDetails(bundlePath),
+    bundleParentDetails: readStatDetails(bundleParentPath)
   };
 }
 
@@ -184,6 +321,7 @@ export class AppUpdateService {
     this.executablePath = options.executablePath ?? app?.getPath?.('exe') ?? process.execPath;
     this.platform = options.platform ?? process.platform;
     this.preferences = normalizePreferences(this.getStoredPreferences());
+    this.preferences = this.reconcileInstallAttemptState(this.preferences);
     this.state = buildInitialState(this.currentVersion, this.preferences, this.isUpdateSupported);
 
     if (this.isUpdateSupported) {
@@ -215,9 +353,14 @@ export class AppUpdateService {
     this.updater.on('update-available', (rawInfo) => {
       const info = rawInfo as UpdateInfo;
       const normalized = normalizeUpdateInfo(info);
+      const installAttemptFailure = normalized ? this.consumeFailedInstallAttempt(normalized.version) : null;
       const shouldShowModal = Boolean(
         normalized
-        && (this.lastCheckSource === 'manual' || this.preferences.dismissedVersion !== normalized.version)
+        && (
+          Boolean(installAttemptFailure)
+          || this.lastCheckSource === 'manual'
+          || this.preferences.dismissedVersion !== normalized.version
+        )
       );
       this.preparedForQuitAndInstall = false;
 
@@ -226,7 +369,7 @@ export class AppUpdateService {
         updateInfo: normalized,
         downloadedVersion: null,
         downloadProgressPercent: null,
-        errorMessage: null,
+        errorMessage: installAttemptFailure,
         shouldShowModal
       });
     });
@@ -445,11 +588,12 @@ export class AppUpdateService {
       return;
     }
 
+    const installDiagnostics = this.buildInstallDiagnostics();
     const installIssue = this.resolveInstallabilityIssue();
     if (installIssue) {
       this.log.warn('app-update-service.install-preflight-failed', {
-        executablePath: this.executablePath,
-        issue: installIssue
+        issue: installIssue,
+        ...installDiagnostics
       });
       this.updateState({
         status: 'error',
@@ -459,6 +603,13 @@ export class AppUpdateService {
       return;
     }
 
+    this.recordInstallAttempt(this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null);
+    this.log.info('app-update-service.install-diagnostics', {
+      phase: 'quit_and_install',
+      ...installDiagnostics,
+      attemptedVersion: this.preferences.installAttemptVersion,
+      attemptedAt: this.preferences.installAttemptedAt
+    });
     this.prepareForQuitAndInstall('user-request');
     this.updater.quitAndInstall(false, true);
   }
@@ -512,7 +663,10 @@ export class AppUpdateService {
     this.log.info('app-update-service.prepare-for-quit-and-install', {
       reason,
       currentVersion: this.state.currentVersion,
-      downloadedVersion: this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null
+      downloadedVersion: this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null,
+      attemptedVersion: this.preferences.installAttemptVersion,
+      attemptedAt: this.preferences.installAttemptedAt,
+      ...this.buildInstallDiagnostics()
     });
     this.onBeforeQuitForUpdate?.();
   }
@@ -539,5 +693,96 @@ export class AppUpdateService {
     }
 
     return null;
+  }
+
+  private reconcileInstallAttemptState(preferences: NormalizedUpdatePreferences): NormalizedUpdatePreferences {
+    if (!preferences.installAttemptVersion) {
+      return preferences;
+    }
+
+    if (compareVersions(this.currentVersion, preferences.installAttemptVersion) >= 0) {
+      const nextPreferences = {
+        ...preferences,
+        installAttemptVersion: null,
+        installAttemptedAt: null
+      };
+      this.persistPreferences(nextPreferences);
+      this.log.info('app-update-service.install-attempt-applied', {
+        currentVersion: this.currentVersion,
+        installedVersion: preferences.installAttemptVersion,
+        attemptedAt: preferences.installAttemptedAt,
+        ...this.buildInstallDiagnostics()
+      });
+      return nextPreferences;
+    }
+
+    this.log.warn('app-update-service.install-attempt-pending-after-relaunch', {
+      currentVersion: this.currentVersion,
+      attemptedVersion: preferences.installAttemptVersion,
+      attemptedAt: preferences.installAttemptedAt,
+      ...this.buildInstallDiagnostics()
+    });
+
+    return preferences;
+  }
+
+  private consumeFailedInstallAttempt(availableVersion: string): string | null {
+    const attemptedVersion = this.preferences.installAttemptVersion;
+    if (!attemptedVersion || attemptedVersion !== availableVersion) {
+      return null;
+    }
+
+    const attemptedAt = this.preferences.installAttemptedAt;
+    this.preferences = {
+      ...this.preferences,
+      installAttemptVersion: null,
+      installAttemptedAt: null
+    };
+    this.persistPreferences(this.preferences);
+
+    this.log.warn('app-update-service.install-attempt-did-not-apply', {
+      currentVersion: this.currentVersion,
+      attemptedVersion,
+      attemptedAt,
+      availableVersion,
+      ...this.buildInstallDiagnostics()
+    });
+
+    return this.buildInstallFailureMessage(attemptedVersion);
+  }
+
+  private recordInstallAttempt(version: string | null): void {
+    if (!version) {
+      return;
+    }
+
+    this.preferences = {
+      ...this.preferences,
+      installAttemptVersion: version,
+      installAttemptedAt: new Date().toISOString()
+    };
+    this.persistPreferences(this.preferences);
+  }
+
+  private buildInstallFailureMessage(targetVersion: string): string {
+    const bundlePath = resolveInstalledBundlePath(this.executablePath);
+    if (bundlePath) {
+      return `KnowledgeBase restarted, but version ${targetVersion} did not replace ${bundlePath}. Check the updater logs for the recorded bundle diagnostics, close any duplicate KnowledgeBase copies, and reinstall the latest DMG manually if needed.`;
+    }
+
+    return `KnowledgeBase restarted, but version ${targetVersion} did not replace the installed app bundle. Check the updater logs for the recorded bundle diagnostics and reinstall the latest DMG manually if needed.`;
+  }
+
+  private buildInstallDiagnostics(): InstallTargetDiagnostics {
+    let isInApplicationsFolder: boolean | null = null;
+    if (this.platform === 'darwin' && typeof app?.isInApplicationsFolder === 'function') {
+      try {
+        isInApplicationsFolder = app.isInApplicationsFolder();
+      } catch {
+        isInApplicationsFolder = null;
+      }
+    }
+
+    return collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder);
   }
 }

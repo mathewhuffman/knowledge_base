@@ -43,6 +43,24 @@ class FakeUpdater extends EventEmitter implements UpdaterLike {
   }
 }
 
+function createLoggerSpy() {
+  const entries: Array<{ level: 'info' | 'warn' | 'error'; message: string; payload: unknown[] }> = [];
+  return {
+    entries,
+    logger: {
+      info(message: string, ...payload: unknown[]) {
+        entries.push({ level: 'info', message, payload });
+      },
+      warn(message: string, ...payload: unknown[]) {
+        entries.push({ level: 'warn', message, payload });
+      },
+      error(message: string, ...payload: unknown[]) {
+        entries.push({ level: 'error', message, payload });
+      }
+    }
+  };
+}
+
 test.describe('app update service', () => {
   test('checks automatically by default and suppresses repeat automatic prompts for the same dismissed version', async () => {
     const updater = new FakeUpdater();
@@ -193,6 +211,66 @@ test.describe('app update service', () => {
       service.dispose();
     } finally {
       fs.chmodSync(lockedApplicationsPath, 0o755);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('logs bundle diagnostics when a relaunched app is still on the previous version', async () => {
+    const updater = new FakeUpdater();
+    const { entries, logger } = createLoggerSpy();
+    let storedPreferences: AppUpdatePreferences = {
+      installAttemptVersion: '0.2.0',
+      installAttemptedAt: '2026-04-22T20:22:52.094Z'
+    };
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-update-service-'));
+    const executablePath = path.join(
+      tempRoot,
+      'Applications',
+      'KnowledgeBase.app',
+      'Contents',
+      'MacOS',
+      'KnowledgeBase'
+    );
+    fs.mkdirSync(path.dirname(executablePath), { recursive: true });
+    fs.writeFileSync(executablePath, '');
+
+    try {
+      const service = new AppUpdateService({
+        updater,
+        currentVersion: '0.1.0',
+        isUpdateSupported: true,
+        startupDelayMs: 60_000,
+        recurringIntervalMs: 60_000,
+        getPreferences: () => storedPreferences,
+        setPreferences: (nextPreferences) => {
+          storedPreferences = nextPreferences;
+        },
+        executablePath,
+        platform: 'darwin',
+        logger
+      });
+
+      service.initialize();
+      await service.checkForUpdates('automatic');
+
+      expect(service.getState().status).toBe('available');
+      expect(service.getState().errorMessage).toContain('did not replace');
+      expect(storedPreferences.installAttemptVersion).toBeNull();
+
+      const pendingLog = entries.find((entry) => entry.message === 'app-update-service.install-attempt-pending-after-relaunch');
+      expect(pendingLog).toBeTruthy();
+
+      const failureLog = entries.find((entry) => entry.message === 'app-update-service.install-attempt-did-not-apply');
+      expect(failureLog).toBeTruthy();
+      expect(failureLog?.payload[0]).toMatchObject({
+        currentVersion: '0.1.0',
+        attemptedVersion: '0.2.0',
+        availableVersion: '0.2.0',
+        bundlePath: path.join(tempRoot, 'Applications', 'KnowledgeBase.app')
+      });
+
+      service.dispose();
+    } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });

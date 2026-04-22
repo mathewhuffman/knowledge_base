@@ -114,7 +114,9 @@ function getAppUpdatePreferences() {
     logger_1.logger.info('app-preferences.getAppUpdatePreferences.success', {
         autoCheckEnabled: preferences.autoCheckEnabled ?? null,
         dismissedVersion: preferences.dismissedVersion ?? null,
-        lastCheckedAt: preferences.lastCheckedAt ?? null
+        lastCheckedAt: preferences.lastCheckedAt ?? null,
+        installAttemptVersion: preferences.installAttemptVersion ?? null,
+        installAttemptedAt: preferences.installAttemptedAt ?? null
     });
     return preferences;
 }
@@ -122,7 +124,9 @@ function setAppUpdatePreferences(nextPreferences) {
     logger_1.logger.info('app-preferences.setAppUpdatePreferences.begin', {
         autoCheckEnabled: nextPreferences.autoCheckEnabled ?? null,
         dismissedVersion: nextPreferences.dismissedVersion ?? null,
-        lastCheckedAt: nextPreferences.lastCheckedAt ?? null
+        lastCheckedAt: nextPreferences.lastCheckedAt ?? null,
+        installAttemptVersion: nextPreferences.installAttemptVersion ?? null,
+        installAttemptedAt: nextPreferences.installAttemptedAt ?? null
     });
     const preferences = readPreferences();
     writePreferences({

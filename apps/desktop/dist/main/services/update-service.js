@@ -38,6 +38,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AppUpdateService = void 0;
 const node_fs_1 = __importDefault(require("node:fs"));
+const node_os_1 = __importDefault(require("node:os"));
 const node_path_1 = __importDefault(require("node:path"));
 const electron_1 = require("electron");
 const electronUpdater = __importStar(require("electron-updater"));
@@ -88,7 +89,101 @@ function normalizePreferences(preferences) {
             : null,
         lastCheckedAt: typeof preferences?.lastCheckedAt === 'string' && preferences.lastCheckedAt.trim()
             ? preferences.lastCheckedAt
+            : null,
+        installAttemptVersion: typeof preferences?.installAttemptVersion === 'string' && preferences.installAttemptVersion.trim()
+            ? preferences.installAttemptVersion.trim()
+            : null,
+        installAttemptedAt: typeof preferences?.installAttemptedAt === 'string' && preferences.installAttemptedAt.trim()
+            ? preferences.installAttemptedAt
             : null
+    };
+}
+function isWritable(targetPath) {
+    if (!targetPath) {
+        return null;
+    }
+    try {
+        node_fs_1.default.accessSync(targetPath, node_fs_1.default.constants.W_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function resolveRealPath(targetPath) {
+    if (!targetPath) {
+        return null;
+    }
+    try {
+        return node_fs_1.default.realpathSync(targetPath);
+    }
+    catch {
+        return null;
+    }
+}
+function readStatDetails(targetPath) {
+    if (!targetPath) {
+        return {
+            exists: false,
+            mode: null,
+            uid: null,
+            gid: null,
+            mtimeMs: null
+        };
+    }
+    try {
+        const stats = node_fs_1.default.statSync(targetPath);
+        return {
+            exists: true,
+            mode: `0${(stats.mode & 0o777).toString(8)}`,
+            uid: typeof stats.uid === 'number' ? stats.uid : null,
+            gid: typeof stats.gid === 'number' ? stats.gid : null,
+            mtimeMs: Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : null
+        };
+    }
+    catch {
+        return {
+            exists: false,
+            mode: null,
+            uid: null,
+            gid: null,
+            mtimeMs: null
+        };
+    }
+}
+function compareVersions(left, right) {
+    return left.localeCompare(right, undefined, {
+        numeric: true,
+        sensitivity: 'base'
+    });
+}
+function collectInstallTargetDiagnostics(executablePath, isInApplicationsFolder) {
+    const normalizedExecutablePath = node_path_1.default.resolve(executablePath);
+    const bundlePath = resolveInstalledBundlePath(normalizedExecutablePath);
+    const bundleParentPath = bundlePath ? node_path_1.default.dirname(bundlePath) : null;
+    const bundleRealPath = resolveRealPath(bundlePath);
+    const executableRealPath = resolveRealPath(normalizedExecutablePath);
+    const userApplicationsPath = node_path_1.default.join(node_os_1.default.homedir(), 'Applications');
+    return {
+        executablePath: normalizedExecutablePath,
+        executableRealPath,
+        executableWritable: isWritable(normalizedExecutablePath),
+        bundlePath,
+        bundleRealPath,
+        bundleWritable: isWritable(bundlePath),
+        bundleExists: Boolean(bundlePath && node_fs_1.default.existsSync(bundlePath)),
+        bundleParentPath,
+        bundleParentWritable: isWritable(bundleParentPath),
+        bundleParentExists: Boolean(bundleParentPath && node_fs_1.default.existsSync(bundleParentPath)),
+        launchedFromMountedVolume: Boolean(bundlePath?.startsWith('/Volumes/')),
+        launchedFromApplications: Boolean(bundlePath?.startsWith('/Applications/')),
+        launchedFromUserApplications: Boolean(bundlePath?.startsWith(userApplicationsPath)),
+        appIsInApplicationsFolder: isInApplicationsFolder,
+        processUid: typeof process.getuid === 'function' ? process.getuid() : null,
+        processGid: typeof process.getgid === 'function' ? process.getgid() : null,
+        executableDetails: readStatDetails(normalizedExecutablePath),
+        bundleDetails: readStatDetails(bundlePath),
+        bundleParentDetails: readStatDetails(bundleParentPath)
     };
 }
 function resolveUpdateSupport() {
@@ -161,6 +256,7 @@ class AppUpdateService {
         this.executablePath = options.executablePath ?? electron_1.app?.getPath?.('exe') ?? process.execPath;
         this.platform = options.platform ?? process.platform;
         this.preferences = normalizePreferences(this.getStoredPreferences());
+        this.preferences = this.reconcileInstallAttemptState(this.preferences);
         this.state = buildInitialState(this.currentVersion, this.preferences, this.isUpdateSupported);
         if (this.isUpdateSupported) {
             this.updater.autoDownload = false;
@@ -187,15 +283,18 @@ class AppUpdateService {
         this.updater.on('update-available', (rawInfo) => {
             const info = rawInfo;
             const normalized = normalizeUpdateInfo(info);
+            const installAttemptFailure = normalized ? this.consumeFailedInstallAttempt(normalized.version) : null;
             const shouldShowModal = Boolean(normalized
-                && (this.lastCheckSource === 'manual' || this.preferences.dismissedVersion !== normalized.version));
+                && (Boolean(installAttemptFailure)
+                    || this.lastCheckSource === 'manual'
+                    || this.preferences.dismissedVersion !== normalized.version));
             this.preparedForQuitAndInstall = false;
             this.updateState({
                 status: 'available',
                 updateInfo: normalized,
                 downloadedVersion: null,
                 downloadProgressPercent: null,
-                errorMessage: null,
+                errorMessage: installAttemptFailure,
                 shouldShowModal
             });
         });
@@ -382,11 +481,12 @@ class AppUpdateService {
         if (!this.isUpdateSupported || this.state.status !== 'downloaded') {
             return;
         }
+        const installDiagnostics = this.buildInstallDiagnostics();
         const installIssue = this.resolveInstallabilityIssue();
         if (installIssue) {
             this.log.warn('app-update-service.install-preflight-failed', {
-                executablePath: this.executablePath,
-                issue: installIssue
+                issue: installIssue,
+                ...installDiagnostics
             });
             this.updateState({
                 status: 'error',
@@ -395,6 +495,13 @@ class AppUpdateService {
             });
             return;
         }
+        this.recordInstallAttempt(this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null);
+        this.log.info('app-update-service.install-diagnostics', {
+            phase: 'quit_and_install',
+            ...installDiagnostics,
+            attemptedVersion: this.preferences.installAttemptVersion,
+            attemptedAt: this.preferences.installAttemptedAt
+        });
         this.prepareForQuitAndInstall('user-request');
         this.updater.quitAndInstall(false, true);
     }
@@ -439,7 +546,10 @@ class AppUpdateService {
         this.log.info('app-update-service.prepare-for-quit-and-install', {
             reason,
             currentVersion: this.state.currentVersion,
-            downloadedVersion: this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null
+            downloadedVersion: this.state.downloadedVersion ?? this.state.updateInfo?.version ?? null,
+            attemptedVersion: this.preferences.installAttemptVersion,
+            attemptedAt: this.preferences.installAttemptedAt,
+            ...this.buildInstallDiagnostics()
         });
         this.onBeforeQuitForUpdate?.();
     }
@@ -462,6 +572,84 @@ class AppUpdateService {
             return `KnowledgeBase cannot install updates because ${bundleParentPath} is not writable for this account. Move the app to ~/Applications or reinstall it so this user owns the app, then try again.`;
         }
         return null;
+    }
+    reconcileInstallAttemptState(preferences) {
+        if (!preferences.installAttemptVersion) {
+            return preferences;
+        }
+        if (compareVersions(this.currentVersion, preferences.installAttemptVersion) >= 0) {
+            const nextPreferences = {
+                ...preferences,
+                installAttemptVersion: null,
+                installAttemptedAt: null
+            };
+            this.persistPreferences(nextPreferences);
+            this.log.info('app-update-service.install-attempt-applied', {
+                currentVersion: this.currentVersion,
+                installedVersion: preferences.installAttemptVersion,
+                attemptedAt: preferences.installAttemptedAt,
+                ...this.buildInstallDiagnostics()
+            });
+            return nextPreferences;
+        }
+        this.log.warn('app-update-service.install-attempt-pending-after-relaunch', {
+            currentVersion: this.currentVersion,
+            attemptedVersion: preferences.installAttemptVersion,
+            attemptedAt: preferences.installAttemptedAt,
+            ...this.buildInstallDiagnostics()
+        });
+        return preferences;
+    }
+    consumeFailedInstallAttempt(availableVersion) {
+        const attemptedVersion = this.preferences.installAttemptVersion;
+        if (!attemptedVersion || attemptedVersion !== availableVersion) {
+            return null;
+        }
+        const attemptedAt = this.preferences.installAttemptedAt;
+        this.preferences = {
+            ...this.preferences,
+            installAttemptVersion: null,
+            installAttemptedAt: null
+        };
+        this.persistPreferences(this.preferences);
+        this.log.warn('app-update-service.install-attempt-did-not-apply', {
+            currentVersion: this.currentVersion,
+            attemptedVersion,
+            attemptedAt,
+            availableVersion,
+            ...this.buildInstallDiagnostics()
+        });
+        return this.buildInstallFailureMessage(attemptedVersion);
+    }
+    recordInstallAttempt(version) {
+        if (!version) {
+            return;
+        }
+        this.preferences = {
+            ...this.preferences,
+            installAttemptVersion: version,
+            installAttemptedAt: new Date().toISOString()
+        };
+        this.persistPreferences(this.preferences);
+    }
+    buildInstallFailureMessage(targetVersion) {
+        const bundlePath = resolveInstalledBundlePath(this.executablePath);
+        if (bundlePath) {
+            return `KnowledgeBase restarted, but version ${targetVersion} did not replace ${bundlePath}. Check the updater logs for the recorded bundle diagnostics, close any duplicate KnowledgeBase copies, and reinstall the latest DMG manually if needed.`;
+        }
+        return `KnowledgeBase restarted, but version ${targetVersion} did not replace the installed app bundle. Check the updater logs for the recorded bundle diagnostics and reinstall the latest DMG manually if needed.`;
+    }
+    buildInstallDiagnostics() {
+        let isInApplicationsFolder = null;
+        if (this.platform === 'darwin' && typeof electron_1.app?.isInApplicationsFolder === 'function') {
+            try {
+                isInApplicationsFolder = electron_1.app.isInApplicationsFolder();
+            }
+            catch {
+                isInApplicationsFolder = null;
+            }
+        }
+        return collectInstallTargetDiagnostics(this.executablePath, isInApplicationsFolder);
     }
 }
 exports.AppUpdateService = AppUpdateService;

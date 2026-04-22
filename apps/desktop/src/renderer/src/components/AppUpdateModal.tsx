@@ -12,6 +12,10 @@ interface AppUpdateModalProps {
 }
 
 function buildTitle(state: AppUpdateState | null): string {
+  if (state?.errorMessage && state.status !== 'downloading' && state.status !== 'downloaded') {
+    return 'Update needs attention';
+  }
+
   switch (state?.status) {
     case 'downloading':
       return 'Downloading update';
@@ -50,11 +54,30 @@ export function AppUpdateModal({
           onClick={onDownload}
           disabled={state.status === 'downloading'}
         >
-          {state.status === 'downloading' ? 'Downloading...' : 'Download Update'}
+          {state.status === 'downloading'
+            ? 'Downloading...'
+            : state.errorMessage
+              ? 'Download Again'
+              : 'Download Update'}
         </button>
       )}
     </div>
   );
+
+  const badgeVariant = state.status === 'downloaded'
+    ? 'success'
+    : state.status === 'error'
+      ? 'danger'
+      : state.errorMessage
+        ? 'warning'
+        : 'primary';
+  const badgeLabel = state.status === 'downloaded'
+    ? 'Ready to install'
+    : state.status === 'downloading'
+      ? 'Downloading'
+      : state.errorMessage
+        ? 'Needs attention'
+        : 'Available';
 
   return (
     <Modal
@@ -77,8 +100,8 @@ export function AppUpdateModal({
                 <strong>{state.updateInfo.version}</strong>
               </div>
             </div>
-            <Badge variant={state.status === 'downloaded' ? 'success' : state.status === 'error' ? 'danger' : 'primary'}>
-              {state.status === 'downloaded' ? 'Ready to install' : state.status === 'downloading' ? 'Downloading' : 'Available'}
+            <Badge variant={badgeVariant}>
+              {badgeLabel}
             </Badge>
           </div>
 
@@ -115,7 +138,7 @@ export function AppUpdateModal({
           </div>
         )}
 
-        {state.status === 'error' && state.errorMessage && (
+        {state.errorMessage && (
           <div className="update-modal__status update-modal__status--error">
             <IconAlertCircle size={16} />
             <span>{state.errorMessage}</span>

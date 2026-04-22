@@ -109,6 +109,10 @@ function formatRelativeTime(utc: string): string {
 }
 
 function appUpdateBadgeVariant(state: AppUpdateState | null): 'neutral' | 'primary' | 'success' | 'warning' | 'danger' {
+  if (state?.errorMessage && state.status === 'available') {
+    return 'warning';
+  }
+
   switch (state?.status) {
     case 'checking':
     case 'downloading':
@@ -127,6 +131,10 @@ function appUpdateBadgeVariant(state: AppUpdateState | null): 'neutral' | 'prima
 }
 
 function appUpdateBadgeLabel(state: AppUpdateState | null): string {
+  if (state?.errorMessage && state.status === 'available') {
+    return 'Needs attention';
+  }
+
   switch (state?.status) {
     case 'checking':
       return 'Checking';
