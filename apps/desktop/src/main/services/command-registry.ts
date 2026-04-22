@@ -171,7 +171,7 @@ import { CursorAcpRuntime, type AgentRuntimeToolContext } from '@kb-vault/agent-
 import { CommandBus } from './command-bus';
 import { JobRegistry } from './job-runner';
 import { JobState } from '@kb-vault/shared-types';
-import { WorkspaceRepository } from './workspace-repository';
+import { WorkspaceRepository, type WorkspaceRepositoryOptions } from './workspace-repository';
 import { ZendeskSyncService, type ZendeskSyncServiceInput } from './zendesk-sync-service';
 import { ZendeskPublishService } from './zendesk-publish-service';
 import { ZendeskRetireService } from './zendesk-retire-service';
@@ -2870,9 +2870,12 @@ export function registerCoreCommands(
   emitAiAssistantEvent?: (event: AiAssistantStreamEvent) => void,
   assistantPresentationService?: AssistantPresentationService,
   assistantViewContextService?: AssistantViewContextService,
-  dispatchAppNavigation?: (event: AppNavigationEvent) => void
+  dispatchAppNavigation?: (event: AppNavigationEvent) => void,
+  options: { protectedWorkspaceRoots?: WorkspaceRepositoryOptions['protectedRoots'] } = {}
 ) {
-  const workspaceRepository = new WorkspaceRepository(workspaceRoot);
+  const workspaceRepository = new WorkspaceRepository(workspaceRoot, {
+    protectedRoots: options.protectedWorkspaceRoots
+  });
   const batchAnalysisOrchestrator = new BatchAnalysisOrchestrator(workspaceRepository);
   const zendeskSyncService = new ZendeskSyncService(workspaceRepository);
   const pbiBatchImportService = new PBIBatchImportService(workspaceRepository);
@@ -3608,7 +3611,7 @@ export function registerCoreCommands(
       await workspaceRepository.getWorkspace(workspaceId);
       const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
       const options = await agentRuntime.getRuntimeOptions(workspaceId);
-      const currentModelId = settings.agentModelId ?? options.currentModelId;
+      const currentModelId = settings.acpModelId ?? settings.agentModelId ?? options.currentModelId;
       const availableModels = Array.from(new Set([
         ...(options.availableModels ?? []),
         ...(currentModelId ? [currentModelId] : [])

@@ -5,6 +5,7 @@ export declare const IPC_CHANNELS: {
     JOB_CANCEL: string;
     JOB_EVENT: string;
     APP_WORKING_STATE_EVENT: string;
+    APP_UPDATE_EVENT: string;
     AI_ASSISTANT_EVENT: string;
     AI_ASSISTANT_PRESENTATION_EVENT: string;
     AI_ASSISTANT_CONTEXT_EVENT: string;

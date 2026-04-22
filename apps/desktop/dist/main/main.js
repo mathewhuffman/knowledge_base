@@ -4,8 +4,10 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
+const node_child_process_1 = require("node:child_process");
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
+const node_tls_1 = __importDefault(require("node:tls"));
 const shared_types_1 = require("@kb-vault/shared-types");
 const workspace_root_1 = require("./config/workspace-root");
 const config_loader_1 = require("./config/config-loader");
@@ -18,12 +20,51 @@ const app_preferences_1 = require("./services/app-preferences");
 const assistant_presentation_service_1 = require("./services/assistant-presentation-service");
 const assistant_view_context_service_1 = require("./services/assistant-view-context-service");
 const assistant_window_manager_1 = require("./services/assistant-window-manager");
+const update_service_1 = require("./services/update-service");
+function splitPemCertificates(pemBundle) {
+    const matches = pemBundle.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+    return matches?.map((certificate) => certificate.trim()).filter(Boolean) ?? [];
+}
+function getDefaultCaCertificates() {
+    const tlsWithSystemCerts = node_tls_1.default;
+    if (typeof tlsWithSystemCerts.getCACertificates === 'function') {
+        return tlsWithSystemCerts.getCACertificates('default');
+    }
+    return [...node_tls_1.default.rootCertificates];
+}
+function getMacSystemCertificates() {
+    const tlsWithSystemCerts = node_tls_1.default;
+    if (typeof tlsWithSystemCerts.getCACertificates === 'function') {
+        return tlsWithSystemCerts.getCACertificates('system');
+    }
+    const pemBundle = (0, node_child_process_1.execSync)('security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null; ' +
+        'security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null; ' +
+        'security find-certificate -a -p ~/Library/Keychains/login.keychain-db 2>/dev/null', { encoding: 'utf8', timeout: 5000 });
+    return splitPemCertificates(pemBundle);
+}
+// Electron's main-process network stack can miss enterprise roots installed in
+// the macOS keychain. Merge them into Node's default trust store up front.
+try {
+    if (process.platform === 'darwin') {
+        const tlsWithSystemCerts = node_tls_1.default;
+        if (typeof tlsWithSystemCerts.setDefaultCACertificates === 'function') {
+            const mergedCertificates = Array.from(new Set([...getDefaultCaCertificates(), ...getMacSystemCertificates()]));
+            if (mergedCertificates.length > 0) {
+                tlsWithSystemCerts.setDefaultCACertificates(mergedCertificates);
+            }
+        }
+    }
+}
+catch {
+    // Fall back to Node's bundled trust store if the system keychain can't be read.
+}
 const commandBus = new command_bus_1.CommandBus();
 const jobs = new job_runner_1.JobRegistry();
 let mcpBridge = null;
 let kbCliLoopback = null;
 let mainWindow = null;
 let assistantWindowManager = null;
+let appUpdateService = null;
 function broadcast(channel, payload) {
     electron_1.BrowserWindow.getAllWindows().forEach((window) => {
         if (!window.isDestroyed()) {
@@ -65,7 +106,7 @@ function createMainWindow() {
     const window = new electron_1.BrowserWindow({
         width: 1280,
         height: 860,
-        title: 'KB Vault',
+        title: 'KnowledgeBase',
         webPreferences: {
             preload: node_path_1.default.join(appRoot, 'dist', 'preload', 'index.js'),
             contextIsolation: true,
@@ -140,7 +181,12 @@ async function bootstrapApp() {
     const appRoot = electron_1.app.isPackaged ? electron_1.app.getAppPath() : process.cwd();
     const assistantPresentationService = new assistant_presentation_service_1.AssistantPresentationService((0, app_preferences_1.getAssistantPresentationPreferences)(), app_preferences_1.setAssistantPresentationPreferences);
     const assistantViewContextService = new assistant_view_context_service_1.AssistantViewContextService();
-    logger_1.logger.info('Booting KB Vault', {
+    appUpdateService = new update_service_1.AppUpdateService({
+        getPreferences: app_preferences_1.getAppUpdatePreferences,
+        setPreferences: app_preferences_1.setAppUpdatePreferences,
+        logger: logger_1.logger
+    });
+    logger_1.logger.info('Booting KnowledgeBase', {
         workspaceRoot,
         featureFlags: config.featureFlags,
         environment: process.env.NODE_ENV ?? 'development'
@@ -151,6 +197,10 @@ async function bootstrapApp() {
     });
     assistantViewContextService.subscribe((event) => {
         broadcast(shared_types_1.IPC_CHANNELS.AI_ASSISTANT_CONTEXT_EVENT, event);
+    });
+    appUpdateService.subscribe((state) => {
+        const event = { state };
+        broadcast(shared_types_1.IPC_CHANNELS.APP_UPDATE_EVENT, event);
     });
     assistantWindowManager = new assistant_window_manager_1.AssistantWindowManager({
         loadRendererWindow,
@@ -199,6 +249,41 @@ async function bootstrapApp() {
             now: new Date().toISOString()
         }
     }));
+    commandBus.register('system.updates.getState', async () => ({
+        ok: true,
+        data: appUpdateService ? appUpdateService.getState() : null
+    }));
+    commandBus.register('system.updates.check', async (payload) => {
+        const source = (payload?.source ?? 'manual') === 'automatic'
+            ? 'automatic'
+            : 'manual';
+        return {
+            ok: true,
+            data: appUpdateService ? await appUpdateService.checkForUpdates(source) : null
+        };
+    });
+    commandBus.register('system.updates.download', async () => ({
+        ok: true,
+        data: appUpdateService ? await appUpdateService.downloadUpdate() : null
+    }));
+    commandBus.register('system.updates.setAutoCheckEnabled', async (payload) => {
+        const enabled = payload?.enabled !== false;
+        return {
+            ok: true,
+            data: appUpdateService ? await appUpdateService.setAutoCheckEnabled(enabled) : null
+        };
+    });
+    commandBus.register('system.updates.dismiss', async () => ({
+        ok: true,
+        data: appUpdateService ? appUpdateService.dismissModal() : null
+    }));
+    commandBus.register('system.updates.quitAndInstall', async () => {
+        appUpdateService?.quitAndInstall();
+        return {
+            ok: true,
+            data: appUpdateService ? appUpdateService.getState() : null
+        };
+    });
     process.env.KBV_ACP_CWD = appRoot;
     const emitAppWorkingStateEvent = (event) => {
         broadcast(shared_types_1.IPC_CHANNELS.APP_WORKING_STATE_EVENT, event);
@@ -252,6 +337,7 @@ electron_1.app.whenReady().then(async () => {
     await bootstrapApp();
     registerIpcHandlers();
     createMainWindow();
+    appUpdateService?.initialize();
     electron_1.app.on('activate', () => {
         if (!mainWindow || mainWindow.isDestroyed()) {
             createMainWindow();
@@ -264,6 +350,7 @@ electron_1.app.on('window-all-closed', () => {
     }
 });
 electron_1.app.on('before-quit', () => {
+    appUpdateService?.dispose();
     assistantWindowManager?.handleBeforeQuit();
     void mcpBridge?.stop();
     void kbCliLoopback?.stop();

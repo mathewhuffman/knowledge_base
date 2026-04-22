@@ -262,6 +262,20 @@ test.describe('workspace repository content model', () => {
     await rm(workspaceRoot, { recursive: true, force: true });
   });
 
+  test('rejects workspace paths inside protected install or build roots', async () => {
+    const protectedRoot = path.join(workspaceRoot, 'packaged-app', 'release');
+    await mkdir(protectedRoot, { recursive: true });
+    repository = new WorkspaceRepository(workspaceRoot, { protectedRoots: [protectedRoot] });
+
+    await expect(repository.createWorkspace({
+      name: 'Unsafe Workspace',
+      zendeskSubdomain: 'support',
+      defaultLocale: 'en-us',
+      enabledLocales: ['en-us'],
+      path: path.join(protectedRoot, 'customer-data')
+    })).rejects.toThrow('outside the app install/build directories');
+  });
+
   test('manages workspace settings through catalog + workspace_settings table', async () => {
     const created = await repository.createWorkspace({
       name: 'Settings Workspace',
@@ -276,6 +290,7 @@ test.describe('workspace repository content model', () => {
     expect(firstGet.defaultLocale).toBe('en-us');
     expect(firstGet.enabledLocales).toEqual(['en-us', 'fr-fr']);
     expect(firstGet.kbAccessMode).toBe('direct');
+    expect(firstGet.acpModelId).toBe('composer-2[fast=true]');
 
     const updated = await repository.updateWorkspaceSettings({
       workspaceId: created.id,
@@ -291,6 +306,7 @@ test.describe('workspace repository content model', () => {
     expect(secondGet.defaultLocale).toBe('fr-fr');
     expect(secondGet.enabledLocales).toEqual(['fr-fr']);
     expect(secondGet.kbAccessMode).toBe('cli');
+    expect(secondGet.acpModelId).toBe('composer-2[fast=true]');
   });
 
   test('persists KB scope catalog entries and resolves display names with overrides', async () => {

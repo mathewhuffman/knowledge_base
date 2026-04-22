@@ -5,7 +5,8 @@
     "moduleResolution": "Node",
     "outDir": "./dist",
     "rootDir": "./src",
-    "declaration": true
+    "declaration": true,
+    "types": ["node"]
   },
   "include": ["src/**/*"]
 }

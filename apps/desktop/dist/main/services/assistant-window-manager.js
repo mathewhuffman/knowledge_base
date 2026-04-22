@@ -260,7 +260,7 @@ class AssistantWindowManager {
             minWidth: shared_types_1.AI_ASSISTANT_DETACHED_PANEL_MIN_WINDOW_SIZE.width,
             minHeight: shared_types_1.AI_ASSISTANT_DETACHED_PANEL_MIN_WINDOW_SIZE.height,
             show: false,
-            title: 'KB Vault Assistant',
+            title: 'KnowledgeBase Assistant',
             autoHideMenuBar: true,
             frame: false,
             transparent: true,

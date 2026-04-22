@@ -8,6 +8,8 @@ exports.getStoredSidebarCollapsedPreference = getStoredSidebarCollapsedPreferenc
 exports.setSidebarCollapsedPreference = setSidebarCollapsedPreference;
 exports.getAssistantPresentationPreferences = getAssistantPresentationPreferences;
 exports.setAssistantPresentationPreferences = setAssistantPresentationPreferences;
+exports.getAppUpdatePreferences = getAppUpdatePreferences;
+exports.setAppUpdatePreferences = setAppUpdatePreferences;
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
 const electron_1 = require("electron");
@@ -101,5 +103,30 @@ function setAssistantPresentationPreferences(nextPreferences) {
             ...preferences.ui,
             assistant: nextPreferences
         }
+    });
+}
+function getAppUpdatePreferences() {
+    const preferences = readPreferences().updates;
+    if (!preferences || typeof preferences !== 'object') {
+        logger_1.logger.info('app-preferences.getAppUpdatePreferences.empty');
+        return {};
+    }
+    logger_1.logger.info('app-preferences.getAppUpdatePreferences.success', {
+        autoCheckEnabled: preferences.autoCheckEnabled ?? null,
+        dismissedVersion: preferences.dismissedVersion ?? null,
+        lastCheckedAt: preferences.lastCheckedAt ?? null
+    });
+    return preferences;
+}
+function setAppUpdatePreferences(nextPreferences) {
+    logger_1.logger.info('app-preferences.setAppUpdatePreferences.begin', {
+        autoCheckEnabled: nextPreferences.autoCheckEnabled ?? null,
+        dismissedVersion: nextPreferences.dismissedVersion ?? null,
+        lastCheckedAt: nextPreferences.lastCheckedAt ?? null
+    });
+    const preferences = readPreferences();
+    writePreferences({
+        ...preferences,
+        updates: nextPreferences
     });
 }

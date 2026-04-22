@@ -3,9 +3,13 @@ import { AppRoute, type AiAssistantRendererWindowRole, type AppNavigationEvent, 
 import { routeToComponent } from './routes/routeMap';
 import { Sidebar } from './components/Sidebar';
 import { WorkspaceProvider, useWorkspace } from './context/WorkspaceContext';
+import { AppUpdateProvider } from './context/AppUpdateContext';
 import type { KbvApi } from './types/window';
 import { AiAssistantProvider } from './components/assistant/AssistantContext';
 import { DetachedAssistantWindowHost, GlobalAssistantHost } from './components/assistant/GlobalAssistantHost';
+import { BootLoadingScreen } from './components/boot/BootLoadingScreen';
+import { BootLoadingStoryboard } from './components/boot/BootLoadingStoryboard';
+import { REPLAY_BOOT_EVENT } from './components/boot/bootLoadingModel';
 
 const PROPOSAL_REVIEW_TARGET_KEY = 'kbv:proposal-review-target';
 const ARTICLE_EXPLORER_TARGET_KEY = 'kbv:article-explorer-target';
@@ -59,6 +63,8 @@ function AppShell() {
   const [boot, setBoot] = useState<RpcResponse<BootData> | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [showBootLoading, setShowBootLoading] = useState(true);
+  const [bootReplayNonce, setBootReplayNonce] = useState(0);
   const { activeWorkspace } = useWorkspace();
 
   const toggleSidebar = useCallback(() => {
@@ -180,7 +186,20 @@ function AppShell() {
     });
   }, [openArticleExplorer, openProposalReview]);
 
+  useEffect(() => {
+    const handleReplayBoot = () => {
+      setBootReplayNonce((current) => current + 1);
+      setShowBootLoading(true);
+    };
+
+    window.addEventListener(REPLAY_BOOT_EVENT, handleReplayBoot);
+    return () => {
+      window.removeEventListener(REPLAY_BOOT_EVENT, handleReplayBoot);
+    };
+  }, []);
+
   const Active = routeToComponent[activeRoute];
+  const bootResolved = boot !== null || bootError !== null;
 
   return (
     <div className="app-shell">
@@ -193,16 +212,25 @@ function AppShell() {
         onToggleCollapse={toggleSidebar}
       />
       {bootError ? <p style={{ padding: '16px', color: 'crimson' }}>{bootError}</p> : null}
-      <AiAssistantProvider
-        windowRole="main"
-        activeRoute={activeRoute}
-        workspaceId={activeWorkspace?.id}
-      >
-        <main className="main-content">
-          <Active />
-        </main>
-        <GlobalAssistantHost />
-      </AiAssistantProvider>
+      <AppUpdateProvider>
+        <AiAssistantProvider
+          windowRole="main"
+          activeRoute={activeRoute}
+          workspaceId={activeWorkspace?.id}
+        >
+          <main className="main-content">
+            <Active />
+          </main>
+          <GlobalAssistantHost />
+        </AiAssistantProvider>
+      </AppUpdateProvider>
+      {showBootLoading ? (
+        <BootLoadingScreen
+          key={bootReplayNonce}
+          bootResolved={bootResolved}
+          onComplete={() => setShowBootLoading(false)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -227,9 +255,18 @@ function getRendererWindowRole(): AiAssistantRendererWindowRole {
   return rawRole === 'assistant_detached' ? 'assistant_detached' : 'main';
 }
 
+function getBootPreviewMode(): 'storyboard' | null {
+  const previewMode = new URLSearchParams(window.location.search).get('bootPreview');
+  return previewMode === 'storyboard' ? 'storyboard' : null;
+}
+
 export function App() {
   if (getRendererWindowRole() === 'assistant_detached') {
     return <DetachedAssistantApp />;
+  }
+
+  if (getBootPreviewMode() === 'storyboard') {
+    return <BootLoadingStoryboard />;
   }
 
   return (

@@ -145,7 +145,7 @@ function buildPlaceholderSvg(description) {
         '<defs><linearGradient id="bg" x1="0%" x2="100%" y1="0%" y2="100%"><stop offset="0%" stop-color="#f8fafc"/><stop offset="100%" stop-color="#dbeafe"/></linearGradient></defs>',
         '<rect width="1280" height="720" fill="url(#bg)"/>',
         '<rect x="48" y="48" width="1184" height="624" rx="28" fill="#ffffff" stroke="#94a3b8" stroke-width="4" stroke-dasharray="18 12"/>',
-        '<text x="640" y="170" text-anchor="middle" font-size="42" font-family="Arial, sans-serif" fill="#1d4ed8">KB Vault Placeholder Image</text>',
+        '<text x="640" y="170" text-anchor="middle" font-size="42" font-family="Arial, sans-serif" fill="#1d4ed8">KnowledgeBase Placeholder Image</text>',
         '<text x="640" y="225" text-anchor="middle" font-size="20" font-family="Arial, sans-serif" fill="#475569">Replace this generated placeholder with the final screenshot or illustration when ready.</text>',
         text,
         '</svg>'

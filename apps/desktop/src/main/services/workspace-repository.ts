@@ -778,9 +778,15 @@ const ACP_ALLOWED_MODEL_IDS = new Set([
   'gemini-2.5-flash[]',
   'kimi-k2.5[]'
 ]);
+const DEFAULT_ACP_MODEL_ID = 'composer-2[fast=true]';
+
+export type WorkspaceRepositoryOptions = {
+  protectedRoots?: string[];
+};
 
 export class WorkspaceRepository {
   private readonly catalogDbPath: string;
+  private readonly protectedWorkspaceRoots: string[];
   private readonly articleRelationsV2ExportService: ArticleRelationsV2ExportService;
   private readonly articleRelationsV2FeatureMapService: ArticleRelationsV2FeatureMapService;
   private readonly articleRelationsV2QueryService: ArticleRelationsV2QueryService;
@@ -788,8 +794,12 @@ export class WorkspaceRepository {
   private lastCatalogFailureMs = 0;
   private lastCatalogFailureMessage: string | undefined;
 
-  constructor(private readonly workspaceRoot: string) {
+  constructor(
+    private readonly workspaceRoot: string,
+    options: WorkspaceRepositoryOptions = {}
+  ) {
     this.catalogDbPath = path.join(this.workspaceRoot, CATALOG_DB_PATH);
+    this.protectedWorkspaceRoots = normalizeProtectedWorkspaceRoots(options.protectedRoots);
     this.articleRelationsV2ExportService = new ArticleRelationsV2ExportService({
       fileExists: async (filePath) => this.fileExists(filePath),
       readTextFile: async (filePath) => fs.readFile(filePath, 'utf8')
@@ -819,6 +829,18 @@ export class WorkspaceRepository {
       return undefined;
     }
     return normalized;
+  }
+
+  private assertWorkspacePathIsSafe(resolvedPath: string): void {
+    for (const protectedRoot of this.protectedWorkspaceRoots) {
+      if (!isSameOrNestedPath(resolvedPath, protectedRoot)) {
+        continue;
+      }
+
+      throw new Error(
+        `Workspace paths must live outside the app install/build directories so updates do not replace user data. Choose a folder outside ${protectedRoot}.`
+      );
+    }
   }
 
   async listWorkspaces(): Promise<WorkspaceRecord[]> {
@@ -909,6 +931,7 @@ export class WorkspaceRepository {
         );
 
         if (settings) {
+          const normalizedAcpModelId = this.normalizeAcpModelId(settings.acp_model_id) ?? DEFAULT_ACP_MODEL_ID;
           return {
             workspaceId: settings.workspace_id,
             zendeskSubdomain: settings.zendesk_subdomain,
@@ -917,7 +940,7 @@ export class WorkspaceRepository {
             enabledLocales: safeParseLocales(settings.enabled_locales),
             kbAccessMode: normalizeKbAccessMode(settings.kb_access_mode),
             agentModelId: this.normalizeAgentModelId(settings.agent_model_id),
-            acpModelId: this.normalizeAcpModelId(settings.acp_model_id),
+            acpModelId: normalizedAcpModelId,
             zendeskPermissionGroupId: normalizeZendeskPublishId(settings.zendesk_permission_group_id),
             zendeskLiveUserSegmentId: normalizeZendeskPublishId(settings.zendesk_live_user_segment_id),
             zendeskNotifySubscribers: normalizeBooleanColumn(settings.zendesk_notify_subscribers, DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS),
@@ -955,7 +978,7 @@ export class WorkspaceRepository {
             enabledLocales: JSON.stringify(enabledLocales),
             kbAccessMode: DEFAULT_KB_ACCESS_MODE,
             agentModelId: null,
-            acpModelId: null,
+            acpModelId: DEFAULT_ACP_MODEL_ID,
             zendeskPermissionGroupId: null,
             zendeskLiveUserSegmentId: null,
             zendeskNotifySubscribers: DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS ? 1 : 0,
@@ -979,7 +1002,7 @@ export class WorkspaceRepository {
           enabledLocales,
           kbAccessMode: DEFAULT_KB_ACCESS_MODE,
           agentModelId: undefined,
-          acpModelId: undefined,
+          acpModelId: DEFAULT_ACP_MODEL_ID,
           zendeskPermissionGroupId: undefined,
           zendeskLiveUserSegmentId: undefined,
           zendeskNotifySubscribers: DEFAULT_ZENDESK_NOTIFY_SUBSCRIBERS,
@@ -1124,7 +1147,7 @@ export class WorkspaceRepository {
           : this.normalizeAgentModelId(existing?.agent_model_id);
         const nextAcpModelId = payload.acpModelId !== undefined
           ? this.normalizeAcpModelId(payload.acpModelId)
-          : this.normalizeAcpModelId(existing?.acp_model_id);
+          : this.normalizeAcpModelId(existing?.acp_model_id) ?? DEFAULT_ACP_MODEL_ID;
         const nextZendeskPermissionGroupId = payload.zendeskPermissionGroupId !== undefined
           ? normalizeZendeskPublishId(payload.zendeskPermissionGroupId)
           : normalizeZendeskPublishId(existing?.zendesk_permission_group_id);
@@ -1268,9 +1291,10 @@ export class WorkspaceRepository {
       hasPathOverride: Boolean(payload.path),
       enabledLocalesCount: payload.enabledLocales?.length ?? 0
     });
-    const catalog = await this.openCatalogWithRecovery();
     const now = new Date().toISOString();
     const resolvedPath = workspacePath(payload.path, this.workspaceRoot, payload.name);
+    this.assertWorkspacePathIsSafe(resolvedPath);
+    const catalog = await this.openCatalogWithRecovery();
     try {
       const existing = catalog.get<CatalogWorkspaceRow>(
         `SELECT id FROM workspaces WHERE name = @name OR path = @path`,
@@ -1342,7 +1366,7 @@ export class WorkspaceRepository {
             enabledLocales: JSON.stringify(enabledLocales),
             kbAccessMode: DEFAULT_KB_ACCESS_MODE,
             agentModelId: null,
-            acpModelId: null,
+            acpModelId: DEFAULT_ACP_MODEL_ID,
             updatedAt: now
           }
         );
@@ -19227,6 +19251,35 @@ function buildWorkspaceItemFromCatalog(row: CatalogWorkspaceRow, articleCount: n
 
 function workspacePath(inputPath: string | undefined, root: string, name: string): string {
   return path.resolve(inputPath ?? path.join(root, sanitizeName(name)));
+}
+
+function normalizeProtectedWorkspaceRoots(protectedRoots?: string[]): string[] {
+  if (!Array.isArray(protectedRoots) || protectedRoots.length === 0) {
+    return [];
+  }
+
+  return Array.from(new Set(
+    protectedRoots
+      .map((value) => value?.trim())
+      .filter((value): value is string => Boolean(value))
+      .map(normalizeComparablePath)
+  ));
+}
+
+function isSameOrNestedPath(candidatePath: string, parentPath: string): boolean {
+  const normalizedCandidatePath = normalizeComparablePath(candidatePath);
+  const normalizedParentPath = normalizeComparablePath(parentPath);
+  if (normalizedCandidatePath === normalizedParentPath) {
+    return true;
+  }
+
+  const relativePath = path.relative(normalizedParentPath, normalizedCandidatePath);
+  return relativePath !== '' && !relativePath.startsWith('..') && !path.isAbsolute(relativePath);
+}
+
+function normalizeComparablePath(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
 function normalizeLocales(locales?: string[]) {

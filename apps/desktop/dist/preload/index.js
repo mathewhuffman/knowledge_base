@@ -9,6 +9,7 @@ const IPC_CHANNELS = {
     JOB_CANCEL: 'kbv:job:cancel',
     JOB_EVENT: 'kbv:job:event',
     APP_WORKING_STATE_EVENT: 'kbv:app-working-state:event',
+    APP_UPDATE_EVENT: 'kbv:app-update:event',
     AI_ASSISTANT_EVENT: 'kbv:ai-assistant:event',
     AI_ASSISTANT_PRESENTATION_EVENT: 'kbv:ai-assistant:presentation:event',
     AI_ASSISTANT_CONTEXT_EVENT: 'kbv:ai-assistant:context:event',
@@ -37,6 +38,13 @@ const emitAppWorkingStateEvents = (cb) => {
     electron_1.ipcRenderer.on(IPC_CHANNELS.APP_WORKING_STATE_EVENT, listener);
     return () => {
         electron_1.ipcRenderer.removeListener(IPC_CHANNELS.APP_WORKING_STATE_EVENT, listener);
+    };
+};
+const emitAppUpdateEvents = (cb) => {
+    const listener = (_event, data) => cb(data);
+    electron_1.ipcRenderer.on(IPC_CHANNELS.APP_UPDATE_EVENT, listener);
+    return () => {
+        electron_1.ipcRenderer.removeListener(IPC_CHANNELS.APP_UPDATE_EVENT, listener);
     };
 };
 const emitAiAssistantEvents = (cb) => {
@@ -80,6 +88,7 @@ electron_1.contextBridge.exposeInMainWorld('kbv', {
     invoke,
     emitJobEvents,
     emitAppWorkingStateEvents,
+    emitAppUpdateEvents,
     emitAiAssistantEvents,
     emitAiAssistantPresentationEvents,
     emitAiAssistantContextEvents,

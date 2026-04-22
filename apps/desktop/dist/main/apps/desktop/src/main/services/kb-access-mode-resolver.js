@@ -18,7 +18,7 @@ function selectKbAccessMode(requestedMode, workspaceMode) {
     return requestedMode ?? workspaceMode;
 }
 function buildKbAccessModePreflightFailureMessage(selectedMode, selectedProvider) {
-    return `Selected KB access mode ${selectedMode.toUpperCase()} is not ready: ${selectedProvider.message || 'not ready'}. KB Vault will not switch providers automatically.`;
+    return `Selected KB access mode ${selectedMode.toUpperCase()} is not ready: ${selectedProvider.message || 'not ready'}. KnowledgeBase will not switch providers automatically.`;
 }
 async function resolveKbAccessModeSelection(input) {
     const workspaceMode = await input.resolveWorkspaceKbAccessMode(input.workspaceId);

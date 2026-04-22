@@ -35,7 +35,7 @@ export function buildKbAccessModePreflightFailureMessage(
   selectedMode: KbAccessMode,
   selectedProvider: Pick<KbAccessHealth, 'message'>
 ): string {
-  return `Selected KB access mode ${selectedMode.toUpperCase()} is not ready: ${selectedProvider.message || 'not ready'}. KB Vault will not switch providers automatically.`;
+  return `Selected KB access mode ${selectedMode.toUpperCase()} is not ready: ${selectedProvider.message || 'not ready'}. KnowledgeBase will not switch providers automatically.`;
 }
 
 export async function resolveKbAccessModeSelection(

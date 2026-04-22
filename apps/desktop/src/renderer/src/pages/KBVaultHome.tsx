@@ -7,6 +7,7 @@ import { LoadingState } from '../components/LoadingState';
 import { Badge } from '../components/Badge';
 import { StatusChip } from '../components/StatusChip';
 import { IconHome, IconLayers, IconRefreshCw } from '../components/icons';
+import { requestBootReplay } from '../components/boot/bootLoadingModel';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { useIpc, useIpcMutation } from '../hooks/useIpc';
 
@@ -268,6 +269,13 @@ export const KBVaultHome = () => {
             >
               <IconLayers size={13} />
               Open Feature Map
+            </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => requestBootReplay()}
+            >
+              <IconRefreshCw size={13} />
+              Replay Loading Sequence
             </button>
           </div>
         }

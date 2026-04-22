@@ -639,8 +639,8 @@ class KbCliRuntimeService {
     buildPromptSuffix() {
         const binaryPath = this.resolveBinaryPath() || this.getBinaryName();
         return [
-            'CLI transport is preconfigured by KB Vault.',
-            `Use this exact KB Vault CLI binary for every command: \`${binaryPath}\`. Do not rely on any other installed \`kb\` binary.`,
+            'CLI transport is preconfigured by KnowledgeBase.',
+            `Use this exact KnowledgeBase CLI binary for every command: \`${binaryPath}\`. Do not rely on any other installed \`kb\` binary.`,
             'Do not invent localhost URLs or auth tokens.',
             'The proposal commands you need are available through this binary:',
             `- \`${binaryPath} proposal create --workspace-id <workspace-id> --batch-id <batch-id> --session-id <session-id> --note "<note>" --rationale "<rationale>" --pbi-ids "<comma-separated-pbi-ids>" --metadata '{"targetTitle":"<article title>","confidenceScore":0.82,"proposedHtml":"<html>...</html>"}' --json\``,

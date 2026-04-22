@@ -5222,6 +5222,9 @@ test.describe('command registry content model transitions', () => {
         payload: { workspaceId: workspace.id }
       });
       expect(runtimeOptionsResp.ok).toBe(true);
+      expect((runtimeOptionsResp.data as { currentModelId?: string }).currentModelId).toBe(
+        'gpt-5.4[reasoning=medium,context=272k,fast=false]'
+      );
 
       await writeFile(releasePath, 'release', 'utf8');
 

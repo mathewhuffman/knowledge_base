@@ -2937,7 +2937,7 @@ function registerCoreCommands(bus, jobs, workspaceRoot, emitAppWorkingStateEvent
             await workspaceRepository.getWorkspace(workspaceId);
             const settings = await workspaceRepository.getWorkspaceSettings(workspaceId);
             const options = await agentRuntime.getRuntimeOptions(workspaceId);
-            const currentModelId = settings.agentModelId ?? options.currentModelId;
+            const currentModelId = settings.acpModelId ?? settings.agentModelId ?? options.currentModelId;
             const availableModels = Array.from(new Set([
                 ...(options.availableModels ?? []),
                 ...(currentModelId ? [currentModelId] : [])
